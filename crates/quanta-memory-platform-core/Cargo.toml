@@ -1,0 +1,18 @@
+[package]
+name = "quanta-memory-platform-core"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+publish.workspace = true
+
+[features]
+default = []
+pressure = []
+scheduler = []
+live_control = ["pressure", "scheduler"]
+telemetry = ["dep:metrics", "dep:hdrhistogram"]
+full = ["live_control", "telemetry"]
+
+[dependencies]
+hdrhistogram = { workspace = true, optional = true }
+metrics = { workspace = true, optional = true }

@@ -1,0 +1,1307 @@
+//! The reusable conformance suite runner.
+//!
+//! [`run_broker_accounting_suite`] drives any [`BrokerConformanceTarget`] through
+//! a deterministic workload and asserts the host-independent accounting
+//! invariants. Each check is attributed to a [`ContractFamily`], so a failure
+//! localizes to a portable contract rather than a host package.
+//!
+//! The suite is itself test infrastructure: it MUST reject a broker that lies
+//! about its accounting. The crate-level self-test feeds a deliberately broken
+//! fake into this suite and asserts the verdict is `Failed`.
+
+use crate::conformance::invariants::{AssertionVerdict, ContractFamily, InvariantAssertion};
+use crate::conformance::target::{AllocatorObservation, BrokerConformanceTarget, ChargeAxis};
+#[cfg(feature = "fixtures")]
+use crate::fixtures::{MemoryFixture, MemoryTestKit};
+
+#[cfg(feature = "fixtures")]
+use quanta_memory_platform_core::{
+    ChargeKind, LiveProcessMemoryBroker, MemoryClass, MemoryClassBudget, MemoryContextKind,
+    MemoryError, MemoryResult, ReclaimPriority, ReservationTicket, StoreBindingHandle, SweepHint,
+};
+#[cfg(feature = "fixtures")]
+use quanta_memory_platform_facade::{
+    AccountingSink, InMemorySpillTarget, PayloadStore, RetainedMapStore, RoutedSpillController,
+    SessionTranscriptStore, SimplePayloadStore, SimpleRetainedMapStore,
+    SimpleSessionTranscriptStore, SpillController, SpillTarget,
+};
+#[cfg(feature = "fixtures")]
+use std::sync::Arc;
+
+/// Stable suite identifiers (kept for the public test-entry surface and for
+/// host fixtures that select a named suite).
+pub const CORE_ACCOUNTING_SUITE: &str = "core-accounting";
+#[cfg(feature = "fixtures")]
+pub const FACADE_STORE_SUITE: &str = "facade-store";
+
+/// Run the broker accounting conformance suite against a target.
+///
+/// Returns the full ordered list of [`AssertionVerdict`]s. The caller (the
+/// [`ConformanceSuite`](crate::conformance::ConformanceSuite)) folds these into a
+/// pass/fail verdict; returning the verdicts (not just a bool) keeps the evidence
+/// for localization and reporting.
+pub fn run_broker_accounting_suite<T>(target: &mut T) -> Vec<AssertionVerdict>
+where
+    T: BrokerConformanceTarget,
+{
+    let mut verdicts = Vec::new();
+
+    // --- Workload: charge two owners across two classes and kinds. The exact
+    // totals are NOT hardcoded as the oracle; the oracle is the *relationship*
+    // (class==owner, owner==partition) read back from the target's own view.
+    let owner_a = "owner:conformance-a";
+    let owner_b = "owner:conformance-b";
+
+    let t1 = target.do_reserve(0, owner_a, ChargeAxis::RetainedPayload, 1_000);
+    let t2 = target.do_reserve(1, owner_a, ChargeAxis::RetainedMetadata, 250);
+    let t3 = target.do_reserve(0, owner_b, ChargeAxis::LiveScratch, 500);
+
+    // Commit whatever reserved successfully; a target that fails an in-cap
+    // reserve is itself a violation, recorded below.
+    let reserve_ok = t1.is_ok() && t2.is_ok() && t3.is_ok();
+    let reserve_assert =
+        InvariantAssertion::new(ContractFamily::ReserveFailClosed, "in_cap_reserves_succeed");
+    verdicts.push(reserve_assert.assert_that(
+        reserve_ok,
+        format!(
+            "uncapped in-budget reserves must succeed: t1={:?} t2={:?} t3={:?}",
+            t1.as_ref().map(|_| "ok").map_err(|e| e.clone()),
+            t2.as_ref().map(|_| "ok").map_err(|e| e.clone()),
+            t3.as_ref().map(|_| "ok").map_err(|e| e.clone()),
+        ),
+    ));
+
+    if let Ok(t) = &t1 {
+        let _ = target.do_commit(t);
+    }
+    if let Ok(t) = &t2 {
+        let _ = target.do_commit(t);
+    }
+    if let Ok(t) = &t3 {
+        let _ = target.do_commit(t);
+    }
+
+    // --- Invariant 1: class total == owner total.
+    let view = target.view();
+    let balance = InvariantAssertion::new(ContractFamily::ClassOwnerBalance, "class_equals_owner");
+    verdicts.push(balance.assert_eq_bytes(
+        "class_total_vs_owner_total",
+        view.total_class_bytes,
+        view.total_owner_bytes,
+    ));
+
+    // --- Invariant 2: owner total == payload + metadata + live scratch.
+    let partition = InvariantAssertion::new(ContractFamily::OwnerPartition, "owner_partitions");
+    verdicts.push(partition.assert_eq_bytes(
+        "owner_total_vs_partition_sum",
+        view.total_owner_bytes,
+        view.partition_sum(),
+    ));
+
+    // --- Invariant 4: rebuild window fences live writes.
+    let fence = InvariantAssertion::new(ContractFamily::RebuildWriteFence, "rebuild_fences_writes");
+    if target.do_begin_rebuild().is_ok() {
+        // Fail-closed evidence: capture accounting BEFORE the denied write so we
+        // can prove the denial was byte-for-byte inert, not merely an `Err`. A
+        // target that returns `Err` *after* mutating its counters is just as
+        // broken as one that admits the write, and must be caught here.
+        let before_denied = target.view();
+        let during = target.do_reserve(0, owner_a, ChargeAxis::RetainedPayload, 1);
+        verdicts.push(fence.assert_that(
+            during.is_err(),
+            format!("reserve during rebuild must be rejected, got {during:?}"),
+        ));
+        let after_denied = target.view();
+        let fail_closed = InvariantAssertion::new(
+            ContractFamily::ReserveFailClosed,
+            "rebuild_denied_reserve_is_inert",
+        );
+        // The denied reserve must leave EVERY accounting axis untouched, not just
+        // the grand total. Compare the full view so a compensating lie (e.g. one
+        // axis up, another down) is still caught.
+        verdicts.push(fail_closed.assert_that(
+            before_denied == after_denied,
+            format!(
+                "denied reserve during rebuild mutated accounting: before={before_denied:?} after={after_denied:?}"
+            ),
+        ));
+        let _ = target.do_finish_rebuild();
+        // Positive pair: after the window closes, a reserve is accepted again.
+        let after = target.do_reserve(0, owner_a, ChargeAxis::RetainedPayload, 1);
+        let after_ok = after.is_ok();
+        if let Ok(t) = &after {
+            let _ = target.do_release(t);
+        }
+        verdicts.push(
+            fence.assert_that(after_ok, "reserve after rebuild window closes must be accepted"),
+        );
+    } else {
+        verdicts.push(fence.assert_that(false, "target failed to enter rebuild window"));
+    }
+
+    // --- Reserve fail-closed: re-read accounting; the suite's own bookkeeping
+    // must still balance after the rebuild excursion (no torn state).
+    let post = target.view();
+    let post_balance =
+        InvariantAssertion::new(ContractFamily::ClassOwnerBalance, "post_excursion_balance");
+    verdicts.push(post_balance.assert_eq_bytes(
+        "post_class_total_vs_owner_total",
+        post.total_class_bytes,
+        post.total_owner_bytes,
+    ));
+
+    // --- Invariant 6: allocator observation is advisory only.
+    let advisory = InvariantAssertion::new(
+        ContractFamily::AllocatorAdvisory,
+        "allocator_observation_is_inert",
+    );
+    let before_advisory = target.view();
+    let mismatch = target.observe_allocator(&AllocatorObservation {
+        resident_bytes: Some(before_advisory.total_owner_bytes.saturating_add(7)),
+    });
+    let after_mismatch = target.view();
+    verdicts.push(advisory.assert_that(
+        matches!(
+            &mismatch,
+            Ok(view)
+                if view.semantic_bytes == before_advisory.total_owner_bytes
+                    && view.allocator_resident_bytes
+                        == Some(before_advisory.total_owner_bytes.saturating_add(7))
+                    && view.mismatch
+                    && view.drift_bytes == Some(7)
+        ) && before_advisory == after_mismatch,
+        format!(
+            "mismatch={mismatch:?} before_advisory={before_advisory:?} after_mismatch={after_mismatch:?}"
+        ),
+    ));
+    let absent = target.observe_allocator(&AllocatorObservation { resident_bytes: None });
+    let after_absent = target.view();
+    verdicts.push(advisory.assert_that(
+        matches!(
+            &absent,
+            Ok(view)
+                if view.semantic_bytes == before_advisory.total_owner_bytes
+                    && view.allocator_resident_bytes.is_none()
+                    && !view.mismatch
+                    && view.drift_bytes.is_none()
+        ) && before_advisory == after_absent,
+        format!(
+            "absent={absent:?} before_advisory={before_advisory:?} after_absent={after_absent:?}"
+        ),
+    ));
+
+    verdicts
+}
+
+#[cfg(feature = "fixtures")]
+#[derive(Clone, Debug)]
+struct LiveBrokerAccountingSink {
+    broker: LiveProcessMemoryBroker,
+}
+
+#[cfg(feature = "fixtures")]
+impl LiveBrokerAccountingSink {
+    fn shared(broker: LiveProcessMemoryBroker) -> Arc<dyn AccountingSink> {
+        Arc::new(Self { broker })
+    }
+}
+
+#[cfg(feature = "fixtures")]
+impl AccountingSink for LiveBrokerAccountingSink {
+    fn charge(
+        &self,
+        class: MemoryClass,
+        owner: String,
+        context: MemoryContextKind,
+        kind: ChargeKind,
+        bytes: u64,
+    ) -> MemoryResult<ReservationTicket> {
+        self.broker.reserve_committed(class, owner, context, kind, bytes)
+    }
+
+    fn refund(&self, ticket: &ReservationTicket) -> MemoryResult<()> {
+        self.broker.release(ticket)
+    }
+
+    fn refund_many(&self, tickets: &[ReservationTicket]) -> MemoryResult<()> {
+        self.broker.release_many(tickets)
+    }
+
+    fn recharge(
+        &self,
+        old: &ReservationTicket,
+        class: MemoryClass,
+        owner: String,
+        context: MemoryContextKind,
+        kind: ChargeKind,
+        bytes: u64,
+    ) -> Result<ReservationTicket, quanta_memory_platform_facade::shared::accounting::RechargeDenied>
+    {
+        self.broker
+            .recharge(old, class, owner, context, kind, bytes)
+            .map_err(|e| (e.error, e.restored))
+    }
+}
+
+#[cfg(feature = "fixtures")]
+fn binding(class: MemoryClass, owner: &str) -> StoreBindingHandle {
+    StoreBindingHandle::new(class, owner.to_string(), None)
+}
+
+#[cfg(feature = "fixtures")]
+fn broker_bytes(broker: &LiveProcessMemoryBroker) -> Result<u64, String> {
+    broker.ledger_snapshot().map(|snapshot| snapshot.total_owner_bytes()).map_err(|e| e.to_string())
+}
+
+#[cfg(feature = "fixtures")]
+fn session_transcript_budget(base: &MemoryTestKit, hard_cap_bytes: u64) -> MemoryTestKit {
+    let mut manifest = base.fixture.manifest.clone();
+    let fallback = MemoryClassBudget {
+        reserved_bytes: 0,
+        soft_cap_bytes: hard_cap_bytes,
+        hard_cap_bytes,
+        borrow_from_shared_pool: false,
+        reclaim_priority: ReclaimPriority::Last,
+    };
+    let prior = manifest
+        .residency
+        .classes
+        .get(&MemoryClass::SessionTranscript)
+        .cloned()
+        .unwrap_or(fallback);
+    manifest.residency = manifest.residency.clone().with_class_budget(
+        MemoryClass::SessionTranscript,
+        MemoryClassBudget { soft_cap_bytes: hard_cap_bytes, hard_cap_bytes, ..prior },
+    );
+    MemoryTestKit { fixture: MemoryFixture { manifest, fake_pressure: base.fixture.fake_pressure } }
+}
+
+/// A kit whose `class` is tightly capped at `hard_cap_bytes`, for driving
+/// over-cap / atomic-recharge cases on a specific store class.
+#[cfg(feature = "fixtures")]
+fn class_capped_kit(
+    base: &MemoryTestKit,
+    class: MemoryClass,
+    hard_cap_bytes: u64,
+) -> MemoryTestKit {
+    let mut manifest = base.fixture.manifest.clone();
+    manifest.residency = manifest.residency.clone().with_class_budget(
+        class,
+        MemoryClassBudget {
+            reserved_bytes: 0,
+            soft_cap_bytes: hard_cap_bytes,
+            hard_cap_bytes,
+            borrow_from_shared_pool: false,
+            reclaim_priority: ReclaimPriority::Last,
+        },
+    );
+    MemoryTestKit { fixture: MemoryFixture { manifest, fake_pressure: base.fixture.fake_pressure } }
+}
+
+/// Run the live broker-backed portable facade-store suite against `kit`.
+///
+/// The harness stays host-independent: it builds only portable facade slices and
+/// a real `LiveProcessMemoryBroker` from the fixture manifest. Verdicts are
+/// emitted as ordinary [`AssertionVerdict`] values so callers get the same
+/// localized evidence shape as the accounting suite.
+#[cfg(feature = "fixtures")]
+pub fn run_facade_store_suite(kit: &MemoryTestKit) -> Vec<AssertionVerdict> {
+    let mut verdicts = Vec::new();
+    verdicts.extend(run_payload_store_slice(kit));
+    verdicts.extend(run_retained_map_slice(kit));
+    verdicts.extend(run_transcript_slice(kit));
+    verdicts.extend(run_spill_slice());
+    verdicts
+}
+
+#[cfg(feature = "fixtures")]
+fn run_payload_store_slice(kit: &MemoryTestKit) -> Vec<AssertionVerdict> {
+    let accounting =
+        InvariantAssertion::new(ContractFamily::ReclaimAccounting, "payload_dedup_refund");
+    let pin_discipline = InvariantAssertion::new(ContractFamily::PinDiscipline, "pin_safe_delete");
+    let broker = match kit.live_broker() {
+        Ok(broker) => broker,
+        Err(err) => {
+            return vec![
+                accounting.assert_that(false, format!("payload broker setup failed: {err}")),
+                pin_discipline
+                    .assert_that(false, "payload pin-safe delete skipped: broker setup failed"),
+            ];
+        }
+    };
+    let sink = LiveBrokerAccountingSink::shared(broker.clone());
+    let store = SimplePayloadStore::<String, Vec<u8>>::new(
+        binding(MemoryClass::ArtifactCache, "conformance:payload"),
+        None,
+    )
+    .charged_against(sink);
+    let payload = vec![7u8; 32];
+    let first = match store
+        .put_canonical(quanta_memory_platform_core::RetainedEnvelope::new(payload.clone()))
+    {
+        Ok(published) => published,
+        Err(err) => {
+            return vec![
+                accounting.assert_that(false, format!("first payload put failed: {err:?}")),
+                pin_discipline
+                    .assert_that(false, "payload pin-safe delete skipped: initial put failed"),
+            ];
+        }
+    };
+    let ledger_after_first = broker_bytes(&broker);
+    let second = store.put_canonical(quanta_memory_platform_core::RetainedEnvelope::new(payload));
+    let ledger_after_dedup = broker_bytes(&broker);
+    let charged_after_dedup = store.charged_bytes().map_err(|e| e.to_string());
+    let pin = store.pin(first.payload_ref());
+    let ledger_before_pinned_delete = broker_bytes(&broker);
+    let pinned_delete = store.delete_if_unpinned(first.payload_ref());
+    let ledger_after_pinned_delete = broker_bytes(&broker);
+    let charged_after_pinned_delete = store.charged_bytes().map_err(|e| e.to_string());
+    let unpin = store.unpin(first.payload_ref());
+    let final_delete = store.delete_if_unpinned(first.payload_ref());
+    let final_ledger = broker_bytes(&broker);
+    let final_charged = store.charged_bytes().map_err(|e| e.to_string());
+
+    vec![
+        accounting.assert_that(
+            matches!(&second, Ok(published) if published.payload_ref() == first.payload_ref())
+                && matches!(&ledger_after_first, Ok(bytes) if *bytes == 32)
+                && matches!(&ledger_after_dedup, Ok(bytes) if *bytes == 32)
+                && matches!(&charged_after_dedup, Ok(bytes) if *bytes == 32)
+                && final_delete.is_ok()
+                && matches!(&final_ledger, Ok(bytes) if *bytes == 0)
+                && matches!(&final_charged, Ok(bytes) if *bytes == 0),
+            format!(
+                "first_ref={} second={second:?} ledger_after_first={ledger_after_first:?} ledger_after_dedup={ledger_after_dedup:?} charged_after_dedup={charged_after_dedup:?} final_delete={final_delete:?} final_ledger={final_ledger:?} final_charged={final_charged:?}",
+                first.payload_ref()
+            ),
+        ),
+        pin_discipline.assert_that(
+            pin.is_ok()
+                && pinned_delete.is_err()
+                && matches!(
+                    (
+                        &ledger_before_pinned_delete,
+                        &ledger_after_pinned_delete,
+                        &charged_after_pinned_delete
+                    ),
+                    (Ok(before), Ok(after), Ok(charged)) if *before == *after && *charged == *before
+                )
+                && unpin.is_ok()
+                // The full discipline cycle belongs to THIS family: after unpin,
+                // the delete must SUCCEED and refund (so a store that refuses a
+                // delete even after unpin is localized to PinDiscipline, not only
+                // to the accounting family).
+                && final_delete.is_ok()
+                && matches!(&final_ledger, Ok(bytes) if *bytes == 0)
+                && matches!(&final_charged, Ok(bytes) if *bytes == 0),
+            format!(
+                "pin={pin:?} pinned_delete={pinned_delete:?} ledger_before_pinned_delete={ledger_before_pinned_delete:?} ledger_after_pinned_delete={ledger_after_pinned_delete:?} charged_after_pinned_delete={charged_after_pinned_delete:?} unpin={unpin:?} final_delete={final_delete:?} final_ledger={final_ledger:?} final_charged={final_charged:?}",
+            ),
+        ),
+    ]
+}
+
+#[cfg(feature = "fixtures")]
+fn run_retained_map_slice(kit: &MemoryTestKit) -> Vec<AssertionVerdict> {
+    let accounting =
+        InvariantAssertion::new(ContractFamily::ReclaimAccounting, "retained_map_refunds");
+    let broker = match kit.live_broker() {
+        Ok(broker) => broker,
+        Err(err) => {
+            return vec![
+                accounting.assert_that(false, format!("retained-map broker setup failed: {err}"))
+            ]
+        }
+    };
+    let sink = LiveBrokerAccountingSink::shared(broker.clone());
+    run_retained_map_slice_with_sink(kit, &broker, sink)
+}
+
+/// The retained-map slice over an INJECTED sink, so the suite can be driven
+/// against a deliberately broken sink and proven to BITE (see the suite-rejects
+/// self-test), not merely accept the honest live broker.
+#[cfg(feature = "fixtures")]
+fn run_retained_map_slice_with_sink(
+    kit: &MemoryTestKit,
+    broker: &LiveProcessMemoryBroker,
+    sink: std::sync::Arc<dyn AccountingSink>,
+) -> Vec<AssertionVerdict> {
+    let accounting =
+        InvariantAssertion::new(ContractFamily::ReclaimAccounting, "retained_map_refunds");
+    let store = SimpleRetainedMapStore::<String, Vec<u8>>::new(binding(
+        MemoryClass::MemoResidency,
+        "conformance:map",
+    ))
+    .charged_against(sink);
+
+    let overwrite = store
+        .insert_checked("k".to_string(), vec![0u8; 24])
+        .and_then(|_| store.insert_checked("k".to_string(), vec![1u8; 10]));
+    let after_overwrite = broker_bytes(broker);
+    let committed_after_overwrite = store.committed_bytes().map_err(|e| e.to_string());
+    let seed_sweep = store
+        .insert_checked("b".to_string(), vec![2u8; 7])
+        .and_then(|_| store.insert_checked("c".to_string(), vec![3u8; 5]));
+    let sweep_stats = store.sweep(SweepHint { target_bytes: 11 });
+    let after_sweep = broker_bytes(broker);
+    let committed_after_sweep = store.committed_bytes().map_err(|e| e.to_string());
+
+    // Tight-cap overwrite: an in-place replace whose NET fits the class cap but
+    // whose (old + new) transiently exceeds it. An atomic recharge admits it; a
+    // non-atomic charge-then-refund regression would be denied. This is the only
+    // way to localize a non-atomic recharge bug to the accounting family.
+    let recharge = InvariantAssertion::new(
+        ContractFamily::ReclaimAccounting,
+        "retained_atomic_recharge_overwrite",
+    );
+    let recharge_verdict = match class_capped_kit(kit, MemoryClass::MemoResidency, 30).live_broker()
+    {
+        Ok(tight_broker) => {
+            let tight_sink = LiveBrokerAccountingSink::shared(tight_broker.clone());
+            let tight_store = SimpleRetainedMapStore::<String, Vec<u8>>::new(binding(
+                MemoryClass::MemoResidency,
+                "conformance:map-tight",
+            ))
+            .charged_against(tight_sink);
+            let seed = tight_store.insert_checked("k".to_string(), vec![0u8; 24]); // 24 of 30
+                                                                                   // old(24) + new(20) = 44 > 30 cap, but net 20 <= 30: atomic recharge only.
+            let net_fit = tight_store.insert_checked("k".to_string(), vec![0u8; 20]);
+            let tight_ledger = broker_bytes(&tight_broker);
+            recharge.assert_that(
+                seed.is_ok()
+                    && net_fit.is_ok()
+                    && matches!(&tight_ledger, Ok(bytes) if *bytes == 20),
+                format!("seed={seed:?} net_fit={net_fit:?} tight_ledger={tight_ledger:?}"),
+            )
+        }
+        Err(err) => {
+            recharge.assert_that(false, format!("tight retained broker setup failed: {err}"))
+        }
+    };
+
+    vec![
+        accounting.assert_that(
+            overwrite.is_ok()
+                && matches!(&after_overwrite, Ok(bytes) if *bytes == 10)
+                && matches!(&committed_after_overwrite, Ok(bytes) if *bytes == 10)
+                && seed_sweep.is_ok()
+                && matches!(&sweep_stats, Ok(stats) if stats.reclaimed_items == 2 && stats.reclaimed_bytes == 12)
+                && matches!(&after_sweep, Ok(bytes) if *bytes == 10)
+                && matches!(&committed_after_sweep, Ok(bytes) if *bytes == 10)
+                && store.get(&"k".to_string()) == Some(vec![1u8; 10]),
+            format!(
+                "overwrite={overwrite:?} after_overwrite={after_overwrite:?} committed_after_overwrite={committed_after_overwrite:?} seed_sweep={seed_sweep:?} sweep_stats={sweep_stats:?} after_sweep={after_sweep:?} committed_after_sweep={committed_after_sweep:?} remaining_keys={:?}",
+                store.keys()
+            ),
+        ),
+        recharge_verdict,
+    ]
+}
+
+#[cfg(feature = "fixtures")]
+fn run_transcript_slice(kit: &MemoryTestKit) -> Vec<AssertionVerdict> {
+    let accounting =
+        InvariantAssertion::new(ContractFamily::ReclaimAccounting, "transcript_truncate_refund");
+    let fail_closed = InvariantAssertion::new(
+        ContractFamily::ReserveFailClosed,
+        "transcript_over_cap_fail_closed",
+    );
+
+    let broker = match kit.live_broker() {
+        Ok(broker) => broker,
+        Err(err) => {
+            return vec![
+                accounting.assert_that(false, format!("transcript broker setup failed: {err}")),
+                fail_closed
+                    .assert_that(false, "transcript over-cap check skipped: broker setup failed"),
+            ];
+        }
+    };
+    let sink = LiveBrokerAccountingSink::shared(broker.clone());
+    let store = SimpleSessionTranscriptStore::<String, String>::new(binding(
+        MemoryClass::SessionTranscript,
+        "conformance:transcript",
+    ))
+    .charged_against(sink);
+    let truncate = store
+        .append("s".to_string(), "aa".to_string())
+        .and_then(|_| store.append("s".to_string(), "bbbbbbbb".to_string()));
+    let before_truncate = broker_bytes(&broker);
+    let truncate_result = store.truncate_to(&"s".to_string(), 1);
+    let after_truncate = broker_bytes(&broker);
+    let retained_after_truncate = store.retained_bytes().map_err(|e| e.to_string());
+
+    let tiny_kit = session_transcript_budget(kit, 4);
+    let tiny_broker = match tiny_kit.live_broker() {
+        Ok(broker) => broker,
+        Err(err) => {
+            return vec![
+                accounting.assert_that(
+                    truncate.is_ok()
+                        && matches!(&before_truncate, Ok(bytes) if *bytes == 10)
+                        && truncate_result.is_ok()
+                        && matches!(&after_truncate, Ok(bytes) if *bytes == 2)
+                        && matches!(&retained_after_truncate, Ok(bytes) if *bytes == 2),
+                    format!(
+                        "truncate={truncate:?} before_truncate={before_truncate:?} truncate_result={truncate_result:?} after_truncate={after_truncate:?} retained_after_truncate={retained_after_truncate:?}",
+                    ),
+                ),
+                fail_closed.assert_that(false, format!("tiny transcript broker setup failed: {err}")),
+            ];
+        }
+    };
+    let tiny_sink = LiveBrokerAccountingSink::shared(tiny_broker.clone());
+    let tiny_store = SimpleSessionTranscriptStore::<String, String>::new(binding(
+        MemoryClass::SessionTranscript,
+        "conformance:transcript-tight",
+    ))
+    .charged_against(tiny_sink);
+    let over_cap = tiny_store.append("s".to_string(), "toolong".to_string());
+    let tiny_ledger_after = broker_bytes(&tiny_broker);
+    let tiny_retained_after = tiny_store.retained_bytes().map_err(|e| e.to_string());
+
+    vec![
+        accounting.assert_that(
+            truncate.is_ok()
+                && matches!(&before_truncate, Ok(bytes) if *bytes == 10)
+                && truncate_result.is_ok()
+                && matches!(&after_truncate, Ok(bytes) if *bytes == 2)
+                && matches!(&retained_after_truncate, Ok(bytes) if *bytes == 2),
+            format!(
+                "truncate={truncate:?} before_truncate={before_truncate:?} truncate_result={truncate_result:?} after_truncate={after_truncate:?} retained_after_truncate={retained_after_truncate:?}",
+            ),
+        ),
+        fail_closed.assert_that(
+            matches!(&over_cap, Err(MemoryError::Capacity(_)))
+                && matches!(&tiny_ledger_after, Ok(bytes) if *bytes == 0)
+                && matches!(&tiny_retained_after, Ok(bytes) if *bytes == 0)
+                && tiny_store.stats().item_count == 0,
+            format!(
+                "over_cap={over_cap:?} tiny_ledger_after={tiny_ledger_after:?} tiny_retained_after={tiny_retained_after:?} tiny_stats={:?}",
+                tiny_store.stats()
+            ),
+        ),
+    ]
+}
+
+/// The SpillRouting round-trip verdict over an INJECTED controller, so the suite
+/// can be driven against a broken (handle-dropping) target and proven to BITE —
+/// not merely accept the honest in-memory target. A spill then restore must hand
+/// back the same handle (1 -> 0 on the counter).
+#[cfg(feature = "fixtures")]
+fn spill_round_trip_verdict<T: SpillTarget<String>>(
+    online: &RoutedSpillController<T>,
+) -> AssertionVerdict {
+    let spill = InvariantAssertion::new(ContractFamily::SpillRouting, "spill_round_trip");
+    let spill_ok = online.spill("handle-a".to_string());
+    // Capture the count BETWEEN spill and restore: a broken counter stuck at 0
+    // would survive an "after == 0" check alone. The round-trip must go 1 -> 0.
+    let before_restore = online.spilled_count();
+    let restore = online.restore();
+    let after = online.spilled_count();
+    spill.assert_that(
+        spill_ok.is_ok()
+            && before_restore == 1
+            && matches!(&restore, Ok(Some(handle)) if handle == "handle-a")
+            && after == 0,
+        format!(
+            "spill_ok={spill_ok:?} before_restore={before_restore} restore={restore:?} after={after}"
+        ),
+    )
+}
+
+#[cfg(feature = "fixtures")]
+fn run_spill_slice() -> Vec<AssertionVerdict> {
+    let fail_closed =
+        InvariantAssertion::new(ContractFamily::SpillRouting, "spill_unavailable_fail_closed");
+
+    // The round-trip check goes through the SAME injectable helper a broken-target
+    // self-test drives, so weakening it would flip that self-test (it BITES).
+    let online = RoutedSpillController::new(InMemorySpillTarget::available());
+    let round_trip = spill_round_trip_verdict(&online);
+
+    let offline = RoutedSpillController::new(InMemorySpillTarget::unavailable());
+    let spill_denied = offline.spill("handle-b".to_string());
+    let offline_spilled_after = offline.spilled_count();
+
+    vec![
+        round_trip,
+        fail_closed.assert_that(
+            matches!(&spill_denied, Err(MemoryError::Capacity(_))) && offline_spilled_after == 0,
+            format!("spill_denied={spill_denied:?} offline_spilled_after={offline_spilled_after}",),
+        ),
+    ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::conformance::target::{AccountingView, AllocatorAdvisoryView};
+    use crate::fake::{AccountingFidelity, FakeProcessBroker};
+    use quanta_memory_platform_core::{
+        EffectiveMemoryBudgetReport, LiveProcessMemoryBroker, MemoryBudgetManifest, MemoryClass,
+        MemoryClassBudget, MemoryError, MemoryPreset, ReclaimPriority, ResidencyPolicy,
+    };
+
+    fn all_held(verdicts: &[AssertionVerdict]) -> bool {
+        verdicts.iter().all(AssertionVerdict::held)
+    }
+
+    /// Families that were VIOLATED in a verdict list (deduplicated, order kept).
+    fn violated(verdicts: &[AssertionVerdict]) -> Vec<ContractFamily> {
+        let mut out = Vec::new();
+        for v in verdicts.iter().filter(|v| !v.held()) {
+            if !out.contains(&v.family) {
+                out.push(v.family);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn honest_fake_passes_every_accounting_invariant() {
+        let mut fake = FakeProcessBroker::honest();
+        let verdicts = run_broker_accounting_suite(&mut fake);
+        assert!(!verdicts.is_empty(), "suite must run at least one check");
+        assert!(
+            all_held(&verdicts),
+            "honest fake must satisfy every invariant: {:?}",
+            verdicts.iter().filter(|v| !v.held()).map(|v| v.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn suite_rejects_fake_that_under_reports_owner_bytes() {
+        // META-REQUIREMENT: a broker that under-reports owner usage must be
+        // CAUGHT. The class total stays honest, so class != owner.
+        let mut broken = FakeProcessBroker::broken(AccountingFidelity::UnderReportOwnerBytes(100));
+        let verdicts = run_broker_accounting_suite(&mut broken);
+        assert!(!all_held(&verdicts), "suite must not pass an under-reporting fake");
+        // The failure must localize to the class/owner balance family.
+        let violated_families: Vec<ContractFamily> =
+            verdicts.iter().filter(|v| !v.held()).map(|v| v.family).collect();
+        assert!(
+            violated_families.contains(&ContractFamily::ClassOwnerBalance),
+            "under-report must surface as a ClassOwnerBalance violation, got {violated_families:?}"
+        );
+    }
+
+    #[test]
+    fn suite_rejects_fake_whose_class_diverges_from_owner() {
+        let mut broken = FakeProcessBroker::broken(AccountingFidelity::DivergeClassFromOwner(64));
+        let verdicts = run_broker_accounting_suite(&mut broken);
+        assert!(!all_held(&verdicts), "class-divergent fake must be rejected");
+        let violated: Vec<ContractFamily> =
+            verdicts.iter().filter(|v| !v.held()).map(|v| v.family).collect();
+        assert!(violated.contains(&ContractFamily::ClassOwnerBalance), "got {violated:?}");
+    }
+
+    // -----------------------------------------------------------------------
+    // META-REQUIREMENT: every AccountingFidelity break variant is rejected.
+    // -----------------------------------------------------------------------
+
+    /// Every non-honest [`AccountingFidelity`] the fake can model. Adding a new
+    /// break variant to the enum and forgetting to list it here will leave a hole
+    /// in the meta-coverage; this is the single place that enumerates them.
+    fn all_break_variants() -> Vec<AccountingFidelity> {
+        // Compile-time tie to the enum: this exhaustive match (no wildcard) fails
+        // to compile when a new AccountingFidelity variant is added, forcing the
+        // author to also list it below. Without this, a new break variant could
+        // silently escape `suite_rejects_every_accounting_fidelity_break_variant`.
+        fn _exhaustiveness_guard(v: AccountingFidelity) {
+            match v {
+                AccountingFidelity::Honest
+                | AccountingFidelity::UnderReportOwnerBytes(_)
+                | AccountingFidelity::DivergeClassFromOwner(_)
+                | AccountingFidelity::DivergeOwnerPartition(_) => {}
+            }
+        }
+        vec![
+            AccountingFidelity::UnderReportOwnerBytes(100),
+            AccountingFidelity::DivergeClassFromOwner(64),
+            AccountingFidelity::DivergeOwnerPartition(48),
+        ]
+    }
+
+    // Guards that the hand-maintained `all_break_variants()` list stays complete:
+    // every entry is a distinct break variant (not Honest) and maps to a family.
+    #[test]
+    fn all_break_variants_are_distinct_non_honest_and_family_mapped() {
+        let variants = all_break_variants();
+        assert_eq!(variants.len(), 3, "update this count when a break variant is added/removed");
+        for v in &variants {
+            assert!(!matches!(v, AccountingFidelity::Honest), "Honest is not a break variant");
+            // expected_family panics on Honest; calling it proves a mapping exists.
+            let _ = expected_family(*v);
+        }
+    }
+
+    /// The contract family each break variant must localize to. A variant that
+    /// failed to localize here (or localized to the wrong family) would mean the
+    /// suite caught "something" but not the SPECIFIC contract the lie violates.
+    fn expected_family(variant: AccountingFidelity) -> ContractFamily {
+        match variant {
+            // Under-reporting owner bytes / inflating class both desync class from
+            // owner -> invariant 1.
+            AccountingFidelity::UnderReportOwnerBytes(_)
+            | AccountingFidelity::DivergeClassFromOwner(_) => ContractFamily::ClassOwnerBalance,
+            // Inflating the totals while leaving the partition honest keeps class
+            // == owner but breaks owner == partition_sum -> invariant 2.
+            AccountingFidelity::DivergeOwnerPartition(_) => ContractFamily::OwnerPartition,
+            AccountingFidelity::Honest => unreachable!("Honest is not a break variant"),
+        }
+    }
+
+    #[test]
+    fn suite_rejects_every_accounting_fidelity_break_variant() {
+        // scenario G-meta: the suite must BITE on EACH way the fake can lie about
+        // its accounting AND localize the failure to the SPECIFIC contract family
+        // that lie violates. A pass on any break variant — or a catch that
+        // mislocalizes — means the suite is a rubber stamp for that contract.
+        for variant in all_break_variants() {
+            let mut broken = FakeProcessBroker::broken(variant);
+            let verdicts = run_broker_accounting_suite(&mut broken);
+            assert!(
+                !all_held(&verdicts),
+                "break variant {variant:?} must be REJECTED by the suite, but every check held"
+            );
+            let fams = violated(&verdicts);
+            let expected = expected_family(variant);
+            assert!(
+                fams.contains(&expected),
+                "break variant {variant:?} must localize to {expected:?}, got {fams:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn owner_partition_break_localizes_to_owner_partition_not_balance() {
+        // The invariant-2 break must NOT masquerade as an invariant-1 (balance)
+        // failure: class == owner still holds, so ONLY OwnerPartition violates.
+        let mut broken = FakeProcessBroker::broken(AccountingFidelity::DivergeOwnerPartition(48));
+        let verdicts = run_broker_accounting_suite(&mut broken);
+        let fams = violated(&verdicts);
+        assert!(
+            fams.contains(&ContractFamily::OwnerPartition),
+            "owner-partition divergence must violate OwnerPartition, got {fams:?}"
+        );
+        assert!(
+            !fams.contains(&ContractFamily::ClassOwnerBalance),
+            "class still equals owner, so ClassOwnerBalance must NOT be flagged, got {fams:?}"
+        );
+    }
+
+    #[test]
+    fn honest_fidelity_is_the_only_variant_the_suite_accepts() {
+        // scenario G-meta (positive pole): the SAME suite that rejects every break
+        // variant must ACCEPT the honest one, or it rejects everything (also
+        // worthless). Pairs the negative enumeration above.
+        let mut honest = FakeProcessBroker::broken(AccountingFidelity::Honest);
+        let verdicts = run_broker_accounting_suite(&mut honest);
+        assert!(all_held(&verdicts), "honest fidelity must pass: {:?}", violated(&verdicts));
+    }
+
+    // -----------------------------------------------------------------------
+    // ReserveFailClosed: a target that MUTATES on a denied write is rejected.
+    // -----------------------------------------------------------------------
+
+    /// A conformance target that lies about fail-closed: it admits (mutates) a
+    /// reserve even while the rebuild window is open. The new in-suite
+    /// `ReserveFailClosed` check must catch this. Implemented locally because the
+    /// stock fake is honest and the trait does not expose a "be dishonest" knob.
+    struct MutateOnDenyTarget {
+        owner_payload_bytes: u64,
+        class_payload_bytes: u64,
+        rebuild: bool,
+        next_id: u64,
+    }
+
+    impl MutateOnDenyTarget {
+        fn new() -> Self {
+            Self { owner_payload_bytes: 0, class_payload_bytes: 0, rebuild: false, next_id: 1 }
+        }
+    }
+
+    impl BrokerConformanceTarget for MutateOnDenyTarget {
+        type Ticket = u64;
+
+        fn do_reserve(
+            &mut self,
+            _class_axis: usize,
+            _owner: &str,
+            _kind: ChargeAxis,
+            bytes: u64,
+        ) -> Result<Self::Ticket, String> {
+            // THE LIE: while rebuilding, return Err (so the RebuildWriteFence
+            // check still sees a rejection) but mutate the counters first. A
+            // correct broker validates and bails BEFORE touching state.
+            if self.rebuild {
+                self.owner_payload_bytes = self.owner_payload_bytes.saturating_add(bytes);
+                self.class_payload_bytes = self.class_payload_bytes.saturating_add(bytes);
+                return Err("rebuild in progress".to_string());
+            }
+            self.owner_payload_bytes = self.owner_payload_bytes.saturating_add(bytes);
+            self.class_payload_bytes = self.class_payload_bytes.saturating_add(bytes);
+            let id = self.next_id;
+            self.next_id = self.next_id.saturating_add(1);
+            Ok(id)
+        }
+
+        fn do_commit(&mut self, _ticket: &Self::Ticket) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn do_release(&mut self, _ticket: &Self::Ticket) -> Result<(), String> {
+            self.owner_payload_bytes = 0;
+            self.class_payload_bytes = 0;
+            Ok(())
+        }
+
+        fn do_begin_rebuild(&mut self) -> Result<(), String> {
+            self.rebuild = true;
+            Ok(())
+        }
+
+        fn do_finish_rebuild(&mut self) -> Result<(), String> {
+            self.rebuild = false;
+            Ok(())
+        }
+
+        fn class_axes(&self) -> &'static [&'static str] {
+            &["a", "b"]
+        }
+
+        fn view(&self) -> AccountingView {
+            AccountingView {
+                total_class_bytes: self.class_payload_bytes,
+                total_owner_bytes: self.owner_payload_bytes,
+                total_retained_payload_bytes: self.owner_payload_bytes,
+                total_retained_metadata_bytes: 0,
+                total_live_scratch_bytes: 0,
+                rebuild_in_progress: self.rebuild,
+            }
+        }
+
+        fn observe_allocator(
+            &self,
+            observation: &AllocatorObservation,
+        ) -> Result<AllocatorAdvisoryView, String> {
+            let semantic_bytes = self.owner_payload_bytes;
+            Ok(AllocatorAdvisoryView {
+                semantic_bytes,
+                allocator_resident_bytes: observation.resident_bytes,
+                mismatch: observation
+                    .resident_bytes
+                    .is_some_and(|resident| resident != semantic_bytes),
+                drift_bytes: observation
+                    .resident_bytes
+                    .map(|resident| i128::from(resident) - i128::from(semantic_bytes)),
+            })
+        }
+    }
+
+    #[test]
+    fn suite_rejects_target_that_mutates_accounting_on_a_denied_reserve() {
+        // scenario G ReserveFailClosed: the denied reserve during rebuild DOES
+        // return Err (so the rebuild fence looks satisfied), yet it moved the
+        // counters. The suite's fail-closed check must surface this as a
+        // ReserveFailClosed violation.
+        let mut liar = MutateOnDenyTarget::new();
+        let verdicts = run_broker_accounting_suite(&mut liar);
+        assert!(!all_held(&verdicts), "a mutate-on-deny target must be rejected");
+        let fams = violated(&verdicts);
+        assert!(
+            fams.contains(&ContractFamily::ReserveFailClosed),
+            "mutating on a denied reserve must localize to ReserveFailClosed, got {fams:?}"
+        );
+    }
+
+    #[test]
+    fn honest_fake_passes_the_strengthened_fail_closed_check() {
+        // scenario G ReserveFailClosed (positive pole): the new in-suite
+        // before==after check must HOLD for an honest fake, proving the
+        // strengthening did not introduce a false positive.
+        let mut honest = FakeProcessBroker::honest();
+        let verdicts = run_broker_accounting_suite(&mut honest);
+        let fail_closed_checks: Vec<&AssertionVerdict> =
+            verdicts.iter().filter(|v| v.family == ContractFamily::ReserveFailClosed).collect();
+        assert!(
+            !fail_closed_checks.is_empty(),
+            "the suite must actually run a ReserveFailClosed check"
+        );
+        assert!(
+            fail_closed_checks.iter().all(|v| v.held()),
+            "honest fake must satisfy fail-closed: {:?}",
+            fail_closed_checks.iter().map(|v| v.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    struct ObserveMutatesTarget(std::cell::Cell<u64>);
+
+    impl ObserveMutatesTarget {
+        fn new() -> Self {
+            Self(std::cell::Cell::new(0))
+        }
+    }
+
+    impl BrokerConformanceTarget for ObserveMutatesTarget {
+        type Ticket = ();
+
+        fn do_reserve(
+            &mut self,
+            _class_axis: usize,
+            _owner: &str,
+            _kind: ChargeAxis,
+            bytes: u64,
+        ) -> Result<Self::Ticket, String> {
+            self.0.set(self.0.get().saturating_add(bytes));
+            Ok(())
+        }
+
+        fn do_commit(&mut self, _ticket: &Self::Ticket) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn do_release(&mut self, _ticket: &Self::Ticket) -> Result<(), String> {
+            self.0.set(0);
+            Ok(())
+        }
+
+        fn do_begin_rebuild(&mut self) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn do_finish_rebuild(&mut self) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn class_axes(&self) -> &'static [&'static str] {
+            &["a", "b"]
+        }
+
+        fn view(&self) -> AccountingView {
+            let bytes = self.0.get();
+            AccountingView {
+                total_class_bytes: bytes,
+                total_owner_bytes: bytes,
+                total_retained_payload_bytes: bytes,
+                total_retained_metadata_bytes: 0,
+                total_live_scratch_bytes: 0,
+                rebuild_in_progress: false,
+            }
+        }
+
+        fn observe_allocator(
+            &self,
+            observation: &AllocatorObservation,
+        ) -> Result<AllocatorAdvisoryView, String> {
+            let before = self.0.get();
+            self.0.set(before.saturating_add(1));
+            Ok(AllocatorAdvisoryView {
+                semantic_bytes: before,
+                allocator_resident_bytes: observation.resident_bytes,
+                mismatch: observation.resident_bytes.is_some_and(|resident| resident != before),
+                drift_bytes: observation
+                    .resident_bytes
+                    .map(|resident| i128::from(resident) - i128::from(before)),
+            })
+        }
+    }
+
+    #[test]
+    fn suite_rejects_target_that_mutates_on_allocator_observation() {
+        let mut liar = ObserveMutatesTarget::new();
+        let verdicts = run_broker_accounting_suite(&mut liar);
+        assert!(!all_held(&verdicts), "observation-mutating target must be rejected");
+        let fams = violated(&verdicts);
+        assert!(
+            fams.contains(&ContractFamily::AllocatorAdvisory),
+            "allocator observation mutation must localize to AllocatorAdvisory, got {fams:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // commit -> release returns the balance to zero (honest fake and real).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn commit_then_release_returns_balance_to_zero_on_honest_fake() {
+        // scenario G commit->release: a full reserve+commit then release must
+        // drive every accounting axis back to zero while keeping invariant 1/2.
+        let mut fake = FakeProcessBroker::honest();
+        let owner = "owner:cycle";
+        let t = fake
+            .do_reserve(0, owner, ChargeAxis::RetainedPayload, 4_096)
+            .expect("in-budget reserve succeeds");
+        fake.do_commit(&t).expect("commit succeeds");
+
+        let mid = fake.view();
+        assert_eq!(mid.total_owner_bytes, 4_096, "committed bytes are accounted");
+        assert_eq!(mid.total_class_bytes, mid.total_owner_bytes, "invariant 1 after commit");
+        assert_eq!(mid.partition_sum(), mid.total_owner_bytes, "invariant 2 after commit");
+
+        fake.do_release(&t).expect("release succeeds");
+        let end = fake.view();
+        assert_eq!(end.total_owner_bytes, 0, "release returns owner usage to zero");
+        assert_eq!(end.total_class_bytes, 0, "release returns class usage to zero");
+        assert_eq!(end, AccountingView::default(), "balance fully zeroed after release");
+    }
+
+    #[test]
+    fn commit_then_release_returns_balance_to_zero_on_real_broker() {
+        // scenario G commit->release: the SAME lifecycle on the real broker must
+        // also return to a zero, balanced ledger.
+        let mut broker = live_broker();
+        let owner = "owner:cycle";
+        let t = broker
+            .do_reserve(0, owner, ChargeAxis::RetainedPayload, 4_096)
+            .expect("in-budget reserve succeeds");
+        broker.do_commit(&t).expect("commit succeeds");
+        assert_eq!(broker.view().total_owner_bytes, 4_096);
+
+        broker.do_release(&t).expect("release succeeds");
+        let end = broker.view();
+        assert_eq!(end.total_owner_bytes, 0, "release zeroes owner usage on the real broker");
+        assert_eq!(end.total_class_bytes, end.total_owner_bytes, "invariant 1 holds at zero");
+        assert_eq!(end.partition_sum(), end.total_owner_bytes, "invariant 2 holds at zero");
+    }
+
+    // -----------------------------------------------------------------------
+    // Cap-deny AGREEMENT: honest fake and real broker deny the same way.
+    // -----------------------------------------------------------------------
+
+    fn live_broker() -> LiveProcessMemoryBroker {
+        let residency = ResidencyPolicy::new(10_000_000)
+            .with_class_budget(
+                MemoryClass::ArtifactCache,
+                MemoryClassBudget {
+                    reserved_bytes: 0,
+                    soft_cap_bytes: 4_000,
+                    hard_cap_bytes: 6_000,
+                    borrow_from_shared_pool: false,
+                    reclaim_priority: ReclaimPriority::Normal,
+                },
+            )
+            .with_class_budget(
+                MemoryClass::EvidenceCache,
+                MemoryClassBudget {
+                    reserved_bytes: 0,
+                    soft_cap_bytes: 4_000,
+                    hard_cap_bytes: 6_000,
+                    borrow_from_shared_pool: false,
+                    reclaim_priority: ReclaimPriority::Normal,
+                },
+            );
+        let report = EffectiveMemoryBudgetReport::from_manifest(
+            MemoryBudgetManifest::new(
+                MemoryPreset::Ci,
+                quanta_memory_platform_core::ExecutionBudget::default(),
+                residency,
+            ),
+            vec!["conformance-cap-test".to_string()],
+        );
+        LiveProcessMemoryBroker::from_report(report).expect("valid residency")
+    }
+
+    #[test]
+    fn cap_deny_agrees_between_honest_fake_and_real_broker() {
+        // scenario G cap-deny agreement: drive an over-cap reserve on BOTH the
+        // honest fake (owner hard cap) and the real broker (class hard cap) and
+        // assert they AGREE on three observable facts: (1) the reserve is denied
+        // with a typed Capacity error, (2) a subsequent in-cap reserve still
+        // succeeds, (3) the denied reserve was byte-for-byte inert (fail-closed).
+        //
+        // Both targets enforce a 6_000-byte cap on the artifact-cache axis.
+        let owner = "owner:capped";
+
+        // Honest fake with a 6_000-byte owner hard cap on this owner.
+        let mut fake = FakeProcessBroker::honest().with_owner_hard_cap(owner, 6_000);
+        let real = live_broker();
+
+        // Capture state before the denied op on both, via the neutral view.
+        let fake_before: AccountingView = fake.view();
+        let real_before: AccountingView = real.view();
+
+        // Over-cap reserve: 7_000 > 6_000 cap on both.
+        let fake_denied = fake.reserve(
+            MemoryClass::ArtifactCache,
+            owner.to_string(),
+            quanta_memory_platform_core::ChargeKind::RetainedPayload,
+            7_000,
+        );
+        let real_denied = real.reserve(
+            MemoryClass::ArtifactCache,
+            owner.to_string(),
+            quanta_memory_platform_core::MemoryContextKind::Request,
+            quanta_memory_platform_core::ChargeKind::RetainedPayload,
+            7_000,
+        );
+
+        // (1) AGREE: both deny with a typed Capacity error (variant, not message).
+        assert!(
+            matches!(fake_denied, Err(MemoryError::Capacity(_))),
+            "fake must deny over-cap with Capacity, got {fake_denied:?}"
+        );
+        assert!(
+            matches!(real_denied, Err(MemoryError::Capacity(_))),
+            "real broker must deny over-cap with Capacity, got {real_denied:?}"
+        );
+
+        // (3) AGREE: fail-closed. Neither denied reserve mutated any axis.
+        assert_eq!(fake.view(), fake_before, "fake denied reserve must be inert");
+        assert_eq!(real.view(), real_before, "real denied reserve must be inert");
+
+        // (2) AGREE: an in-cap reserve (under 6_000) still succeeds on both.
+        let fake_ok = fake.reserve(
+            MemoryClass::ArtifactCache,
+            owner.to_string(),
+            quanta_memory_platform_core::ChargeKind::RetainedPayload,
+            5_000,
+        );
+        let real_ok = real.reserve(
+            MemoryClass::ArtifactCache,
+            owner.to_string(),
+            quanta_memory_platform_core::MemoryContextKind::Request,
+            quanta_memory_platform_core::ChargeKind::RetainedPayload,
+            5_000,
+        );
+        assert!(fake_ok.is_ok(), "fake in-cap reserve must succeed, got {fake_ok:?}");
+        assert!(real_ok.is_ok(), "real in-cap reserve must succeed, got {real_ok:?}");
+
+        // And the accounting moved identically (5_000 on the owner/class axis).
+        assert_eq!(fake.view().total_owner_bytes, 5_000);
+        assert_eq!(real.view().total_owner_bytes, 5_000);
+        assert_eq!(
+            fake.view().total_owner_bytes,
+            real.view().total_owner_bytes,
+            "fake and real agree on post-reserve owner usage"
+        );
+    }
+
+    #[test]
+    fn both_targets_still_pass_the_portable_suite_after_strengthening() {
+        // scenario G regression guard: the strengthened suite must still PASS the
+        // honest fake AND the real broker end-to-end (the existing self_tests
+        // property, re-asserted against the new in-suite fail-closed check).
+        let mut fake = FakeProcessBroker::honest();
+        let fake_verdicts = run_broker_accounting_suite(&mut fake);
+        assert!(all_held(&fake_verdicts), "honest fake: {:?}", violated(&fake_verdicts));
+
+        let mut real = live_broker();
+        let real_verdicts = run_broker_accounting_suite(&mut real);
+        assert!(all_held(&real_verdicts), "real broker: {:?}", violated(&real_verdicts));
+    }
+
+    // -----------------------------------------------------------------------
+    // The FACADE-STORE suite itself must BITE: driving a slice against a broken
+    // sink must flip the suite's own verdict to violated (not just a standalone
+    // assertion). Mirrors suite_rejects_* for the core accounting suite.
+    // -----------------------------------------------------------------------
+
+    /// A sink that charges honestly but SWALLOWS refunds and leaks on recharge —
+    /// exactly the ReclaimAccounting fault the facade-store suite must reject.
+    #[cfg(feature = "fixtures")]
+    #[derive(Debug)]
+    struct SwallowRefundSink(LiveProcessMemoryBroker);
+
+    #[cfg(feature = "fixtures")]
+    impl AccountingSink for SwallowRefundSink {
+        fn charge(
+            &self,
+            class: MemoryClass,
+            owner: String,
+            context: MemoryContextKind,
+            kind: ChargeKind,
+            bytes: u64,
+        ) -> MemoryResult<ReservationTicket> {
+            self.0.reserve_committed(class, owner, context, kind, bytes)
+        }
+        fn refund(&self, _ticket: &ReservationTicket) -> MemoryResult<()> {
+            Ok(()) // BUG under test: never refunds.
+        }
+        fn refund_many(&self, _tickets: &[ReservationTicket]) -> MemoryResult<()> {
+            Ok(()) // BUG under test.
+        }
+        fn recharge(
+            &self,
+            _old: &ReservationTicket,
+            class: MemoryClass,
+            owner: String,
+            context: MemoryContextKind,
+            kind: ChargeKind,
+            bytes: u64,
+        ) -> Result<
+            ReservationTicket,
+            quanta_memory_platform_facade::shared::accounting::RechargeDenied,
+        > {
+            // Charges the new value but never releases the old: a leaking overwrite.
+            self.charge(class, owner, context, kind, bytes).map_err(|e| (e, None))
+        }
+    }
+
+    #[cfg(feature = "fixtures")]
+    #[test]
+    fn facade_store_suite_rejects_a_refund_swallowing_sink_localized_to_reclaim_accounting() {
+        let kit = MemoryTestKit::ci();
+
+        // Positive pole: the honest live sink passes the slice's own checks.
+        let honest_broker = kit.live_broker().expect("honest broker");
+        let honest = run_retained_map_slice_with_sink(
+            &kit,
+            &honest_broker,
+            LiveBrokerAccountingSink::shared(honest_broker.clone()),
+        );
+        assert!(all_held(&honest), "honest sink must pass the slice: {:?}", violated(&honest));
+
+        // Bite: a refund-swallowing sink must make the SUITE slice VIOLATE, localized
+        // to ReclaimAccounting — a check that passed this would be a rubber stamp.
+        let broken_broker = kit.live_broker().expect("broken broker");
+        let broken: std::sync::Arc<dyn AccountingSink> =
+            std::sync::Arc::new(SwallowRefundSink(broken_broker.clone()));
+        let verdicts = run_retained_map_slice_with_sink(&kit, &broken_broker, broken);
+        assert!(!all_held(&verdicts), "a refund-swallowing sink must make the slice violate");
+        assert!(
+            violated(&verdicts).contains(&ContractFamily::ReclaimAccounting),
+            "the violation must localize to ReclaimAccounting, got {:?}",
+            violated(&verdicts)
+        );
+    }
+
+    /// A spill target that CLAIMS to accept but retains nothing (drops the handle),
+    /// so a restore can never bring it back — the SpillRouting fault.
+    #[cfg(feature = "fixtures")]
+    #[derive(Debug, Default)]
+    struct DroppingSpillTarget;
+
+    #[cfg(feature = "fixtures")]
+    impl quanta_memory_platform_facade::SpillTarget<String> for DroppingSpillTarget {
+        fn is_available(&self) -> bool {
+            true
+        }
+        fn accept(&self, _handle: String) -> MemoryResult<()> {
+            Ok(()) // BUG under test: reports success but drops the handle.
+        }
+        // restore uses the trait default -> always Ok(None): nothing comes back.
+    }
+
+    // The SpillRouting verdict must be able to VIOLATE: driving the SUITE's own
+    // `spill_round_trip_verdict` against an honest in-memory target HOLDS, against a
+    // handle-dropping target VIOLATES. A check that passed the dropping target —
+    // or a weakened suite helper — would be a rubber stamp.
+    #[cfg(feature = "fixtures")]
+    #[test]
+    fn spill_routing_verdict_holds_for_honest_and_violates_for_a_dropping_target() {
+        let honest = RoutedSpillController::new(InMemorySpillTarget::available());
+        assert!(
+            spill_round_trip_verdict(&honest).held(),
+            "honest in-memory target must hold SpillRouting via the suite helper"
+        );
+
+        let dropping = RoutedSpillController::new(DroppingSpillTarget);
+        assert!(
+            !spill_round_trip_verdict(&dropping).held(),
+            "SpillRouting MUST violate for a handle-dropping target (suite helper bites)"
+        );
+    }
+}

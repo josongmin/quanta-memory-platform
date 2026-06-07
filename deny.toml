@@ -1,0 +1,31 @@
+[advisories]
+version = 2
+ignore = []
+
+[licenses]
+version = 2
+# The workspace crates are unpublished internal members declared
+# `license = "UNLICENSED"`, which is not a valid SPDX expression. Treat private
+# (unpublished) crates as license-exempt so the rail validates third-party deps
+# only, not our own internal members.
+private = { ignore = true }
+# Only licenses actually encountered in the full (`--all-features`) dependency
+# graph are listed, so the allow-list stays drift-free: an unencountered
+# allowance surfaces as a warning, and a newly introduced license fails closed.
+# MPL-2.0 (tracking-allocator, testkit `alloc_tracking` only) and
+# LGPL-2.1-or-later (r-efi, transitive) are file-/dynamic-scope copyleft and are
+# accepted for this internal library; revisit if either reaches a distributed
+# binary surface.
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "LGPL-2.1-or-later",
+    "MIT",
+    "MPL-2.0",
+    "Unlicense",
+    "Zlib",
+]
+
+[bans]
+multiple-versions = "allow"

@@ -1,0 +1,53 @@
+# Regression guards for bug classes found during the 2026-06 audit sweep.
+#
+# Each rule pins a SPECIFIC defect this codebase already hit, so the same shape
+# cannot silently come back. They are intentionally narrow (the broad clippy cast
+# lints are too noisy for this byte-accounting code); if a flagged use is provably
+# safe, justify it with a trailing `// nosemgrep: <rule-id> -- reason: <why>`.
+#
+# Run via `scripts/regression-guards.sh` (also wired into check-workspace.sh and
+# scripts/memory-platform-doctor).
+rules:
+  - id: qmp-magnitude-as-signed
+    languages: [rust]
+    severity: ERROR
+    message: >-
+      Casting a value to a signed integer with `as i64/i32/i16/i8` can sign-flip a
+      large magnitude. This is the fake-ledger `bytes as i64` bug: a byte count
+      > i64::MAX wrapped negative and silently SUBTRACTED, corrupting the counters
+      and breaking ledger invariant 1. Keep byte/budget magnitudes as `u64` with
+      saturating/checked ops, or use `i64::try_from(..)?`. For a signed DIFFERENCE,
+      widen to `i128` (lossless for u64). If genuinely safe, append
+      `// nosemgrep: qmp-magnitude-as-signed -- reason: <why>`.
+    patterns:
+      - pattern-either:
+          - pattern: $X as i64
+          - pattern: $X as i32
+          - pattern: $X as i16
+          - pattern: $X as i8
+
+  - id: qmp-saturating-mul-then-divide
+    languages: [rust]
+    severity: ERROR
+    message: >-
+      `a.saturating_mul(b) / c` saturates the product BEFORE the divide, which
+      rounds the ratio DOWN (the unsafe direction) once `a*b` exceeds u64 — the
+      pressure-percent and weighted-cap under-report bug. Compute the ratio in
+      u128 instead: `u64::try_from(u128::from(a) * u128::from(b) / u128::from(c))`.
+      If `a*b` provably cannot overflow, append
+      `// nosemgrep: qmp-saturating-mul-then-divide -- reason: <why>`.
+    patterns:
+      - pattern: $A.saturating_mul($B) / $C
+
+  - id: qmp-atomic-fetch-sub
+    languages: [rust]
+    severity: ERROR
+    message: >-
+      `AtomicU*::fetch_sub` can underflow and WRAP to the max value — the
+      spilled-count drift bug, where a concurrent decrement drove the counter
+      negative. Decrement with a saturating compare-and-set instead:
+      `c.fetch_update(SeqCst, SeqCst, |v| Some(v.saturating_sub(n)))`. If the
+      value provably cannot underflow here, append
+      `// nosemgrep: qmp-atomic-fetch-sub -- reason: <why>`.
+    patterns:
+      - pattern: $A.fetch_sub($N, $O)

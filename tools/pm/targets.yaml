@@ -1,0 +1,49 @@
+targets:
+  agents:
+    output: AGENTS.md
+    template: templates/agents.md.j2
+    sections:
+      - sources/operational/agent-router.md
+      - sources/operational/agent-core.md
+      - sources/operational/agent-playbook.md
+
+  codex_rules:
+    output: .codex/CODEX-RULES.md
+    template: templates/codex-rules.md.j2
+    sections:
+      - sources/rules/cheatsheet.md
+      - sources/rules/architecture.md
+      - sources/rules/build.md
+      - sources/rules/tests.md
+      - sources/rules/determinism.md
+      - sources/rules/error-handling.md
+      - sources/rules/dependencies.md
+      - sources/agent-specific/codex.md
+
+  codex_start:
+    output: .codex/CODEX-START-PROMPT.md
+    template: templates/codex-start.md.j2
+    sections:
+      - sources/operational/quick-reference.md
+
+  claude:
+    output: CLAUDE.md
+    template: templates/claude.md.j2
+    sections:
+      - sources/operational/agent-router.md
+      - sources/operational/agent-core.md
+      - sources/rules/cheatsheet.md
+      - sources/operational/agent-playbook.md
+      - sources/agent-specific/claude.md
+
+  cursor_rules:
+    output: .cursorrules
+    template: templates/cursorrules.md.j2
+    sections:
+      - sources/rules/cursor-architecture.md
+      - sources/rules/cheatsheet.md
+      - sources/rules/architecture.md
+      - sources/rules/build.md
+      - sources/rules/tests.md
+      - sources/rules/error-handling.md
+      - sources/agent-specific/cursor.md

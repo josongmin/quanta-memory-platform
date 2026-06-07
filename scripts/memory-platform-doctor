@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# memory-platform-doctor — repo-local health check (the doctor CLI surface).
+#
+# Runs the standalone rails this repo carries itself: fmt, clippy `-D warnings`,
+# the per-feature build matrix, workspace check, workspace tests, example
+# builds, and cargo deny when available. No dependency on monorepo-local
+# `tools/ci/gates/*`.
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "${repo_root}"
+
+echo "[doctor] fmt --check"
+cargo fmt --all --check
+
+echo "[doctor] clippy -D warnings"
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+echo "[doctor] regression-guards"
+scripts/regression-guards.sh
+
+echo "[doctor] feature-matrix"
+tools/ci/feature-matrix.sh
+
+echo "[doctor] cargo check --workspace --all-features"
+cargo check --workspace --all-features
+
+echo "[doctor] cargo test --workspace --all-features"
+cargo test --workspace --all-features
+
+echo "[doctor] cargo build --examples --all-features"
+cargo build --examples --all-features
+
+echo "[doctor] cargo deny"
+if command -v cargo-deny >/dev/null 2>&1; then
+  cargo deny --all-features check
+else
+  echo "memory-platform-doctor: cargo-deny unavailable; skipped"
+fi
+
+echo "memory-platform-doctor: clean (repo-local lint/build/test rails only)"

@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# memory-platform-fix — apply the mechanical fixes the doctor checks for.
+#
+# Formats the workspace and applies clippy's machine-applicable suggestions, so a
+# `memory-platform-doctor` run afterwards is clean for anything auto-fixable.
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "${repo_root}"
+
+echo "[fix] rustfmt"
+cargo fmt --all
+
+echo "[fix] clippy --fix (machine-applicable lints)"
+cargo clippy --workspace --all-targets --all-features --fix --allow-dirty --allow-staged \
+  -- -D warnings || true
+
+echo "memory-platform-fix: applied fmt + clippy --fix (re-run memory-platform-doctor to verify)"

@@ -1,0 +1,30 @@
+[package]
+name = "quanta-memory-platform-testkit"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+publish.workspace = true
+
+[features]
+default = []
+conformance = [
+    "quanta-memory-platform-core/live_control",
+    "quanta-memory-platform-facade/core-live-accounting",
+    "quanta-memory-platform-facade/payload_store",
+    "quanta-memory-platform-facade/retained_map",
+    "quanta-memory-platform-facade/transcript",
+    "quanta-memory-platform-facade/spill",
+]
+fixtures = ["conformance"]
+doctor = []
+faults = [
+    "quanta-memory-platform-facade/payload_store",
+    "quanta-memory-platform-facade/spill",
+]
+alloc_tracking = ["dep:tracking-allocator"]
+full = ["fixtures", "doctor", "conformance", "faults", "alloc_tracking"]
+
+[dependencies]
+quanta-memory-platform-core = { path = "../quanta-memory-platform-core", default-features = false }
+quanta-memory-platform-facade = { path = "../quanta-memory-platform-facade", default-features = false }
+tracking-allocator = { workspace = true, optional = true }
