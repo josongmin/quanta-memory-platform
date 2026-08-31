@@ -553,6 +553,17 @@ mod tests {
             matches!(store.stats_checked(), Err(MemoryError::InvalidState(message)) if message == "retained map lock poisoned"),
             "checked stats must preserve the typed poison failure"
         );
+        assert_eq!(store.get(&key), None, "advisory get must fail closed after poison");
+        assert_eq!(
+            store.stats(),
+            StoreStats::default(),
+            "advisory stats must not fabricate retained usage after poison"
+        );
+        assert!(store.keys().is_empty(), "advisory keys must expose no partial poisoned state");
+        assert!(
+            store.entries().is_empty(),
+            "advisory entries must expose no partial poisoned state"
+        );
     }
 
     #[test]
