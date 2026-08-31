@@ -22,6 +22,22 @@ pub enum RetainedMapInsertOutcomeV1 {
 /// that compare equal MUST produce the same hash. Implementations may rely on
 /// that law for exact lookup, overwrite, and removal without scanning the
 /// retained set.
+///
+/// A key with equality but no lawful hash identity is rejected at the public
+/// trait boundary:
+///
+/// ```compile_fail
+/// use quanta_memory_platform_facade::RetainedMapStore;
+///
+/// #[derive(Clone, PartialEq)]
+/// struct PartialEqOnly(String);
+///
+/// fn require_retained_store<S>()
+/// where
+///     S: RetainedMapStore<PartialEqOnly, Vec<u8>>,
+/// {
+/// }
+/// ```
 pub trait RetainedMapStore<Key, Value>
 where
     Key: Eq + Hash,

@@ -346,7 +346,7 @@ mod tests {
     use super::*;
     use quanta_memory_platform_core::{MemoryClass, StoreBindingHandle};
     use std::hash::{Hash, Hasher};
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier};
 
     fn store() -> SimpleRetainedMapStore<String, Vec<u8>> {
@@ -422,6 +422,126 @@ mod tests {
         );
         assert_eq!(store.stats().item_count, 1);
         assert_eq!(store.committed_bytes().expect("committed bytes"), 1);
+    }
+
+    #[test]
+    fn concurrent_checked_read_observes_only_complete_old_or_new_payloads_v1() {
+        const READERS: usize = 4;
+        const ITERATIONS: usize = 2_000;
+        const PAYLOAD_BYTES: usize = 4_096;
+
+        let store = Arc::new(store());
+        let key = "concurrent-overwrite".to_string();
+        let old = vec![0x11; PAYLOAD_BYTES];
+        let new = vec![0xee; PAYLOAD_BYTES];
+        store.insert_checked(key.clone(), old.clone()).expect("seed old payload");
+
+        let barrier = Arc::new(Barrier::new(READERS + 1));
+        let old_observations = Arc::new(AtomicUsize::new(0));
+        let new_observations = Arc::new(AtomicUsize::new(0));
+        let mut readers = Vec::new();
+        for _ in 0..READERS {
+            let store = Arc::clone(&store);
+            let barrier = Arc::clone(&barrier);
+            let key = key.clone();
+            let old = old.clone();
+            let new = new.clone();
+            let old_observations = Arc::clone(&old_observations);
+            let new_observations = Arc::clone(&new_observations);
+            readers.push(std::thread::spawn(move || {
+                for _ in 0..ITERATIONS {
+                    // Reusable two-phase barrier: every read races exactly one
+                    // overwrite epoch instead of merely starting near the writer.
+                    barrier.wait();
+                    let observed = store
+                        .get_checked(&key)
+                        .expect("checked read during overwrite")
+                        .expect("seeded key remains resident");
+                    if observed == old {
+                        old_observations.fetch_add(1, Ordering::Relaxed);
+                    } else if observed == new {
+                        new_observations.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        panic!("checked read observed a torn or foreign payload");
+                    }
+                    barrier.wait();
+                }
+            }));
+        }
+
+        for iteration in 0..ITERATIONS {
+            barrier.wait();
+            let payload = if iteration % 2 == 0 { new.clone() } else { old.clone() };
+            store.insert_checked(key.clone(), payload).expect("atomic overwrite");
+            barrier.wait();
+        }
+        for reader in readers {
+            reader.join().expect("reader joins without invalid observation");
+        }
+
+        assert_eq!(
+            old_observations.load(Ordering::Relaxed) + new_observations.load(Ordering::Relaxed),
+            READERS * ITERATIONS,
+            "every checked read must classify as one complete published payload"
+        );
+        assert!(
+            old_observations.load(Ordering::Relaxed) > 0
+                && new_observations.load(Ordering::Relaxed) > 0,
+            "the synchronized overwrite epochs must expose both complete generations"
+        );
+    }
+
+    #[derive(Debug)]
+    struct ClonePanicsWhenArmed {
+        bytes: Vec<u8>,
+        armed: Arc<AtomicBool>,
+    }
+
+    impl Clone for ClonePanicsWhenArmed {
+        fn clone(&self) -> Self {
+            assert!(
+                !self.armed.load(Ordering::SeqCst),
+                "injected clone panic while retained-map lock is held"
+            );
+            Self { bytes: self.bytes.clone(), armed: Arc::clone(&self.armed) }
+        }
+    }
+
+    impl ByteSized for ClonePanicsWhenArmed {
+        fn byte_size(&self) -> u64 {
+            u64::try_from(self.bytes.len()).expect("test payload length fits u64")
+        }
+    }
+
+    #[test]
+    fn checked_reads_report_typed_invalid_state_after_owner_mutex_poison_v1() {
+        let binding =
+            StoreBindingHandle::new(MemoryClass::MemoResidency, "owner-poison".to_string(), None);
+        let store: SimpleRetainedMapStore<String, ClonePanicsWhenArmed> =
+            SimpleRetainedMapStore::new(binding);
+        let armed = Arc::new(AtomicBool::new(false));
+        let key = "poison".to_string();
+        store
+            .insert_checked(
+                key.clone(),
+                ClonePanicsWhenArmed { bytes: vec![1, 2, 3], armed: Arc::clone(&armed) },
+            )
+            .expect("seed panic-capable payload");
+
+        armed.store(true, Ordering::SeqCst);
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = store.get_checked(&key);
+        }));
+        assert!(panic.is_err(), "clone panic must poison the canonical owner mutex");
+
+        assert!(
+            matches!(store.get_checked(&key), Err(MemoryError::InvalidState(message)) if message == "retained map lock poisoned"),
+            "checked point read must preserve the typed poison failure"
+        );
+        assert!(
+            matches!(store.stats_checked(), Err(MemoryError::InvalidState(message)) if message == "retained map lock poisoned"),
+            "checked stats must preserve the typed poison failure"
+        );
     }
 
     #[test]
@@ -533,11 +653,13 @@ mod tests {
         }
     }
 
-    #[test]
-    fn exact_key_lookup_uses_keyed_admission_instead_of_scanning_live_entries() {
+    fn exercise_endpoint_point_operations_without_linear_probe_growth(endpoint_id: u64) {
+        const LIVE_ENTRIES: u64 = 4_096;
+        const MAX_EQUALITY_PROBES_PER_POINT_OPERATION: usize = 64;
+
         let binding = StoreBindingHandle::new(
             MemoryClass::MemoResidency,
-            "owner-keyed-lookup".to_string(),
+            format!("owner-keyed-lookup-{endpoint_id}"),
             None,
         );
         let equality_probes = Arc::new(AtomicUsize::new(0));
@@ -545,7 +667,7 @@ mod tests {
         let store: SimpleRetainedMapStore<LookupProbeKey, Vec<u8>> =
             SimpleRetainedMapStore::new(binding);
 
-        for id in 0..4_096 {
+        for id in 0..LIVE_ENTRIES {
             store
                 .insert_checked(
                     LookupProbeKey {
@@ -553,7 +675,7 @@ mod tests {
                         equality_probes: Arc::clone(&equality_probes),
                         hash_probes: Arc::clone(&hash_probes),
                     },
-                    vec![id as u8],
+                    vec![u8::try_from(id % 256).expect("modulo value fits u8")],
                 )
                 .expect("seed keyed entry");
         }
@@ -561,14 +683,18 @@ mod tests {
         equality_probes.store(0, Ordering::Relaxed);
         hash_probes.store(0, Ordering::Relaxed);
         let query = LookupProbeKey {
-            id: 4_095,
+            id: endpoint_id,
             equality_probes: Arc::clone(&equality_probes),
             hash_probes: Arc::clone(&hash_probes),
         };
-        assert_eq!(store.get(&query), Some(vec![255]));
+        let expected_byte = u8::try_from(endpoint_id % 256).expect("modulo value fits u8");
+        assert_eq!(
+            store.get_checked(&query).expect("checked endpoint lookup"),
+            Some(vec![expected_byte])
+        );
         assert!(
-            equality_probes.load(Ordering::Relaxed) < 32,
-            "exact point lookup must not compare against the full live-entry population"
+            equality_probes.load(Ordering::Relaxed) <= MAX_EQUALITY_PROBES_PER_POINT_OPERATION,
+            "endpoint lookup must stay within the documented N-independent equality-probe bound"
         );
         assert_eq!(hash_probes.load(Ordering::Relaxed), 1, "lookup hashes the exact key once");
 
@@ -576,8 +702,8 @@ mod tests {
         hash_probes.store(0, Ordering::Relaxed);
         store.insert_checked(query.clone(), vec![7u8; 3]).expect("overwrite exact key");
         assert!(
-            equality_probes.load(Ordering::Relaxed) < 32,
-            "overwrite must not scan the full live-entry population"
+            equality_probes.load(Ordering::Relaxed) <= MAX_EQUALITY_PROBES_PER_POINT_OPERATION,
+            "endpoint overwrite must stay within the documented N-independent equality-probe bound"
         );
         assert_eq!(hash_probes.load(Ordering::Relaxed), 1, "overwrite hashes the exact key once");
 
@@ -585,14 +711,20 @@ mod tests {
         hash_probes.store(0, Ordering::Relaxed);
         assert_eq!(store.remove(&query).expect("remove exact key"), Some(vec![7u8; 3]));
         assert!(
-            equality_probes.load(Ordering::Relaxed) < 64,
-            "remove must not scan the full live-entry population"
+            equality_probes.load(Ordering::Relaxed) <= MAX_EQUALITY_PROBES_PER_POINT_OPERATION,
+            "endpoint remove must stay within the documented N-independent equality-probe bound"
         );
         assert_eq!(
             hash_probes.load(Ordering::Relaxed),
             2,
             "fail-closed remove validates then removes by exact key"
         );
+    }
+
+    #[test]
+    fn first_and_last_key_point_operations_share_one_n_independent_probe_bound_v1() {
+        exercise_endpoint_point_operations_without_linear_probe_growth(0);
+        exercise_endpoint_point_operations_without_linear_probe_growth(4_095);
     }
 
     #[test]
@@ -1138,6 +1270,28 @@ mod tests {
                 broker.ledger_snapshot().expect("snap").total_owner_bytes(),
                 5,
                 "sweep must refund the reclaimed bytes to the ledger"
+            );
+        }
+
+        #[test]
+        fn charged_full_eviction_leaves_no_entry_key_ticket_or_accounting_residue_v1() {
+            let broker = live_broker(1_000_000);
+            let store = charged(&broker);
+            store.insert_checked("a".to_string(), vec![0u8; 2]).expect("a");
+            store.insert_checked("b".to_string(), vec![0u8; 3]).expect("b");
+            store.insert_checked("c".to_string(), vec![0u8; 5]).expect("c");
+            assert_eq!(broker.ledger_snapshot().expect("before").total_owner_bytes(), 10);
+
+            let swept = store.sweep(SweepHint { target_bytes: 10 }).expect("full sweep");
+            assert_eq!(swept, SweepStats { reclaimed_items: 3, reclaimed_bytes: 10 });
+            assert_eq!(store.stats_checked().expect("checked empty stats"), StoreStats::default());
+            assert!(store.keys().is_empty(), "full eviction leaves no reachable key");
+            assert!(store.entries().is_empty(), "full eviction leaves no reachable entry");
+            assert_eq!(store.committed_bytes().expect("empty committed bytes"), 0);
+            assert_eq!(broker.ledger_snapshot().expect("after").total_owner_bytes(), 0);
+            assert!(
+                store.state.lock().expect("state").entries.is_empty(),
+                "the canonical owner contains no entry and therefore no live ticket"
             );
         }
 
