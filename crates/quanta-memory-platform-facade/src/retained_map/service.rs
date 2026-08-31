@@ -439,6 +439,7 @@ mod tests {
         let barrier = Arc::new(Barrier::new(READERS + 1));
         let old_observations = Arc::new(AtomicUsize::new(0));
         let new_observations = Arc::new(AtomicUsize::new(0));
+        let invalid_observations = Arc::new(AtomicUsize::new(0));
         let mut readers = Vec::new();
         for _ in 0..READERS {
             let store = Arc::clone(&store);
@@ -448,31 +449,35 @@ mod tests {
             let new = new.clone();
             let old_observations = Arc::clone(&old_observations);
             let new_observations = Arc::clone(&new_observations);
+            let invalid_observations = Arc::clone(&invalid_observations);
             readers.push(std::thread::spawn(move || {
                 for _ in 0..ITERATIONS {
                     // Reusable two-phase barrier: every read races exactly one
                     // overwrite epoch instead of merely starting near the writer.
                     barrier.wait();
-                    let observed = store
-                        .get_checked(&key)
-                        .expect("checked read during overwrite")
-                        .expect("seeded key remains resident");
-                    if observed == old {
-                        old_observations.fetch_add(1, Ordering::Relaxed);
-                    } else if observed == new {
-                        new_observations.fetch_add(1, Ordering::Relaxed);
-                    } else {
-                        panic!("checked read observed a torn or foreign payload");
+                    match store.get_checked(&key) {
+                        Ok(Some(observed)) if observed == old => {
+                            old_observations.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Ok(Some(observed)) if observed == new => {
+                            new_observations.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Ok(Some(_)) | Ok(None) | Err(_) => {
+                            invalid_observations.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                     barrier.wait();
                 }
             }));
         }
 
+        let mut write_failures = 0usize;
         for iteration in 0..ITERATIONS {
             barrier.wait();
             let payload = if iteration % 2 == 0 { new.clone() } else { old.clone() };
-            store.insert_checked(key.clone(), payload).expect("atomic overwrite");
+            if store.insert_checked(key.clone(), payload).is_err() {
+                write_failures += 1;
+            }
             barrier.wait();
         }
         for reader in readers {
@@ -483,6 +488,12 @@ mod tests {
             old_observations.load(Ordering::Relaxed) + new_observations.load(Ordering::Relaxed),
             READERS * ITERATIONS,
             "every checked read must classify as one complete published payload"
+        );
+        assert_eq!(write_failures, 0, "every synchronized overwrite must publish successfully");
+        assert_eq!(
+            invalid_observations.load(Ordering::Relaxed),
+            0,
+            "no checked read may observe absence, error, torn bytes, or a foreign generation"
         );
         assert!(
             old_observations.load(Ordering::Relaxed) > 0
