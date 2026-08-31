@@ -10,7 +10,7 @@ use quanta_memory_platform_core::{
     StoreWriteError, SweepHint, SweepStats,
 };
 
-use crate::retained_map::RetainedMapStore;
+use crate::retained_map::{RetainedMapInsertOutcomeV1, RetainedMapStore};
 use crate::shared::accounting::SharedAccountingSink;
 use crate::shared::measure::ByteSized;
 
@@ -104,6 +104,24 @@ where
     pub fn committed_bytes(&self) -> Result<u64, MemoryError> {
         Ok(self.lock()?.committed_bytes)
     }
+
+    fn charge_new_entry_v1(
+        &self,
+        reserved_bytes: u64,
+    ) -> Result<Option<ReservationTicket>, StoreWriteError> {
+        self.charger
+            .as_ref()
+            .map(|sink| {
+                sink.charge(
+                    self.binding.class.clone(),
+                    self.binding.owner.clone(),
+                    MemoryContextKind::Request,
+                    ChargeKind::RetainedMetadata,
+                    reserved_bytes,
+                )
+            })
+            .transpose()
+    }
 }
 
 impl<Key, Value> RetainedMapStore<Key, Value> for SimpleRetainedMapStore<Key, Value>
@@ -178,16 +196,7 @@ where
             Entry::Vacant(vacant) => {
                 // Charge before publication so a denied admission leaves payload,
                 // order, and local accounting unchanged.
-                let new_ticket = match &self.charger {
-                    Some(sink) => Some(sink.charge(
-                        self.binding.class.clone(),
-                        self.binding.owner.clone(),
-                        MemoryContextKind::Request,
-                        ChargeKind::RetainedMetadata,
-                        reserved_bytes,
-                    )?),
-                    None => None,
-                };
+                let new_ticket = self.charge_new_entry_v1(reserved_bytes)?;
                 vacant.insert(MapEntry {
                     value,
                     charged_bytes: reserved_bytes,
@@ -199,9 +208,32 @@ where
         }
     }
 
-    fn get(&self, key: &Key) -> Option<Value> {
-        let state = self.lock().ok()?;
-        state.entries.get(key).map(|entry| entry.value.clone())
+    fn insert_if_absent_checked(
+        &self,
+        key: Key,
+        value: Value,
+    ) -> Result<RetainedMapInsertOutcomeV1, StoreWriteError> {
+        let mut state = self.lock()?;
+        let MapState { entries, committed_bytes } = &mut *state;
+        match entries.entry(key) {
+            Entry::Occupied(_) => Ok(RetainedMapInsertOutcomeV1::AlreadyPresent),
+            Entry::Vacant(vacant) => {
+                let reserved_bytes = value.byte_size();
+                let new_ticket = self.charge_new_entry_v1(reserved_bytes)?;
+                vacant.insert(MapEntry {
+                    value,
+                    charged_bytes: reserved_bytes,
+                    ticket: new_ticket,
+                });
+                *committed_bytes = committed_bytes.saturating_add(reserved_bytes);
+                Ok(RetainedMapInsertOutcomeV1::Inserted)
+            }
+        }
+    }
+
+    fn get_checked(&self, key: &Key) -> Result<Option<Value>, MemoryError> {
+        let state = self.lock()?;
+        Ok(state.entries.get(key).map(|entry| entry.value.clone()))
     }
 
     fn remove(&self, key: &Key) -> Result<Option<Value>, MemoryError> {
@@ -271,14 +303,9 @@ where
         Ok(SweepStats { reclaimed_items, reclaimed_bytes })
     }
 
-    fn stats(&self) -> StoreStats {
-        match self.lock() {
-            Ok(state) => StoreStats {
-                item_count: state.entries.len(),
-                estimated_bytes: state.committed_bytes,
-            },
-            Err(_) => StoreStats::default(),
-        }
+    fn stats_checked(&self) -> Result<StoreStats, MemoryError> {
+        let state = self.lock()?;
+        Ok(StoreStats { item_count: state.entries.len(), estimated_bytes: state.committed_bytes })
     }
 
     fn keys(&self) -> Vec<Key>
@@ -320,7 +347,7 @@ mod tests {
     use quanta_memory_platform_core::{MemoryClass, StoreBindingHandle};
     use std::hash::{Hash, Hasher};
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
+    use std::sync::{Arc, Barrier};
 
     fn store() -> SimpleRetainedMapStore<String, Vec<u8>> {
         let binding =
@@ -356,6 +383,45 @@ mod tests {
         assert_eq!(store.committed_bytes().expect("committed"), 3);
         assert_eq!(store.stats(), StoreStats { item_count: 1, estimated_bytes: 3 });
         assert_eq!(store.get(&"k1".to_string()), Some(vec![1u8, 2, 3]));
+    }
+
+    #[test]
+    fn concurrent_insert_if_absent_has_one_creator_and_never_overwrites_v1() {
+        const WRITERS: usize = 12;
+        let store = Arc::new(store());
+        let barrier = Arc::new(Barrier::new(WRITERS));
+        let mut joins = Vec::new();
+        for writer in 0..WRITERS {
+            let store = Arc::clone(&store);
+            let barrier = Arc::clone(&barrier);
+            joins.push(std::thread::spawn(move || {
+                barrier.wait();
+                let writer_byte = u8::try_from(writer).expect("writer index fits u8");
+                store
+                    .insert_if_absent_checked("canonical".to_string(), vec![writer_byte])
+                    .expect("atomic insert-if-absent")
+            }));
+        }
+        let outcomes: Vec<_> =
+            joins.into_iter().map(|join| join.join().expect("writer joins")).collect();
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| **outcome == RetainedMapInsertOutcomeV1::Inserted)
+                .count(),
+            1,
+            "exactly one caller owns creation"
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| **outcome == RetainedMapInsertOutcomeV1::AlreadyPresent)
+                .count(),
+            WRITERS - 1,
+            "all losing callers observe an existing row"
+        );
+        assert_eq!(store.stats().item_count, 1);
+        assert_eq!(store.committed_bytes().expect("committed bytes"), 1);
     }
 
     #[test]
@@ -887,6 +953,60 @@ mod tests {
                 broker.ledger_snapshot().expect("snap").total_owner_bytes(),
                 0,
                 "remove must refund the ledger"
+            );
+        }
+
+        #[test]
+        fn atomic_insert_if_absent_never_recharges_or_overwrites_an_existing_entry_v1() {
+            let broker = live_broker(50);
+            let store = charged(&broker);
+            store.insert_checked("canonical".to_string(), vec![1u8; 30]).expect("seed");
+
+            // The losing candidate is larger than the remaining budget. An
+            // occupied decision must happen before charging, so it still returns
+            // AlreadyPresent and leaves both authorities byte-for-byte intact.
+            assert_eq!(
+                store
+                    .insert_if_absent_checked("canonical".to_string(), vec![2u8; 60])
+                    .expect("occupied publication is not an admission attempt"),
+                RetainedMapInsertOutcomeV1::AlreadyPresent
+            );
+            assert_eq!(
+                store.get_checked(&"canonical".to_string()).expect("checked read"),
+                Some(vec![1u8; 30]),
+                "a losing publisher must not replace the canonical payload"
+            );
+            assert_eq!(store.stats_checked().expect("checked stats").estimated_bytes, 30);
+            assert_eq!(
+                broker.ledger_snapshot().expect("snap").total_owner_bytes(),
+                30,
+                "a losing publisher must not charge or refund the ledger"
+            );
+        }
+
+        #[test]
+        fn denied_atomic_insert_if_absent_publishes_neither_payload_nor_charge_v1() {
+            let broker = live_broker(50);
+            let store = charged(&broker);
+            store.insert_checked("keep".to_string(), vec![0u8; 40]).expect("seed");
+            let ledger_before = broker.ledger_snapshot().expect("snap").total_owner_bytes();
+            let stats_before = store.stats_checked().expect("checked stats before");
+
+            let denied = store.insert_if_absent_checked("denied".to_string(), vec![0u8; 20]);
+            assert!(
+                matches!(denied, Err(MemoryError::Capacity(_))),
+                "a denied atomic publication must preserve the typed error: {denied:?}"
+            );
+            assert_eq!(store.stats_checked().expect("checked stats after"), stats_before);
+            assert_eq!(
+                store.get_checked(&"denied".to_string()).expect("checked absent read"),
+                None,
+                "charge denial must not publish a payload"
+            );
+            assert_eq!(
+                broker.ledger_snapshot().expect("snap").total_owner_bytes(),
+                ledger_before,
+                "charge denial must not mutate the accounting authority"
             );
         }
 

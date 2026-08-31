@@ -93,7 +93,8 @@ fn names_payload_store_reexports() {
 
 #[cfg(feature = "retained_map")]
 use quanta_memory_platform_facade::{
-    BoundRetainedMapStoreBuilder, RetainedMapStore, RetainedMapStoreBuilder, SimpleRetainedMapStore,
+    BoundRetainedMapStoreBuilder, RetainedMapInsertOutcomeV1, RetainedMapStore,
+    RetainedMapStoreBuilder, SimpleRetainedMapStore,
 };
 
 /// Pins the `retained_map` slice's public exports.
@@ -104,6 +105,7 @@ fn names_retained_map_reexports() {
     type _Impl = SimpleRetainedMapStore<String, Vec<u8>>;
     type _Builder = RetainedMapStoreBuilder<String, Vec<u8>>;
     type _BoundBuilder = BoundRetainedMapStoreBuilder<String, Vec<u8>>;
+    type _AtomicInsertOutcome = RetainedMapInsertOutcomeV1;
 }
 
 #[cfg(feature = "revocable_store")]

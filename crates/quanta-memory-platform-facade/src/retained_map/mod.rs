@@ -9,6 +9,13 @@ use quanta_memory_platform_core::{
 pub use crate::shared::builder::{BoundRetainedMapStoreBuilder, RetainedMapStoreBuilder};
 pub use service::SimpleRetainedMapStore;
 
+/// Result of an atomic insert-if-absent publication.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetainedMapInsertOutcomeV1 {
+    Inserted,
+    AlreadyPresent,
+}
+
 /// A retained key/value store with exact, hash-indexed point operations.
 ///
 /// `Key` equality and hashing are part of the public identity contract: keys
@@ -21,14 +28,37 @@ where
 {
     fn binding(&self) -> &StoreBindingHandle;
     fn insert_checked(&self, key: Key, value: Value) -> Result<(), StoreWriteError>;
-    fn get(&self, key: &Key) -> Option<Value>
+    /// Publish only when `key` is absent, deciding presence and mutation under
+    /// the store's canonical state lock. An `AlreadyPresent` result leaves the
+    /// existing payload, charge, and insertion order unchanged.
+    fn insert_if_absent_checked(
+        &self,
+        key: Key,
+        value: Value,
+    ) -> Result<RetainedMapInsertOutcomeV1, StoreWriteError>;
+    /// Checked point read. Lock/storage failure is distinct from absence.
+    fn get_checked(&self, key: &Key) -> MemoryResult<Option<Value>>
     where
         Value: Clone;
+    /// Compatibility projection for advisory callers that cannot carry a
+    /// storage error. Correctness-sensitive paths MUST use `get_checked`.
+    fn get(&self, key: &Key) -> Option<Value>
+    where
+        Value: Clone,
+    {
+        self.get_checked(key).ok().flatten()
+    }
     fn remove(&self, key: &Key) -> MemoryResult<Option<Value>>
     where
         Value: Clone;
     fn sweep(&self, hint: SweepHint) -> MemoryResult<SweepStats>;
-    fn stats(&self) -> StoreStats;
+    /// Checked statistics read. A poisoned store is not an empty store.
+    fn stats_checked(&self) -> MemoryResult<StoreStats>;
+    /// Advisory compatibility projection. Admission and consistency checks
+    /// MUST use `stats_checked`.
+    fn stats(&self) -> StoreStats {
+        self.stats_checked().unwrap_or_default()
+    }
 
     /// Enumerate every live key in a deterministic, key-sorted order.
     ///
