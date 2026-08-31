@@ -15,18 +15,18 @@ impl SccBacking {
     /// `false` if `key` already existed (the prior value is left untouched). The
     /// result is surfaced, never swallowed.
     pub fn insert(&self, key: String, charged_bytes: usize) -> bool {
-        self.index.insert(key, charged_bytes).is_ok()
+        self.index.insert_sync(key, charged_bytes).is_ok()
     }
 
     /// The charged byte size recorded for `key`, if present.
     #[must_use]
     pub fn get(&self, key: &str) -> Option<usize> {
-        self.index.read(key, |_, value| *value)
+        self.index.read_sync(key, |_, value| *value)
     }
 
     /// Remove an entry, returning its recorded byte size if it was present.
     pub fn remove(&self, key: &str) -> Option<usize> {
-        self.index.remove(key).map(|(_, value)| value)
+        self.index.remove_sync(key).map(|(_, value)| value)
     }
 
     /// Number of resident entries.

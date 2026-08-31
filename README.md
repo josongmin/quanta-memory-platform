@@ -36,9 +36,11 @@ Consumers use the builder-first API, never low-level broker backdoors:
 - Store/pipeline builders (`PayloadStoreBuilder`, `RetainedMapStoreBuilder`,
   `RevocableStoreBuilder`, `PublishPipelineBuilder`,
   `SessionTranscriptStoreBuilder`).
-- Charged store assembly stays builder-first too: the relevant store builders
-  expose `charged_against(...)` so consumers do not have to drop to
-  `Simple*Store::new(...).charged_against(...)`.
+- Charged store assembly stays builder-first too. For retained maps,
+  `RetainedMapStoreBuilder::bind(...)` moves into a bound typestate whose
+  `build()` is infallible; `charged_against(...)` is available on either builder
+  state. `SimpleRetainedMapStore` deliberately exposes no late sink attachment,
+  so uncharged entries can never be reclassified as ledger-backed.
 
 Examples (compile against the real public APIs):
 

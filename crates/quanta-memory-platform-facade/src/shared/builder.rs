@@ -7,12 +7,19 @@ use quanta_memory_platform_core::{
 // such slice is enabled, so a slice-free build carries no unused imports.
 #[cfg(any(
     feature = "payload_store",
+    feature = "revocable_store",
+    feature = "publish_pipeline",
+    feature = "transcript"
+))]
+use quanta_memory_platform_core::MemoryError;
+#[cfg(any(
+    feature = "payload_store",
     feature = "retained_map",
     feature = "revocable_store",
     feature = "publish_pipeline",
     feature = "transcript"
 ))]
-use quanta_memory_platform_core::{MemoryError, StoreBindingHandle};
+use quanta_memory_platform_core::StoreBindingHandle;
 #[cfg(any(
     feature = "payload_store",
     feature = "retained_map",
@@ -204,7 +211,6 @@ impl<PayloadRef, Bytes> PayloadStoreBuilder<PayloadRef, Bytes> {
 /// `-> Result` paths, so a missing binding is a typed `Err`, never a panic.
 #[cfg(any(
     feature = "payload_store",
-    feature = "retained_map",
     feature = "revocable_store",
     feature = "publish_pipeline",
     feature = "transcript"
@@ -214,9 +220,28 @@ fn missing_binding() -> MemoryError {
 }
 
 #[cfg(feature = "retained_map")]
+/// Unbound retained-map builder state.
+///
+/// Binding is a compile-time construction prerequisite: this state deliberately
+/// has no `build` method.
+///
+/// ```compile_fail
+/// use quanta_memory_platform_facade::RetainedMapStoreBuilder;
+///
+/// let _ = RetainedMapStoreBuilder::<String, Vec<u8>>::new().build();
+/// ```
 #[derive(Clone, Debug)]
 pub struct RetainedMapStoreBuilder<Key, Value> {
-    binding: Option<StoreBindingHandle>,
+    charger: Option<SharedAccountingSink>,
+    _marker: PhantomData<(Key, Value)>,
+}
+
+/// Bound retained-map builder state. Only this state can build a store, and the
+/// build is infallible because its required binding is owned, not optional.
+#[cfg(feature = "retained_map")]
+#[derive(Clone, Debug)]
+pub struct BoundRetainedMapStoreBuilder<Key, Value> {
+    binding: StoreBindingHandle,
     charger: Option<SharedAccountingSink>,
     _marker: PhantomData<(Key, Value)>,
 }
@@ -224,7 +249,7 @@ pub struct RetainedMapStoreBuilder<Key, Value> {
 #[cfg(feature = "retained_map")]
 impl<Key, Value> Default for RetainedMapStoreBuilder<Key, Value> {
     fn default() -> Self {
-        Self { binding: None, charger: None, _marker: PhantomData }
+        Self { charger: None, _marker: PhantomData }
     }
 }
 
@@ -234,9 +259,8 @@ impl<Key, Value> RetainedMapStoreBuilder<Key, Value> {
         Self::default()
     }
 
-    pub fn bind(mut self, binding: StoreBindingHandle) -> Self {
-        self.binding = Some(binding);
-        self
+    pub fn bind(self, binding: StoreBindingHandle) -> BoundRetainedMapStoreBuilder<Key, Value> {
+        BoundRetainedMapStoreBuilder { binding, charger: self.charger, _marker: PhantomData }
     }
 
     #[must_use]
@@ -244,14 +268,21 @@ impl<Key, Value> RetainedMapStoreBuilder<Key, Value> {
         self.charger = Some(sink);
         self
     }
+}
 
-    pub fn build(self) -> MemoryResult<SimpleRetainedMapStore<Key, Value>> {
-        let binding = self.binding.ok_or_else(missing_binding)?;
-        let mut store = SimpleRetainedMapStore::new(binding);
-        if let Some(sink) = self.charger {
-            store = store.charged_against(sink);
+#[cfg(feature = "retained_map")]
+impl<Key, Value> BoundRetainedMapStoreBuilder<Key, Value> {
+    #[must_use]
+    pub fn charged_against(mut self, sink: SharedAccountingSink) -> Self {
+        self.charger = Some(sink);
+        self
+    }
+
+    pub fn build(self) -> SimpleRetainedMapStore<Key, Value> {
+        match self.charger {
+            Some(sink) => SimpleRetainedMapStore::new_charged(self.binding, sink),
+            None => SimpleRetainedMapStore::new(self.binding),
         }
-        Ok(store)
     }
 }
 
@@ -427,13 +458,6 @@ mod tests {
     }
 
     #[test]
-    fn retained_map_builder_without_binding_fails_with_build_error() {
-        let err =
-            RetainedMapStoreBuilder::<String, Vec<u8>>::new().build().expect_err("missing binding");
-        assert!(matches!(err, MemoryError::Build(_)), "got {err:?}");
-    }
-
-    #[test]
     fn retained_map_builder_charged_against_routes_bytes_through_the_ledger() {
         use crate::retained_map::RetainedMapStore;
 
@@ -442,8 +466,7 @@ mod tests {
         let store = RetainedMapStoreBuilder::<String, Vec<u8>>::new()
             .bind(binding())
             .charged_against(sink)
-            .build()
-            .expect("builder charged retained map");
+            .build();
 
         store.insert_checked("k".to_string(), vec![0u8; 64]).expect("insert");
         assert_eq!(broker.ledger_snapshot().expect("snap").total_owner_bytes(), 64);
@@ -513,11 +536,8 @@ mod tests {
             .with_preset(MemoryPreset::Development)
             .build_live()
             .expect("live platform builds from preset");
-        let store = platform
-            .retained_map_store_builder::<String, Vec<u8>>()
-            .bind(binding())
-            .build()
-            .expect("charged retained map via platform");
+        let store =
+            platform.retained_map_store_builder::<String, Vec<u8>>().bind(binding()).build();
 
         store.insert_checked("k".to_string(), vec![0u8; 48]).expect("insert");
         assert_eq!(
@@ -542,13 +562,11 @@ mod tests {
         let a = platform
             .retained_map_store_builder::<String, Vec<u8>>()
             .bind(StoreBindingHandle::new(MemoryClass::ArtifactCache, "owner-a".to_string(), None))
-            .build()
-            .expect("store a");
+            .build();
         let b = platform
             .retained_map_store_builder::<String, Vec<u8>>()
             .bind(StoreBindingHandle::new(MemoryClass::ArtifactCache, "owner-b".to_string(), None))
-            .build()
-            .expect("store b");
+            .build();
         a.insert_checked("x".to_string(), vec![0u8; 10]).expect("insert a");
         b.insert_checked("y".to_string(), vec![0u8; 25]).expect("insert b");
         assert_eq!(

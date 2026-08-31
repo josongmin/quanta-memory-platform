@@ -21,8 +21,8 @@ use quanta_memory_platform_core::{
 };
 #[cfg(feature = "fixtures")]
 use quanta_memory_platform_facade::{
-    AccountingSink, InMemorySpillTarget, PayloadStore, RetainedMapStore, RoutedSpillController,
-    SessionTranscriptStore, SimplePayloadStore, SimpleRetainedMapStore,
+    AccountingSink, InMemorySpillTarget, PayloadStore, RetainedMapStore, RetainedMapStoreBuilder,
+    RoutedSpillController, SessionTranscriptStore, SimplePayloadStore,
     SimpleSessionTranscriptStore, SpillController, SpillTarget,
 };
 #[cfg(feature = "fixtures")]
@@ -429,11 +429,10 @@ fn run_retained_map_slice_with_sink(
 ) -> Vec<AssertionVerdict> {
     let accounting =
         InvariantAssertion::new(ContractFamily::ReclaimAccounting, "retained_map_refunds");
-    let store = SimpleRetainedMapStore::<String, Vec<u8>>::new(binding(
-        MemoryClass::MemoResidency,
-        "conformance:map",
-    ))
-    .charged_against(sink);
+    let store = RetainedMapStoreBuilder::<String, Vec<u8>>::new()
+        .bind(binding(MemoryClass::MemoResidency, "conformance:map"))
+        .charged_against(sink)
+        .build();
 
     let overwrite = store
         .insert_checked("k".to_string(), vec![0u8; 24])
@@ -459,11 +458,10 @@ fn run_retained_map_slice_with_sink(
     {
         Ok(tight_broker) => {
             let tight_sink = LiveBrokerAccountingSink::shared(tight_broker.clone());
-            let tight_store = SimpleRetainedMapStore::<String, Vec<u8>>::new(binding(
-                MemoryClass::MemoResidency,
-                "conformance:map-tight",
-            ))
-            .charged_against(tight_sink);
+            let tight_store = RetainedMapStoreBuilder::<String, Vec<u8>>::new()
+                .bind(binding(MemoryClass::MemoResidency, "conformance:map-tight"))
+                .charged_against(tight_sink)
+                .build();
             let seed = tight_store.insert_checked("k".to_string(), vec![0u8; 24]); // 24 of 30
                                                                                    // old(24) + new(20) = 44 > 30 cap, but net 20 <= 30: atomic recharge only.
             let net_fit = tight_store.insert_checked("k".to_string(), vec![0u8; 20]);

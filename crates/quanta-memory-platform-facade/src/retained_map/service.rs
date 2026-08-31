@@ -1,4 +1,9 @@
+use std::collections::hash_map::RandomState;
+use std::hash::Hash;
 use std::sync::Mutex;
+
+use hashlink::linked_hash_map::Entry;
+use hashlink::LinkedHashMap;
 
 use quanta_memory_platform_core::{
     ChargeKind, MemoryContextKind, MemoryError, ReservationTicket, StoreBindingHandle, StoreStats,
@@ -10,8 +15,7 @@ use crate::shared::accounting::SharedAccountingSink;
 use crate::shared::measure::ByteSized;
 
 #[derive(Debug)]
-struct MapEntry<Key, Value> {
-    key: Key,
+struct MapEntry<Value> {
     value: Value,
     charged_bytes: u64,
     /// Ledger receipt when the store is charged against a broker; `None` in
@@ -22,7 +26,10 @@ struct MapEntry<Key, Value> {
 
 #[derive(Debug)]
 struct MapState<Key, Value> {
-    entries: Vec<MapEntry<Key, Value>>,
+    /// Single canonical payload/index/order owner. Randomized hashing prevents
+    /// attacker-selected keys from deterministically degrading point operations;
+    /// the linked order preserves newest-first sweep semantics.
+    entries: LinkedHashMap<Key, MapEntry<Value>, RandomState>,
     committed_bytes: u64,
 }
 
@@ -39,6 +46,21 @@ struct MapState<Key, Value> {
 /// global/owner/class caps gate real map bytes and a denied insert fails closed.
 /// Without a sink the store self-accounts (explicit non-budgeted mode) and never
 /// touches a ledger (invariant 2: it never requires full broker mutation access).
+///
+/// Charged construction is builder-only so a ledger sink can never be attached
+/// after uncharged entries already exist:
+///
+/// ```compile_fail
+/// use quanta_memory_platform_facade::{SharedAccountingSink, SimpleRetainedMapStore};
+/// use quanta_memory_platform_core::StoreBindingHandle;
+///
+/// fn attach_after_construction(
+///     store: SimpleRetainedMapStore<String, Vec<u8>>,
+///     sink: SharedAccountingSink,
+/// ) {
+///     let _ = store.charged_against(sink);
+/// }
+/// ```
 #[derive(Debug)]
 pub struct SimpleRetainedMapStore<Key, Value> {
     binding: StoreBindingHandle,
@@ -48,25 +70,28 @@ pub struct SimpleRetainedMapStore<Key, Value> {
 
 impl<Key, Value> SimpleRetainedMapStore<Key, Value> {
     pub fn new(binding: StoreBindingHandle) -> Self {
-        Self {
-            binding,
-            charger: None,
-            state: Mutex::new(MapState { entries: Vec::new(), committed_bytes: 0 }),
-        }
+        Self::with_charger(binding, None)
     }
 
-    /// Charge this store's bytes against a broker ledger (the accounting SSOT).
-    /// Without this, the store self-accounts and no cap controls its bytes.
-    #[must_use]
-    pub fn charged_against(mut self, sink: SharedAccountingSink) -> Self {
-        self.charger = Some(sink);
-        self
+    pub(crate) fn new_charged(binding: StoreBindingHandle, sink: SharedAccountingSink) -> Self {
+        Self::with_charger(binding, Some(sink))
+    }
+
+    fn with_charger(binding: StoreBindingHandle, charger: Option<SharedAccountingSink>) -> Self {
+        Self {
+            binding,
+            charger,
+            state: Mutex::new(MapState {
+                entries: LinkedHashMap::with_hasher(RandomState::new()),
+                committed_bytes: 0,
+            }),
+        }
     }
 }
 
 impl<Key, Value> SimpleRetainedMapStore<Key, Value>
 where
-    Key: Clone + PartialEq,
+    Key: Clone + Eq + Hash,
     Value: Clone + ByteSized,
 {
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, MapState<Key, Value>>, MemoryError> {
@@ -83,7 +108,7 @@ where
 
 impl<Key, Value> RetainedMapStore<Key, Value> for SimpleRetainedMapStore<Key, Value>
 where
-    Key: Clone + PartialEq,
+    Key: Clone + Eq + Hash,
     Value: Clone + ByteSized,
 {
     fn binding(&self) -> &StoreBindingHandle {
@@ -93,111 +118,109 @@ where
     fn insert_checked(&self, key: Key, value: Value) -> Result<(), StoreWriteError> {
         let reserved_bytes = value.byte_size();
         let mut state = self.lock()?;
+        let MapState { entries, committed_bytes } = &mut *state;
 
-        if let Some(index) = state.entries.iter().position(|entry| entry.key == key) {
-            // OVERWRITE. For a charged store this is a single atomic recharge
-            // (release old + charge new under one broker lock), so the overwrite
-            // never transiently double-counts against caps/group admission nor
-            // strands bytes if a rebuild interleaves. Fail-closed: on denial the
-            // entry keeps its old value and a valid ticket (the original, or the
-            // broker-restored one), and committed_bytes is unchanged.
-            match &self.charger {
-                Some(sink) => {
-                    let old_ticket = match state.entries[index].ticket.take() {
-                        Some(t) => t,
-                        None => {
-                            // Unreachable: a charged store always stores `Some(ticket)`
-                            // on insert — even a zero-byte value mints a live ledger
-                            // ticket via `sink.charge(.., 0)`. A ticket-less charged
-                            // entry would mean a prior charge was lost, so fail closed
-                            // LOUDLY rather than silently re-charging and diverging the
-                            // store from the ledger (the old silent fallback could mask
-                            // a charge-invariant regression).
-                            return Err(MemoryError::InvalidState(
-                                "charged retained-map entry has no ticket on overwrite: \
-                                 charge invariant broken"
-                                    .to_string(),
-                            ));
+        match entries.entry(key) {
+            Entry::Occupied(mut occupied) => {
+                // Mutate an occupied value in place. Unlike an order-refreshing
+                // insert, this preserves the original insertion position and thus
+                // the store's established newest-first sweep contract.
+                match &self.charger {
+                    Some(sink) => {
+                        let entry = occupied.get_mut();
+                        let old_ticket = match entry.ticket.take() {
+                            Some(ticket) => ticket,
+                            None => {
+                                return Err(MemoryError::InvalidState(
+                                    "charged retained-map entry has no ticket on overwrite: \
+                                     charge invariant broken"
+                                        .to_string(),
+                                ));
+                            }
+                        };
+                        match sink.recharge(
+                            &old_ticket,
+                            self.binding.class.clone(),
+                            self.binding.owner.clone(),
+                            MemoryContextKind::Request,
+                            ChargeKind::RetainedMetadata,
+                            reserved_bytes,
+                        ) {
+                            Ok(new_ticket) => {
+                                *committed_bytes = committed_bytes
+                                    .saturating_sub(entry.charged_bytes)
+                                    .saturating_add(reserved_bytes);
+                                entry.value = value;
+                                entry.charged_bytes = reserved_bytes;
+                                entry.ticket = Some(new_ticket);
+                                Ok(())
+                            }
+                            Err((err, restored)) => {
+                                // Recharge restores the old ledger charge before
+                                // returning failure. Publish the restored ticket but
+                                // leave payload, bytes, and insertion position intact.
+                                entry.ticket = restored.or(Some(old_ticket));
+                                Err(err)
+                            }
                         }
-                    };
-                    match sink.recharge(
-                        &old_ticket,
+                    }
+                    None => {
+                        let entry = occupied.get_mut();
+                        *committed_bytes = committed_bytes
+                            .saturating_sub(entry.charged_bytes)
+                            .saturating_add(reserved_bytes);
+                        entry.value = value;
+                        entry.charged_bytes = reserved_bytes;
+                        Ok(())
+                    }
+                }
+            }
+            Entry::Vacant(vacant) => {
+                // Charge before publication so a denied admission leaves payload,
+                // order, and local accounting unchanged.
+                let new_ticket = match &self.charger {
+                    Some(sink) => Some(sink.charge(
                         self.binding.class.clone(),
                         self.binding.owner.clone(),
                         MemoryContextKind::Request,
                         ChargeKind::RetainedMetadata,
                         reserved_bytes,
-                    ) {
-                        Ok(new_ticket) => {
-                            let old_charge = state.entries[index].charged_bytes;
-                            state.committed_bytes = state
-                                .committed_bytes
-                                .saturating_sub(old_charge)
-                                .saturating_add(reserved_bytes);
-                            state.entries[index].value = value;
-                            state.entries[index].charged_bytes = reserved_bytes;
-                            state.entries[index].ticket = Some(new_ticket);
-                            Ok(())
-                        }
-                        Err((err, restored)) => {
-                            // Restore the entry's ticket so no charge is lost: the
-                            // broker-restored fresh ticket if old was released, else
-                            // the original old ticket (untouched). Value/bytes stay.
-                            state.entries[index].ticket = restored.or(Some(old_ticket));
-                            Err(err)
-                        }
-                    }
-                }
-                None => {
-                    // Uncharged (non-budgeted) overwrite: swap value + self counter.
-                    let old_charge = state.entries[index].charged_bytes;
-                    state.committed_bytes = state
-                        .committed_bytes
-                        .saturating_sub(old_charge)
-                        .saturating_add(reserved_bytes);
-                    state.entries[index].value = value;
-                    state.entries[index].charged_bytes = reserved_bytes;
-                    Ok(())
-                }
+                    )?),
+                    None => None,
+                };
+                vacant.insert(MapEntry {
+                    value,
+                    charged_bytes: reserved_bytes,
+                    ticket: new_ticket,
+                });
+                *committed_bytes = committed_bytes.saturating_add(reserved_bytes);
+                Ok(())
             }
-        } else {
-            // INSERT a new key. Charge the ledger BEFORE pushing, so a cap denial
-            // fails closed (no entry created, ledger untouched).
-            let new_ticket = match &self.charger {
-                Some(sink) => Some(sink.charge(
-                    self.binding.class.clone(),
-                    self.binding.owner.clone(),
-                    MemoryContextKind::Request,
-                    ChargeKind::RetainedMetadata,
-                    reserved_bytes,
-                )?),
-                None => None,
-            };
-            state.entries.push(MapEntry {
-                key,
-                value,
-                charged_bytes: reserved_bytes,
-                ticket: new_ticket,
-            });
-            state.committed_bytes = state.committed_bytes.saturating_add(reserved_bytes);
-            Ok(())
         }
     }
 
     fn get(&self, key: &Key) -> Option<Value> {
         let state = self.lock().ok()?;
-        state.entries.iter().find(|entry| &entry.key == key).map(|entry| entry.value.clone())
+        state.entries.get(key).map(|entry| entry.value.clone())
     }
 
     fn remove(&self, key: &Key) -> Result<Option<Value>, MemoryError> {
         let mut state = self.lock()?;
-        let Some(index) = state.entries.iter().position(|entry| &entry.key == key) else {
+        let Some(entry) = state.entries.get(key) else {
             return Ok(None);
         };
-        if let (Some(sink), Some(ticket)) = (&self.charger, state.entries[index].ticket.as_ref()) {
+        if let Some(sink) = &self.charger {
+            let ticket = entry.ticket.as_ref().ok_or_else(|| {
+                MemoryError::InvalidState(
+                    "charged retained-map entry has no ticket on remove: charge invariant broken"
+                        .to_string(),
+                )
+            })?;
             sink.refund(ticket)?;
         }
-        let removed = state.entries.remove(index);
+        let removed = state.entries.remove(key).ok_or_else(|| {
+            MemoryError::InvalidState("retained-map key disappeared during remove".to_string())
+        })?;
         state.committed_bytes = state.committed_bytes.saturating_sub(removed.charged_bytes);
         Ok(Some(removed.value))
     }
@@ -207,14 +230,13 @@ where
         let mut reclaimed_items = 0usize;
         let mut reclaimed_bytes = 0u64;
         let mut refunds: Vec<ReservationTicket> = Vec::new();
-        // Indices to evict, collected newest-first (LIFO). Descending order, so
-        // removing them in sequence keeps the lower indices valid.
-        let mut evict_indices: Vec<usize> = Vec::new();
-        for idx in (0..state.entries.len()).rev() {
+        // Keys to evict, collected newest-first from the canonical linked order.
+        // Only selected keys are cloned; each publication remove is average O(1).
+        let mut evict_keys: Vec<Key> = Vec::new();
+        for (key, entry) in state.entries.iter().rev() {
             if reclaimed_bytes >= hint.target_bytes {
                 break;
             }
-            let entry = &state.entries[idx];
             // A zero-byte entry frees no memory toward a BYTE target; evicting it is
             // pure data loss that never advances `reclaimed_bytes`. Skip it so a
             // positive target can never wipe an entire store of zero-byte entries
@@ -224,16 +246,26 @@ where
             }
             reclaimed_items += 1;
             reclaimed_bytes = reclaimed_bytes.saturating_add(entry.charged_bytes);
-            if let Some(ticket) = &entry.ticket {
+            if self.charger.is_some() {
+                let ticket = entry.ticket.as_ref().ok_or_else(|| {
+                    MemoryError::InvalidState(
+                        "charged retained-map entry has no ticket on sweep: charge invariant broken"
+                            .to_string(),
+                    )
+                })?;
                 refunds.push(ticket.clone());
             }
-            evict_indices.push(idx);
+            evict_keys.push(key.clone());
         }
         if let Some(sink) = &self.charger {
             sink.refund_many(&refunds)?;
         }
-        for idx in &evict_indices {
-            let removed = state.entries.remove(*idx);
+        for key in &evict_keys {
+            let removed = state.entries.remove(key).ok_or_else(|| {
+                MemoryError::InvalidState(
+                    "retained-map sweep key disappeared while its state lock was held".to_string(),
+                )
+            })?;
             state.committed_bytes = state.committed_bytes.saturating_sub(removed.charged_bytes);
         }
         Ok(SweepStats { reclaimed_items, reclaimed_bytes })
@@ -259,7 +291,7 @@ where
             // unobservable, so we never fabricate a partial key set.
             Err(_) => return Vec::new(),
         };
-        let mut keys: Vec<Key> = state.entries.iter().map(|entry| entry.key.clone()).collect();
+        let mut keys: Vec<Key> = state.entries.keys().cloned().collect();
         // Deterministic, key-sorted order independent of insertion order.
         keys.sort();
         keys
@@ -275,7 +307,7 @@ where
             Err(_) => return Vec::new(),
         };
         let mut entries: Vec<(Key, Value)> =
-            state.entries.iter().map(|entry| (entry.key.clone(), entry.value.clone())).collect();
+            state.entries.iter().map(|(key, entry)| (key.clone(), entry.value.clone())).collect();
         // Same deterministic key order as `keys`.
         entries.sort_by(|a, b| a.0.cmp(&b.0));
         entries
@@ -286,11 +318,34 @@ where
 mod tests {
     use super::*;
     use quanta_memory_platform_core::{MemoryClass, StoreBindingHandle};
+    use std::hash::{Hash, Hasher};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
 
     fn store() -> SimpleRetainedMapStore<String, Vec<u8>> {
         let binding =
             StoreBindingHandle::new(MemoryClass::MemoResidency, "owner-map".to_string(), None);
         SimpleRetainedMapStore::new(binding)
+    }
+
+    #[test]
+    fn retained_map_owner_has_one_keyed_container_and_no_linear_point_path() {
+        let source = include_str!("service.rs");
+        for forbidden in [
+            concat!("Vec<", "MapEntry"),
+            concat!("Index", "Map"),
+            concat!(".iter()", ".position("),
+            concat!(".iter()", ".find("),
+            concat!("shift_", "remove"),
+            concat!("pub fn charged", "_against"),
+        ] {
+            assert!(
+                !source.contains(forbidden),
+                "retained-map owner must not regain forbidden linear/dual-authority path: {forbidden}"
+            );
+        }
+        assert!(source.contains("LinkedHashMap<Key, MapEntry<Value>, RandomState>"));
+        assert!(source.contains("pub(crate) fn new_charged"));
     }
 
     #[test]
@@ -325,14 +380,14 @@ mod tests {
         assert_eq!(store.stats(), StoreStats { item_count: 0, estimated_bytes: 0 });
     }
 
-    // --- Audit U: the map Key is `PartialEq`-only (not necessarily bit-identical
-    // for equal keys). A second put of a key that is `==` an existing key must
-    // overwrite in place and must NOT double-count bytes. ---
+    // --- Audit U: equal keys need not be bit-identical. A second put of a key
+    // that is equal under the lawful Eq + Hash contract must overwrite in place
+    // and must NOT double-count bytes. ---
 
     #[derive(Clone, Debug)]
     struct CaseInsensitiveKey {
         // The canonical (lowercased) form drives equality; `raw` can differ for
-        // two equal keys, exercising the PartialEq-only contract.
+        // two equal keys, exercising the Eq + Hash identity law.
         raw: String,
     }
 
@@ -342,9 +397,20 @@ mod tests {
         }
     }
 
+    impl Eq for CaseInsensitiveKey {}
+
+    impl Hash for CaseInsensitiveKey {
+        fn hash<H: Hasher>(&self, state: &mut H) {
+            self.raw.len().hash(state);
+            for byte in self.raw.bytes() {
+                byte.to_ascii_lowercase().hash(state);
+            }
+        }
+    }
+
     #[test]
-    fn partial_eq_only_duplicate_key_overwrites_and_does_not_double_count() {
-        // scenario F (audit U): two keys equal under PartialEq but not bit-identical
+    fn equal_hash_key_duplicate_overwrites_and_does_not_double_count() {
+        // scenario F (audit U): two keys equal under Eq but not bit-identical
         // ("Key" vs "KEY") must collapse to one live entry with one live charge.
         let binding = StoreBindingHandle::new(
             MemoryClass::MemoResidency,
@@ -367,7 +433,7 @@ mod tests {
         assert_eq!(
             store.committed_bytes().expect("c2"),
             3,
-            "PartialEq-equal duplicate must overwrite, never double-count bytes"
+            "Eq-equal duplicate must overwrite, never double-count bytes"
         );
         assert_eq!(store.stats().item_count, 1, "equal keys must collapse to one entry");
         // The new value is observable under either equal key form.
@@ -375,6 +441,91 @@ mod tests {
             store.get(&CaseInsensitiveKey { raw: "key".to_string() }),
             Some(vec![0u8; 3]),
             "get under any equal key form returns the overwritten value"
+        );
+    }
+
+    #[derive(Clone, Debug)]
+    struct LookupProbeKey {
+        id: u64,
+        equality_probes: Arc<AtomicUsize>,
+        hash_probes: Arc<AtomicUsize>,
+    }
+
+    impl PartialEq for LookupProbeKey {
+        fn eq(&self, other: &Self) -> bool {
+            self.equality_probes.fetch_add(1, Ordering::Relaxed);
+            self.id == other.id
+        }
+    }
+
+    impl Eq for LookupProbeKey {}
+
+    impl Hash for LookupProbeKey {
+        fn hash<H: Hasher>(&self, state: &mut H) {
+            self.hash_probes.fetch_add(1, Ordering::Relaxed);
+            self.id.hash(state);
+        }
+    }
+
+    #[test]
+    fn exact_key_lookup_uses_keyed_admission_instead_of_scanning_live_entries() {
+        let binding = StoreBindingHandle::new(
+            MemoryClass::MemoResidency,
+            "owner-keyed-lookup".to_string(),
+            None,
+        );
+        let equality_probes = Arc::new(AtomicUsize::new(0));
+        let hash_probes = Arc::new(AtomicUsize::new(0));
+        let store: SimpleRetainedMapStore<LookupProbeKey, Vec<u8>> =
+            SimpleRetainedMapStore::new(binding);
+
+        for id in 0..4_096 {
+            store
+                .insert_checked(
+                    LookupProbeKey {
+                        id,
+                        equality_probes: Arc::clone(&equality_probes),
+                        hash_probes: Arc::clone(&hash_probes),
+                    },
+                    vec![id as u8],
+                )
+                .expect("seed keyed entry");
+        }
+
+        equality_probes.store(0, Ordering::Relaxed);
+        hash_probes.store(0, Ordering::Relaxed);
+        let query = LookupProbeKey {
+            id: 4_095,
+            equality_probes: Arc::clone(&equality_probes),
+            hash_probes: Arc::clone(&hash_probes),
+        };
+        assert_eq!(store.get(&query), Some(vec![255]));
+        assert!(
+            equality_probes.load(Ordering::Relaxed) < 32,
+            "exact point lookup must not compare against the full live-entry population"
+        );
+        assert_eq!(hash_probes.load(Ordering::Relaxed), 1, "lookup hashes the exact key once");
+
+        equality_probes.store(0, Ordering::Relaxed);
+        hash_probes.store(0, Ordering::Relaxed);
+        store.insert_checked(query.clone(), vec![7u8; 3]).expect("overwrite exact key");
+        assert!(
+            equality_probes.load(Ordering::Relaxed) < 32,
+            "overwrite must not scan the full live-entry population"
+        );
+        assert_eq!(hash_probes.load(Ordering::Relaxed), 1, "overwrite hashes the exact key once");
+
+        equality_probes.store(0, Ordering::Relaxed);
+        hash_probes.store(0, Ordering::Relaxed);
+        assert_eq!(store.remove(&query).expect("remove exact key"), Some(vec![7u8; 3]));
+        assert!(
+            equality_probes.load(Ordering::Relaxed) < 64,
+            "remove must not scan the full live-entry population"
+        );
+        assert_eq!(
+            hash_probes.load(Ordering::Relaxed),
+            2,
+            "fail-closed remove validates then removes by exact key"
         );
     }
 
@@ -422,6 +573,40 @@ mod tests {
         assert_eq!(stats.reclaimed_bytes, 10);
         assert_eq!(store.committed_bytes().expect("after sweep"), 5);
         assert_eq!(store.stats().item_count, 1);
+    }
+
+    #[test]
+    fn overwrite_preserves_original_insertion_position_for_newest_first_sweep() {
+        let store = store();
+        store.insert_checked("a".to_string(), vec![1]).expect("a");
+        store.insert_checked("b".to_string(), vec![2]).expect("b");
+        store.insert_checked("c".to_string(), vec![3]).expect("c");
+
+        // Updating b must not turn it into the newest entry.
+        store.insert_checked("b".to_string(), vec![9, 9]).expect("overwrite b");
+        let swept = store.sweep(SweepHint { target_bytes: 1 }).expect("sweep newest");
+
+        assert_eq!(swept, SweepStats { reclaimed_items: 1, reclaimed_bytes: 1 });
+        assert_eq!(store.get(&"b".to_string()), Some(vec![9, 9]), "overwritten b stays resident");
+        assert_eq!(store.get(&"c".to_string()), None, "original newest c is evicted first");
+        assert_eq!(store.keys(), vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn arbitrary_remove_preserves_remaining_newest_first_sweep_order() {
+        let store = store();
+        for key in ["a", "b", "c", "d"] {
+            store.insert_checked(key.to_string(), vec![1]).expect("seed");
+        }
+
+        assert_eq!(store.remove(&"b".to_string()).expect("remove b"), Some(vec![1]));
+        store.sweep(SweepHint { target_bytes: 1 }).expect("sweep d");
+        assert_eq!(store.get(&"d".to_string()), None, "d remains newest after removing b");
+        assert!(store.get(&"c".to_string()).is_some(), "c must survive the first sweep");
+
+        store.sweep(SweepHint { target_bytes: 1 }).expect("sweep c");
+        assert_eq!(store.get(&"c".to_string()), None, "c is next newest");
+        assert_eq!(store.keys(), vec!["a".to_string()]);
     }
 
     #[test]
@@ -669,7 +854,7 @@ mod tests {
             let sink: SharedAccountingSink = Arc::new(broker.clone());
             let binding =
                 StoreBindingHandle::new(MemoryClass::MemoResidency, "owner-map".to_string(), None);
-            SimpleRetainedMapStore::new(binding).charged_against(sink)
+            SimpleRetainedMapStore::new_charged(binding, sink)
         }
 
         #[test]
@@ -858,6 +1043,20 @@ mod tests {
         }
 
         #[test]
+        fn charged_remove_rejects_a_ticketless_entry_without_mutating_state() {
+            let broker = live_broker(1_000_000);
+            let store = charged(&broker);
+            store.insert_checked("k".to_string(), vec![0u8; 7]).expect("seed");
+            store.state.lock().expect("state").entries.get_mut("k").expect("entry").ticket = None;
+
+            let denied = store.remove(&"k".to_string());
+            assert!(matches!(denied, Err(MemoryError::InvalidState(_))), "got {denied:?}");
+            assert_eq!(store.get(&"k".to_string()), Some(vec![0u8; 7]));
+            assert_eq!(store.committed_bytes().expect("committed"), 7);
+            assert_eq!(broker.ledger_snapshot().expect("snap").total_owner_bytes(), 7);
+        }
+
+        #[test]
         fn charged_sweep_during_rebuild_is_fail_closed() {
             let broker = live_broker(1_000_000);
             let store = charged(&broker);
@@ -870,6 +1069,42 @@ mod tests {
             assert!(
                 matches!(denied, Err(MemoryError::InvalidState(_))),
                 "sweep during rebuild must fail closed, got {denied:?}"
+            );
+            assert_eq!(store.keys(), vec!["a".to_string(), "b".to_string(), "c".to_string()]);
+            assert_eq!(store.committed_bytes().expect("committed"), 15);
+            assert_eq!(broker.ledger_snapshot().expect("snap").total_owner_bytes(), 15);
+
+            // A failed refund_many must also leave internal insertion order intact.
+            // Once the accounting gate reopens, the original newest entry is still
+            // the first one reclaimed.
+            broker.finish_rebuild().expect("finish rebuild");
+            let swept = store.sweep(SweepHint { target_bytes: 5 }).expect("sweep after retry");
+            assert_eq!(swept, SweepStats { reclaimed_items: 1, reclaimed_bytes: 5 });
+            assert_eq!(store.get(&"c".to_string()), None, "c remains newest after denial");
+            assert_eq!(store.keys(), vec!["a".to_string(), "b".to_string()]);
+            assert_eq!(broker.ledger_snapshot().expect("snap").total_owner_bytes(), 10);
+        }
+
+        #[test]
+        fn charged_sweep_rejects_a_ticketless_candidate_without_partial_refund_or_eviction() {
+            let broker = live_broker(1_000_000);
+            let store = charged(&broker);
+            for key in ["a", "b", "c"] {
+                store.insert_checked(key.to_string(), vec![0u8; 5]).expect("seed");
+            }
+            store.state.lock().expect("state").entries.get_mut("b").expect("entry").ticket = None;
+
+            // c is visited first and has a ticket, then b exposes corruption.
+            // No refund_many call or keyed removal may happen before all selected
+            // entries have proven their ticket invariant.
+            let denied = store.sweep(SweepHint { target_bytes: 10 });
+            assert!(matches!(denied, Err(MemoryError::InvalidState(_))), "got {denied:?}");
+            let insertion_order =
+                store.state.lock().expect("state").entries.keys().cloned().collect::<Vec<_>>();
+            assert_eq!(
+                insertion_order,
+                vec!["a".to_string(), "b".to_string(), "c".to_string()],
+                "ticket validation failure must preserve canonical linked order"
             );
             assert_eq!(store.keys(), vec!["a".to_string(), "b".to_string(), "c".to_string()]);
             assert_eq!(store.committed_bytes().expect("committed"), 15);

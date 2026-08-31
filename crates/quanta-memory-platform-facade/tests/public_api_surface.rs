@@ -93,7 +93,7 @@ fn names_payload_store_reexports() {
 
 #[cfg(feature = "retained_map")]
 use quanta_memory_platform_facade::{
-    RetainedMapStore, RetainedMapStoreBuilder, SimpleRetainedMapStore,
+    BoundRetainedMapStoreBuilder, RetainedMapStore, RetainedMapStoreBuilder, SimpleRetainedMapStore,
 };
 
 /// Pins the `retained_map` slice's public exports.
@@ -103,6 +103,7 @@ fn names_retained_map_reexports() {
     type _Trait = Box<dyn RetainedMapStore<String, Vec<u8>>>;
     type _Impl = SimpleRetainedMapStore<String, Vec<u8>>;
     type _Builder = RetainedMapStoreBuilder<String, Vec<u8>>;
+    type _BoundBuilder = BoundRetainedMapStoreBuilder<String, Vec<u8>>;
 }
 
 #[cfg(feature = "revocable_store")]
@@ -260,8 +261,7 @@ fn retained_map_builder_exposes_public_charged_path() {
         RetainedMapStoreBuilder::<String, Vec<u8>>::new()
             .bind(binding)
             .charged_against(sink)
-            .build()
-            .expect("charged retained map builder must build");
+            .build();
 
     store.insert_checked("k".to_string(), vec![0u8; 32]).expect("insert");
     assert_eq!(broker.ledger_snapshot().expect("snap").total_owner_bytes(), 32);

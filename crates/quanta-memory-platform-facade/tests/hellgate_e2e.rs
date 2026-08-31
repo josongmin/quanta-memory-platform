@@ -21,7 +21,7 @@ use quanta_memory_platform_core::{
     StoreBindingHandle,
 };
 use quanta_memory_platform_facade::{
-    RetainedMapStore, SharedAccountingSink, SimpleRetainedMapStore,
+    RetainedMapStore, RetainedMapStoreBuilder, SharedAccountingSink, SimpleRetainedMapStore,
 };
 
 const OWNER: &str = "e2e-owner";
@@ -49,7 +49,7 @@ fn broker(global: u64, class_hard: u64) -> LiveProcessMemoryBroker {
 fn charged_map(broker: &LiveProcessMemoryBroker) -> SimpleRetainedMapStore<String, Vec<u8>> {
     let sink: SharedAccountingSink = Arc::new(broker.clone());
     let binding = StoreBindingHandle::new(MemoryClass::MemoResidency, OWNER.to_string(), None);
-    SimpleRetainedMapStore::new(binding).charged_against(sink)
+    RetainedMapStoreBuilder::new().bind(binding).charged_against(sink).build()
 }
 
 /// Assert the three accounting axes balance — the SSOT is internally consistent.

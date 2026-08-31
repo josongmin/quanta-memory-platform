@@ -12,7 +12,7 @@ default = []
 # present whenever the facade wires the broker in as an accounting sink.
 core-live-accounting = ["quanta-memory-platform-core/live_control"]
 payload_store = ["dep:bumpalo"]
-retained_map = []
+retained_map = ["dep:hashlink"]
 # Base store/pipeline slices are pure-Rust in-memory and carry NO third-party
 # (copyleft) backing deps. Durable/concurrent backings are opt-in via the
 # `*-redb` / `*-moka` / `*-scc` features below, so a consumer that does not ask
@@ -44,6 +44,7 @@ full-backings = ["full", "spill-redb", "revocable-moka", "revocable-scc"]
 
 [dependencies]
 bumpalo = { workspace = true, optional = true }
+hashlink = { workspace = true, optional = true }
 moka = { workspace = true, optional = true }
 quanta-memory-platform-core = { path = "../quanta-memory-platform-core" }
 redb = { workspace = true, optional = true }

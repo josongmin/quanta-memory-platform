@@ -21,7 +21,8 @@ use quanta_memory_platform_core::{
 };
 use quanta_memory_platform_facade::shared::accounting::RechargeDenied;
 use quanta_memory_platform_facade::{
-    AccountingSink, RetainedMapStore, SharedAccountingSink, SimpleRetainedMapStore,
+    AccountingSink, RetainedMapStore, RetainedMapStoreBuilder, SharedAccountingSink,
+    SimpleRetainedMapStore,
 };
 
 fn broker() -> LiveProcessMemoryBroker {
@@ -40,7 +41,7 @@ fn charged(
     let _ = broker;
     let binding =
         StoreBindingHandle::new(MemoryClass::MemoResidency, "bite-owner".to_string(), None);
-    SimpleRetainedMapStore::new(binding).charged_against(sink)
+    RetainedMapStoreBuilder::new().bind(binding).charged_against(sink).build()
 }
 
 /// Honest sink: routes everything to the broker (the contract-correct behavior).
