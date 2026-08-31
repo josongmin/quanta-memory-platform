@@ -93,8 +93,8 @@ fn names_payload_store_reexports() {
 
 #[cfg(feature = "retained_map")]
 use quanta_memory_platform_facade::{
-    BoundRetainedMapStoreBuilder, RetainedMapInsertOutcomeV1, RetainedMapStore,
-    RetainedMapStoreBuilder, SimpleRetainedMapStore,
+    BoundRetainedMapStoreBuilder, RetainedMapInsertOrExistingV1, RetainedMapInsertOutcomeV1,
+    RetainedMapStore, RetainedMapStoreBuilder, SimpleRetainedMapStore,
 };
 
 /// Pins the `retained_map` slice's public exports.
@@ -106,6 +106,7 @@ fn names_retained_map_reexports() {
     type _Builder = RetainedMapStoreBuilder<String, Vec<u8>>;
     type _BoundBuilder = BoundRetainedMapStoreBuilder<String, Vec<u8>>;
     type _AtomicInsertOutcome = RetainedMapInsertOutcomeV1;
+    type _AtomicInsertOrExisting = RetainedMapInsertOrExistingV1<Vec<u8>>;
 }
 
 #[cfg(feature = "revocable_store")]
@@ -267,6 +268,42 @@ fn retained_map_builder_exposes_public_charged_path() {
 
     store.insert_checked("k".to_string(), vec![0u8; 32]).expect("insert");
     assert_eq!(broker.ledger_snapshot().expect("snap").total_owner_bytes(), 32);
+}
+
+#[cfg(feature = "retained_map")]
+#[test]
+fn retained_map_atomic_insert_returns_occupied_value_without_overwrite() {
+    use std::sync::Arc;
+
+    use quanta_memory_platform_core::StoreBindingHandle;
+
+    let binding =
+        StoreBindingHandle::new(MemoryClass::ArtifactCache, "owner-occupied".to_string(), None);
+    let store: SimpleRetainedMapStore<String, Arc<Vec<u8>>> =
+        RetainedMapStoreBuilder::<String, Arc<Vec<u8>>>::new().bind(binding).build();
+    let retained = Arc::new(vec![1, 2, 3]);
+
+    let first = store
+        .insert_if_absent_or_get_checked("k".to_string(), Arc::clone(&retained))
+        .expect("first atomic insert");
+    assert_eq!(first, RetainedMapInsertOrExistingV1::Inserted);
+
+    let duplicate = store
+        .insert_if_absent_or_get_checked("k".to_string(), Arc::new(vec![9, 9, 9, 9]))
+        .expect("occupied atomic insert");
+    let RetainedMapInsertOrExistingV1::AlreadyPresent(existing) = duplicate else {
+        panic!("occupied insert must return the existing value");
+    };
+    assert!(
+        Arc::ptr_eq(&existing, &retained),
+        "occupied result must share the retained payload allocation"
+    );
+    let stored = store.get(&"k".to_string()).expect("stored value");
+    assert!(
+        Arc::ptr_eq(&stored, &retained),
+        "occupied insert must preserve the original allocation"
+    );
+    assert_eq!(store.stats().estimated_bytes, 3);
 }
 
 #[cfg(all(feature = "core-live-accounting", feature = "revocable_store"))]

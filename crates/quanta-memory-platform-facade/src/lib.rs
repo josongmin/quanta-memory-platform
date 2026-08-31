@@ -37,8 +37,8 @@ pub use publish_pipeline::{
 };
 #[cfg(feature = "retained_map")]
 pub use retained_map::{
-    BoundRetainedMapStoreBuilder, RetainedMapInsertOutcomeV1, RetainedMapStore,
-    RetainedMapStoreBuilder, SimpleRetainedMapStore,
+    BoundRetainedMapStoreBuilder, RetainedMapInsertOrExistingV1, RetainedMapInsertOutcomeV1,
+    RetainedMapStore, RetainedMapStoreBuilder, SimpleRetainedMapStore,
 };
 #[cfg(feature = "revocable_store")]
 pub use revocable_store::{RevocableStore, RevocableStoreBuilder, SimpleRevocableStore};

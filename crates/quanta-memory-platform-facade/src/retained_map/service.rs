@@ -10,7 +10,9 @@ use quanta_memory_platform_core::{
     StoreWriteError, SweepHint, SweepStats,
 };
 
-use crate::retained_map::{RetainedMapInsertOutcomeV1, RetainedMapStore};
+use crate::retained_map::{
+    RetainedMapInsertOrExistingV1, RetainedMapInsertOutcomeV1, RetainedMapStore,
+};
 use crate::shared::accounting::SharedAccountingSink;
 use crate::shared::measure::ByteSized;
 
@@ -105,6 +107,67 @@ where
         Ok(self.lock()?.committed_bytes)
     }
 
+    fn committed_bytes_after_replace_v1(
+        committed_bytes: u64,
+        removed_bytes: u64,
+        added_bytes: u64,
+    ) -> Result<u64, StoreWriteError> {
+        let retained_without_old = committed_bytes.checked_sub(removed_bytes).ok_or_else(|| {
+            MemoryError::InvalidState(
+                "retained-map committed bytes are smaller than the replaced entry".to_string(),
+            )
+        })?;
+        retained_without_old
+            .checked_add(added_bytes)
+            .ok_or_else(|| MemoryError::capacity("retained-map committed byte accounting overflow"))
+    }
+
+    /// Publish `value` only when `key` is absent, otherwise return the existing
+    /// value observed under the same canonical state lock.
+    ///
+    /// The occupied path performs no charge, mutation, or insertion-order
+    /// refresh. Callers can therefore validate immutable payload metadata
+    /// without a `get` -> `insert` TOCTOU window.
+    pub fn insert_if_absent_or_get_checked(
+        &self,
+        key: Key,
+        value: Value,
+    ) -> Result<RetainedMapInsertOrExistingV1<Value>, StoreWriteError> {
+        self.insert_if_absent_with_v1(
+            key,
+            value,
+            |existing| RetainedMapInsertOrExistingV1::AlreadyPresent(existing.clone()),
+            RetainedMapInsertOrExistingV1::Inserted,
+        )
+    }
+
+    fn insert_if_absent_with_v1<Outcome>(
+        &self,
+        key: Key,
+        value: Value,
+        on_occupied: impl FnOnce(&Value) -> Outcome,
+        inserted: Outcome,
+    ) -> Result<Outcome, StoreWriteError> {
+        let mut state = self.lock()?;
+        let MapState { entries, committed_bytes } = &mut *state;
+        match entries.entry(key) {
+            Entry::Occupied(occupied) => Ok(on_occupied(&occupied.get().value)),
+            Entry::Vacant(vacant) => {
+                let reserved_bytes = value.byte_size();
+                let next_committed_bytes =
+                    Self::committed_bytes_after_replace_v1(*committed_bytes, 0, reserved_bytes)?;
+                let new_ticket = self.charge_new_entry_v1(reserved_bytes)?;
+                vacant.insert(MapEntry {
+                    value,
+                    charged_bytes: reserved_bytes,
+                    ticket: new_ticket,
+                });
+                *committed_bytes = next_committed_bytes;
+                Ok(inserted)
+            }
+        }
+    }
+
     fn charge_new_entry_v1(
         &self,
         reserved_bytes: u64,
@@ -143,6 +206,11 @@ where
                 // Mutate an occupied value in place. Unlike an order-refreshing
                 // insert, this preserves the original insertion position and thus
                 // the store's established newest-first sweep contract.
+                let next_committed_bytes = Self::committed_bytes_after_replace_v1(
+                    *committed_bytes,
+                    occupied.get().charged_bytes,
+                    reserved_bytes,
+                )?;
                 match &self.charger {
                     Some(sink) => {
                         let entry = occupied.get_mut();
@@ -165,9 +233,7 @@ where
                             reserved_bytes,
                         ) {
                             Ok(new_ticket) => {
-                                *committed_bytes = committed_bytes
-                                    .saturating_sub(entry.charged_bytes)
-                                    .saturating_add(reserved_bytes);
+                                *committed_bytes = next_committed_bytes;
                                 entry.value = value;
                                 entry.charged_bytes = reserved_bytes;
                                 entry.ticket = Some(new_ticket);
@@ -184,9 +250,7 @@ where
                     }
                     None => {
                         let entry = occupied.get_mut();
-                        *committed_bytes = committed_bytes
-                            .saturating_sub(entry.charged_bytes)
-                            .saturating_add(reserved_bytes);
+                        *committed_bytes = next_committed_bytes;
                         entry.value = value;
                         entry.charged_bytes = reserved_bytes;
                         Ok(())
@@ -196,16 +260,26 @@ where
             Entry::Vacant(vacant) => {
                 // Charge before publication so a denied admission leaves payload,
                 // order, and local accounting unchanged.
+                let next_committed_bytes =
+                    Self::committed_bytes_after_replace_v1(*committed_bytes, 0, reserved_bytes)?;
                 let new_ticket = self.charge_new_entry_v1(reserved_bytes)?;
                 vacant.insert(MapEntry {
                     value,
                     charged_bytes: reserved_bytes,
                     ticket: new_ticket,
                 });
-                *committed_bytes = committed_bytes.saturating_add(reserved_bytes);
+                *committed_bytes = next_committed_bytes;
                 Ok(())
             }
         }
+    }
+
+    fn insert_if_absent_or_get_checked(
+        &self,
+        key: Key,
+        value: Value,
+    ) -> Result<RetainedMapInsertOrExistingV1<Value>, StoreWriteError> {
+        SimpleRetainedMapStore::insert_if_absent_or_get_checked(self, key, value)
     }
 
     fn insert_if_absent_checked(
@@ -213,22 +287,12 @@ where
         key: Key,
         value: Value,
     ) -> Result<RetainedMapInsertOutcomeV1, StoreWriteError> {
-        let mut state = self.lock()?;
-        let MapState { entries, committed_bytes } = &mut *state;
-        match entries.entry(key) {
-            Entry::Occupied(_) => Ok(RetainedMapInsertOutcomeV1::AlreadyPresent),
-            Entry::Vacant(vacant) => {
-                let reserved_bytes = value.byte_size();
-                let new_ticket = self.charge_new_entry_v1(reserved_bytes)?;
-                vacant.insert(MapEntry {
-                    value,
-                    charged_bytes: reserved_bytes,
-                    ticket: new_ticket,
-                });
-                *committed_bytes = committed_bytes.saturating_add(reserved_bytes);
-                Ok(RetainedMapInsertOutcomeV1::Inserted)
-            }
-        }
+        self.insert_if_absent_with_v1(
+            key,
+            value,
+            |_| RetainedMapInsertOutcomeV1::AlreadyPresent,
+            RetainedMapInsertOutcomeV1::Inserted,
+        )
     }
 
     fn get_checked(&self, key: &Key) -> Result<Option<Value>, MemoryError> {
@@ -241,6 +305,8 @@ where
         let Some(entry) = state.entries.get(key) else {
             return Ok(None);
         };
+        let next_committed_bytes =
+            Self::committed_bytes_after_replace_v1(state.committed_bytes, entry.charged_bytes, 0)?;
         if let Some(sink) = &self.charger {
             let ticket = entry.ticket.as_ref().ok_or_else(|| {
                 MemoryError::InvalidState(
@@ -253,7 +319,7 @@ where
         let removed = state.entries.remove(key).ok_or_else(|| {
             MemoryError::InvalidState("retained-map key disappeared during remove".to_string())
         })?;
-        state.committed_bytes = state.committed_bytes.saturating_sub(removed.charged_bytes);
+        state.committed_bytes = next_committed_bytes;
         Ok(Some(removed.value))
     }
 
@@ -277,7 +343,12 @@ where
                 continue;
             }
             reclaimed_items += 1;
-            reclaimed_bytes = reclaimed_bytes.saturating_add(entry.charged_bytes);
+            reclaimed_bytes =
+                reclaimed_bytes.checked_add(entry.charged_bytes).ok_or_else(|| {
+                    MemoryError::InvalidState(
+                        "retained-map sweep byte total overflowed committed accounting".to_string(),
+                    )
+                })?;
             if self.charger.is_some() {
                 let ticket = entry.ticket.as_ref().ok_or_else(|| {
                     MemoryError::InvalidState(
@@ -289,17 +360,19 @@ where
             }
             evict_keys.push(key.clone());
         }
+        let next_committed_bytes =
+            Self::committed_bytes_after_replace_v1(state.committed_bytes, reclaimed_bytes, 0)?;
         if let Some(sink) = &self.charger {
             sink.refund_many(&refunds)?;
         }
         for key in &evict_keys {
-            let removed = state.entries.remove(key).ok_or_else(|| {
+            state.entries.remove(key).ok_or_else(|| {
                 MemoryError::InvalidState(
                     "retained-map sweep key disappeared while its state lock was held".to_string(),
                 )
             })?;
-            state.committed_bytes = state.committed_bytes.saturating_sub(removed.charged_bytes);
         }
+        state.committed_bytes = next_committed_bytes;
         Ok(SweepStats { reclaimed_items, reclaimed_bytes })
     }
 
@@ -355,6 +428,27 @@ mod tests {
         SimpleRetainedMapStore::new(binding)
     }
 
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct DeclaredBytesV1 {
+        marker: u8,
+        retained_bytes: u64,
+    }
+
+    impl ByteSized for DeclaredBytesV1 {
+        fn byte_size(&self) -> u64 {
+            self.retained_bytes
+        }
+    }
+
+    fn declared_bytes_store_v1() -> SimpleRetainedMapStore<String, DeclaredBytesV1> {
+        let binding = StoreBindingHandle::new(
+            MemoryClass::MemoResidency,
+            "owner-map-declared-bytes".to_string(),
+            None,
+        );
+        SimpleRetainedMapStore::new(binding)
+    }
+
     #[test]
     fn retained_map_owner_has_one_keyed_container_and_no_linear_point_path() {
         let source = include_str!("service.rs");
@@ -383,6 +477,41 @@ mod tests {
         assert_eq!(store.committed_bytes().expect("committed"), 3);
         assert_eq!(store.stats(), StoreStats { item_count: 1, estimated_bytes: 3 });
         assert_eq!(store.get(&"k1".to_string()), Some(vec![1u8, 2, 3]));
+    }
+
+    #[test]
+    fn committed_byte_overflow_rejects_before_payload_or_accounting_mutation_v1() {
+        let store = declared_bytes_store_v1();
+        let original = DeclaredBytesV1 { marker: 1, retained_bytes: 1 };
+        store.insert_checked("stable".to_string(), original.clone()).expect("first insert");
+        store.insert_checked("other".to_string(), original.clone()).expect("second insert");
+
+        let replacement = DeclaredBytesV1 { marker: 9, retained_bytes: u64::MAX };
+        let overwrite_error = store
+            .insert_checked("stable".to_string(), replacement)
+            .expect_err("overflowing overwrite must fail closed");
+        assert!(matches!(overwrite_error, MemoryError::Capacity(_)));
+        assert_eq!(store.get_checked(&"stable".to_string()).expect("stable read"), Some(original));
+        assert_eq!(store.committed_bytes().expect("unchanged committed bytes"), 2);
+        assert_eq!(store.stats_checked().expect("unchanged stats").item_count, 2);
+
+        let max_store = declared_bytes_store_v1();
+        max_store
+            .insert_if_absent_checked(
+                "max".to_string(),
+                DeclaredBytesV1 { marker: 7, retained_bytes: u64::MAX },
+            )
+            .expect("the first maximum-sized declaration is representable");
+        let insert_error = max_store
+            .insert_if_absent_checked(
+                "overflow".to_string(),
+                DeclaredBytesV1 { marker: 8, retained_bytes: 1 },
+            )
+            .expect_err("overflowing vacant insert must fail closed");
+        assert!(matches!(insert_error, MemoryError::Capacity(_)));
+        assert_eq!(max_store.get_checked(&"overflow".to_string()).expect("absent read"), None);
+        assert_eq!(max_store.committed_bytes().expect("maximum committed bytes"), u64::MAX);
+        assert_eq!(max_store.stats_checked().expect("maximum stats").item_count, 1);
     }
 
     #[test]
@@ -553,7 +682,7 @@ mod tests {
             matches!(store.stats_checked(), Err(MemoryError::InvalidState(message)) if message == "retained map lock poisoned"),
             "checked stats must preserve the typed poison failure"
         );
-        assert_eq!(store.get(&key), None, "advisory get must fail closed after poison");
+        assert!(store.get(&key).is_none(), "advisory get must fail closed after poison");
         assert_eq!(
             store.stats(),
             StoreStats::default(),
