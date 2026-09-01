@@ -289,10 +289,10 @@ fn double_remove_does_not_double_refund_the_ledger() {
     assert_balanced(&snap);
 }
 
-// 8) Direct broker recharge restores the old charge under a fresh ticket when the
-//    new charge is denied — exercised at the public surface alongside the stores.
+// 8) Direct broker recharge preserves the old charge and original ticket when
+//    the replacement is denied.
 #[test]
-fn broker_recharge_denied_restores_old_charge() {
+fn broker_recharge_denied_preserves_old_ticket() {
     let b = broker(10_000_000, 1_000);
     let old = b
         .reserve_committed(
@@ -314,9 +314,9 @@ fn broker_recharge_denied_restores_old_charge() {
         )
         .expect_err("over-cap recharge denied");
     assert!(matches!(err.error, MemoryError::Capacity(_)));
-    let restored = err.restored.expect("old restored under a fresh ticket");
+    assert_eq!(err.recovery, quanta_memory_platform_core::RechargeRecoveryV1::OldChargePreserved);
     assert_eq!(b.ledger_snapshot().expect("snap").total_owner_bytes(), 800, "old charge preserved");
-    b.release(&restored).expect("restored ticket releases the old bytes");
+    b.release(&old).expect("preserved ticket releases the old bytes");
     assert_eq!(b.ledger_snapshot().expect("snap").total_owner_bytes(), 0);
 }
 

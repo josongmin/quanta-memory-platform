@@ -6,8 +6,8 @@ use hashlink::linked_hash_map::Entry;
 use hashlink::LinkedHashMap;
 
 use quanta_memory_platform_core::{
-    ChargeKind, MemoryContextKind, MemoryError, ReservationTicket, StoreBindingHandle, StoreStats,
-    StoreWriteError, SweepHint, SweepStats,
+    ChargeKind, MemoryContextKind, MemoryError, RechargeRecoveryV1, ReservationTicket,
+    StoreBindingHandle, StoreStats, StoreWriteError, SweepHint, SweepStats,
 };
 
 use crate::retained_map::{
@@ -239,12 +239,38 @@ where
                                 entry.ticket = Some(new_ticket);
                                 Ok(())
                             }
-                            Err((err, restored)) => {
-                                // Recharge restores the old ledger charge before
-                                // returning failure. Publish the restored ticket but
-                                // leave payload, bytes, and insertion position intact.
-                                entry.ticket = restored.or(Some(old_ticket));
-                                Err(err)
+                            Err(denied) => {
+                                match denied.recovery {
+                                    RechargeRecoveryV1::OldChargePreserved => {
+                                        entry.ticket = Some(old_ticket);
+                                    }
+                                    RechargeRecoveryV1::OldChargeRestored(restored) => {
+                                        entry.ticket = Some(restored);
+                                    }
+                                    RechargeRecoveryV1::RecoveryRequired { rollback_error } => {
+                                        // The accounting authority explicitly states
+                                        // that the old charge is gone. Keeping the old
+                                        // payload would create uncharged retained state,
+                                        // so remove it under this same map lock.
+                                        let removed_bytes = entry.charged_bytes;
+                                        let next_committed_bytes = committed_bytes
+                                            .checked_sub(removed_bytes)
+                                            .ok_or_else(|| {
+                                                MemoryError::InvalidState(
+                                                    "recharge recovery removal exceeded committed bytes"
+                                                        .to_string(),
+                                                )
+                                            })?;
+                                        let _ = entry;
+                                        occupied.remove();
+                                        *committed_bytes = next_committed_bytes;
+                                        return Err(MemoryError::InvalidState(format!(
+                                            "recharge rollback failed; uncharged retained payload was removed: primary=[{}], rollback=[{}]",
+                                            denied.error, rollback_error
+                                        )));
+                                    }
+                                }
+                                Err(denied.error)
                             }
                         }
                     }
@@ -381,36 +407,28 @@ where
         Ok(StoreStats { item_count: state.entries.len(), estimated_bytes: state.committed_bytes })
     }
 
-    fn keys(&self) -> Vec<Key>
+    fn keys_checked(&self) -> Result<Vec<Key>, MemoryError>
     where
         Key: Clone + Ord,
     {
-        let state = match self.lock() {
-            Ok(state) => state,
-            // Fail-closed: a poisoned lock yields no keys; accounting/state is
-            // unobservable, so we never fabricate a partial key set.
-            Err(_) => return Vec::new(),
-        };
+        let state = self.lock()?;
         let mut keys: Vec<Key> = state.entries.keys().cloned().collect();
         // Deterministic, key-sorted order independent of insertion order.
         keys.sort();
-        keys
+        Ok(keys)
     }
 
-    fn entries(&self) -> Vec<(Key, Value)>
+    fn entries_checked(&self) -> Result<Vec<(Key, Value)>, MemoryError>
     where
         Key: Clone + Ord,
         Value: Clone,
     {
-        let state = match self.lock() {
-            Ok(state) => state,
-            Err(_) => return Vec::new(),
-        };
+        let state = self.lock()?;
         let mut entries: Vec<(Key, Value)> =
             state.entries.iter().map(|(key, entry)| (key.clone(), entry.value.clone())).collect();
         // Same deterministic key order as `keys`.
         entries.sort_by(|a, b| a.0.cmp(&b.0));
-        entries
+        Ok(entries)
     }
 }
 
@@ -681,6 +699,14 @@ mod tests {
         assert!(
             matches!(store.stats_checked(), Err(MemoryError::InvalidState(message)) if message == "retained map lock poisoned"),
             "checked stats must preserve the typed poison failure"
+        );
+        assert!(
+            matches!(store.keys_checked(), Err(MemoryError::InvalidState(message)) if message == "retained map lock poisoned"),
+            "checked key enumeration must preserve the typed poison failure"
+        );
+        assert!(
+            matches!(store.entries_checked(), Err(MemoryError::InvalidState(message)) if message == "retained map lock poisoned"),
+            "checked entry enumeration must preserve the typed poison failure"
         );
         assert!(store.get(&key).is_none(), "advisory get must fail closed after poison");
         assert_eq!(
@@ -1169,11 +1195,11 @@ mod tests {
     #[cfg(feature = "core-live-accounting")]
     mod charged {
         use super::*;
-        use crate::shared::accounting::SharedAccountingSink;
+        use crate::shared::accounting::{AccountingSink, SharedAccountingSink};
         use quanta_memory_platform_core::{
             EffectiveMemoryBudgetReport, ExecutionBudget, LiveProcessMemoryBroker,
-            MemoryBudgetManifest, MemoryClassBudget, MemoryPreset, ReclaimPriority,
-            ResidencyPolicy,
+            MemoryBudgetManifest, MemoryClassBudget, MemoryPreset, MemoryResult, RechargeError,
+            RechargeRecoveryV1, ReclaimPriority, ResidencyPolicy,
         };
         use std::sync::Arc;
 
@@ -1204,6 +1230,92 @@ mod tests {
             let binding =
                 StoreBindingHandle::new(MemoryClass::MemoResidency, "owner-map".to_string(), None);
             SimpleRetainedMapStore::new_charged(binding, sink)
+        }
+
+        #[derive(Clone)]
+        struct RollbackLosingSink {
+            broker: LiveProcessMemoryBroker,
+        }
+
+        impl std::fmt::Debug for RollbackLosingSink {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("RollbackLosingSink")
+            }
+        }
+
+        impl AccountingSink for RollbackLosingSink {
+            fn charge(
+                &self,
+                class: MemoryClass,
+                owner: String,
+                context: MemoryContextKind,
+                kind: ChargeKind,
+                bytes: u64,
+            ) -> MemoryResult<ReservationTicket> {
+                self.broker.reserve_committed(class, owner, context, kind, bytes)
+            }
+
+            fn refund(&self, ticket: &ReservationTicket) -> MemoryResult<()> {
+                self.broker.release(ticket)
+            }
+
+            fn refund_many(&self, tickets: &[ReservationTicket]) -> MemoryResult<()> {
+                self.broker.release_many(tickets)
+            }
+
+            fn recharge(
+                &self,
+                old: &ReservationTicket,
+                _class: MemoryClass,
+                _owner: String,
+                _context: MemoryContextKind,
+                _kind: ChargeKind,
+                _bytes: u64,
+            ) -> Result<ReservationTicket, RechargeError> {
+                self.broker.release(old).map_err(|error| RechargeError {
+                    error,
+                    recovery: RechargeRecoveryV1::OldChargePreserved,
+                })?;
+                Err(RechargeError {
+                    error: MemoryError::capacity("injected replacement denial"),
+                    recovery: RechargeRecoveryV1::RecoveryRequired {
+                        rollback_error: MemoryError::InvalidState(
+                            "injected rollback failure".to_string(),
+                        ),
+                    },
+                })
+            }
+        }
+
+        #[test]
+        fn rollback_failure_removes_uncharged_payload_under_the_owner_lock_v1() {
+            let broker = live_broker(1_000);
+            let sink: SharedAccountingSink =
+                Arc::new(RollbackLosingSink { broker: broker.clone() });
+            let binding =
+                StoreBindingHandle::new(MemoryClass::MemoResidency, "owner-map".to_string(), None);
+            let store: SimpleRetainedMapStore<String, Vec<u8>> =
+                SimpleRetainedMapStore::new_charged(binding, sink);
+            store.insert_checked("key".to_string(), vec![1u8; 30]).expect("seed charged entry");
+
+            let error = store
+                .insert_checked("key".to_string(), vec![2u8; 20])
+                .expect_err("injected rollback loss must fail closed");
+            assert!(
+                matches!(error, MemoryError::InvalidState(message) if message.contains("uncharged retained payload was removed")),
+                "rollback loss must surface a recovery-required state"
+            );
+            assert_eq!(
+                store.get_checked(&"key".to_string()).expect("checked read after recovery"),
+                None,
+                "an uncharged payload must not remain readable"
+            );
+            assert_eq!(store.stats_checked().expect("checked stats"), StoreStats::default());
+            assert_eq!(
+                broker.ledger_snapshot().expect("ledger after recovery").total_owner_bytes(),
+                0,
+                "the store and ledger must agree after quarantine removal"
+            );
         }
 
         #[test]

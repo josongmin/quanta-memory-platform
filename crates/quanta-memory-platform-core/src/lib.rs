@@ -11,7 +11,7 @@ pub use api::broker::{
 };
 pub use api::builder::ProcessMemoryBrokerBuilder;
 #[cfg(feature = "live_control")]
-pub use api::control::{LiveProcessMemoryBroker, RechargeError};
+pub use api::control::{LiveProcessMemoryBroker, RechargeError, RechargeRecoveryV1};
 #[cfg(feature = "live_control")]
 pub use application::controller::{
     LadderPressureController, PressureController, PressureThresholds, ReclaimRung,

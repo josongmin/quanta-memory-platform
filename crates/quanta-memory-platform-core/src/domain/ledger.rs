@@ -444,6 +444,39 @@ impl AccountingLedger {
         Ok(())
     }
 
+    /// Replace one live committed charge with another as one ledger mutation.
+    ///
+    /// The old ticket is removed before admission so an overwrite is charged on
+    /// the net postimage, but a denied replacement restores that exact ticket by
+    /// direct owner-state rollback. Rollback never re-enters admission and cannot
+    /// fail: no policy, scheduler, or external callback participates in it.
+    pub(crate) fn replace_committed(
+        &mut self,
+        old: &ReservationTicket,
+        class: MemoryClass,
+        owner: OwnerKey,
+        context: MemoryContextKind,
+        kind: ChargeKind,
+        bytes: u64,
+    ) -> MemoryResult<ReservationTicket> {
+        self.validate_release_ticket(old)?;
+        self.apply_release(old);
+
+        let replacement = match self.reserve(class, owner, context, kind, bytes) {
+            Ok(ticket) => ticket,
+            Err(error) => {
+                self.restore_released_ticket_v1(old);
+                return Err(error);
+            }
+        };
+        if let Err(error) = self.commit(&replacement) {
+            self.apply_release(&replacement);
+            self.restore_released_ticket_v1(old);
+            return Err(error);
+        }
+        Ok(replacement)
+    }
+
     /// Release a batch of reservations/charges atomically.
     ///
     /// The full batch is pre-validated before any counter moves, so a rebuild or
@@ -525,6 +558,20 @@ impl AccountingLedger {
         if self.context_usage.get(&ticket.context).is_some_and(|u| u.total() == 0) {
             self.context_usage.remove(&ticket.context);
         }
+    }
+
+    /// Restore a ticket removed by this ledger's in-lock replacement primitive.
+    /// The caller has already validated the ticket and no operation can
+    /// interleave, so this is a deterministic inverse of `apply_release` rather
+    /// than a second admission attempt.
+    fn restore_released_ticket_v1(&mut self, ticket: &ReservationTicket) {
+        self.live_tickets.insert(ticket.id);
+        if ticket.bytes == 0 {
+            return;
+        }
+        self.class_usage.entry(ticket.class.clone()).or_default().add(ticket.kind, ticket.bytes);
+        self.owner_usage.entry(ticket.owner.clone()).or_default().add(ticket.kind, ticket.bytes);
+        self.context_usage.entry(ticket.context).or_default().add(ticket.kind, ticket.bytes);
     }
 
     /// Immutable usage snapshot for reporting and invariant assertions.

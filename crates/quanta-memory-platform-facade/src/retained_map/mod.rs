@@ -97,20 +97,38 @@ where
         self.stats_checked().unwrap_or_default()
     }
 
-    /// Enumerate every live key in a deterministic, key-sorted order.
+    /// Checked enumeration of every live key in deterministic key order.
     ///
+    /// Enumerations return owned vectors so callers never retain the state lock.
     /// The order is stable across runs and process boundaries (sorted by `Key`),
     /// so callers that need to iterate, GC, or list-all over the retained set get
-    /// a reproducible result rather than insertion order. Returns an owned `Vec`
-    /// so callers never hold the store's internal lock.
-    fn keys(&self) -> Vec<Key>
+    /// a reproducible result rather than insertion order.
+    fn keys_checked(&self) -> MemoryResult<Vec<Key>>
     where
         Key: Clone + Ord;
 
-    /// Enumerate every live `(key, value)` pair in the same deterministic,
-    /// key-sorted order as [`RetainedMapStore::keys`].
-    fn entries(&self) -> Vec<(Key, Value)>
+    /// Advisory compatibility projection. Correctness-sensitive enumeration
+    /// such as GC MUST use [`RetainedMapStore::keys_checked`].
+    fn keys(&self) -> Vec<Key>
+    where
+        Key: Clone + Ord,
+    {
+        self.keys_checked().unwrap_or_default()
+    }
+
+    /// Checked enumeration of every live `(key, value)` pair.
+    fn entries_checked(&self) -> MemoryResult<Vec<(Key, Value)>>
     where
         Key: Clone + Ord,
         Value: Clone;
+
+    /// Advisory compatibility projection. Correctness-sensitive callers MUST
+    /// use [`RetainedMapStore::entries_checked`].
+    fn entries(&self) -> Vec<(Key, Value)>
+    where
+        Key: Clone + Ord,
+        Value: Clone,
+    {
+        self.entries_checked().unwrap_or_default()
+    }
 }

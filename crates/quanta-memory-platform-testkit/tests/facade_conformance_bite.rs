@@ -17,7 +17,7 @@ use std::sync::Arc;
 use quanta_memory_platform_core::{
     ChargeKind, EffectiveMemoryBudgetReport, ExecutionBudget, LiveProcessMemoryBroker,
     MemoryBudgetManifest, MemoryClass, MemoryContextKind, MemoryPreset, MemoryResult, OwnerKey,
-    ReservationTicket, ResidencyPolicy, StoreBindingHandle,
+    RechargeError, RechargeRecoveryV1, ReservationTicket, ResidencyPolicy, StoreBindingHandle,
 };
 use quanta_memory_platform_facade::shared::accounting::RechargeDenied;
 use quanta_memory_platform_facade::{
@@ -74,7 +74,7 @@ impl AccountingSink for HonestSink {
         kind: ChargeKind,
         bytes: u64,
     ) -> Result<ReservationTicket, RechargeDenied> {
-        self.0.recharge(old, class, owner, context, kind, bytes).map_err(|e| (e.error, e.restored))
+        self.0.recharge(old, class, owner, context, kind, bytes)
     }
 }
 
@@ -110,7 +110,10 @@ impl AccountingSink for RefundSwallowingSink {
         bytes: u64,
     ) -> Result<ReservationTicket, RechargeDenied> {
         // Charge the new value but never release the old: a leaking overwrite.
-        self.charge(class, owner, context, kind, bytes).map_err(|e| (e, None))
+        self.charge(class, owner, context, kind, bytes).map_err(|error| RechargeError {
+            error,
+            recovery: RechargeRecoveryV1::OldChargePreserved,
+        })
     }
 }
 

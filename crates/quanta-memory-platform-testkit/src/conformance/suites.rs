@@ -237,9 +237,7 @@ impl AccountingSink for LiveBrokerAccountingSink {
         bytes: u64,
     ) -> Result<ReservationTicket, quanta_memory_platform_facade::shared::accounting::RechargeDenied>
     {
-        self.broker
-            .recharge(old, class, owner, context, kind, bytes)
-            .map_err(|e| (e.error, e.restored))
+        self.broker.recharge(old, class, owner, context, kind, bytes)
     }
 }
 
@@ -639,7 +637,8 @@ mod tests {
     use crate::fake::{AccountingFidelity, FakeProcessBroker};
     use quanta_memory_platform_core::{
         EffectiveMemoryBudgetReport, LiveProcessMemoryBroker, MemoryBudgetManifest, MemoryClass,
-        MemoryClassBudget, MemoryError, MemoryPreset, ReclaimPriority, ResidencyPolicy,
+        MemoryClassBudget, MemoryError, MemoryPreset, RechargeError, RechargeRecoveryV1,
+        ReclaimPriority, ResidencyPolicy,
     };
 
     fn all_held(verdicts: &[AssertionVerdict]) -> bool {
@@ -1234,7 +1233,10 @@ mod tests {
             quanta_memory_platform_facade::shared::accounting::RechargeDenied,
         > {
             // Charges the new value but never releases the old: a leaking overwrite.
-            self.charge(class, owner, context, kind, bytes).map_err(|e| (e, None))
+            self.charge(class, owner, context, kind, bytes).map_err(|error| RechargeError {
+                error,
+                recovery: RechargeRecoveryV1::OldChargePreserved,
+            })
         }
     }
 

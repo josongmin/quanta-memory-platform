@@ -32,18 +32,28 @@ pub struct LiveProcessMemoryBroker {
 
 /// Outcome of a denied [`LiveProcessMemoryBroker::recharge`].
 ///
-/// The new charge was rejected. `restored` carries the OLD charge re-committed
-/// under a fresh [`ReservationTicket`] when the old charge had already been
-/// released as part of the attempt (the caller must adopt it in place of the
-/// ticket it passed in); it is `None` when the old charge was never released, in
-/// which case the original ticket the caller holds is still valid.
-#[derive(Debug)]
+/// Accounting disposition after a denied recharge.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RechargeRecoveryV1 {
+    /// The old charge and its original ticket remain live and unchanged.
+    OldChargePreserved,
+    /// A sink that cannot replace in place restored the old charge under a new
+    /// ticket. The caller must adopt this ticket.
+    OldChargeRestored(ReservationTicket),
+    /// The old charge was released and could not be restored. The caller must
+    /// remove or quarantine the corresponding payload; it must never continue
+    /// serving it as charged state.
+    RecoveryRequired { rollback_error: MemoryError },
+}
+
+/// The new charge was rejected together with an unambiguous accounting
+/// disposition for the old charge.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RechargeError {
     /// Why the new charge was denied.
     pub error: MemoryError,
-    /// The restored old charge under a fresh ticket, if the old charge had to be
-    /// released before the (failed) new charge.
-    pub restored: Option<ReservationTicket>,
+    /// What happened to the old charge.
+    pub recovery: RechargeRecoveryV1,
 }
 
 struct BrokerCore {
@@ -128,12 +138,10 @@ impl LiveProcessMemoryBroker {
     ///
     /// - `Ok(new)`: the swap happened; `old` is consumed (released) and `new` is
     ///   the fresh committed receipt.
-    /// - `Err(RechargeError { restored: None, .. })`: `old` could not even be
-    ///   released (not live, or a rebuild is in progress); nothing was mutated and
-    ///   the original `old` ticket is still valid.
-    /// - `Err(RechargeError { restored: Some(t), .. })`: the new charge was denied
-    ///   (cap/admission); `old`'s bytes were restored under the fresh ticket `t`
-    ///   (callers holding `old` must replace it with `t`).
+    /// - `Err(..OldChargePreserved)`: nothing was mutated and the original old
+    ///   ticket remains valid.
+    /// - other recovery states are reserved for generic accounting sinks; this
+    ///   broker's ledger replacement never needs external rollback.
     ///
     /// Because release-then-charge happens under one lock, an overwrite never
     /// transiently double-counts against caps/group admission, and no rebuild can
@@ -147,45 +155,72 @@ impl LiveProcessMemoryBroker {
         kind: ChargeKind,
         bytes: u64,
     ) -> Result<ReservationTicket, RechargeError> {
-        let mut core = self.lock().map_err(|e| RechargeError { error: e, restored: None })?;
+        use crate::application::scheduler::ResourceGroupScheduler;
 
-        // 1) Release the old charge first. Fail-closed: if it cannot be released
-        //    (forged/replayed ticket, or rebuild in progress) nothing is mutated
-        //    and the caller's original ticket remains valid.
-        Self::release_on(&mut core, old).map_err(|e| RechargeError { error: e, restored: None })?;
+        let mut core = self.lock().map_err(|error| RechargeError {
+            error,
+            recovery: RechargeRecoveryV1::OldChargePreserved,
+        })?;
 
-        // 2) Charge the new value. Under the same lock, no rebuild can interleave.
-        match Self::reserve_committed_on(&mut core, class, owner, context, kind, bytes) {
-            Ok(new) => Ok(new),
-            Err(error) => {
-                // New charge denied (e.g. cap). Restore the old bytes — guaranteed
-                // to fit since we just released them under the same lock and no
-                // rebuild can interleave — under a fresh ticket the caller adopts.
-                match Self::reserve_committed_on(
-                    &mut core,
-                    old.class().clone(),
-                    old.owner().clone(),
-                    old.context(),
-                    old.kind(),
-                    old.bytes(),
-                ) {
-                    Ok(restored) => Err(RechargeError { error, restored: Some(restored) }),
-                    // Unreachable (the just-released bytes provably fit). Do NOT
-                    // silently collapse to `restored: None` — that would be
-                    // indistinguishable from the "old never released" case and let
-                    // the caller adopt an already-released ticket. Surface a hard,
-                    // unambiguous internal-invariant error instead, naming both
-                    // denials, so accounting can never silently drift.
-                    Err(restore_err) => Err(RechargeError {
-                        error: MemoryError::InvalidState(format!(
-                            "recharge restore-after-release failed (internal invariant breach): \
-                             new charge denied [{error}]; restore denied [{restore_err}]"
-                        )),
-                        restored: None,
-                    }),
-                }
+        // Validate resource-group admission against the replacement postimage,
+        // not against a transient double charge. A cloned candidate gives us an
+        // infallible scheduler commit after the ledger replacement succeeds.
+        let old_group = core.ticket_groups.get(&old.id()).cloned();
+        let new_group = core.ledger.policy().owner_groups.get(&owner).cloned();
+        let mut next_scheduler = core.scheduler.clone();
+        if let Some(group) = &old_group {
+            next_scheduler.record_release(group, old.bytes());
+        }
+        if let Some(group) = &new_group {
+            if !next_scheduler.admits(group, bytes) {
+                return Err(RechargeError {
+                    error: MemoryError::capacity(format!(
+                        "resource group {group} admission denied for owner {owner} recharge of {bytes} bytes"
+                    )),
+                    recovery: RechargeRecoveryV1::OldChargePreserved,
+                });
             }
         }
+
+        // The execution scratch ceiling is a broker-owned admission axis, not a
+        // ledger class cap. Evaluate the same replacement postimage used by the
+        // ledger so the atomic primitive cannot bypass this outer authority.
+        if let Some(max) = core.report.execution.max_execution_scratch_bytes {
+            let max = u64::try_from(max).unwrap_or(u64::MAX);
+            let current = core.ledger.snapshot().total_live_scratch_bytes();
+            let without_old = if old.kind() == ChargeKind::LiveScratch {
+                current.saturating_sub(old.bytes())
+            } else {
+                current
+            };
+            let live_after = if kind == ChargeKind::LiveScratch {
+                without_old.saturating_add(bytes)
+            } else {
+                without_old
+            };
+            if live_after > max {
+                return Err(RechargeError {
+                    error: MemoryError::capacity(format!(
+                        "execution scratch budget {max} exceeded by recharge to {live_after}"
+                    )),
+                    recovery: RechargeRecoveryV1::OldChargePreserved,
+                });
+            }
+        }
+
+        let replacement =
+            core.ledger.replace_committed(old, class, owner, context, kind, bytes).map_err(
+                |error| RechargeError { error, recovery: RechargeRecoveryV1::OldChargePreserved },
+            )?;
+        if let Some(group) = &new_group {
+            next_scheduler.record_usage(group, bytes);
+        }
+        core.scheduler = next_scheduler;
+        core.ticket_groups.remove(&old.id());
+        if let Some(group) = new_group {
+            core.ticket_groups.insert(replacement.id(), group);
+        }
+        Ok(replacement)
     }
 
     /// Reserve + commit on an already-held lock guard, rolling the reservation
@@ -1532,7 +1567,7 @@ mod tests {
     // — proving the restore path is exercised for the scratch-budget denial source,
     // not just cap denials.
     #[test]
-    fn recharge_denied_by_scratch_budget_restores_old_scratch_charge() {
+    fn recharge_denied_by_scratch_budget_preserves_old_scratch_charge() {
         let report = EffectiveMemoryBudgetReport {
             execution: crate::domain::policy::ExecutionBudget {
                 max_execution_scratch_bytes: Some(100_000),
@@ -1551,7 +1586,7 @@ mod tests {
             )
             .expect("seed 80k scratch (within 100k budget)");
 
-        // Recharge to 120k > 100k scratch budget -> NEW charge denied; old restored.
+        // Recharge to 120k > 100k scratch budget -> denied without consuming old.
         let err = b
             .recharge(
                 &old,
@@ -1563,11 +1598,11 @@ mod tests {
             )
             .expect_err("over scratch budget must be denied");
         assert!(matches!(err.error, MemoryError::Capacity(_)));
-        let restored = err.restored.expect("old scratch restored under a fresh ticket");
+        assert_eq!(err.recovery, RechargeRecoveryV1::OldChargePreserved);
         let snap = b.ledger_snapshot().expect("snap");
         assert_eq!(snap.total_live_scratch_bytes(), 80_000, "old scratch charge restored exactly");
         assert!(snap.class_owner_balanced() && snap.owner_partition_balanced(), "axes balanced");
-        b.release(&restored).expect("release restored");
+        b.release(&old).expect("release preserved old ticket");
         assert_eq!(b.ledger_snapshot().expect("snap").total_owner_bytes(), 0);
     }
 
@@ -1864,7 +1899,7 @@ mod tests {
     }
 
     #[test]
-    fn recharge_denied_restores_old_under_fresh_ticket() {
+    fn recharge_denied_preserves_original_old_ticket() {
         let b = broker(); // owner:a hard cap 500k
         let old = b
             .reserve_committed(
@@ -1875,7 +1910,7 @@ mod tests {
                 400_000,
             )
             .expect("charge old");
-        // Recharge to 600k > owner cap 500k -> denied; old must be restored.
+        // Recharge to 600k > owner cap 500k -> denied with no old-state mutation.
         let err = b
             .recharge(
                 &old,
@@ -1887,7 +1922,7 @@ mod tests {
             )
             .expect_err("over owner cap must be denied");
         assert!(matches!(err.error, MemoryError::Capacity(_)));
-        let restored = err.restored.expect("old must be restored under a fresh ticket");
+        assert_eq!(err.recovery, RechargeRecoveryV1::OldChargePreserved);
         // The old bytes are still charged (no loss) AND every accounting axis is
         // balanced — a wrong-axis restore (e.g. restoring a different ChargeKind)
         // would pass the owner-total check but break the partition/class balance.
@@ -1900,7 +1935,7 @@ mod tests {
             400_000,
             "restored to the SAME charge kind"
         );
-        b.release(&restored).expect("restored ticket releases the old bytes");
+        b.release(&old).expect("preserved ticket releases the old bytes");
         assert_eq!(b.ledger_snapshot().expect("snap").total_owner_bytes(), 0);
     }
 
@@ -1909,7 +1944,7 @@ mod tests {
     // totals balanced (so the existing test passes) yet move bytes to the wrong
     // partition — this pins the partition, not just the grand total.
     #[test]
-    fn denied_recharge_restores_on_the_old_axis_not_the_new_one() {
+    fn denied_recharge_preserves_the_old_axis_not_the_new_one() {
         let b = broker(); // owner:a hard cap 500k
         let old = b
             .reserve_committed(
@@ -1934,7 +1969,7 @@ mod tests {
             )
             .expect_err("over owner cap denied");
         assert!(matches!(err.error, MemoryError::Capacity(_)));
-        let restored = err.restored.expect("old restored");
+        assert_eq!(err.recovery, RechargeRecoveryV1::OldChargePreserved);
         let snap = b.ledger_snapshot().expect("snap");
         assert_eq!(
             snap.total_retained_payload_bytes(),
@@ -1950,7 +1985,7 @@ mod tests {
             snap.owner_partition_balanced(),
             "partition balanced after wrong-axis-safe restore"
         );
-        b.release(&restored).expect("release");
+        b.release(&old).expect("release preserved ticket");
     }
 
     #[test]
@@ -1977,7 +2012,7 @@ mod tests {
             )
             .expect_err("recharge during rebuild is rejected");
         assert!(matches!(err.error, MemoryError::InvalidState(_)));
-        assert!(err.restored.is_none(), "old was never released, so nothing to restore");
+        assert_eq!(err.recovery, RechargeRecoveryV1::OldChargePreserved);
         assert_eq!(
             b.ledger_snapshot().expect("snap").total_owner_bytes(),
             100_000,
@@ -2044,11 +2079,10 @@ mod tests {
         b.release(&new).expect("release");
     }
 
-    // A DENIED recharge on a grouped owner must restore the old charge AND keep
-    // scheduler group usage symmetric (release-old then re-record on restore), so
-    // the group lands back at exactly its pre-recharge usage — no phantom drift.
+    // A DENIED recharge on a grouped owner must preserve the old charge and keep
+    // scheduler group usage unchanged — no release/restore drift.
     #[test]
-    fn denied_recharge_on_grouped_owner_restores_group_usage_symmetrically() {
+    fn denied_recharge_on_grouped_owner_preserves_group_usage() {
         use crate::domain::policy::ResourceGroup;
         let group = ResourceGroup {
             reserved_bytes: 0,
@@ -2059,7 +2093,7 @@ mod tests {
             admission_weight: 1,
         };
         // owner:g mapped to group g (cap 100k); class cap 80k so the NEW charge is
-        // denied by the class while the group has room — forcing the restore path.
+        // denied by the class while the group has room.
         let residency = ResidencyPolicy::new(10_000_000)
             .with_class_budget(MemoryClass::ArtifactCache, class_budget(0, 60_000, 80_000, false))
             .with_resource_group("g", group)
@@ -2076,7 +2110,7 @@ mod tests {
             )
             .expect("seed 70k (group usage 70k)");
 
-        // Recharge to 90k > class cap 80k -> NEW charge denied; old 70k restored.
+        // Recharge to 90k > class cap 80k -> denied; old 70k remains live.
         let err = b
             .recharge(
                 &old,
@@ -2088,7 +2122,7 @@ mod tests {
             )
             .expect_err("over class cap denied");
         assert!(matches!(err.error, MemoryError::Capacity(_)));
-        let restored = err.restored.expect("old restored");
+        assert_eq!(err.recovery, RechargeRecoveryV1::OldChargePreserved);
         assert_eq!(b.ledger_snapshot().expect("snap").total_owner_bytes(), 70_000);
 
         // Group usage is back at exactly 70k: it admits 30k more (-> 100k cap) but
@@ -2101,7 +2135,7 @@ mod tests {
             !b.admits_group("g", 31_000).expect("admits"),
             "group must be exactly at 70k usage (no phantom drift), so 31k overflows"
         );
-        b.release(&restored).expect("release restored");
+        b.release(&old).expect("release preserved ticket");
     }
 
     fn poison_broker_lock(broker: &LiveProcessMemoryBroker) {

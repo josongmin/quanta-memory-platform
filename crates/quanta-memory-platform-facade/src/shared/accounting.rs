@@ -18,15 +18,13 @@ use std::sync::Arc;
 #[cfg(feature = "core-live-accounting")]
 use quanta_memory_platform_core::LiveProcessMemoryBroker;
 use quanta_memory_platform_core::{
-    ChargeKind, MemoryClass, MemoryContextKind, MemoryError, MemoryResult, OwnerKey,
+    ChargeKind, MemoryClass, MemoryContextKind, MemoryResult, OwnerKey, RechargeError,
     ReservationTicket,
 };
 
-/// Outcome of a denied [`AccountingSink::recharge`]: the new charge was rejected.
-/// `restored` carries the old charge under a fresh ticket the caller must adopt,
-/// or `None` when the old charge was never released (the original ticket stays
-/// valid).
-pub type RechargeDenied = (MemoryError, Option<ReservationTicket>);
+/// Outcome of a denied [`AccountingSink::recharge`]. The typed recovery state
+/// cannot conflate an untouched old ticket with a failed rollback.
+pub type RechargeDenied = RechargeError;
 
 /// A charge/refund seam against the broker's accounting ledger.
 ///
@@ -36,8 +34,8 @@ pub type RechargeDenied = (MemoryError, Option<ReservationTicket>);
 ///
 /// `recharge` is a REQUIRED atomic contract: the facade no longer provides a
 /// refund-old-then-charge-new fallback because that shape cannot fail closed for
-/// a generic sink. Implementors must either preserve the old charge or restore
-/// it under a fresh ticket when the new charge is denied.
+/// a generic sink. Implementors must return the exact typed disposition of the
+/// old charge when the new charge is denied.
 pub trait AccountingSink: std::fmt::Debug + Send + Sync {
     /// Reserve and commit `bytes` against (class, owner, context, kind). Fails
     /// closed: a cap denial returns `Err` and charges nothing.
@@ -62,8 +60,8 @@ pub trait AccountingSink: std::fmt::Debug + Send + Sync {
 
     /// Atomically swap `old`'s charge for a new charge of `bytes` (an in-place
     /// overwrite). On success the old receipt is consumed and the new receipt is
-    /// returned. On denial the old charge is preserved or restored under a fresh
-    /// receipt — see [`RechargeDenied`].
+    /// returned. On denial the caller receives the exact recovery disposition —
+    /// see [`RechargeDenied`].
     ///
     fn recharge(
         &self,
@@ -115,6 +113,5 @@ impl AccountingSink for LiveProcessMemoryBroker {
     ) -> Result<ReservationTicket, RechargeDenied> {
         // Single-lock atomic swap: no transient double-count, no mid-rebuild strand.
         LiveProcessMemoryBroker::recharge(self, old, class, owner, context, kind, bytes)
-            .map_err(|e| (e.error, e.restored))
     }
 }
