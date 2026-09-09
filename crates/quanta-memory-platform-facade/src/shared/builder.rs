@@ -25,7 +25,6 @@ use quanta_memory_platform_core::StoreBindingHandle;
     feature = "publish_pipeline",
     feature = "retained_map",
     feature = "revocable_store",
-    feature = "publish_pipeline",
     feature = "transcript"
 ))]
 use std::marker::PhantomData;
@@ -42,6 +41,7 @@ use crate::retained_map::service::SimpleRetainedMapStore;
 use crate::revocable_store::service::SimpleRevocableStore;
 #[cfg(any(
     feature = "payload_store",
+    feature = "publish_pipeline",
     feature = "retained_map",
     feature = "revocable_store",
     feature = "transcript"

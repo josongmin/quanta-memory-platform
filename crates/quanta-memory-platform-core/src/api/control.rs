@@ -17,6 +17,7 @@ use crate::domain::context::{MemoryContextKind, OwnerKey};
 use crate::domain::errors::{MemoryError, MemoryResult};
 use crate::domain::ledger::{AccountingLedger, ChargeKind, LedgerSnapshot, ReservationTicket};
 use crate::domain::policy::{MemoryClass, ResidencyPolicy};
+use crate::domain::recharge::{RechargeError, RechargeRecoveryV1};
 use crate::domain::stats::{AllocatorSnapshot, EffectiveMemoryBudgetReport, PressureState};
 use crate::ports::telemetry::AllocatorAdvisory;
 
@@ -28,32 +29,6 @@ use crate::ports::telemetry::AllocatorAdvisory;
 #[derive(Clone)]
 pub struct LiveProcessMemoryBroker {
     inner: Arc<Mutex<BrokerCore>>,
-}
-
-/// Outcome of a denied [`LiveProcessMemoryBroker::recharge`].
-///
-/// Accounting disposition after a denied recharge.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum RechargeRecoveryV1 {
-    /// The old charge and its original ticket remain live and unchanged.
-    OldChargePreserved,
-    /// A sink that cannot replace in place restored the old charge under a new
-    /// ticket. The caller must adopt this ticket.
-    OldChargeRestored(ReservationTicket),
-    /// The old charge was released and could not be restored. The caller must
-    /// remove or quarantine the corresponding payload; it must never continue
-    /// serving it as charged state.
-    RecoveryRequired { rollback_error: MemoryError },
-}
-
-/// The new charge was rejected together with an unambiguous accounting
-/// disposition for the old charge.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RechargeError {
-    /// Why the new charge was denied.
-    pub error: MemoryError,
-    /// What happened to the old charge.
-    pub recovery: RechargeRecoveryV1,
 }
 
 struct BrokerCore {

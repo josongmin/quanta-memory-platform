@@ -13,23 +13,25 @@ use crate::conformance::invariants::{AssertionVerdict, ContractFamily, Invariant
 use crate::conformance::target::{AllocatorObservation, BrokerConformanceTarget, ChargeAxis};
 #[cfg(feature = "fixtures")]
 use crate::fixtures::{MemoryFixture, MemoryTestKit};
+use quanta_memory_platform_core::MemoryError;
 use quanta_memory_platform_facade::{
     AbortDispositionV1, PrepareDispositionV1, PreparedPublicationErrorV1,
     PreparedPublicationIdentityV1, PreparedPublicationRequestV1, PreparedPublicationService,
     PreparedPublicationStatsV1, PreparedPublicationTokenV1, SessionTranscriptStore,
     SimpleSessionTranscriptStore, TranscriptAppendDispositionV1, TranscriptAppendErrorV1,
-    TranscriptAppendIdentityV1, TranscriptAppendRequestV1, TranscriptRetentionPolicyV1,
+    TranscriptAppendIdentityV1, TranscriptAppendRequestV1,
 };
 
 #[cfg(feature = "fixtures")]
 use quanta_memory_platform_core::{
     ChargeKind, LiveProcessMemoryBroker, MemoryClass, MemoryClassBudget, MemoryContextKind,
-    MemoryError, MemoryResult, ReclaimPriority, ReservationTicket, StoreBindingHandle, SweepHint,
+    MemoryResult, ReclaimPriority, ReservationTicket, StoreBindingHandle, SweepHint,
 };
 #[cfg(feature = "fixtures")]
 use quanta_memory_platform_facade::{
     AccountingSink, InMemorySpillTarget, PayloadStore, RetainedMapStore, RetainedMapStoreBuilder,
     RoutedSpillController, SimplePayloadStore, SpillController, SpillTarget,
+    TranscriptRetentionPolicyV1,
 };
 #[cfg(feature = "fixtures")]
 use std::sync::Arc;
@@ -886,9 +888,11 @@ mod tests {
     use crate::fake::{AccountingFidelity, FakeProcessBroker};
     use quanta_memory_platform_core::{
         EffectiveMemoryBudgetReport, LiveProcessMemoryBroker, MemoryBudgetManifest, MemoryClass,
-        MemoryClassBudget, MemoryError, MemoryPreset, RechargeError, RechargeRecoveryV1,
-        ReclaimPriority, ResidencyPolicy, StoreBindingHandle,
+        MemoryClassBudget, MemoryPreset, ReclaimPriority, ResidencyPolicy, StoreBindingHandle,
     };
+    #[cfg(feature = "fixtures")]
+    use quanta_memory_platform_core::{RechargeError, RechargeRecoveryV1};
+    use quanta_memory_platform_facade::TranscriptRetentionPolicyV1;
 
     fn all_held(verdicts: &[AssertionVerdict]) -> bool {
         verdicts.iter().all(AssertionVerdict::held)

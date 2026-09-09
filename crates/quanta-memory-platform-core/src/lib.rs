@@ -11,7 +11,7 @@ pub use api::broker::{
 };
 pub use api::builder::ProcessMemoryBrokerBuilder;
 #[cfg(feature = "live_control")]
-pub use api::control::{LiveProcessMemoryBroker, RechargeError, RechargeRecoveryV1};
+pub use api::control::LiveProcessMemoryBroker;
 #[cfg(feature = "live_control")]
 pub use application::controller::{
     LadderPressureController, PressureController, PressureThresholds, ReclaimRung,
@@ -36,6 +36,7 @@ pub use domain::policy::{
     ExecutionBudget, MemoryBudgetManifest, MemoryClass, MemoryClassBudget, MemoryPreset,
     OwnerQuota, ReclaimPriority, ResidencyPolicy, ResourceGroup,
 };
+pub use domain::recharge::{RechargeError, RechargeRecoveryV1};
 pub use domain::stats::{AllocatorSnapshot, EffectiveMemoryBudgetReport, PressureState};
 pub use ports::pin::{InvalidationOutcome, PayloadPinLease, PinRegistry};
 pub use ports::scratch::{ScratchAllocator, ScratchRequest, ScratchReservation};
