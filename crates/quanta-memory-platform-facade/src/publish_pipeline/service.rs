@@ -149,6 +149,7 @@ where
 }
 
 #[cfg(test)]
+#[allow(deprecated)] // Legacy-path tests remain until the QMP publish-pipeline removal owner deletes it.
 mod tests {
     use super::*;
     use quanta_memory_platform_core::{MemoryClass, StoreBindingHandle};

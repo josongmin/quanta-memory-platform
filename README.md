@@ -34,8 +34,12 @@ Consumers use the builder-first API, never low-level broker backdoors:
 - `MemoryPlatformBuilder` (facade) to build a broker from a preset/manifest.
 - `PortableMemoryPresets` for named budget manifests.
 - Store/pipeline builders (`PayloadStoreBuilder`, `RetainedMapStoreBuilder`,
-  `RevocableStoreBuilder`, `PublishPipelineBuilder`,
+  `RevocableStoreBuilder`, `PreparedPublicationServiceBuilder`,
   `SessionTranscriptStoreBuilder`).
+- `PublishPipelineBuilder` and its non-retaining `stage`/`commit` transition are
+  legacy compatibility surfaces. New retaining publication code uses
+  `PreparedPublicationServiceBuilder`; the QMP publish-pipeline migration owns
+  removal of the legacy surface.
 - Charged store assembly stays builder-first too. For retained maps,
   `RetainedMapStoreBuilder::bind(...)` moves into a bound typestate whose
   `build()` is infallible; `charged_against(...)` is available on either builder
