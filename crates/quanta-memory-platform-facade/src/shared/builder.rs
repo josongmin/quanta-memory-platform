@@ -14,14 +14,15 @@ use quanta_memory_platform_core::{
 use quanta_memory_platform_core::MemoryError;
 #[cfg(any(
     feature = "payload_store",
+    feature = "publish_pipeline",
     feature = "retained_map",
     feature = "revocable_store",
-    feature = "publish_pipeline",
     feature = "transcript"
 ))]
 use quanta_memory_platform_core::StoreBindingHandle;
 #[cfg(any(
     feature = "payload_store",
+    feature = "publish_pipeline",
     feature = "retained_map",
     feature = "revocable_store",
     feature = "publish_pipeline",
@@ -32,7 +33,9 @@ use std::marker::PhantomData;
 #[cfg(feature = "payload_store")]
 use crate::payload_store::service::SimplePayloadStore;
 #[cfg(feature = "publish_pipeline")]
-use crate::publish_pipeline::service::SimplePublishPipeline;
+use crate::publish_pipeline::{
+    prepared_publication::PreparedPublicationService, service::SimplePublishPipeline,
+};
 #[cfg(feature = "retained_map")]
 use crate::retained_map::service::SimpleRetainedMapStore;
 #[cfg(feature = "revocable_store")]
@@ -155,6 +158,15 @@ impl LiveMemoryPlatform {
         &self,
     ) -> SessionTranscriptStoreBuilder<SessionId, Message> {
         SessionTranscriptStoreBuilder::new().charged_against(self.sink())
+    }
+
+    /// A prepared-publication builder already charged against this platform's ledger.
+    #[cfg(feature = "publish_pipeline")]
+    #[must_use]
+    pub fn prepared_publication_builder<Payload>(
+        &self,
+    ) -> PreparedPublicationServiceBuilder<Payload> {
+        PreparedPublicationServiceBuilder::new().charged_against(self.sink())
     }
 }
 
@@ -363,6 +375,55 @@ impl<Stage, Commit, Published> PublishPipelineBuilder<Stage, Commit, Published> 
     {
         let binding = self.binding.ok_or_else(missing_binding)?;
         Ok(SimplePublishPipeline::new(binding))
+    }
+}
+
+#[cfg(feature = "publish_pipeline")]
+#[derive(Clone, Debug)]
+pub struct PreparedPublicationServiceBuilder<Payload> {
+    binding: Option<StoreBindingHandle>,
+    capacity_bytes: Option<u64>,
+    charger: Option<SharedAccountingSink>,
+    _marker: PhantomData<Payload>,
+}
+
+#[cfg(feature = "publish_pipeline")]
+impl<Payload> Default for PreparedPublicationServiceBuilder<Payload> {
+    fn default() -> Self {
+        Self { binding: None, capacity_bytes: None, charger: None, _marker: PhantomData }
+    }
+}
+
+#[cfg(feature = "publish_pipeline")]
+impl<Payload> PreparedPublicationServiceBuilder<Payload> {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn bind(mut self, binding: StoreBindingHandle) -> Self {
+        self.binding = Some(binding);
+        self
+    }
+
+    #[must_use]
+    pub fn with_capacity_bytes(mut self, capacity_bytes: u64) -> Self {
+        self.capacity_bytes = Some(capacity_bytes);
+        self
+    }
+
+    #[must_use]
+    pub fn charged_against(mut self, sink: SharedAccountingSink) -> Self {
+        self.charger = Some(sink);
+        self
+    }
+
+    pub fn build(self) -> MemoryResult<PreparedPublicationService<Payload>> {
+        let binding = self.binding.ok_or_else(missing_binding)?;
+        let mut service = PreparedPublicationService::new(binding, self.capacity_bytes);
+        if let Some(sink) = self.charger {
+            service = service.charged_against(sink);
+        }
+        Ok(service)
     }
 }
 

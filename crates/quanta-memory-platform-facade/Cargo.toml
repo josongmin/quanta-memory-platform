@@ -19,7 +19,7 @@ retained_map = ["dep:hashlink"]
 # for a heavy backing never links one (and `full` stays copyleft-free).
 revocable_store = []
 transcript = []
-publish_pipeline = []
+publish_pipeline = ["dep:blake3"]
 spill = []
 
 # Opt-in heavy backings (each pulls one third-party crate).
@@ -43,6 +43,7 @@ full = [
 full-backings = ["full", "spill-redb", "revocable-moka", "revocable-scc"]
 
 [dependencies]
+blake3 = { workspace = true, optional = true }
 bumpalo = { workspace = true, optional = true }
 hashlink = { workspace = true, optional = true }
 moka = { workspace = true, optional = true }

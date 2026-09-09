@@ -32,8 +32,10 @@ pub use shared::measure::{ByteSized, CanonicalKey, MeasuredValue};
 pub use payload_store::{PayloadStore, PayloadStoreBuilder, SimplePayloadStore};
 #[cfg(feature = "publish_pipeline")]
 pub use publish_pipeline::{
-    CommitTransition, DefaultCommitTransition, PublishPipeline, PublishPipelineBuilder,
-    SimplePublishPipeline,
+    AbortDispositionV1, CommitTransition, DefaultCommitTransition, PrepareDispositionV1,
+    PreparedPublicationErrorV1, PreparedPublicationIdentityV1, PreparedPublicationReceiptV1,
+    PreparedPublicationRequestV1, PreparedPublicationService, PreparedPublicationStatsV1,
+    PreparedPublicationTokenV1, PublishPipeline, PublishPipelineBuilder, SimplePublishPipeline,
 };
 #[cfg(feature = "retained_map")]
 pub use retained_map::{
@@ -42,6 +44,8 @@ pub use retained_map::{
 };
 #[cfg(feature = "revocable_store")]
 pub use revocable_store::{RevocableStore, RevocableStoreBuilder, SimpleRevocableStore};
+#[cfg(feature = "publish_pipeline")]
+pub use shared::builder::PreparedPublicationServiceBuilder;
 #[cfg(feature = "transcript")]
 pub use shared::builder::SessionTranscriptStoreBuilder;
 #[cfg(feature = "spill")]

@@ -26,9 +26,15 @@ where
     }
 }
 
-/// Portable staged-publish pipeline.
+/// Portable legacy staged-publish transition.
 ///
-/// Owns the stage -> commit -> publish transaction skeleton (playbook 5.2):
+/// New retaining publication integrations use
+/// [`crate::publish_pipeline::PreparedPublicationService`]. This type remains
+/// only for existing non-retaining transition callers; it owns no visibility
+/// or storage authority and is scheduled for removal by the QMP publish-pipeline
+/// migration owner.
+///
+/// Owns the stage -> commit -> publish transition skeleton (playbook 5.2):
 /// `stage` reserves a staged handle, `commit` runs the caller's commit transition,
 /// and only a successful transition yields a published value. The `published_count`
 /// counter increments solely inside a committed transition, so the count never

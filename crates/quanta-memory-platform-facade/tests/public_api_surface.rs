@@ -137,8 +137,10 @@ fn names_transcript_reexports() {
 
 #[cfg(feature = "publish_pipeline")]
 use quanta_memory_platform_facade::{
-    CommitTransition, DefaultCommitTransition, PublishPipeline, PublishPipelineBuilder,
-    SimplePublishPipeline,
+    AbortDispositionV1, CommitTransition, DefaultCommitTransition, PrepareDispositionV1,
+    PreparedPublicationErrorV1, PreparedPublicationIdentityV1, PreparedPublicationRequestV1,
+    PreparedPublicationService, PreparedPublicationServiceBuilder, PreparedPublicationStatsV1,
+    PreparedPublicationTokenV1, PublishPipeline, PublishPipelineBuilder, SimplePublishPipeline,
 };
 
 /// Pins the `publish_pipeline` slice's public exports.
@@ -150,6 +152,37 @@ fn names_publish_pipeline_reexports() {
     type _DefaultTransition = DefaultCommitTransition;
     type _Impl = SimplePublishPipeline<String, String, String>;
     type _Builder = PublishPipelineBuilder<String, String, String>;
+    type _Prepared = PreparedPublicationService<Vec<u8>>;
+    type _PreparedBuilder = PreparedPublicationServiceBuilder<Vec<u8>>;
+    type _PreparedError = PreparedPublicationErrorV1;
+    type _PreparedStats = PreparedPublicationStatsV1;
+    type _PreparedToken = PreparedPublicationTokenV1;
+    type _PreparedDispositions = (PrepareDispositionV1, AbortDispositionV1);
+}
+
+#[cfg(feature = "publish_pipeline")]
+#[test]
+fn prepared_publication_builder_exposes_root_bound_resolution_contract() {
+    use quanta_memory_platform_core::{MemoryClass, StoreBindingHandle};
+
+    let service = PreparedPublicationServiceBuilder::<Vec<u8>>::new()
+        .bind(StoreBindingHandle::new(
+            MemoryClass::ManifestResidency,
+            "public-prepared-publication".to_string(),
+            None,
+        ))
+        .with_capacity_bytes(1024)
+        .build()
+        .expect("prepared publication builder");
+    let identity = PreparedPublicationIdentityV1::new(b"root-owned-id".to_vec()).expect("identity");
+    let receipt = service
+        .prepare(PreparedPublicationRequestV1::new(identity, b"payload".to_vec()))
+        .expect("prepare");
+
+    assert_eq!(receipt.disposition(), PrepareDispositionV1::Applied);
+    assert_eq!(service.resolve(receipt.token()).expect("root-bound resolve"), b"payload".to_vec());
+    let serialized_token = *receipt.token().as_bytes();
+    assert_eq!(PreparedPublicationTokenV1::from_bytes(serialized_token), *receipt.token());
 }
 
 #[cfg(feature = "spill")]

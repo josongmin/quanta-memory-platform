@@ -13,6 +13,11 @@ use crate::conformance::invariants::{AssertionVerdict, ContractFamily, Invariant
 use crate::conformance::target::{AllocatorObservation, BrokerConformanceTarget, ChargeAxis};
 #[cfg(feature = "fixtures")]
 use crate::fixtures::{MemoryFixture, MemoryTestKit};
+use quanta_memory_platform_facade::{
+    AbortDispositionV1, PrepareDispositionV1, PreparedPublicationErrorV1,
+    PreparedPublicationIdentityV1, PreparedPublicationRequestV1, PreparedPublicationService,
+    PreparedPublicationStatsV1, PreparedPublicationTokenV1,
+};
 
 #[cfg(feature = "fixtures")]
 use quanta_memory_platform_core::{
@@ -33,6 +38,116 @@ use std::sync::Arc;
 pub const CORE_ACCOUNTING_SUITE: &str = "core-accounting";
 #[cfg(feature = "fixtures")]
 pub const FACADE_STORE_SUITE: &str = "facade-store";
+
+/// Backend-neutral target for prepared-publication replay and abort behavior.
+pub trait PreparedPublicationConformanceTarget {
+    type Token: Clone + std::fmt::Debug + PartialEq + Eq;
+
+    fn prepare(
+        &self,
+        identity: &[u8],
+        payload: &[u8],
+    ) -> Result<(Self::Token, PrepareDispositionV1), PreparedPublicationErrorV1>;
+    fn resolve(&self, token: &Self::Token) -> Result<Vec<u8>, PreparedPublicationErrorV1>;
+    fn abort(&self, token: &Self::Token) -> Result<AbortDispositionV1, PreparedPublicationErrorV1>;
+    fn stats(&self) -> Result<PreparedPublicationStatsV1, PreparedPublicationErrorV1>;
+}
+
+impl PreparedPublicationConformanceTarget for PreparedPublicationService<Vec<u8>> {
+    type Token = PreparedPublicationTokenV1;
+
+    fn prepare(
+        &self,
+        identity: &[u8],
+        payload: &[u8],
+    ) -> Result<(Self::Token, PrepareDispositionV1), PreparedPublicationErrorV1> {
+        let identity = PreparedPublicationIdentityV1::new(identity.to_vec())?;
+        let receipt =
+            self.prepare(PreparedPublicationRequestV1::new(identity, payload.to_vec()))?;
+        Ok((receipt.token().clone(), receipt.disposition()))
+    }
+
+    fn resolve(&self, token: &Self::Token) -> Result<Vec<u8>, PreparedPublicationErrorV1> {
+        self.resolve(token)
+    }
+
+    fn abort(&self, token: &Self::Token) -> Result<AbortDispositionV1, PreparedPublicationErrorV1> {
+        self.abort(token)
+    }
+
+    fn stats(&self) -> Result<PreparedPublicationStatsV1, PreparedPublicationErrorV1> {
+        self.stats()
+    }
+}
+
+/// Exercise exact replay, payload-conflict, token resolution, and exact abort.
+/// The returned verdicts deliberately compare both disposition and retained
+/// accounting so a fake cannot pass by returning `Replayed` after mutating.
+pub fn run_prepared_publication_suite<T>(target: &T) -> Vec<AssertionVerdict>
+where
+    T: PreparedPublicationConformanceTarget,
+{
+    let replay = InvariantAssertion::new(
+        ContractFamily::ReserveFailClosed,
+        "prepared_publication_replay_is_inert",
+    );
+    let conflict = InvariantAssertion::new(
+        ContractFamily::ReserveFailClosed,
+        "prepared_publication_payload_drift_conflicts",
+    );
+    let abort = InvariantAssertion::new(
+        ContractFamily::ReclaimAccounting,
+        "prepared_publication_abort_reclaims_exactly_once",
+    );
+
+    let first = target.prepare(b"identity", b"payload");
+    let replayed = target.prepare(b"identity", b"payload");
+    let before_conflict = target.stats();
+    let drift = target.prepare(b"identity", b"different");
+    let after_conflict = target.stats();
+
+    let (resolution, abort_first, abort_replay, final_stats) = match &first {
+        Ok((token, _)) => {
+            (target.resolve(token), target.abort(token), target.abort(token), target.stats())
+        }
+        Err(error) => {
+            let failure = PreparedPublicationErrorV1::Storage(MemoryError::InvalidState(format!(
+                "first prepare failed: {error}"
+            )));
+            (Err(failure.clone()), Err(failure.clone()), Err(failure), target.stats())
+        }
+    };
+
+    vec![
+        replay.assert_that(
+            matches!((&first, &replayed, &before_conflict),
+                (Ok((first_token, PrepareDispositionV1::Applied)),
+                 Ok((replay_token, PrepareDispositionV1::Replayed)),
+                 Ok(PreparedPublicationStatsV1 { prepared_count: 1, charged_bytes: 7 }))
+                 if first_token == replay_token),
+            format!("first={first:?} replay={replayed:?} stats={before_conflict:?}"),
+        ),
+        conflict.assert_that(
+            matches!(&drift, Err(PreparedPublicationErrorV1::IdentityConflict { .. }))
+                && before_conflict == after_conflict,
+            format!(
+                "drift={drift:?} before={before_conflict:?} after={after_conflict:?}"
+            ),
+        ),
+        abort.assert_that(
+            matches!(&resolution, Ok(bytes) if bytes == b"payload")
+                && matches!(abort_first, Ok(AbortDispositionV1::Aborted))
+                && matches!(abort_replay, Ok(AbortDispositionV1::Replayed))
+                && matches!(
+                    final_stats,
+                    Ok(PreparedPublicationStatsV1 { prepared_count: 0, charged_bytes: 0 })
+                ),
+            format!(
+                "resolution={resolution:?} abort={abort_first:?} replay={abort_replay:?} final={final_stats:?}"
+            ),
+        ),
+    ]
+}
 
 /// Run the broker accounting conformance suite against a target.
 ///
@@ -638,7 +753,7 @@ mod tests {
     use quanta_memory_platform_core::{
         EffectiveMemoryBudgetReport, LiveProcessMemoryBroker, MemoryBudgetManifest, MemoryClass,
         MemoryClassBudget, MemoryError, MemoryPreset, RechargeError, RechargeRecoveryV1,
-        ReclaimPriority, ResidencyPolicy,
+        ReclaimPriority, ResidencyPolicy, StoreBindingHandle,
     };
 
     fn all_held(verdicts: &[AssertionVerdict]) -> bool {
@@ -654,6 +769,77 @@ mod tests {
             }
         }
         out
+    }
+
+    #[test]
+    fn prepared_publication_suite_accepts_honest_service() {
+        let service = PreparedPublicationService::<Vec<u8>>::new(
+            StoreBindingHandle::new(
+                MemoryClass::ManifestResidency,
+                "prepared-conformance".to_string(),
+                None,
+            ),
+            None,
+        );
+        let verdicts = run_prepared_publication_suite(&service);
+        assert!(all_held(&verdicts), "honest prepared service failed: {verdicts:?}");
+    }
+
+    #[derive(Debug, Default)]
+    struct BrokenPreparedTarget {
+        prepares: std::sync::Mutex<u64>,
+    }
+
+    impl PreparedPublicationConformanceTarget for BrokenPreparedTarget {
+        type Token = u64;
+
+        fn prepare(
+            &self,
+            _identity: &[u8],
+            _payload: &[u8],
+        ) -> Result<(Self::Token, PrepareDispositionV1), PreparedPublicationErrorV1> {
+            let mut prepares = self.prepares.lock().map_err(|_| {
+                PreparedPublicationErrorV1::Storage(MemoryError::InvalidState(
+                    "poisoned".to_string(),
+                ))
+            })?;
+            *prepares = prepares.saturating_add(1);
+            Ok((*prepares, PrepareDispositionV1::Applied))
+        }
+
+        fn resolve(&self, _token: &Self::Token) -> Result<Vec<u8>, PreparedPublicationErrorV1> {
+            Ok(b"payload".to_vec())
+        }
+
+        fn abort(
+            &self,
+            _token: &Self::Token,
+        ) -> Result<AbortDispositionV1, PreparedPublicationErrorV1> {
+            Ok(AbortDispositionV1::Aborted)
+        }
+
+        fn stats(&self) -> Result<PreparedPublicationStatsV1, PreparedPublicationErrorV1> {
+            let prepares = *self.prepares.lock().map_err(|_| {
+                PreparedPublicationErrorV1::Storage(MemoryError::InvalidState(
+                    "poisoned".to_string(),
+                ))
+            })?;
+            Ok(PreparedPublicationStatsV1 {
+                prepared_count: prepares as usize,
+                charged_bytes: prepares.saturating_mul(7),
+            })
+        }
+    }
+
+    #[test]
+    fn prepared_publication_suite_rejects_duplicate_charging_fake() {
+        let fake = BrokenPreparedTarget::default();
+        let verdicts = run_prepared_publication_suite(&fake);
+        assert!(!all_held(&verdicts), "duplicate-charging fake must be rejected");
+        assert!(
+            violated(&verdicts).contains(&ContractFamily::ReserveFailClosed),
+            "duplicate mutation must localize to fail-closed: {verdicts:?}"
+        );
     }
 
     #[test]
