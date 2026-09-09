@@ -383,6 +383,21 @@ mod tests {
     }
 
     #[test]
+    fn append_identity_is_partitioned_by_session() {
+        let store = store();
+        assert_eq!(
+            store.append(request("left", 4, "m0", "left-body")).expect("left"),
+            TranscriptAppendDispositionV1::Applied
+        );
+        assert_eq!(
+            store.append(request("right", 4, "m0", "right-body")).expect("right"),
+            TranscriptAppendDispositionV1::Applied
+        );
+        assert_eq!(store.load(&"left".to_string()).expect("left load")[0].body(), "left-body");
+        assert_eq!(store.load(&"right".to_string()).expect("right load")[0].body(), "right-body");
+    }
+
+    #[test]
     fn concurrent_identical_appends_have_one_applied_winner() {
         const N: usize = 8;
         let store = Arc::new(store());
@@ -407,6 +422,43 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_conflicting_appends_have_one_applied_winner() {
+        let store = Arc::new(store());
+        let barrier = Arc::new(Barrier::new(2));
+        let handles: Vec<_> = ["left", "right"]
+            .into_iter()
+            .map(|body| {
+                let store = Arc::clone(&store);
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    store.append(request("s", 0, "m0", body))
+                })
+            })
+            .collect();
+        let outcomes: Vec<_> =
+            handles.into_iter().map(|handle| handle.join().expect("join")).collect();
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(outcome, Ok(TranscriptAppendDispositionV1::Applied)))
+                .count(),
+            1
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(
+                    outcome,
+                    Err(TranscriptAppendErrorV1::PayloadConflict { sequence: 0 })
+                ))
+                .count(),
+            1
+        );
+        assert_eq!(store.load(&"s".to_string()).expect("load").len(), 1);
+    }
+
+    #[test]
     fn truncate_retains_tombstone_so_late_retry_cannot_reappend() {
         let store = store();
         store.append(request("s", 0, "m0", "old")).expect("first");
@@ -422,6 +474,26 @@ mod tests {
             store.append(request("s", 1, "m1", "drift")),
             Err(TranscriptAppendErrorV1::PayloadConflict { sequence: 1 })
         ));
+    }
+
+    #[test]
+    fn truncate_to_zero_retains_all_identity_tombstones() {
+        let store = store();
+        store.append(request("s", 0, "m0", "zero")).expect("zero");
+        store.append(request("s", 2, "m2", "two")).expect("two");
+        store.truncate_to(&"s".to_string(), 0).expect("truncate all");
+
+        assert!(store.load(&"s".to_string()).expect("load").is_empty());
+        assert_eq!(store.retained_bytes().expect("bytes"), 0);
+        assert_eq!(
+            store.append(request("s", 0, "m0", "zero")).expect("zero replay"),
+            TranscriptAppendDispositionV1::Replayed
+        );
+        assert_eq!(
+            store.append(request("s", 2, "m2", "two")).expect("two replay"),
+            TranscriptAppendDispositionV1::Replayed
+        );
+        assert!(store.load(&"s".to_string()).expect("load after retries").is_empty());
     }
 
     #[test]
@@ -498,6 +570,31 @@ mod tests {
                 store.append(request("s", 0, "m0", "ok")).expect("no index residue"),
                 TranscriptAppendDispositionV1::Applied
             );
+        }
+
+        #[test]
+        fn every_conflict_axis_preserves_rows_indexes_and_accounting() {
+            let broker = broker(1_000_000);
+            let store = charged(&broker);
+            store.append(request("s", 4, "m0", "body")).expect("seed");
+
+            let conflicts = [
+                store.append(request("s", 4, "m0", "drift")),
+                store.append(request("s", 4, "m1", "body")),
+                store.append(request("s", 5, "m0", "body")),
+            ];
+            assert!(matches!(
+                conflicts[0],
+                Err(TranscriptAppendErrorV1::PayloadConflict { sequence: 4 })
+            ));
+            assert!(matches!(
+                conflicts[1],
+                Err(TranscriptAppendErrorV1::SequenceConflict { sequence: 4 })
+            ));
+            assert!(matches!(conflicts[2], Err(TranscriptAppendErrorV1::MessageIdConflict)));
+            assert_eq!(store.load(&"s".to_string()).expect("load").len(), 1);
+            assert_eq!(store.retained_bytes().expect("bytes"), 4);
+            assert_eq!(broker.ledger_snapshot().expect("snapshot").total_owner_bytes(), 4);
         }
 
         #[test]

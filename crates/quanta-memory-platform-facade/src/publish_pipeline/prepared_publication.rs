@@ -586,6 +586,25 @@ mod tests {
         assert_eq!(service.stats().expect("stats").prepared_count, 1);
     }
 
+    #[test]
+    fn orphan_gc_with_unknown_token_is_batch_atomic() {
+        let service = service(None);
+        let first = service.prepare(request("id-1", b"one")).expect("first");
+        let second = service.prepare(request("id-2", b"two")).expect("second");
+        let forged = PreparedPublicationTokenV1::from_bytes([0xA5; 32]);
+
+        let error = service
+            .gc_orphans(&[first.token().clone(), forged])
+            .expect_err("the whole batch must reject an unknown token");
+        assert!(matches!(error, PreparedPublicationErrorV1::UnknownToken { .. }));
+        assert_eq!(service.resolve(first.token()).expect("first intact"), b"one".to_vec());
+        assert_eq!(service.resolve(second.token()).expect("second intact"), b"two".to_vec());
+        assert_eq!(
+            service.stats().expect("stats"),
+            PreparedPublicationStatsV1 { prepared_count: 2, charged_bytes: 6 }
+        );
+    }
+
     #[cfg(feature = "core-live-accounting")]
     mod accounting {
         use super::*;
@@ -664,6 +683,34 @@ mod tests {
                 Err(PreparedPublicationErrorV1::Accounting(MemoryError::Capacity(_)))
             ));
             assert_eq!(service.stats().expect("stats"), PreparedPublicationStatsV1::default());
+            assert_eq!(broker.ledger_snapshot().expect("snapshot").total_owner_bytes(), 0);
+        }
+
+        #[test]
+        fn failed_orphan_gc_preserves_every_payload_index_and_charge() {
+            let broker = broker(1_000_000);
+            let service = charged(&broker);
+            let first = service.prepare(request("id-1", b"one")).expect("first");
+            let second = service.prepare(request("id-2", b"two")).expect("second");
+            broker.begin_rebuild().expect("begin rebuild");
+
+            let denied = service.gc_orphans(&[first.token().clone(), second.token().clone()]);
+            assert!(matches!(denied, Err(PreparedPublicationErrorV1::Accounting(_))));
+            assert_eq!(service.resolve(first.token()).expect("first intact"), b"one".to_vec());
+            assert_eq!(service.resolve(second.token()).expect("second intact"), b"two".to_vec());
+            assert_eq!(
+                service.stats().expect("stats"),
+                PreparedPublicationStatsV1 { prepared_count: 2, charged_bytes: 6 }
+            );
+            assert_eq!(broker.ledger_snapshot().expect("snapshot").total_owner_bytes(), 6);
+
+            broker.finish_rebuild().expect("finish rebuild");
+            assert_eq!(
+                service
+                    .gc_orphans(&[first.token().clone(), second.token().clone()])
+                    .expect("retry GC"),
+                2
+            );
             assert_eq!(broker.ledger_snapshot().expect("snapshot").total_owner_bytes(), 0);
         }
     }
