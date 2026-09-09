@@ -355,31 +355,42 @@ where
         Ok(AbortDispositionV1::Aborted)
     }
 
+    /// Enumerate prepared entries not referenced by the caller's complete
+    /// canonical-root snapshot.
+    ///
+    /// QMP validates the supplied references but does not own activation state.
+    /// Callers must therefore stabilize their root snapshot for the duration of
+    /// this call and supply every referenced token; a missing or aborted
+    /// reference fails closed.
     pub fn orphan_tokens(
         &self,
+        referenced_tokens: &[PreparedPublicationTokenV1],
     ) -> Result<Vec<PreparedPublicationTokenV1>, PreparedPublicationErrorV1> {
-        Ok(self.lock()?.entries.keys().cloned().collect())
+        let state = self.lock()?;
+        classify_orphan_tokens(&state, referenced_tokens)
     }
 
+    /// Collect every prepared entry absent from the caller's complete
+    /// canonical-root snapshot.
+    ///
+    /// Reference validation and the complete refund/removal batch happen under
+    /// one service lock. The caller must serialize root activation against this
+    /// call; QMP never infers or owns activation/publication itself.
     pub fn gc_orphans(
         &self,
-        tokens: &[PreparedPublicationTokenV1],
+        referenced_tokens: &[PreparedPublicationTokenV1],
     ) -> Result<usize, PreparedPublicationErrorV1> {
-        let unique_tokens: BTreeSet<_> = tokens.iter().cloned().collect();
         let mut state = self.lock()?;
+        let orphan_tokens = classify_orphan_tokens(&state, referenced_tokens)?;
         let mut prepared_tokens = Vec::new();
         let mut tickets = Vec::new();
 
-        // Validate the whole batch before refunding or removing anything. A
-        // forged token therefore cannot leave a partially collected batch.
-        for token in unique_tokens {
-            if state.aborted_tokens.contains(&token) {
-                continue;
-            }
-            let entry = state
-                .entries
-                .get(&token)
-                .ok_or_else(|| PreparedPublicationErrorV1::UnknownToken { token: token.clone() })?;
+        for token in orphan_tokens {
+            let entry = state.entries.get(&token).ok_or_else(|| {
+                PreparedPublicationErrorV1::Storage(MemoryError::InvalidState(
+                    "classified orphan token disappeared before collection".to_string(),
+                ))
+            })?;
             if let Some(ticket) = &entry.ticket {
                 tickets.push(ticket.clone());
             }
@@ -412,6 +423,22 @@ where
             charged_bytes: state.charged_bytes,
         })
     }
+}
+
+fn classify_orphan_tokens<Payload>(
+    state: &PreparedState<Payload>,
+    referenced_tokens: &[PreparedPublicationTokenV1],
+) -> Result<Vec<PreparedPublicationTokenV1>, PreparedPublicationErrorV1> {
+    let referenced: BTreeSet<_> = referenced_tokens.iter().cloned().collect();
+    for token in &referenced {
+        if state.aborted_tokens.contains(token) {
+            return Err(PreparedPublicationErrorV1::AbortedToken { token: token.clone() });
+        }
+        if !state.entries.contains_key(token) {
+            return Err(PreparedPublicationErrorV1::UnknownToken { token: token.clone() });
+        }
+    }
+    Ok(state.entries.keys().filter(|token| !referenced.contains(*token)).cloned().collect())
 }
 
 fn derive_token(
@@ -458,7 +485,7 @@ mod tests {
         let err = service.prepare(request("id-1", b"four")).expect_err("capacity denial");
         assert!(matches!(err, PreparedPublicationErrorV1::Capacity { .. }));
         assert_eq!(service.stats().expect("stats"), PreparedPublicationStatsV1::default());
-        assert!(service.orphan_tokens().expect("orphans").is_empty());
+        assert!(service.orphan_tokens(&[]).expect("orphans").is_empty());
     }
 
     #[test]
@@ -568,16 +595,16 @@ mod tests {
     }
 
     #[test]
-    fn orphan_gc_never_makes_payload_generally_visible() {
+    fn root_referenced_token_is_never_enumerated_or_collected_as_an_orphan() {
         let service = service(None);
         let first = service.prepare(request("id-1", b"one")).expect("first");
         let second = service.prepare(request("id-2", b"two")).expect("second");
-        let mut orphans = service.orphan_tokens().expect("orphans");
-        orphans.sort();
-        let mut expected = vec![first.token().clone(), second.token().clone()];
-        expected.sort();
-        assert_eq!(orphans, expected);
-        assert_eq!(service.gc_orphans(&[first.token().clone()]).expect("gc"), 1);
+        let referenced = [second.token().clone()];
+        assert_eq!(
+            service.orphan_tokens(&referenced).expect("orphans"),
+            vec![first.token().clone()]
+        );
+        assert_eq!(service.gc_orphans(&referenced).expect("gc"), 1);
         assert!(matches!(
             service.resolve(first.token()),
             Err(PreparedPublicationErrorV1::AbortedToken { .. })
@@ -587,21 +614,39 @@ mod tests {
     }
 
     #[test]
-    fn orphan_gc_with_unknown_token_is_batch_atomic() {
+    fn orphan_gc_with_unknown_root_reference_is_batch_atomic() {
         let service = service(None);
         let first = service.prepare(request("id-1", b"one")).expect("first");
         let second = service.prepare(request("id-2", b"two")).expect("second");
         let forged = PreparedPublicationTokenV1::from_bytes([0xA5; 32]);
 
         let error = service
-            .gc_orphans(&[first.token().clone(), forged])
-            .expect_err("the whole batch must reject an unknown token");
+            .gc_orphans(&[forged])
+            .expect_err("the root snapshot must reject an unknown token");
         assert!(matches!(error, PreparedPublicationErrorV1::UnknownToken { .. }));
         assert_eq!(service.resolve(first.token()).expect("first intact"), b"one".to_vec());
         assert_eq!(service.resolve(second.token()).expect("second intact"), b"two".to_vec());
         assert_eq!(
             service.stats().expect("stats"),
             PreparedPublicationStatsV1 { prepared_count: 2, charged_bytes: 6 }
+        );
+    }
+
+    #[test]
+    fn aborted_root_reference_fails_closed_without_collecting_other_entries() {
+        let service = service(None);
+        let aborted = service.prepare(request("id-1", b"one")).expect("aborted");
+        let survivor = service.prepare(request("id-2", b"two")).expect("survivor");
+        service.abort(aborted.token()).expect("abort");
+
+        let error = service
+            .gc_orphans(&[aborted.token().clone()])
+            .expect_err("an aborted canonical-root reference must fail closed");
+        assert!(matches!(error, PreparedPublicationErrorV1::AbortedToken { .. }));
+        assert_eq!(service.resolve(survivor.token()).expect("survivor intact"), b"two".to_vec());
+        assert_eq!(
+            service.stats().expect("stats"),
+            PreparedPublicationStatsV1 { prepared_count: 1, charged_bytes: 3 }
         );
     }
 
@@ -694,7 +739,7 @@ mod tests {
             let second = service.prepare(request("id-2", b"two")).expect("second");
             broker.begin_rebuild().expect("begin rebuild");
 
-            let denied = service.gc_orphans(&[first.token().clone(), second.token().clone()]);
+            let denied = service.gc_orphans(&[]);
             assert!(matches!(denied, Err(PreparedPublicationErrorV1::Accounting(_))));
             assert_eq!(service.resolve(first.token()).expect("first intact"), b"one".to_vec());
             assert_eq!(service.resolve(second.token()).expect("second intact"), b"two".to_vec());
@@ -705,12 +750,7 @@ mod tests {
             assert_eq!(broker.ledger_snapshot().expect("snapshot").total_owner_bytes(), 6);
 
             broker.finish_rebuild().expect("finish rebuild");
-            assert_eq!(
-                service
-                    .gc_orphans(&[first.token().clone(), second.token().clone()])
-                    .expect("retry GC"),
-                2
-            );
+            assert_eq!(service.gc_orphans(&[]).expect("retry GC"), 2);
             assert_eq!(broker.ledger_snapshot().expect("snapshot").total_owner_bytes(), 0);
         }
     }

@@ -40,6 +40,10 @@ Consumers use the builder-first API, never low-level broker backdoors:
   legacy compatibility surfaces. New retaining publication code uses
   `PreparedPublicationServiceBuilder`; the QMP publish-pipeline migration owns
   removal of the legacy surface.
+- Prepared-publication orphan enumeration and GC require the caller's complete
+  canonical-root token snapshot, stabilized against concurrent activation for
+  the duration of the call. QMP validates and excludes referenced tokens; it
+  never invents or owns the caller's activation state.
 - Charged store assembly stays builder-first too. For retained maps,
   `RetainedMapStoreBuilder::bind(...)` moves into a bound typestate whose
   `build()` is infallible; `charged_against(...)` is available on either builder

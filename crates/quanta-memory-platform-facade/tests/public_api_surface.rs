@@ -189,6 +189,13 @@ fn prepared_publication_builder_exposes_root_bound_resolution_contract() {
 
     assert_eq!(receipt.disposition(), PrepareDispositionV1::Applied);
     assert_eq!(service.resolve(receipt.token()).expect("root-bound resolve"), b"payload".to_vec());
+    assert!(
+        service
+            .orphan_tokens(&[receipt.token().clone()])
+            .expect("root snapshot validation")
+            .is_empty(),
+        "a canonical-root reference must exclude its token from orphan enumeration"
+    );
     let serialized_token = *receipt.token().as_bytes();
     assert_eq!(PreparedPublicationTokenV1::from_bytes(serialized_token), *receipt.token());
 }

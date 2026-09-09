@@ -53,6 +53,14 @@ pub trait PreparedPublicationConformanceTarget {
     ) -> Result<(Self::Token, PrepareDispositionV1), PreparedPublicationErrorV1>;
     fn resolve(&self, token: &Self::Token) -> Result<Vec<u8>, PreparedPublicationErrorV1>;
     fn abort(&self, token: &Self::Token) -> Result<AbortDispositionV1, PreparedPublicationErrorV1>;
+    fn orphan_tokens(
+        &self,
+        referenced_tokens: &[Self::Token],
+    ) -> Result<Vec<Self::Token>, PreparedPublicationErrorV1>;
+    fn gc_orphans(
+        &self,
+        referenced_tokens: &[Self::Token],
+    ) -> Result<usize, PreparedPublicationErrorV1>;
     fn stats(&self) -> Result<PreparedPublicationStatsV1, PreparedPublicationErrorV1>;
 }
 
@@ -76,6 +84,20 @@ impl PreparedPublicationConformanceTarget for PreparedPublicationService<Vec<u8>
 
     fn abort(&self, token: &Self::Token) -> Result<AbortDispositionV1, PreparedPublicationErrorV1> {
         self.abort(token)
+    }
+
+    fn orphan_tokens(
+        &self,
+        referenced_tokens: &[Self::Token],
+    ) -> Result<Vec<Self::Token>, PreparedPublicationErrorV1> {
+        self.orphan_tokens(referenced_tokens)
+    }
+
+    fn gc_orphans(
+        &self,
+        referenced_tokens: &[Self::Token],
+    ) -> Result<usize, PreparedPublicationErrorV1> {
+        self.gc_orphans(referenced_tokens)
     }
 
     fn stats(&self) -> Result<PreparedPublicationStatsV1, PreparedPublicationErrorV1> {
@@ -102,6 +124,10 @@ where
         ContractFamily::ReclaimAccounting,
         "prepared_publication_abort_reclaims_exactly_once",
     );
+    let root_aware_gc = InvariantAssertion::new(
+        ContractFamily::ReclaimAccounting,
+        "prepared_publication_gc_preserves_root_references",
+    );
 
     let first = target.prepare(b"identity", b"payload");
     let replayed = target.prepare(b"identity", b"payload");
@@ -118,6 +144,47 @@ where
                 "first prepare failed: {error}"
             )));
             (Err(failure.clone()), Err(failure.clone()), Err(failure), target.stats())
+        }
+    };
+
+    let orphan = target.prepare(b"orphan-identity", b"orphan");
+    let referenced = target.prepare(b"referenced-identity", b"rooted");
+    let root_aware_gc_verdict = match (&orphan, &referenced) {
+        (
+            Ok((orphan_token, PrepareDispositionV1::Applied)),
+            Ok((referenced_token, PrepareDispositionV1::Applied)),
+        ) => {
+            let roots = [referenced_token.clone()];
+            let enumerated = target.orphan_tokens(&roots);
+            let collected = target.gc_orphans(&roots);
+            let orphan_after = target.resolve(orphan_token);
+            let referenced_after = target.resolve(referenced_token);
+            let cleanup = target.abort(referenced_token);
+            let stats_after_cleanup = target.stats();
+
+            root_aware_gc.assert_that(
+                matches!(&enumerated, Ok(tokens) if tokens == std::slice::from_ref(orphan_token))
+                    && matches!(collected, Ok(1))
+                    && matches!(
+                        &orphan_after,
+                        Err(PreparedPublicationErrorV1::AbortedToken { .. })
+                    )
+                    && matches!(&referenced_after, Ok(payload) if payload == b"rooted")
+                    && matches!(cleanup, Ok(AbortDispositionV1::Aborted))
+                    && matches!(
+                        stats_after_cleanup,
+                        Ok(PreparedPublicationStatsV1 {
+                            prepared_count: 0,
+                            charged_bytes: 0
+                        })
+                    ),
+                format!(
+                    "orphan={orphan:?} referenced={referenced:?} enumerated={enumerated:?} collected={collected:?} orphan_after={orphan_after:?} referenced_after={referenced_after:?} cleanup={cleanup:?} final={stats_after_cleanup:?}"
+                ),
+            )
+        }
+        _ => {
+            root_aware_gc.assert_that(false, format!("orphan={orphan:?} referenced={referenced:?}"))
         }
     };
 
@@ -149,6 +216,7 @@ where
                 "resolution={resolution:?} abort={abort_first:?} replay={abort_replay:?} final={final_stats:?}"
             ),
         ),
+        root_aware_gc_verdict,
     ]
 }
 
@@ -956,6 +1024,20 @@ mod tests {
             Ok(AbortDispositionV1::Aborted)
         }
 
+        fn orphan_tokens(
+            &self,
+            _referenced_tokens: &[Self::Token],
+        ) -> Result<Vec<Self::Token>, PreparedPublicationErrorV1> {
+            Ok(Vec::new())
+        }
+
+        fn gc_orphans(
+            &self,
+            _referenced_tokens: &[Self::Token],
+        ) -> Result<usize, PreparedPublicationErrorV1> {
+            Ok(0)
+        }
+
         fn stats(&self) -> Result<PreparedPublicationStatsV1, PreparedPublicationErrorV1> {
             let prepares = *self.prepares.lock().map_err(|_| {
                 PreparedPublicationErrorV1::Storage(MemoryError::InvalidState(
@@ -977,6 +1059,78 @@ mod tests {
         assert!(
             violated(&verdicts).contains(&ContractFamily::ReserveFailClosed),
             "duplicate mutation must localize to fail-closed: {verdicts:?}"
+        );
+    }
+
+    #[derive(Debug)]
+    struct RootBlindPreparedTarget {
+        service: PreparedPublicationService<Vec<u8>>,
+    }
+
+    impl RootBlindPreparedTarget {
+        fn new() -> Self {
+            Self {
+                service: PreparedPublicationService::new(
+                    StoreBindingHandle::new(
+                        MemoryClass::ManifestResidency,
+                        "root-blind-prepared-conformance".to_string(),
+                        None,
+                    ),
+                    None,
+                ),
+            }
+        }
+    }
+
+    impl PreparedPublicationConformanceTarget for RootBlindPreparedTarget {
+        type Token = PreparedPublicationTokenV1;
+
+        fn prepare(
+            &self,
+            identity: &[u8],
+            payload: &[u8],
+        ) -> Result<(Self::Token, PrepareDispositionV1), PreparedPublicationErrorV1> {
+            PreparedPublicationConformanceTarget::prepare(&self.service, identity, payload)
+        }
+
+        fn resolve(&self, token: &Self::Token) -> Result<Vec<u8>, PreparedPublicationErrorV1> {
+            self.service.resolve(token)
+        }
+
+        fn abort(
+            &self,
+            token: &Self::Token,
+        ) -> Result<AbortDispositionV1, PreparedPublicationErrorV1> {
+            self.service.abort(token)
+        }
+
+        fn orphan_tokens(
+            &self,
+            _referenced_tokens: &[Self::Token],
+        ) -> Result<Vec<Self::Token>, PreparedPublicationErrorV1> {
+            self.service.orphan_tokens(&[])
+        }
+
+        fn gc_orphans(
+            &self,
+            _referenced_tokens: &[Self::Token],
+        ) -> Result<usize, PreparedPublicationErrorV1> {
+            self.service.gc_orphans(&[])
+        }
+
+        fn stats(&self) -> Result<PreparedPublicationStatsV1, PreparedPublicationErrorV1> {
+            self.service.stats()
+        }
+    }
+
+    #[test]
+    fn prepared_publication_suite_rejects_root_blind_gc_fake() {
+        let fake = RootBlindPreparedTarget::new();
+        let verdicts = run_prepared_publication_suite(&fake);
+        assert!(!all_held(&verdicts), "root-blind GC fake must be rejected");
+        assert!(
+            violated(&verdicts).contains(&ContractFamily::ReclaimAccounting),
+            "root-blind GC must localize to reclaim accounting: {verdicts:?}"
         );
     }
 
