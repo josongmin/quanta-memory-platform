@@ -18,7 +18,7 @@ retained_map = ["dep:hashlink"]
 # `*-redb` / `*-moka` / `*-scc` features below, so a consumer that does not ask
 # for a heavy backing never links one (and `full` stays copyleft-free).
 revocable_store = []
-transcript = []
+transcript = ["dep:blake3"]
 publish_pipeline = ["dep:blake3"]
 spill = []
 

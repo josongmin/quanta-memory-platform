@@ -54,4 +54,8 @@ pub use spill::{
     SpillController, SpillTarget,
 };
 #[cfg(feature = "transcript")]
-pub use transcript_store::{SessionTranscriptStore, SimpleSessionTranscriptStore};
+pub use transcript_store::{
+    SessionTranscriptStore, SimpleSessionTranscriptStore, TranscriptAppendDispositionV1,
+    TranscriptAppendErrorV1, TranscriptAppendIdentityV1, TranscriptAppendRequestV1,
+    TranscriptRecordV1, TranscriptRetentionPolicyV1,
+};

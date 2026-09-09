@@ -124,15 +124,23 @@ fn names_revocable_store_reexports() {
 #[cfg(feature = "transcript")]
 use quanta_memory_platform_facade::{
     SessionTranscriptStore, SessionTranscriptStoreBuilder, SimpleSessionTranscriptStore,
+    TranscriptAppendDispositionV1, TranscriptAppendErrorV1, TranscriptAppendIdentityV1,
+    TranscriptAppendRequestV1, TranscriptRecordV1, TranscriptRetentionPolicyV1,
 };
 
 /// Pins the `transcript` slice's public exports.
 #[cfg(feature = "transcript")]
 #[allow(dead_code, clippy::type_complexity)] // -- reason: compile-time surface pin; never executed.
 fn names_transcript_reexports() {
-    type _Trait = Box<dyn SessionTranscriptStore<String, String>>;
-    type _Impl = SimpleSessionTranscriptStore<String, String>;
-    type _Builder = SessionTranscriptStoreBuilder<String, String>;
+    type _Trait = Box<dyn SessionTranscriptStore<String, String, String>>;
+    type _Impl = SimpleSessionTranscriptStore<String, String, String>;
+    type _Builder = SessionTranscriptStoreBuilder<String, String, String>;
+    type _Identity = TranscriptAppendIdentityV1<String, String>;
+    type _Request = TranscriptAppendRequestV1<String, String, String>;
+    type _Record = TranscriptRecordV1<String, String>;
+    type _Error = TranscriptAppendErrorV1;
+    type _Disposition = TranscriptAppendDispositionV1;
+    type _Retention = TranscriptRetentionPolicyV1;
 }
 
 #[cfg(feature = "publish_pipeline")]
@@ -368,14 +376,22 @@ fn transcript_builder_exposes_public_charged_path() {
     let sink: SharedAccountingSink = std::sync::Arc::new(broker.clone());
     let binding =
         StoreBindingHandle::new(MemoryClass::ArtifactCache, "owner-transcript".to_string(), None);
-    let store: SimpleSessionTranscriptStore<String, String> =
-        SessionTranscriptStoreBuilder::<String, String>::new()
+    let store: SimpleSessionTranscriptStore<String, String, String> =
+        SessionTranscriptStoreBuilder::<String, String, String>::new()
             .bind(binding)
             .charged_against(sink)
+            .with_retention_policy(TranscriptRetentionPolicyV1::process_lifetime())
             .build()
             .expect("charged transcript builder must build");
 
-    store.append("s".to_string(), "hello".to_string()).expect("append");
+    let disposition = store
+        .append(TranscriptAppendRequestV1::new(
+            TranscriptAppendIdentityV1::new("s".to_string(), 0, "m0".to_string()),
+            "hello".to_string(),
+        ))
+        .expect("append");
+    assert_eq!(disposition, TranscriptAppendDispositionV1::Applied);
+    assert_eq!(store.load(&"s".to_string()).expect("load").len(), 1);
     assert_eq!(broker.ledger_snapshot().expect("snap").total_owner_bytes(), 5);
 }
 

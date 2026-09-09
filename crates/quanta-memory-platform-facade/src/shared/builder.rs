@@ -48,7 +48,7 @@ use crate::revocable_store::service::SimpleRevocableStore;
 ))]
 use crate::shared::accounting::SharedAccountingSink;
 #[cfg(feature = "transcript")]
-use crate::transcript_store::service::SimpleSessionTranscriptStore;
+use crate::transcript_store::{service::SimpleSessionTranscriptStore, TranscriptRetentionPolicyV1};
 #[cfg(feature = "payload_store")]
 use quanta_memory_platform_core::MemoryContextHandle;
 
@@ -154,9 +154,9 @@ impl LiveMemoryPlatform {
     /// A session-transcript-store builder already charged against this platform's ledger.
     #[cfg(feature = "transcript")]
     #[must_use]
-    pub fn transcript_store_builder<SessionId, Message>(
+    pub fn transcript_store_builder<SessionId, MessageId, Message>(
         &self,
-    ) -> SessionTranscriptStoreBuilder<SessionId, Message> {
+    ) -> SessionTranscriptStoreBuilder<SessionId, MessageId, Message> {
         SessionTranscriptStoreBuilder::new().charged_against(self.sink())
     }
 
@@ -429,21 +429,29 @@ impl<Payload> PreparedPublicationServiceBuilder<Payload> {
 
 #[cfg(feature = "transcript")]
 #[derive(Clone, Debug)]
-pub struct SessionTranscriptStoreBuilder<SessionId, Message> {
+pub struct SessionTranscriptStoreBuilder<SessionId, MessageId, Message> {
     binding: Option<StoreBindingHandle>,
     charger: Option<SharedAccountingSink>,
-    _marker: PhantomData<(SessionId, Message)>,
+    retention: TranscriptRetentionPolicyV1,
+    _marker: PhantomData<(SessionId, MessageId, Message)>,
 }
 
 #[cfg(feature = "transcript")]
-impl<SessionId, Message> Default for SessionTranscriptStoreBuilder<SessionId, Message> {
+impl<SessionId, MessageId, Message> Default
+    for SessionTranscriptStoreBuilder<SessionId, MessageId, Message>
+{
     fn default() -> Self {
-        Self { binding: None, charger: None, _marker: PhantomData }
+        Self {
+            binding: None,
+            charger: None,
+            retention: TranscriptRetentionPolicyV1::process_lifetime(),
+            _marker: PhantomData,
+        }
     }
 }
 
 #[cfg(feature = "transcript")]
-impl<SessionId, Message> SessionTranscriptStoreBuilder<SessionId, Message> {
+impl<SessionId, MessageId, Message> SessionTranscriptStoreBuilder<SessionId, MessageId, Message> {
     pub fn new() -> Self {
         Self::default()
     }
@@ -459,9 +467,17 @@ impl<SessionId, Message> SessionTranscriptStoreBuilder<SessionId, Message> {
         self
     }
 
-    pub fn build(self) -> MemoryResult<SimpleSessionTranscriptStore<SessionId, Message>> {
+    #[must_use]
+    pub fn with_retention_policy(mut self, retention: TranscriptRetentionPolicyV1) -> Self {
+        self.retention = retention;
+        self
+    }
+
+    pub fn build(
+        self,
+    ) -> MemoryResult<SimpleSessionTranscriptStore<SessionId, MessageId, Message>> {
         let binding = self.binding.ok_or_else(missing_binding)?;
-        let mut store = SimpleSessionTranscriptStore::new(binding);
+        let mut store = SimpleSessionTranscriptStore::new(binding, self.retention);
         if let Some(sink) = self.charger {
             store = store.charged_against(sink);
         }
@@ -543,7 +559,7 @@ mod tests {
 
     #[test]
     fn transcript_builder_without_binding_fails_with_build_error() {
-        let err = SessionTranscriptStoreBuilder::<String, String>::new()
+        let err = SessionTranscriptStoreBuilder::<String, String, String>::new()
             .build()
             .expect_err("missing binding");
         assert!(matches!(err, MemoryError::Build(_)), "got {err:?}");
@@ -551,17 +567,24 @@ mod tests {
 
     #[test]
     fn transcript_builder_charged_against_routes_bytes_through_the_ledger() {
-        use crate::transcript_store::SessionTranscriptStore;
+        use crate::transcript_store::{
+            SessionTranscriptStore, TranscriptAppendIdentityV1, TranscriptAppendRequestV1,
+        };
 
         let broker = live_broker();
         let sink: SharedAccountingSink = std::sync::Arc::new(broker.clone());
-        let store = SessionTranscriptStoreBuilder::<String, String>::new()
+        let store = SessionTranscriptStoreBuilder::<String, String, String>::new()
             .bind(binding())
             .charged_against(sink)
             .build()
             .expect("builder charged transcript store");
 
-        store.append("s".to_string(), "hello".to_string()).expect("append");
+        store
+            .append(TranscriptAppendRequestV1::new(
+                TranscriptAppendIdentityV1::new("s".to_string(), 0, "m0".to_string()),
+                "hello".to_string(),
+            ))
+            .expect("append");
         assert_eq!(broker.ledger_snapshot().expect("snap").total_owner_bytes(), 5);
     }
 

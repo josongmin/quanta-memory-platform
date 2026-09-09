@@ -16,7 +16,9 @@ use crate::fixtures::{MemoryFixture, MemoryTestKit};
 use quanta_memory_platform_facade::{
     AbortDispositionV1, PrepareDispositionV1, PreparedPublicationErrorV1,
     PreparedPublicationIdentityV1, PreparedPublicationRequestV1, PreparedPublicationService,
-    PreparedPublicationStatsV1, PreparedPublicationTokenV1,
+    PreparedPublicationStatsV1, PreparedPublicationTokenV1, SessionTranscriptStore,
+    SimpleSessionTranscriptStore, TranscriptAppendDispositionV1, TranscriptAppendErrorV1,
+    TranscriptAppendIdentityV1, TranscriptAppendRequestV1, TranscriptRetentionPolicyV1,
 };
 
 #[cfg(feature = "fixtures")]
@@ -27,8 +29,7 @@ use quanta_memory_platform_core::{
 #[cfg(feature = "fixtures")]
 use quanta_memory_platform_facade::{
     AccountingSink, InMemorySpillTarget, PayloadStore, RetainedMapStore, RetainedMapStoreBuilder,
-    RoutedSpillController, SessionTranscriptStore, SimplePayloadStore,
-    SimpleSessionTranscriptStore, SpillController, SpillTarget,
+    RoutedSpillController, SimplePayloadStore, SpillController, SpillTarget,
 };
 #[cfg(feature = "fixtures")]
 use std::sync::Arc;
@@ -144,6 +145,125 @@ where
                 ),
             format!(
                 "resolution={resolution:?} abort={abort_first:?} replay={abort_replay:?} final={final_stats:?}"
+            ),
+        ),
+    ]
+}
+
+/// Backend-neutral target for transcript append idempotency conformance.
+pub trait TranscriptAppendConformanceTarget {
+    fn append(
+        &self,
+        session_id: &[u8],
+        sequence: u64,
+        message_id: &[u8],
+        body: &[u8],
+    ) -> Result<TranscriptAppendDispositionV1, TranscriptAppendErrorV1>;
+    fn load(&self, session_id: &[u8]) -> Result<Vec<(u64, Vec<u8>, Vec<u8>)>, MemoryError>;
+    fn truncate_to(&self, session_id: &[u8], max_messages: usize) -> Result<(), MemoryError>;
+    fn retained_bytes(&self) -> Result<u64, MemoryError>;
+}
+
+impl TranscriptAppendConformanceTarget for SimpleSessionTranscriptStore<Vec<u8>, Vec<u8>, Vec<u8>> {
+    fn append(
+        &self,
+        session_id: &[u8],
+        sequence: u64,
+        message_id: &[u8],
+        body: &[u8],
+    ) -> Result<TranscriptAppendDispositionV1, TranscriptAppendErrorV1> {
+        SessionTranscriptStore::append(
+            self,
+            TranscriptAppendRequestV1::new(
+                TranscriptAppendIdentityV1::new(session_id.to_vec(), sequence, message_id.to_vec()),
+                body.to_vec(),
+            ),
+        )
+    }
+
+    fn load(&self, session_id: &[u8]) -> Result<Vec<(u64, Vec<u8>, Vec<u8>)>, MemoryError> {
+        SessionTranscriptStore::load(self, &session_id.to_vec()).map(|rows| {
+            rows.into_iter()
+                .map(|row| (row.sequence(), row.message_id().clone(), row.into_body()))
+                .collect()
+        })
+    }
+
+    fn truncate_to(&self, session_id: &[u8], max_messages: usize) -> Result<(), MemoryError> {
+        SessionTranscriptStore::truncate_to(self, &session_id.to_vec(), max_messages)
+    }
+
+    fn retained_bytes(&self) -> Result<u64, MemoryError> {
+        self.retained_bytes()
+    }
+}
+
+/// Exercise exact replay, all three collision axes, ordered load, and a
+/// truncate-late-retry tombstone against any transcript target.
+pub fn run_transcript_append_suite<T>(target: &T) -> Vec<AssertionVerdict>
+where
+    T: TranscriptAppendConformanceTarget,
+{
+    let replay = InvariantAssertion::new(
+        ContractFamily::ReserveFailClosed,
+        "transcript_exact_replay_is_inert",
+    );
+    let collisions = InvariantAssertion::new(
+        ContractFamily::ReserveFailClosed,
+        "transcript_collision_axes_are_typed",
+    );
+    let retention = InvariantAssertion::new(
+        ContractFamily::ReclaimAccounting,
+        "transcript_truncate_preserves_retry_tombstone",
+    );
+
+    let first = target.append(b"s", 0, b"m0", b"one");
+    let replayed = target.append(b"s", 0, b"m0", b"one");
+    let rows_after_replay = target.load(b"s");
+    let bytes_after_replay = target.retained_bytes();
+    let payload_conflict = target.append(b"s", 0, b"m0", b"different");
+    let sequence_conflict = target.append(b"s", 0, b"m1", b"one");
+    let message_conflict = target.append(b"s", 1, b"m0", b"one");
+
+    let second = target.append(b"s", 1, b"m1", b"four");
+    let truncate = target.truncate_to(b"s", 1);
+    let late_retry = target.append(b"s", 1, b"m1", b"four");
+    let rows_after_late_retry = target.load(b"s");
+    let bytes_after_late_retry = target.retained_bytes();
+
+    vec![
+        replay.assert_that(
+            matches!(first, Ok(TranscriptAppendDispositionV1::Applied))
+                && matches!(replayed, Ok(TranscriptAppendDispositionV1::Replayed))
+                && matches!(&rows_after_replay, Ok(rows) if rows.len() == 1)
+                && matches!(bytes_after_replay, Ok(3)),
+            format!(
+                "first={first:?} replay={replayed:?} rows={rows_after_replay:?} bytes={bytes_after_replay:?}"
+            ),
+        ),
+        collisions.assert_that(
+            matches!(
+                payload_conflict,
+                Err(TranscriptAppendErrorV1::PayloadConflict { sequence: 0 })
+            ) && matches!(
+                sequence_conflict,
+                Err(TranscriptAppendErrorV1::SequenceConflict { sequence: 0 })
+            ) && matches!(
+                message_conflict,
+                Err(TranscriptAppendErrorV1::MessageIdConflict)
+            ),
+            format!(
+                "payload={payload_conflict:?} sequence={sequence_conflict:?} message={message_conflict:?}"
+            ),
+        ),
+        retention.assert_that(
+            matches!(second, Ok(TranscriptAppendDispositionV1::Applied))
+                && truncate.is_ok()
+                && matches!(late_retry, Ok(TranscriptAppendDispositionV1::Replayed))
+                && matches!(&rows_after_late_retry, Ok(rows) if rows.len() == 1)
+                && matches!(bytes_after_late_retry, Ok(3)),
+            format!(
+                "second={second:?} truncate={truncate:?} late={late_retry:?} rows={rows_after_late_retry:?} bytes={bytes_after_late_retry:?}"
             ),
         ),
     ]
@@ -630,14 +750,22 @@ fn run_transcript_slice(kit: &MemoryTestKit) -> Vec<AssertionVerdict> {
         }
     };
     let sink = LiveBrokerAccountingSink::shared(broker.clone());
-    let store = SimpleSessionTranscriptStore::<String, String>::new(binding(
-        MemoryClass::SessionTranscript,
-        "conformance:transcript",
-    ))
+    let store = SimpleSessionTranscriptStore::<String, String, String>::new(
+        binding(MemoryClass::SessionTranscript, "conformance:transcript"),
+        TranscriptRetentionPolicyV1::process_lifetime(),
+    )
     .charged_against(sink);
     let truncate = store
-        .append("s".to_string(), "aa".to_string())
-        .and_then(|_| store.append("s".to_string(), "bbbbbbbb".to_string()));
+        .append(TranscriptAppendRequestV1::new(
+            TranscriptAppendIdentityV1::new("s".to_string(), 0, "m0".to_string()),
+            "aa".to_string(),
+        ))
+        .and_then(|_| {
+            store.append(TranscriptAppendRequestV1::new(
+                TranscriptAppendIdentityV1::new("s".to_string(), 1, "m1".to_string()),
+                "bbbbbbbb".to_string(),
+            ))
+        });
     let before_truncate = broker_bytes(&broker);
     let truncate_result = store.truncate_to(&"s".to_string(), 1);
     let after_truncate = broker_bytes(&broker);
@@ -663,12 +791,15 @@ fn run_transcript_slice(kit: &MemoryTestKit) -> Vec<AssertionVerdict> {
         }
     };
     let tiny_sink = LiveBrokerAccountingSink::shared(tiny_broker.clone());
-    let tiny_store = SimpleSessionTranscriptStore::<String, String>::new(binding(
-        MemoryClass::SessionTranscript,
-        "conformance:transcript-tight",
-    ))
+    let tiny_store = SimpleSessionTranscriptStore::<String, String, String>::new(
+        binding(MemoryClass::SessionTranscript, "conformance:transcript-tight"),
+        TranscriptRetentionPolicyV1::process_lifetime(),
+    )
     .charged_against(tiny_sink);
-    let over_cap = tiny_store.append("s".to_string(), "toolong".to_string());
+    let over_cap = tiny_store.append(TranscriptAppendRequestV1::new(
+        TranscriptAppendIdentityV1::new("s".to_string(), 0, "m0".to_string()),
+        "toolong".to_string(),
+    ));
     let tiny_ledger_after = broker_bytes(&tiny_broker);
     let tiny_retained_after = tiny_store.retained_bytes().map_err(|e| e.to_string());
 
@@ -684,7 +815,10 @@ fn run_transcript_slice(kit: &MemoryTestKit) -> Vec<AssertionVerdict> {
             ),
         ),
         fail_closed.assert_that(
-            matches!(&over_cap, Err(MemoryError::Capacity(_)))
+            matches!(
+                &over_cap,
+                Err(TranscriptAppendErrorV1::Accounting(MemoryError::Capacity(_)))
+            )
                 && matches!(&tiny_ledger_after, Ok(bytes) if *bytes == 0)
                 && matches!(&tiny_retained_after, Ok(bytes) if *bytes == 0)
                 && tiny_store.stats().item_count == 0,
@@ -836,6 +970,77 @@ mod tests {
         let fake = BrokenPreparedTarget::default();
         let verdicts = run_prepared_publication_suite(&fake);
         assert!(!all_held(&verdicts), "duplicate-charging fake must be rejected");
+        assert!(
+            violated(&verdicts).contains(&ContractFamily::ReserveFailClosed),
+            "duplicate mutation must localize to fail-closed: {verdicts:?}"
+        );
+    }
+
+    #[test]
+    fn transcript_append_suite_accepts_honest_service() {
+        let store = SimpleSessionTranscriptStore::<Vec<u8>, Vec<u8>, Vec<u8>>::new(
+            StoreBindingHandle::new(
+                MemoryClass::SessionTranscript,
+                "transcript-conformance".to_string(),
+                None,
+            ),
+            TranscriptRetentionPolicyV1::process_lifetime(),
+        );
+        let verdicts = run_transcript_append_suite(&store);
+        assert!(all_held(&verdicts), "honest transcript store failed: {verdicts:?}");
+    }
+
+    #[derive(Debug, Default)]
+    struct BrokenTranscriptTarget {
+        rows: std::sync::Mutex<Vec<(u64, Vec<u8>, Vec<u8>)>>,
+    }
+
+    impl TranscriptAppendConformanceTarget for BrokenTranscriptTarget {
+        fn append(
+            &self,
+            _session_id: &[u8],
+            sequence: u64,
+            message_id: &[u8],
+            body: &[u8],
+        ) -> Result<TranscriptAppendDispositionV1, TranscriptAppendErrorV1> {
+            self.rows
+                .lock()
+                .map_err(|_| {
+                    TranscriptAppendErrorV1::Storage(MemoryError::InvalidState(
+                        "poisoned".to_string(),
+                    ))
+                })?
+                .push((sequence, message_id.to_vec(), body.to_vec()));
+            Ok(TranscriptAppendDispositionV1::Applied)
+        }
+
+        fn load(&self, _session_id: &[u8]) -> Result<Vec<(u64, Vec<u8>, Vec<u8>)>, MemoryError> {
+            self.rows
+                .lock()
+                .map(|rows| rows.clone())
+                .map_err(|_| MemoryError::InvalidState("poisoned".to_string()))
+        }
+
+        fn truncate_to(&self, _session_id: &[u8], max_messages: usize) -> Result<(), MemoryError> {
+            self.rows
+                .lock()
+                .map(|mut rows| rows.truncate(max_messages))
+                .map_err(|_| MemoryError::InvalidState("poisoned".to_string()))
+        }
+
+        fn retained_bytes(&self) -> Result<u64, MemoryError> {
+            self.rows
+                .lock()
+                .map(|rows| rows.iter().map(|(_, _, body)| body.len() as u64).sum())
+                .map_err(|_| MemoryError::InvalidState("poisoned".to_string()))
+        }
+    }
+
+    #[test]
+    fn transcript_append_suite_rejects_non_idempotent_fake() {
+        let fake = BrokenTranscriptTarget::default();
+        let verdicts = run_transcript_append_suite(&fake);
+        assert!(!all_held(&verdicts), "append-every-time fake must be rejected");
         assert!(
             violated(&verdicts).contains(&ContractFamily::ReserveFailClosed),
             "duplicate mutation must localize to fail-closed: {verdicts:?}"
