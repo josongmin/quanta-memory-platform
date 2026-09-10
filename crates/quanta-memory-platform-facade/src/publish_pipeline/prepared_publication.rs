@@ -10,6 +10,9 @@ use crate::shared::accounting::SharedAccountingSink;
 use crate::shared::measure::{ByteSized, CanonicalKey};
 
 const TOKEN_DOMAIN: &[u8] = b"qmp.prepared-publication.v1\0";
+const DEFAULT_TOMBSTONE_COUNT_CAPACITY: usize = 4_096;
+const DEFAULT_TOMBSTONE_BYTES_CAPACITY: u64 = 4 * 1024 * 1024;
+const TOKEN_BYTES: u64 = 32;
 
 /// Caller-owned stable identity for one logical publication attempt.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -119,16 +122,37 @@ impl PreparedPublicationReceiptV1 {
 pub struct PreparedPublicationStatsV1 {
     pub prepared_count: usize,
     pub charged_bytes: u64,
+    pub tombstone_count: usize,
+    pub tombstone_bytes: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PreparedPublicationErrorV1 {
-    InvalidIdentity { reason: String },
-    Capacity { requested_bytes: u64, available_bytes: u64 },
-    IdentityConflict { identity: PreparedPublicationIdentityV1 },
-    TokenCollision { token: PreparedPublicationTokenV1 },
-    UnknownToken { token: PreparedPublicationTokenV1 },
-    AbortedToken { token: PreparedPublicationTokenV1 },
+    InvalidIdentity {
+        reason: String,
+    },
+    Capacity {
+        requested_bytes: u64,
+        available_bytes: u64,
+    },
+    TombstoneCapacity {
+        requested_count: usize,
+        available_count: usize,
+        requested_bytes: u64,
+        available_bytes: u64,
+    },
+    IdentityConflict {
+        identity: PreparedPublicationIdentityV1,
+    },
+    TokenCollision {
+        token: PreparedPublicationTokenV1,
+    },
+    UnknownToken {
+        token: PreparedPublicationTokenV1,
+    },
+    AbortedToken {
+        token: PreparedPublicationTokenV1,
+    },
     Accounting(MemoryError),
     Storage(MemoryError),
 }
@@ -140,6 +164,15 @@ impl Display for PreparedPublicationErrorV1 {
             Self::Capacity { requested_bytes, available_bytes } => write!(
                 f,
                 "prepared publication capacity exceeded: requested {requested_bytes}, available {available_bytes}"
+            ),
+            Self::TombstoneCapacity {
+                requested_count,
+                available_count,
+                requested_bytes,
+                available_bytes,
+            } => write!(
+                f,
+                "prepared publication tombstone capacity exceeded: requested {requested_count} entries/{requested_bytes} bytes, available {available_count} entries/{available_bytes} bytes"
             ),
             Self::IdentityConflict { identity } => {
                 write!(f, "prepared publication identity conflict: {identity:?}")
@@ -175,6 +208,7 @@ struct PreparedState<Payload> {
     identity_index: BTreeMap<PreparedPublicationIdentityV1, IdentityState>,
     aborted_tokens: BTreeSet<PreparedPublicationTokenV1>,
     charged_bytes: u64,
+    tombstone_bytes: u64,
 }
 
 /// In-memory prepared-publication owner. It proves process-lifetime atomicity
@@ -184,6 +218,8 @@ struct PreparedState<Payload> {
 pub struct PreparedPublicationService<Payload> {
     binding: StoreBindingHandle,
     capacity_bytes: Option<u64>,
+    tombstone_count_capacity: usize,
+    tombstone_bytes_capacity: u64,
     charger: Option<SharedAccountingSink>,
     state: Mutex<PreparedState<Payload>>,
 }
@@ -199,8 +235,22 @@ impl<Payload> PreparedPublicationService<Payload> {
                 identity_index: BTreeMap::new(),
                 aborted_tokens: BTreeSet::new(),
                 charged_bytes: 0,
+                tombstone_bytes: 0,
             }),
+            tombstone_count_capacity: DEFAULT_TOMBSTONE_COUNT_CAPACITY,
+            tombstone_bytes_capacity: DEFAULT_TOMBSTONE_BYTES_CAPACITY,
         }
+    }
+
+    /// Bound process-lifetime retry tombstones by both cardinality and logical
+    /// key bytes. Saturation fails abort/GC before payload or accounting state
+    /// changes; it never forgets retry evidence and never resurrects an aborted
+    /// publication.
+    #[must_use]
+    pub fn with_tombstone_limits(mut self, max_count: usize, max_bytes: u64) -> Self {
+        self.tombstone_count_capacity = max_count;
+        self.tombstone_bytes_capacity = max_bytes;
+        self
     }
 
     #[must_use]
@@ -341,6 +391,7 @@ where
             .entries
             .get(token)
             .ok_or_else(|| PreparedPublicationErrorV1::UnknownToken { token: token.clone() })?;
+        let tombstone_bytes = self.ensure_tombstone_capacity(&state, [entry])?;
         if let (Some(sink), Some(ticket)) = (&self.charger, &entry.ticket) {
             sink.refund(ticket).map_err(PreparedPublicationErrorV1::Accounting)?;
         }
@@ -352,6 +403,12 @@ where
         state.charged_bytes = state.charged_bytes.saturating_sub(entry.charged_bytes);
         state.identity_index.insert(entry.identity, IdentityState::Aborted(token.clone()));
         state.aborted_tokens.insert(token.clone());
+        state.tombstone_bytes =
+            state.tombstone_bytes.checked_add(tombstone_bytes).ok_or_else(|| {
+                PreparedPublicationErrorV1::Storage(MemoryError::InvalidState(
+                    "prepared publication tombstone-byte counter overflow".to_string(),
+                ))
+            })?;
         Ok(AbortDispositionV1::Aborted)
     }
 
@@ -397,6 +454,19 @@ where
             prepared_tokens.push(token);
         }
 
+        let tombstone_entries = prepared_tokens
+            .iter()
+            .map(|token| {
+                state.entries.get(token).ok_or_else(|| {
+                    PreparedPublicationErrorV1::Storage(MemoryError::InvalidState(
+                        "classified prepared token disappeared before tombstone admission"
+                            .to_string(),
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let tombstone_bytes = self.ensure_tombstone_capacity(&state, tombstone_entries)?;
+
         if let Some(sink) = &self.charger {
             sink.refund_many(&tickets).map_err(PreparedPublicationErrorV1::Accounting)?;
         }
@@ -413,6 +483,12 @@ where
             state.aborted_tokens.insert(token.clone());
         }
         state.charged_bytes = state.charged_bytes.saturating_sub(reclaimed_bytes);
+        state.tombstone_bytes =
+            state.tombstone_bytes.checked_add(tombstone_bytes).ok_or_else(|| {
+                PreparedPublicationErrorV1::Storage(MemoryError::InvalidState(
+                    "prepared publication tombstone-byte counter overflow".to_string(),
+                ))
+            })?;
         Ok(prepared_tokens.len())
     }
 
@@ -421,7 +497,54 @@ where
         Ok(PreparedPublicationStatsV1 {
             prepared_count: state.entries.len(),
             charged_bytes: state.charged_bytes,
+            tombstone_count: state.aborted_tokens.len(),
+            tombstone_bytes: state.tombstone_bytes,
         })
+    }
+
+    fn ensure_tombstone_capacity<'a>(
+        &self,
+        state: &PreparedState<Payload>,
+        entries: impl IntoIterator<Item = &'a PreparedEntry<Payload>>,
+    ) -> Result<u64, PreparedPublicationErrorV1>
+    where
+        Payload: 'a,
+    {
+        let mut requested_count = 0usize;
+        let mut requested_bytes = 0u64;
+        for entry in entries {
+            requested_count = requested_count.checked_add(1).ok_or_else(|| {
+                PreparedPublicationErrorV1::Storage(MemoryError::InvalidState(
+                    "prepared publication tombstone-count overflow".to_string(),
+                ))
+            })?;
+            let identity_bytes = u64::try_from(entry.identity.as_bytes().len()).map_err(|_| {
+                PreparedPublicationErrorV1::Storage(MemoryError::InvalidState(
+                    "prepared publication identity length does not fit u64".to_string(),
+                ))
+            })?;
+            requested_bytes = requested_bytes
+                .checked_add(identity_bytes)
+                .and_then(|bytes| bytes.checked_add(TOKEN_BYTES))
+                .ok_or_else(|| {
+                    PreparedPublicationErrorV1::Storage(MemoryError::InvalidState(
+                        "prepared publication tombstone-byte counter overflow".to_string(),
+                    ))
+                })?;
+        }
+
+        let available_count =
+            self.tombstone_count_capacity.saturating_sub(state.aborted_tokens.len());
+        let available_bytes = self.tombstone_bytes_capacity.saturating_sub(state.tombstone_bytes);
+        if requested_count > available_count || requested_bytes > available_bytes {
+            return Err(PreparedPublicationErrorV1::TombstoneCapacity {
+                requested_count,
+                available_count,
+                requested_bytes,
+                available_bytes,
+            });
+        }
+        Ok(requested_bytes)
     }
 }
 
@@ -536,7 +659,15 @@ mod tests {
             service.resolve(receipt.token()),
             Err(PreparedPublicationErrorV1::AbortedToken { .. })
         ));
-        assert_eq!(service.stats().expect("stats"), PreparedPublicationStatsV1::default());
+        assert_eq!(
+            service.stats().expect("stats"),
+            PreparedPublicationStatsV1 {
+                prepared_count: 0,
+                charged_bytes: 0,
+                tombstone_count: 1,
+                tombstone_bytes: 36,
+            }
+        );
     }
 
     #[test]
@@ -628,7 +759,11 @@ mod tests {
         assert_eq!(service.resolve(second.token()).expect("second intact"), b"two".to_vec());
         assert_eq!(
             service.stats().expect("stats"),
-            PreparedPublicationStatsV1 { prepared_count: 2, charged_bytes: 6 }
+            PreparedPublicationStatsV1 {
+                prepared_count: 2,
+                charged_bytes: 6,
+                ..PreparedPublicationStatsV1::default()
+            }
         );
     }
 
@@ -646,7 +781,59 @@ mod tests {
         assert_eq!(service.resolve(survivor.token()).expect("survivor intact"), b"two".to_vec());
         assert_eq!(
             service.stats().expect("stats"),
-            PreparedPublicationStatsV1 { prepared_count: 1, charged_bytes: 3 }
+            PreparedPublicationStatsV1 {
+                prepared_count: 1,
+                charged_bytes: 3,
+                tombstone_count: 1,
+                tombstone_bytes: 36,
+            }
+        );
+    }
+
+    #[test]
+    fn tombstone_limits_bound_n_cycle_churn_and_fail_closed_at_saturation() {
+        const MAX_TOMBSTONES: usize = 4;
+        const TOMBSTONE_BYTES_PER_CYCLE: u64 = 36;
+        let service = service(None).with_tombstone_limits(
+            MAX_TOMBSTONES,
+            MAX_TOMBSTONES as u64 * TOMBSTONE_BYTES_PER_CYCLE,
+        );
+
+        for cycle in 0..MAX_TOMBSTONES {
+            let identity = format!("id-{cycle}");
+            service.prepare(request(&identity, b"x")).expect("prepare");
+            assert_eq!(service.gc_orphans(&[]).expect("gc"), 1);
+        }
+        assert_eq!(
+            service.stats().expect("bounded stats"),
+            PreparedPublicationStatsV1 {
+                prepared_count: 0,
+                charged_bytes: 0,
+                tombstone_count: MAX_TOMBSTONES,
+                tombstone_bytes: MAX_TOMBSTONES as u64 * TOMBSTONE_BYTES_PER_CYCLE,
+            }
+        );
+
+        let saturated = service.prepare(request("id-4", b"x")).expect("prepare at limit");
+        let error = service.gc_orphans(&[]).expect_err("GC must fail before dropping payload");
+        assert!(matches!(
+            error,
+            PreparedPublicationErrorV1::TombstoneCapacity {
+                requested_count: 1,
+                available_count: 0,
+                requested_bytes: TOMBSTONE_BYTES_PER_CYCLE,
+                available_bytes: 0,
+            }
+        ));
+        assert_eq!(service.resolve(saturated.token()).expect("payload intact"), b"x".to_vec());
+        assert_eq!(
+            service.stats().expect("saturated stats"),
+            PreparedPublicationStatsV1 {
+                prepared_count: 1,
+                charged_bytes: 1,
+                tombstone_count: MAX_TOMBSTONES,
+                tombstone_bytes: MAX_TOMBSTONES as u64 * TOMBSTONE_BYTES_PER_CYCLE,
+            }
         );
     }
 
@@ -745,7 +932,11 @@ mod tests {
             assert_eq!(service.resolve(second.token()).expect("second intact"), b"two".to_vec());
             assert_eq!(
                 service.stats().expect("stats"),
-                PreparedPublicationStatsV1 { prepared_count: 2, charged_bytes: 6 }
+                PreparedPublicationStatsV1 {
+                    prepared_count: 2,
+                    charged_bytes: 6,
+                    ..PreparedPublicationStatsV1::default()
+                }
             );
             assert_eq!(broker.ledger_snapshot().expect("snapshot").total_owner_bytes(), 6);
 

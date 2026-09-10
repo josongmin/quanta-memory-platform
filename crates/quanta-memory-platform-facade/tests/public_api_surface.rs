@@ -180,6 +180,7 @@ fn prepared_publication_builder_exposes_root_bound_resolution_contract() {
             None,
         ))
         .with_capacity_bytes(1024)
+        .with_tombstone_limits(16, 4096)
         .build()
         .expect("prepared publication builder");
     let identity = PreparedPublicationIdentityV1::new(b"root-owned-id".to_vec()).expect("identity");

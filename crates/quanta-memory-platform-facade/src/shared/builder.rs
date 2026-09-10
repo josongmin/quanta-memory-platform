@@ -383,6 +383,7 @@ impl<Stage, Commit, Published> PublishPipelineBuilder<Stage, Commit, Published> 
 pub struct PreparedPublicationServiceBuilder<Payload> {
     binding: Option<StoreBindingHandle>,
     capacity_bytes: Option<u64>,
+    tombstone_limits: Option<(usize, u64)>,
     charger: Option<SharedAccountingSink>,
     _marker: PhantomData<Payload>,
 }
@@ -390,7 +391,13 @@ pub struct PreparedPublicationServiceBuilder<Payload> {
 #[cfg(feature = "publish_pipeline")]
 impl<Payload> Default for PreparedPublicationServiceBuilder<Payload> {
     fn default() -> Self {
-        Self { binding: None, capacity_bytes: None, charger: None, _marker: PhantomData }
+        Self {
+            binding: None,
+            capacity_bytes: None,
+            tombstone_limits: None,
+            charger: None,
+            _marker: PhantomData,
+        }
     }
 }
 
@@ -411,6 +418,14 @@ impl<Payload> PreparedPublicationServiceBuilder<Payload> {
         self
     }
 
+    /// Bound process-lifetime retry tombstones retained after abort or orphan
+    /// collection. Saturation fails the transition before any payload change.
+    #[must_use]
+    pub fn with_tombstone_limits(mut self, max_count: usize, max_bytes: u64) -> Self {
+        self.tombstone_limits = Some((max_count, max_bytes));
+        self
+    }
+
     #[must_use]
     pub fn charged_against(mut self, sink: SharedAccountingSink) -> Self {
         self.charger = Some(sink);
@@ -420,6 +435,9 @@ impl<Payload> PreparedPublicationServiceBuilder<Payload> {
     pub fn build(self) -> MemoryResult<PreparedPublicationService<Payload>> {
         let binding = self.binding.ok_or_else(missing_binding)?;
         let mut service = PreparedPublicationService::new(binding, self.capacity_bytes);
+        if let Some((max_count, max_bytes)) = self.tombstone_limits {
+            service = service.with_tombstone_limits(max_count, max_bytes);
+        }
         if let Some(sink) = self.charger {
             service = service.charged_against(sink);
         }

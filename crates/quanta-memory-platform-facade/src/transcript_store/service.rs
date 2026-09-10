@@ -204,6 +204,42 @@ where
     }
 }
 
+impl<SessionId, MessageId, Message> SimpleSessionTranscriptStore<SessionId, MessageId, Message>
+where
+    SessionId: Clone + Ord,
+    MessageId: Clone + Ord,
+    Message: Clone + ByteSized + CanonicalKey,
+{
+    /// Select and retain active rows from one store-owned snapshot.
+    ///
+    /// The selector receives rows ordered by sequence and returns the exact
+    /// sequence set to retain. Selection failure leaves rows and accounting
+    /// unchanged.
+    pub fn retain_sequences_selected_from_snapshot<F>(
+        &self,
+        session_id: &SessionId,
+        select: F,
+    ) -> MemoryResult<()>
+    where
+        F: FnOnce(&[TranscriptRecordV1<MessageId, Message>]) -> MemoryResult<Vec<u64>>,
+    {
+        let mut state = self.lock()?;
+        let records = state.sessions.get(session_id).map_or_else(Vec::new, |session| {
+            session
+                .rows
+                .values()
+                .map(|entry| TranscriptRecordV1 {
+                    sequence: entry.sequence,
+                    message_id: entry.message_id.clone(),
+                    body: entry.body.clone(),
+                })
+                .collect()
+        });
+        let retained_sequences = select(&records)?;
+        self.retain_sequences_in_state(&mut state, session_id, &retained_sequences)
+    }
+}
+
 impl<SessionId, MessageId, Message> SessionTranscriptStore<SessionId, MessageId, Message>
     for SimpleSessionTranscriptStore<SessionId, MessageId, Message>
 where
@@ -352,8 +388,9 @@ mod tests {
         TranscriptAppendIdentityV1, TranscriptAppendRequestV1, TranscriptRetentionPolicyV1,
     };
     use quanta_memory_platform_core::{MemoryClass, StoreBindingHandle};
-    use std::sync::{Arc, Barrier};
+    use std::sync::{mpsc, Arc, Barrier};
     use std::thread;
+    use std::time::Duration;
 
     type Store = SimpleSessionTranscriptStore<String, String, String>;
 
@@ -576,6 +613,64 @@ mod tests {
         ));
         assert_eq!(store.load(&"s".to_string()).expect("load").len(), 2);
         assert_eq!(store.retained_bytes().expect("after"), before);
+    }
+
+    #[test]
+    fn snapshot_selected_retain_linearizes_against_concurrent_append() {
+        let store = Arc::new(store());
+        store.append(request("s", 0, "m0", "zero")).expect("zero");
+        store.append(request("s", 1, "m1", "one")).expect("one");
+
+        let selection_entered = Arc::new(Barrier::new(2));
+        let release_selection = Arc::new(Barrier::new(2));
+        let retention = {
+            let store = Arc::clone(&store);
+            let selection_entered = Arc::clone(&selection_entered);
+            let release_selection = Arc::clone(&release_selection);
+            thread::spawn(move || {
+                store.retain_sequences_selected_from_snapshot(&"s".to_string(), |rows| {
+                    assert_eq!(
+                        rows.iter().map(TranscriptRecordV1::sequence).collect::<Vec<_>>(),
+                        vec![0, 1]
+                    );
+                    selection_entered.wait();
+                    release_selection.wait();
+                    Ok(vec![0])
+                })
+            })
+        };
+
+        selection_entered.wait();
+        let append_started = Arc::new(Barrier::new(2));
+        let (append_done_tx, append_done_rx) = mpsc::channel();
+        let append = {
+            let store = Arc::clone(&store);
+            let append_started = Arc::clone(&append_started);
+            thread::spawn(move || {
+                append_started.wait();
+                let outcome = store.append(request("s", 2, "m2", "two"));
+                append_done_tx.send(outcome).expect("report append");
+            })
+        };
+        append_started.wait();
+
+        let append_during_selection = append_done_rx.recv_timeout(Duration::from_millis(250));
+        release_selection.wait();
+        retention.join().expect("retention join").expect("retention");
+        append.join().expect("append join");
+        assert!(
+            matches!(append_during_selection, Err(mpsc::RecvTimeoutError::Timeout)),
+            "append committed while the retention snapshot was still being selected"
+        );
+        assert_eq!(
+            store
+                .load(&"s".to_string())
+                .expect("load")
+                .iter()
+                .map(TranscriptRecordV1::sequence)
+                .collect::<Vec<_>>(),
+            vec![0, 2]
+        );
     }
 
     #[test]

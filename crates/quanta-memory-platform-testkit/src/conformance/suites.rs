@@ -175,7 +175,8 @@ where
                         stats_after_cleanup,
                         Ok(PreparedPublicationStatsV1 {
                             prepared_count: 0,
-                            charged_bytes: 0
+                            charged_bytes: 0,
+                            ..
                         })
                     ),
                 format!(
@@ -193,7 +194,7 @@ where
             matches!((&first, &replayed, &before_conflict),
                 (Ok((first_token, PrepareDispositionV1::Applied)),
                  Ok((replay_token, PrepareDispositionV1::Replayed)),
-                 Ok(PreparedPublicationStatsV1 { prepared_count: 1, charged_bytes: 7 }))
+                 Ok(PreparedPublicationStatsV1 { prepared_count: 1, charged_bytes: 7, .. }))
                  if first_token == replay_token),
             format!("first={first:?} replay={replayed:?} stats={before_conflict:?}"),
         ),
@@ -210,7 +211,7 @@ where
                 && matches!(abort_replay, Ok(AbortDispositionV1::Replayed))
                 && matches!(
                     final_stats,
-                    Ok(PreparedPublicationStatsV1 { prepared_count: 0, charged_bytes: 0 })
+                    Ok(PreparedPublicationStatsV1 { prepared_count: 0, charged_bytes: 0, .. })
                 ),
             format!(
                 "resolution={resolution:?} abort={abort_first:?} replay={abort_replay:?} final={final_stats:?}"
@@ -1047,6 +1048,7 @@ mod tests {
             Ok(PreparedPublicationStatsV1 {
                 prepared_count: prepares as usize,
                 charged_bytes: prepares.saturating_mul(7),
+                ..PreparedPublicationStatsV1::default()
             })
         }
     }
