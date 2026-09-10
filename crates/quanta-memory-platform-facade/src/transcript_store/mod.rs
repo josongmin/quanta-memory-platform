@@ -174,6 +174,15 @@ pub trait SessionTranscriptStore<SessionId, MessageId, Message> {
     where
         MessageId: Clone,
         Message: Clone;
+    /// Retain exactly the named active sequences and evict every other active
+    /// row. Identity tombstones survive eviction, so late retries remain
+    /// idempotent. Duplicate or unknown sequence selectors fail closed before
+    /// accounting or row state changes.
+    fn retain_sequences(
+        &self,
+        session_id: &SessionId,
+        retained_sequences: &[u64],
+    ) -> MemoryResult<()>;
     fn truncate_to(&self, session_id: &SessionId, max_messages: usize) -> MemoryResult<()>;
     fn stats(&self) -> StoreStats;
 }

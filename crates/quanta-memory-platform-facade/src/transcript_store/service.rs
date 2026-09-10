@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
 
 use quanta_memory_platform_core::{
@@ -129,6 +129,79 @@ where
             estimated_bytes: state.retained_bytes,
         })
     }
+
+    fn retain_sequences_in_state(
+        &self,
+        state: &mut TranscriptState<SessionId, MessageId, Message>,
+        session_id: &SessionId,
+        retained_sequences: &[u64],
+    ) -> MemoryResult<()> {
+        let retained: BTreeSet<_> = retained_sequences.iter().copied().collect();
+        if retained.len() != retained_sequences.len() {
+            return Err(MemoryError::InvalidState(
+                "transcript retain selector contains duplicate sequences".to_string(),
+            ));
+        }
+
+        let Some(session) = state.sessions.get(session_id) else {
+            return if retained.is_empty() {
+                Ok(())
+            } else {
+                Err(MemoryError::InvalidState(
+                    "transcript retain selector references a missing session".to_string(),
+                ))
+            };
+        };
+        if let Some(sequence) =
+            retained.iter().find(|sequence| !session.rows.contains_key(sequence))
+        {
+            return Err(MemoryError::InvalidState(format!(
+                "transcript retain selector references inactive sequence {sequence}"
+            )));
+        }
+
+        let drop_sequences: Vec<_> =
+            session.rows.keys().copied().filter(|sequence| !retained.contains(sequence)).collect();
+        let mut dropped_bytes = 0u64;
+        let mut dropped_tickets = Vec::new();
+        for sequence in &drop_sequences {
+            let entry = session.rows.get(sequence).ok_or_else(|| {
+                MemoryError::InvalidState("transcript row disappeared during retain".to_string())
+            })?;
+            dropped_bytes = dropped_bytes.checked_add(entry.charged_bytes).ok_or_else(|| {
+                MemoryError::InvalidState("transcript dropped-byte counter overflow".to_string())
+            })?;
+            if let Some(ticket) = &entry.ticket {
+                dropped_tickets.push(ticket.clone());
+            }
+        }
+        let next_retained_bytes =
+            state.retained_bytes.checked_sub(dropped_bytes).ok_or_else(|| {
+                MemoryError::InvalidState("transcript retained-byte underflow".to_string())
+            })?;
+
+        if !dropped_tickets.is_empty() {
+            let sink = self.charger.as_ref().ok_or_else(|| {
+                MemoryError::InvalidState(
+                    "ticketed transcript row has no accounting sink".to_string(),
+                )
+            })?;
+            sink.refund_many(&dropped_tickets)?;
+        }
+
+        let session = state.sessions.get_mut(session_id).ok_or_else(|| {
+            MemoryError::InvalidState("transcript session disappeared during retain".to_string())
+        })?;
+        for sequence in drop_sequences {
+            session.rows.remove(&sequence).ok_or_else(|| {
+                MemoryError::InvalidState("transcript row disappeared during retain".to_string())
+            })?;
+        }
+        // sequence_evidence and message_evidence intentionally survive as
+        // process-lifetime tombstones. They are the late-retry safety owner.
+        state.retained_bytes = next_retained_bytes;
+        Ok(())
+    }
 }
 
 impl<SessionId, MessageId, Message> SessionTranscriptStore<SessionId, MessageId, Message>
@@ -242,50 +315,21 @@ where
         }))
     }
 
+    fn retain_sequences(
+        &self,
+        session_id: &SessionId,
+        retained_sequences: &[u64],
+    ) -> MemoryResult<()> {
+        let mut state = self.lock()?;
+        self.retain_sequences_in_state(&mut state, session_id, retained_sequences)
+    }
+
     fn truncate_to(&self, session_id: &SessionId, max_messages: usize) -> MemoryResult<()> {
         let mut state = self.lock()?;
-        let Some(session) = state.sessions.get(session_id) else {
-            return Ok(());
-        };
-        let drop_sequences: Vec<_> = session.rows.keys().copied().skip(max_messages).collect();
-        let mut dropped_bytes = 0u64;
-        let mut dropped_tickets = Vec::new();
-        for sequence in &drop_sequences {
-            let entry = session.rows.get(sequence).ok_or_else(|| {
-                MemoryError::InvalidState("transcript row disappeared during truncate".to_string())
-            })?;
-            dropped_bytes = dropped_bytes.checked_add(entry.charged_bytes).ok_or_else(|| {
-                MemoryError::InvalidState("transcript dropped-byte counter overflow".to_string())
-            })?;
-            if let Some(ticket) = &entry.ticket {
-                dropped_tickets.push(ticket.clone());
-            }
-        }
-
-        if !dropped_tickets.is_empty() {
-            let sink = self.charger.as_ref().ok_or_else(|| {
-                MemoryError::InvalidState(
-                    "ticketed transcript row has no accounting sink".to_string(),
-                )
-            })?;
-            sink.refund_many(&dropped_tickets)?;
-        }
-
-        let session = state.sessions.get_mut(session_id).ok_or_else(|| {
-            MemoryError::InvalidState("transcript session disappeared during truncate".to_string())
-        })?;
-        for sequence in drop_sequences {
-            session.rows.remove(&sequence).ok_or_else(|| {
-                MemoryError::InvalidState("transcript row disappeared during truncate".to_string())
-            })?;
-        }
-        // sequence_evidence and message_evidence intentionally survive as
-        // process-lifetime tombstones. They are the late-retry safety owner.
-        state.retained_bytes =
-            state.retained_bytes.checked_sub(dropped_bytes).ok_or_else(|| {
-                MemoryError::InvalidState("transcript retained-byte underflow".to_string())
-            })?;
-        Ok(())
+        let retained_sequences = state.sessions.get(session_id).map_or_else(Vec::new, |session| {
+            session.rows.keys().copied().take(max_messages).collect()
+        });
+        self.retain_sequences_in_state(&mut state, session_id, &retained_sequences)
     }
 
     fn stats(&self) -> StoreStats {
@@ -494,6 +538,44 @@ mod tests {
             TranscriptAppendDispositionV1::Replayed
         );
         assert!(store.load(&"s".to_string()).expect("load after retries").is_empty());
+    }
+
+    #[test]
+    fn selective_retain_preserves_sparse_rows_and_evicted_identity_tombstones() {
+        let store = store();
+        store.append(request("s", 0, "m0", "zero")).expect("zero");
+        store.append(request("s", 1, "m1", "one")).expect("one");
+        store.append(request("s", 2, "m2", "two")).expect("two");
+
+        store.retain_sequences(&"s".to_string(), &[0, 2]).expect("retain sparse set");
+
+        let rows = store.load(&"s".to_string()).expect("load");
+        assert_eq!(rows.iter().map(TranscriptRecordV1::sequence).collect::<Vec<_>>(), vec![0, 2]);
+        assert_eq!(store.retained_bytes().expect("bytes"), 7);
+        assert_eq!(
+            store.append(request("s", 1, "m1", "one")).expect("evicted replay"),
+            TranscriptAppendDispositionV1::Replayed
+        );
+        assert_eq!(store.load(&"s".to_string()).expect("load after replay").len(), 2);
+    }
+
+    #[test]
+    fn selective_retain_rejects_invalid_selector_without_mutation() {
+        let store = store();
+        store.append(request("s", 0, "m0", "zero")).expect("zero");
+        store.append(request("s", 1, "m1", "one")).expect("one");
+        let before = store.retained_bytes().expect("before");
+
+        assert!(matches!(
+            store.retain_sequences(&"s".to_string(), &[0, 0]),
+            Err(MemoryError::InvalidState(_))
+        ));
+        assert!(matches!(
+            store.retain_sequences(&"s".to_string(), &[0, 9]),
+            Err(MemoryError::InvalidState(_))
+        ));
+        assert_eq!(store.load(&"s".to_string()).expect("load").len(), 2);
+        assert_eq!(store.retained_bytes().expect("after"), before);
     }
 
     #[test]
