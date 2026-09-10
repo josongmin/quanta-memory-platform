@@ -111,6 +111,40 @@ pub struct TranscriptRecordV1<MessageId, Message> {
     body: Message,
 }
 
+/// Immutable active-row snapshot paired with the session mutation version.
+///
+/// Callers may derive a retention selector without holding the store mutex,
+/// then submit it through `retain_sequences_if_version`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TranscriptSnapshotV1<MessageId, Message> {
+    version: u64,
+    records: Vec<TranscriptRecordV1<MessageId, Message>>,
+}
+
+impl<MessageId, Message> TranscriptSnapshotV1<MessageId, Message> {
+    #[must_use]
+    pub fn version(&self) -> u64 {
+        self.version
+    }
+
+    #[must_use]
+    pub fn records(&self) -> &[TranscriptRecordV1<MessageId, Message>] {
+        &self.records
+    }
+
+    #[must_use]
+    pub fn into_records(self) -> Vec<TranscriptRecordV1<MessageId, Message>> {
+        self.records
+    }
+}
+
+/// Result of a conditional retention mutation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TranscriptRetainDispositionV1 {
+    Applied { version: u64 },
+    StaleSnapshot { expected_version: u64, actual_version: u64 },
+}
+
 impl<MessageId, Message> TranscriptRecordV1<MessageId, Message> {
     #[must_use]
     pub fn sequence(&self) -> u64 {

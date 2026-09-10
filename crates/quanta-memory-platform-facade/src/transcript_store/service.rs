@@ -10,7 +10,8 @@ use crate::shared::accounting::SharedAccountingSink;
 use crate::shared::measure::{ByteSized, CanonicalKey};
 use crate::transcript_store::{
     SessionTranscriptStore, TranscriptAppendDispositionV1, TranscriptAppendErrorV1,
-    TranscriptAppendRequestV1, TranscriptRecordV1, TranscriptRetentionPolicyV1,
+    TranscriptAppendRequestV1, TranscriptRecordV1, TranscriptRetainDispositionV1,
+    TranscriptRetentionPolicyV1, TranscriptSnapshotV1,
 };
 
 const BODY_DIGEST_DOMAIN: &[u8] = b"qmp.transcript-body.v1\0";
@@ -38,6 +39,7 @@ struct MessageEvidence {
 
 #[derive(Debug)]
 struct SessionState<MessageId, Message> {
+    version: u64,
     rows: BTreeMap<u64, TranscriptEntry<MessageId, Message>>,
     sequence_evidence: BTreeMap<u64, SequenceEvidence<MessageId>>,
     message_evidence: BTreeMap<MessageId, MessageEvidence>,
@@ -46,6 +48,7 @@ struct SessionState<MessageId, Message> {
 impl<MessageId, Message> Default for SessionState<MessageId, Message> {
     fn default() -> Self {
         Self {
+            version: 0,
             rows: BTreeMap::new(),
             sequence_evidence: BTreeMap::new(),
             message_evidence: BTreeMap::new(),
@@ -162,6 +165,12 @@ where
 
         let drop_sequences: Vec<_> =
             session.rows.keys().copied().filter(|sequence| !retained.contains(sequence)).collect();
+        if drop_sequences.is_empty() {
+            return Ok(());
+        }
+        let next_version = session.version.checked_add(1).ok_or_else(|| {
+            MemoryError::InvalidState("transcript session version overflow".to_string())
+        })?;
         let mut dropped_bytes = 0u64;
         let mut dropped_tickets = Vec::new();
         for sequence in &drop_sequences {
@@ -197,6 +206,7 @@ where
                 MemoryError::InvalidState("transcript row disappeared during retain".to_string())
             })?;
         }
+        session.version = next_version;
         // sequence_evidence and message_evidence intentionally survive as
         // process-lifetime tombstones. They are the late-retry safety owner.
         state.retained_bytes = next_retained_bytes;
@@ -210,20 +220,14 @@ where
     MessageId: Clone + Ord,
     Message: Clone + ByteSized + CanonicalKey,
 {
-    /// Select and retain active rows from one store-owned snapshot.
-    ///
-    /// The selector receives rows ordered by sequence and returns the exact
-    /// sequence set to retain. Selection failure leaves rows and accounting
-    /// unchanged.
-    pub fn retain_sequences_selected_from_snapshot<F>(
+    /// Copy active rows and their mutation version under the store mutex.
+    /// Caller policy executes after this method releases the mutex.
+    pub fn load_versioned_snapshot(
         &self,
         session_id: &SessionId,
-        select: F,
-    ) -> MemoryResult<()>
-    where
-        F: FnOnce(&[TranscriptRecordV1<MessageId, Message>]) -> MemoryResult<Vec<u64>>,
-    {
-        let mut state = self.lock()?;
+    ) -> MemoryResult<TranscriptSnapshotV1<MessageId, Message>> {
+        let state = self.lock()?;
+        let version = state.sessions.get(session_id).map_or(0, |session| session.version);
         let records = state.sessions.get(session_id).map_or_else(Vec::new, |session| {
             session
                 .rows
@@ -235,8 +239,28 @@ where
                 })
                 .collect()
         });
-        let retained_sequences = select(&records)?;
-        self.retain_sequences_in_state(&mut state, session_id, &retained_sequences)
+        Ok(TranscriptSnapshotV1 { version, records })
+    }
+
+    /// Retain rows only if no append or retention mutation occurred after the
+    /// supplied snapshot. Stale snapshots are reported without mutation.
+    pub fn retain_sequences_if_version(
+        &self,
+        session_id: &SessionId,
+        expected_version: u64,
+        retained_sequences: &[u64],
+    ) -> MemoryResult<TranscriptRetainDispositionV1> {
+        let mut state = self.lock()?;
+        let actual_version = state.sessions.get(session_id).map_or(0, |session| session.version);
+        if actual_version != expected_version {
+            return Ok(TranscriptRetainDispositionV1::StaleSnapshot {
+                expected_version,
+                actual_version,
+            });
+        }
+        self.retain_sequences_in_state(&mut state, session_id, retained_sequences)?;
+        let version = state.sessions.get(session_id).map_or(0, |session| session.version);
+        Ok(TranscriptRetainDispositionV1::Applied { version })
     }
 }
 
@@ -295,6 +319,13 @@ where
                 "transcript retained-byte counter overflow",
             ))
         })?;
+        let next_version = state.sessions.get(&session_id).map_or(Ok(1), |session| {
+            session.version.checked_add(1).ok_or_else(|| {
+                TranscriptAppendErrorV1::Storage(MemoryError::InvalidState(
+                    "transcript session version overflow".to_string(),
+                ))
+            })
+        })?;
         let ticket = self
             .charger
             .as_ref()
@@ -311,6 +342,7 @@ where
             .map_err(TranscriptAppendErrorV1::Accounting)?;
 
         let session = state.sessions.entry(session_id).or_default();
+        session.version = next_version;
         session.rows.insert(
             sequence,
             TranscriptEntry {
@@ -388,9 +420,8 @@ mod tests {
         TranscriptAppendIdentityV1, TranscriptAppendRequestV1, TranscriptRetentionPolicyV1,
     };
     use quanta_memory_platform_core::{MemoryClass, StoreBindingHandle};
-    use std::sync::{mpsc, Arc, Barrier};
+    use std::sync::{Arc, Barrier};
     use std::thread;
-    use std::time::Duration;
 
     type Store = SimpleSessionTranscriptStore<String, String, String>;
 
@@ -616,56 +647,40 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_selected_retain_linearizes_against_concurrent_append() {
-        let store = Arc::new(store());
+    fn versioned_snapshot_retain_rejects_concurrent_append_without_dropping_rows() {
+        let store = store();
         store.append(request("s", 0, "m0", "zero")).expect("zero");
         store.append(request("s", 1, "m1", "one")).expect("one");
-
-        let selection_entered = Arc::new(Barrier::new(2));
-        let release_selection = Arc::new(Barrier::new(2));
-        let retention = {
-            let store = Arc::clone(&store);
-            let selection_entered = Arc::clone(&selection_entered);
-            let release_selection = Arc::clone(&release_selection);
-            thread::spawn(move || {
-                store.retain_sequences_selected_from_snapshot(&"s".to_string(), |rows| {
-                    assert_eq!(
-                        rows.iter().map(TranscriptRecordV1::sequence).collect::<Vec<_>>(),
-                        vec![0, 1]
-                    );
-                    selection_entered.wait();
-                    release_selection.wait();
-                    Ok(vec![0])
-                })
-            })
-        };
-
-        selection_entered.wait();
-        let append_started = Arc::new(Barrier::new(2));
-        let (append_done_tx, append_done_rx) = mpsc::channel();
-        let append = {
-            let store = Arc::clone(&store);
-            let append_started = Arc::clone(&append_started);
-            thread::spawn(move || {
-                append_started.wait();
-                let outcome = store.append(request("s", 2, "m2", "two"));
-                append_done_tx.send(outcome).expect("report append");
-            })
-        };
-        append_started.wait();
-
-        let append_during_selection = append_done_rx.recv_timeout(Duration::from_millis(250));
-        release_selection.wait();
-        retention.join().expect("retention join").expect("retention");
-        append.join().expect("append join");
-        assert!(
-            matches!(append_during_selection, Err(mpsc::RecvTimeoutError::Timeout)),
-            "append committed while the retention snapshot was still being selected"
+        let stale = store.load_versioned_snapshot(&"s".to_string()).expect("snapshot");
+        assert_eq!(stale.version(), 2);
+        store.append(request("s", 2, "m2", "two")).expect("concurrent append");
+        assert_eq!(
+            store
+                .retain_sequences_if_version(&"s".to_string(), stale.version(), &[0])
+                .expect("conditional retain"),
+            TranscriptRetainDispositionV1::StaleSnapshot { expected_version: 2, actual_version: 3 }
         );
         assert_eq!(
             store
                 .load(&"s".to_string())
                 .expect("load")
+                .iter()
+                .map(TranscriptRecordV1::sequence)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+
+        let current = store.load_versioned_snapshot(&"s".to_string()).expect("current snapshot");
+        assert_eq!(
+            store
+                .retain_sequences_if_version(&"s".to_string(), current.version(), &[0, 2])
+                .expect("current retain"),
+            TranscriptRetainDispositionV1::Applied { version: 4 }
+        );
+        assert_eq!(
+            store
+                .load(&"s".to_string())
+                .expect("load after retain")
                 .iter()
                 .map(TranscriptRecordV1::sequence)
                 .collect::<Vec<_>>(),
