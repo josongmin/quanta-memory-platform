@@ -87,5 +87,5 @@ python3 tools/pm/pm.py lint
 
 ## Receipt
 
-- Validator implementation commits: `fd4fdf08c362131193856898a4d7aeb539f59d53`, `dc2e7d0373911ec4fa943a5c0129ebf680ca0817`
-- Receipt: [`receipts/2026-09-20T183609Z-dc2e7d0.md`](receipts/2026-09-20T183609Z-dc2e7d0.md)
+- Validator implementation commits: `fd4fdf08c362131193856898a4d7aeb539f59d53`, `dc2e7d0373911ec4fa943a5c0129ebf680ca0817`, `b91044e4972a550a8d56c781df1e5721c6429172`
+- Receipt: [`receipts/2026-09-20T183609Z-b91044e.md`](receipts/2026-09-20T183609Z-b91044e.md)
