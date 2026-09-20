@@ -45,7 +45,7 @@
 | [QMP-010](QMP-010-policy-totality/TICKET.md) | P1 | IMPLEMENTED | mandatory class totality와 validated policy authority | QMP-000 | core `policy.rs`, `config.rs`, builder/policy tests |
 | [QMP-020](QMP-020-reservation-lifecycle/TICKET.md) | P1 | IMPLEMENTED | reservation typestate, commit-once, abandoned rollback | QMP-010 | core `ledger.rs`, recharge/control seams |
 | [QMP-030](QMP-030-enforced-builder-runtime-view/TICKET.md) | P1 | IMPLEMENTED | enforced default builder, raw authority 축소, broker-bound runtime scratch | QMP-010, QMP-020 | core/facade builders, broker/control/scratch API, examples |
-| [QMP-040](QMP-040-store-lifecycle/TICKET.md) | P1 | BLOCKED | store construction typestate, close/drain, callback lock discipline | QMP-020, QMP-030 | facade shared builder/accounting + all store services |
+| [QMP-040](QMP-040-store-lifecycle/TICKET.md) | P1 | IN_PROGRESS | store construction typestate, close/drain, callback lock discipline | QMP-020, QMP-030 | facade shared builder/accounting + all store services |
 | [QMP-050](QMP-050-total-retained-cost/TICKET.md) | P1 | BLOCKED | total retained-cost accounting | QMP-040 | measure/accounting + store entry cost paths |
 | [QMP-060](QMP-060-transcript-tombstones/TICKET.md) | P1 | BLOCKED | bounded transcript tombstone/idempotency lifecycle | QMP-050 | transcript types/service/builder |
 | [QMP-070](QMP-070-spill-transfer-backings/TICKET.md) | P1 | BLOCKED | reclaim→spill receipt transfer, safe spill semantics, real backings | QMP-020, QMP-040, QMP-050 | revocable/spill/backings/builders |
