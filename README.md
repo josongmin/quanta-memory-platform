@@ -4,6 +4,14 @@ Portable, host-independent memory-platform workspace. It is consumed by the
 Semantica monorepo through a dedicated host adapter (`quanta-memory-host`) and is
 designed to be extracted into its own repository without rewrites.
 
+> **Current qualification status (2026-09-21): NOT production-ready and NOT
+> extraction-ready at audit base `e103771670da3143e2ffebb8950a5dfc7e3d4515`.**
+> Workspace rails pass, but the final audit confirmed accounting-authority and
+> lifecycle gaps, and actual standalone extraction fails. The authoritative
+> remediation inventory, status, dependencies, acceptance criteria, and receipts
+> live in [`tickets/README.md`](./tickets/README.md). Passing a focused test or
+> dry-run does not supersede that status.
+
 ## Packages and dependency direction
 
 ```
