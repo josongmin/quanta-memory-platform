@@ -51,9 +51,12 @@ pub enum ChargeKind {
     LiveScratch,
 }
 
-/// A tentative reservation token. Holding one means bytes have been provisioned
-/// against class/owner/context but not yet committed. It must be either
-/// committed (charge persists) or released (charge is returned).
+/// Compatibility handle for the pre-typestate facade accounting bridge.
+///
+/// New consumers use `PendingReservation` and `CommittedCharge` from the live
+/// broker API. This cloneable handle remains temporarily while QMP-040 migrates
+/// every facade store; the ledger state map, not copies of this value, is the
+/// authority and rejects duplicate commit/release.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReservationTicket {
     /// Per-ledger id (unique within the issuing ledger only).
@@ -65,6 +68,12 @@ pub struct ReservationTicket {
     context: MemoryContextKind,
     kind: ChargeKind,
     bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TicketState {
+    Pending,
+    Committed,
 }
 
 impl ReservationTicket {
@@ -228,10 +237,11 @@ pub struct AccountingLedger {
     context_usage: BTreeMap<MemoryContextKind, UsageBreakdown>,
     /// This ledger's process-unique instance tag, stamped on every issued ticket.
     instance_id: u64,
-    /// Ids of tickets issued by `reserve` and not yet released. Guards against
-    /// double-release / commit-after-release corruption (invariant 7).
-    live_tickets: BTreeSet<u64>,
-    next_ticket_id: u64,
+    /// Canonical reservation state machine. An id exists exactly while its
+    /// charge is live, and can transition only Pending -> Committed -> absent.
+    ticket_states: BTreeMap<u64, TicketState>,
+    /// `None` means the u64 id space was exhausted. IDs never wrap or reuse.
+    next_ticket_id: Option<u64>,
     rebuild_in_progress: bool,
 }
 
@@ -244,8 +254,8 @@ impl AccountingLedger {
             owner_usage: BTreeMap::new(),
             context_usage: BTreeMap::new(),
             instance_id: LEDGER_INSTANCE.fetch_add(1, Ordering::Relaxed),
-            live_tickets: BTreeSet::new(),
-            next_ticket_id: 1,
+            ticket_states: BTreeMap::new(),
+            next_ticket_id: Some(1),
             rebuild_in_progress: false,
         }
     }
@@ -375,9 +385,11 @@ impl AccountingLedger {
         }
 
         // --- all checks passed: mutate ---
-        let id = self.next_ticket_id;
-        self.next_ticket_id = self.next_ticket_id.saturating_add(1);
-        self.live_tickets.insert(id);
+        let id = self.next_ticket_id.ok_or_else(|| {
+            MemoryError::InvalidState("reservation ticket id space exhausted".to_string())
+        })?;
+        self.next_ticket_id = id.checked_add(1);
+        self.ticket_states.insert(id, TicketState::Pending);
 
         // A zero-byte reserve is a real, live, single-use ticket but must not
         // create empty axis entries, so snapshots stay canonical (a 0-byte
@@ -429,15 +441,40 @@ impl AccountingLedger {
                 ticket.id
             )));
         }
-        // Only a live (issued, not-yet-released) ticket can be finalized.
-        // Committing a released or forged ticket is rejected.
-        if !self.live_tickets.contains(&ticket.id) {
-            return Err(MemoryError::InvalidState(format!(
+        match self.ticket_states.get_mut(&ticket.id) {
+            Some(state @ TicketState::Pending) => {
+                *state = TicketState::Committed;
+                Ok(ticket.bytes)
+            }
+            Some(TicketState::Committed) => Err(MemoryError::InvalidState(format!(
+                "commit rejected: ticket {} is already committed",
+                ticket.id
+            ))),
+            None => Err(MemoryError::InvalidState(format!(
                 "commit rejected: ticket {} is not live (already released or never issued)",
                 ticket.id
-            )));
+            ))),
         }
-        Ok(ticket.bytes)
+    }
+
+    /// Cancel a pending reservation even while rebuild fencing is active.
+    /// This is rollback of an incomplete write, not a new live write.
+    pub(crate) fn rollback_pending(&mut self, ticket: &ReservationTicket) -> MemoryResult<()> {
+        self.validate_ledger_identity(ticket, "pending rollback")?;
+        match self.ticket_states.get(&ticket.id) {
+            Some(TicketState::Pending) => {
+                self.apply_release(ticket);
+                Ok(())
+            }
+            Some(TicketState::Committed) => Err(MemoryError::InvalidState(format!(
+                "pending rollback rejected: ticket {} is already committed",
+                ticket.id
+            ))),
+            None => Err(MemoryError::InvalidState(format!(
+                "pending rollback rejected: ticket {} is not live",
+                ticket.id
+            ))),
+        }
     }
 
     /// Release a reservation/charge, subtracting from class, owner, and context
@@ -464,7 +501,7 @@ impl AccountingLedger {
         kind: ChargeKind,
         bytes: u64,
     ) -> MemoryResult<ReservationTicket> {
-        self.validate_release_ticket(old)?;
+        self.validate_committed_ticket(old)?;
         self.apply_release(old);
 
         let replacement = match self.reserve(class, owner, context, kind, bytes) {
@@ -524,13 +561,8 @@ impl AccountingLedger {
         // ledger is rejected first (its id may collide with a live local id),
         // then a replayed/cloned/forged ticket is rejected by the live set, so
         // usage can never drift below truth.
-        if ticket.ledger != self.instance_id {
-            return Err(MemoryError::InvalidState(format!(
-                "release rejected: ticket {} was issued by a different ledger",
-                ticket.id
-            )));
-        }
-        if !self.live_tickets.contains(&ticket.id) {
+        self.validate_ledger_identity(ticket, "release")?;
+        if !self.ticket_states.contains_key(&ticket.id) {
             return Err(MemoryError::InvalidState(format!(
                 "release rejected: ticket {} is not live (already released or never issued)",
                 ticket.id
@@ -539,8 +571,33 @@ impl AccountingLedger {
         Ok(())
     }
 
+    fn validate_committed_ticket(&self, ticket: &ReservationTicket) -> MemoryResult<()> {
+        self.validate_release_ticket(ticket)?;
+        if self.ticket_states.get(&ticket.id) != Some(&TicketState::Committed) {
+            return Err(MemoryError::InvalidState(format!(
+                "operation requires committed ticket {}, but it is pending",
+                ticket.id
+            )));
+        }
+        Ok(())
+    }
+
+    fn validate_ledger_identity(
+        &self,
+        ticket: &ReservationTicket,
+        operation: &str,
+    ) -> MemoryResult<()> {
+        if ticket.ledger != self.instance_id {
+            return Err(MemoryError::InvalidState(format!(
+                "{operation} rejected: ticket {} was issued by a different ledger",
+                ticket.id
+            )));
+        }
+        Ok(())
+    }
+
     fn apply_release(&mut self, ticket: &ReservationTicket) {
-        self.live_tickets.remove(&ticket.id);
+        self.ticket_states.remove(&ticket.id);
         // Subtract the ticket's exact byte magnitude with a `u64` (never an
         // `i64` delta): a ticket with `bytes > i64::MAX` must subtract its full
         // magnitude, not a wrapped value. After subtracting, prune any axis entry
@@ -570,7 +627,7 @@ impl AccountingLedger {
     /// interleave, so this is a deterministic inverse of `apply_release` rather
     /// than a second admission attempt.
     fn restore_released_ticket_v1(&mut self, ticket: &ReservationTicket) {
-        self.live_tickets.insert(ticket.id);
+        self.ticket_states.insert(ticket.id, TicketState::Committed);
         if ticket.bytes == 0 {
             return;
         }
@@ -727,6 +784,36 @@ mod tests {
             matches!(ledger.commit(&ticket), Err(MemoryError::InvalidState(_))),
             "committing a released ticket must be rejected"
         );
+    }
+
+    #[test]
+    fn second_commit_of_same_reservation_is_rejected() {
+        let mut ledger = ledger_from_policy(ResidencyPolicy::new(1_000_000));
+        let ticket =
+            reserve(&mut ledger, MemoryClass::ArtifactCache, "o", 10_000).expect("reserve");
+        let replay = ticket.clone();
+        ledger.commit(&ticket).expect("first commit");
+        let before = ledger.snapshot();
+
+        let second = ledger.commit(&replay);
+
+        assert!(matches!(second, Err(MemoryError::InvalidState(_))));
+        assert_eq!(ledger.snapshot(), before, "duplicate commit must not mutate counters");
+    }
+
+    #[test]
+    fn ticket_id_exhaustion_fails_without_reuse() {
+        let mut ledger = ledger_from_policy(ResidencyPolicy::new(1_000_000));
+        ledger.next_ticket_id = Some(u64::MAX);
+        let last = reserve(&mut ledger, MemoryClass::ArtifactCache, "o", 1)
+            .expect("last representable id is issued once");
+        assert_eq!(last.id(), u64::MAX);
+        let before = ledger.snapshot();
+
+        let exhausted = reserve(&mut ledger, MemoryClass::ArtifactCache, "o", 1);
+
+        assert!(matches!(exhausted, Err(MemoryError::InvalidState(_))));
+        assert_eq!(ledger.snapshot(), before, "exhaustion must not mutate or reuse an id");
     }
 
     // ---- #6: borrowing over a class cap is bounded by the shared burst pool ----

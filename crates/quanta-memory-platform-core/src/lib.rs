@@ -11,7 +11,10 @@ pub use api::broker::{
 };
 pub use api::builder::ProcessMemoryBrokerBuilder;
 #[cfg(feature = "live_control")]
-pub use api::control::LiveProcessMemoryBroker;
+pub use api::control::{
+    ChargeRechargeError, ChargeRechargeRecovery, ChargeReleaseError, CommittedCharge,
+    LiveProcessMemoryBroker, PendingReservation,
+};
 #[cfg(feature = "live_control")]
 pub use application::controller::{
     LadderPressureController, PressureController, PressureThresholds, ReclaimRung,

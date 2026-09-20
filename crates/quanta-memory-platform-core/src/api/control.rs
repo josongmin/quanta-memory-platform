@@ -42,6 +42,102 @@ struct BrokerCore {
     ticket_groups: BTreeMap<u64, String>,
 }
 
+/// An owned pending reservation. This type is intentionally not `Clone`.
+/// Dropping it before commit rolls its class/owner/context/group capacity back,
+/// including while rebuild fencing is active.
+#[derive(Debug)]
+pub struct PendingReservation {
+    broker: LiveProcessMemoryBroker,
+    ticket: Option<ReservationTicket>,
+}
+
+impl PendingReservation {
+    #[must_use]
+    pub fn id(&self) -> u64 {
+        self.ticket.as_ref().expect("pending reservation owns a ticket").id()
+    }
+
+    #[must_use]
+    pub fn bytes(&self) -> u64 {
+        self.ticket.as_ref().expect("pending reservation owns a ticket").bytes()
+    }
+
+    /// Consume this pending authority and produce one committed charge.
+    /// A failed commit rolls the pending reservation back before returning.
+    pub fn commit(mut self) -> MemoryResult<CommittedCharge> {
+        let ticket = self.ticket.take().expect("pending reservation owns a ticket");
+        match self.broker.commit(&ticket) {
+            Ok(_) => Ok(CommittedCharge { ticket }),
+            Err(error) => {
+                self.broker.rollback_pending_ticket(&ticket)?;
+                Err(error)
+            }
+        }
+    }
+}
+
+impl Drop for PendingReservation {
+    fn drop(&mut self) {
+        if let Some(ticket) = self.ticket.take() {
+            let _ = self.broker.rollback_pending_ticket(&ticket);
+        }
+    }
+}
+
+/// Single-owner committed accounting authority.
+///
+/// This type is intentionally not `Clone`:
+///
+/// ```compile_fail
+/// # use quanta_memory_platform_core::CommittedCharge;
+/// # fn cannot_clone(charge: CommittedCharge) {
+/// let duplicate = charge.clone();
+/// # }
+/// ```
+#[derive(Debug, PartialEq, Eq)]
+pub struct CommittedCharge {
+    ticket: ReservationTicket,
+}
+
+impl CommittedCharge {
+    #[must_use]
+    pub fn id(&self) -> u64 {
+        self.ticket.id()
+    }
+
+    #[must_use]
+    pub fn bytes(&self) -> u64 {
+        self.ticket.bytes()
+    }
+
+    #[must_use]
+    pub fn class(&self) -> &MemoryClass {
+        self.ticket.class()
+    }
+}
+
+/// Failed consuming release. The unchanged live charge is returned so the
+/// caller never loses accounting authority on an error path.
+#[derive(Debug)]
+pub struct ChargeReleaseError {
+    pub error: MemoryError,
+    pub charge: CommittedCharge,
+}
+
+/// Recovery disposition for a failed consuming recharge.
+#[derive(Debug)]
+pub enum ChargeRechargeRecovery {
+    ChargePreserved(CommittedCharge),
+    RecoveryRequired { rollback_error: MemoryError },
+}
+
+/// Failed consuming recharge with explicit ownership recovery.
+#[derive(Debug)]
+pub struct ChargeRechargeError {
+    pub error: MemoryError,
+    pub recovery: ChargeRechargeRecovery,
+}
+
 impl LiveProcessMemoryBroker {
     /// Build a live broker from a validated effective report. The residency
     /// policy is re-validated here so a broker can never come up on an invalid
@@ -91,6 +187,20 @@ impl LiveProcessMemoryBroker {
         Self::reserve_on(&mut core, class, owner, context, kind, bytes)
     }
 
+    /// Canonical single-owner reservation path. If the returned value is
+    /// abandoned, its `Drop` implementation rolls the pending capacity back.
+    pub fn reserve_owned(
+        &self,
+        class: MemoryClass,
+        owner: OwnerKey,
+        context: MemoryContextKind,
+        kind: ChargeKind,
+        bytes: u64,
+    ) -> MemoryResult<PendingReservation> {
+        let ticket = self.reserve(class, owner, context, kind, bytes)?;
+        Ok(PendingReservation { broker: self.clone(), ticket: Some(ticket) })
+    }
+
     /// Reserve AND commit under a SINGLE lock acquisition, so no live reconfigure
     /// or rebuild can interleave between the reservation and its commit (which
     /// would otherwise strand reserved bytes behind a discarded ticket). This is
@@ -105,6 +215,72 @@ impl LiveProcessMemoryBroker {
     ) -> MemoryResult<ReservationTicket> {
         let mut core = self.lock()?;
         Self::reserve_committed_on(&mut core, class, owner, context, kind, bytes)
+    }
+
+    /// Canonical atomic reserve+commit path returning non-clone authority.
+    pub fn reserve_committed_owned(
+        &self,
+        class: MemoryClass,
+        owner: OwnerKey,
+        context: MemoryContextKind,
+        kind: ChargeKind,
+        bytes: u64,
+    ) -> MemoryResult<CommittedCharge> {
+        self.reserve_committed(class, owner, context, kind, bytes)
+            .map(|ticket| CommittedCharge { ticket })
+    }
+
+    /// Consume a committed charge. On denial the same charge is returned.
+    ///
+    /// ```compile_fail
+    /// # use quanta_memory_platform_core::{CommittedCharge, LiveProcessMemoryBroker};
+    /// # fn cannot_reuse(broker: &LiveProcessMemoryBroker, charge: CommittedCharge) {
+    /// let result = broker.release_owned(charge);
+    /// let bytes = charge.bytes();
+    /// # }
+    /// ```
+    pub fn release_owned(&self, charge: CommittedCharge) -> Result<(), ChargeReleaseError> {
+        match self.release(&charge.ticket) {
+            Ok(()) => Ok(()),
+            Err(error) => Err(ChargeReleaseError { error, charge }),
+        }
+    }
+
+    /// Consume an old committed charge and atomically return its replacement.
+    /// Every failure branch returns either a live charge or an explicit recovery
+    /// failure; ownership is never silently discarded.
+    pub fn recharge_owned(
+        &self,
+        old: CommittedCharge,
+        class: MemoryClass,
+        owner: OwnerKey,
+        context: MemoryContextKind,
+        kind: ChargeKind,
+        bytes: u64,
+    ) -> Result<CommittedCharge, ChargeRechargeError> {
+        match self.recharge(&old.ticket, class, owner, context, kind, bytes) {
+            Ok(ticket) => Ok(CommittedCharge { ticket }),
+            Err(RechargeError { error, recovery: RechargeRecoveryV1::OldChargePreserved }) => {
+                Err(ChargeRechargeError {
+                    error,
+                    recovery: ChargeRechargeRecovery::ChargePreserved(old),
+                })
+            }
+            Err(RechargeError {
+                error,
+                recovery: RechargeRecoveryV1::OldChargeRestored(ticket),
+            }) => Err(ChargeRechargeError {
+                error,
+                recovery: ChargeRechargeRecovery::ChargePreserved(CommittedCharge { ticket }),
+            }),
+            Err(RechargeError {
+                error,
+                recovery: RechargeRecoveryV1::RecoveryRequired { rollback_error },
+            }) => Err(ChargeRechargeError {
+                error,
+                recovery: ChargeRechargeRecovery::RecoveryRequired { rollback_error },
+            }),
+        }
     }
 
     /// Atomically swap one committed charge for another under a SINGLE lock:
@@ -227,6 +403,19 @@ impl LiveProcessMemoryBroker {
             core.scheduler.record_release(&group, ticket.bytes());
         }
         Ok(())
+    }
+
+    fn rollback_pending_on(core: &mut BrokerCore, ticket: &ReservationTicket) -> MemoryResult<()> {
+        core.ledger.rollback_pending(ticket)?;
+        if let Some(group) = core.ticket_groups.remove(&ticket.id()) {
+            core.scheduler.record_release(&group, ticket.bytes());
+        }
+        Ok(())
+    }
+
+    fn rollback_pending_ticket(&self, ticket: &ReservationTicket) -> MemoryResult<()> {
+        let mut core = self.lock()?;
+        Self::rollback_pending_on(&mut core, ticket)
     }
 
     fn release_many_on(core: &mut BrokerCore, tickets: &[ReservationTicket]) -> MemoryResult<()> {
@@ -632,6 +821,205 @@ mod tests {
     fn broker() -> LiveProcessMemoryBroker {
         LiveProcessMemoryBroker::from_report(report_with(base_residency()))
             .expect("base residency is valid")
+    }
+
+    #[test]
+    fn dropping_pending_reservation_rolls_back_all_axes() {
+        let b = broker();
+        let before = b.ledger_snapshot().expect("before");
+        {
+            let pending = b
+                .reserve_owned(
+                    MemoryClass::ArtifactCache,
+                    "owner:a".to_string(),
+                    MemoryContextKind::Request,
+                    ChargeKind::RetainedPayload,
+                    100_000,
+                )
+                .expect("reserve pending");
+            assert_eq!(pending.bytes(), 100_000);
+            assert_eq!(b.ledger_snapshot().expect("reserved").total_owner_bytes(), 100_000);
+        }
+
+        assert_eq!(b.ledger_snapshot().expect("after drop"), before);
+    }
+
+    #[test]
+    fn dropping_pending_reservation_during_rebuild_does_not_strand_capacity() {
+        let b = broker();
+        let pending = b
+            .reserve_owned(
+                MemoryClass::ArtifactCache,
+                "owner:a".to_string(),
+                MemoryContextKind::Request,
+                ChargeKind::RetainedPayload,
+                100_000,
+            )
+            .expect("reserve pending");
+        b.begin_rebuild().expect("begin rebuild");
+
+        drop(pending);
+
+        let snapshot = b.ledger_snapshot().expect("snapshot");
+        assert!(snapshot.rebuild_in_progress);
+        assert_eq!(snapshot.total_owner_bytes(), 0);
+        b.finish_rebuild().expect("finish rebuild");
+    }
+
+    #[test]
+    fn failed_pending_commit_during_rebuild_rolls_back_capacity() {
+        let b = broker();
+        let pending = b
+            .reserve_owned(
+                MemoryClass::ArtifactCache,
+                "owner:a".to_string(),
+                MemoryContextKind::Request,
+                ChargeKind::RetainedPayload,
+                100_000,
+            )
+            .expect("reserve pending");
+        b.begin_rebuild().expect("begin rebuild");
+
+        assert!(matches!(pending.commit(), Err(MemoryError::InvalidState(_))));
+        assert_eq!(b.ledger_snapshot().expect("snapshot").total_owner_bytes(), 0);
+        b.finish_rebuild().expect("finish rebuild");
+    }
+
+    #[test]
+    fn pending_drop_restores_resource_group_capacity() {
+        let group = ResourceGroup {
+            reserved_bytes: 0,
+            soft_cap_bytes: 100,
+            hard_cap_bytes: 100,
+            burst_percent: 0,
+            reclaim_priority: ReclaimPriority::Normal,
+            admission_weight: 1,
+        };
+        let residency = ResidencyPolicy::new(10_000)
+            .with_class_budget(MemoryClass::ArtifactCache, class_budget(0, 10_000, 10_000, false))
+            .with_resource_group("g", group)
+            .with_owner_group("owner:g", "g");
+        let b = LiveProcessMemoryBroker::from_report(report_with(residency)).expect("broker");
+        let pending = b
+            .reserve_owned(
+                MemoryClass::ArtifactCache,
+                "owner:g".to_string(),
+                MemoryContextKind::Request,
+                ChargeKind::RetainedPayload,
+                100,
+            )
+            .expect("fill group capacity");
+        assert!(!b.admits_group("g", 1).expect("probe full group"));
+
+        drop(pending);
+
+        assert!(b.admits_group("g", 100).expect("capacity restored"));
+        assert_eq!(b.ledger_snapshot().expect("snapshot").total_owner_bytes(), 0);
+    }
+
+    #[test]
+    fn replace_denial_returns_original_live_charge() {
+        let b = broker();
+        let charge = b
+            .reserve_committed_owned(
+                MemoryClass::ArtifactCache,
+                "owner:a".to_string(),
+                MemoryContextKind::Request,
+                ChargeKind::RetainedPayload,
+                100_000,
+            )
+            .expect("seed committed charge");
+
+        let denied = b
+            .recharge_owned(
+                charge,
+                MemoryClass::ArtifactCache,
+                "owner:a".to_string(),
+                MemoryContextKind::Request,
+                ChargeKind::RetainedPayload,
+                700_000,
+            )
+            .expect_err("replacement over class cap is denied");
+        let ChargeRechargeRecovery::ChargePreserved(charge) = denied.recovery else {
+            panic!("broker denial must preserve the old charge");
+        };
+        assert_eq!(charge.bytes(), 100_000);
+        assert_eq!(b.ledger_snapshot().expect("snapshot").total_owner_bytes(), 100_000);
+        b.release_owned(charge).expect("release preserved charge");
+    }
+
+    #[test]
+    fn owned_charge_sequence_matches_exact_reference_model() {
+        let b = broker();
+        let mut live = Vec::<CommittedCharge>::new();
+        let mut model_bytes = 0u64;
+
+        for step in 0..100u64 {
+            match step % 4 {
+                0 => {
+                    let pending = b
+                        .reserve_owned(
+                            MemoryClass::ArtifactCache,
+                            "owner:a".to_string(),
+                            MemoryContextKind::Request,
+                            ChargeKind::RetainedPayload,
+                            100,
+                        )
+                        .expect("pending reserve");
+                    drop(pending);
+                }
+                1 => {
+                    let charge = b
+                        .reserve_owned(
+                            MemoryClass::ArtifactCache,
+                            "owner:a".to_string(),
+                            MemoryContextKind::Request,
+                            ChargeKind::RetainedPayload,
+                            100,
+                        )
+                        .expect("reserve")
+                        .commit()
+                        .expect("commit");
+                    live.push(charge);
+                    model_bytes += 100;
+                }
+                2 if !live.is_empty() => {
+                    let charge = live.pop().expect("non-empty");
+                    model_bytes -= charge.bytes();
+                    b.release_owned(charge).expect("release");
+                }
+                _ if !live.is_empty() => {
+                    let old = live.pop().expect("non-empty");
+                    model_bytes -= old.bytes();
+                    let replacement = b
+                        .recharge_owned(
+                            old,
+                            MemoryClass::ArtifactCache,
+                            "owner:a".to_string(),
+                            MemoryContextKind::Request,
+                            ChargeKind::RetainedPayload,
+                            150,
+                        )
+                        .expect("replacement fits");
+                    model_bytes += replacement.bytes();
+                    live.push(replacement);
+                }
+                _ => {}
+            }
+
+            let snapshot = b.ledger_snapshot().expect("snapshot");
+            assert_eq!(snapshot.total_owner_bytes(), model_bytes, "step {step}");
+            assert!(snapshot.class_owner_balanced(), "step {step}");
+            assert!(snapshot.owner_partition_balanced(), "step {step}");
+            assert!(snapshot.context_owner_balanced(), "step {step}");
+        }
+
+        while let Some(charge) = live.pop() {
+            model_bytes -= charge.bytes();
+            b.release_owned(charge).expect("drain");
+        }
+        assert_eq!(model_bytes, 0);
+        assert_eq!(b.ledger_snapshot().expect("final").total_owner_bytes(), 0);
     }
 
     // --- Invariant 1 & 2: class total == owner total == payload+metadata+scratch
