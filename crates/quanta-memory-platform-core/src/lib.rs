@@ -20,7 +20,7 @@ pub use application::controller::{
 pub use application::scheduler::{ResourceGroupScheduler, WeightedResourceGroupScheduler};
 pub use domain::config::{
     validate_residency, BudgetOverrideLayer, EffectiveBudgetResolver, OverrideRecord,
-    OverrideSource, ResolvedBudget,
+    OverrideSource, ResolvedBudget, ValidatedResidencyPolicy,
 };
 pub use domain::context::{
     MemoryContextHandle, MemoryContextKind, OwnerKey, RuntimeId, RuntimeKind,

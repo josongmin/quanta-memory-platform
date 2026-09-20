@@ -30,9 +30,7 @@ use quanta_memory_platform_facade::{
 // assertions below). These are core re-exports consumed through the facade's
 // public dependency, not facade internals.
 #[cfg(feature = "core-live-accounting")]
-use quanta_memory_platform_core::{
-    EffectiveMemoryBudgetReport, ExecutionBudget, LiveProcessMemoryBroker, ResidencyPolicy,
-};
+use quanta_memory_platform_core::{EffectiveMemoryBudgetReport, LiveProcessMemoryBroker};
 use quanta_memory_platform_core::{MemoryBudgetManifest, MemoryClass, MemoryPreset};
 
 /// Names EVERY always-on facade re-export in type position. Never called; its only
@@ -55,11 +53,7 @@ fn names_always_on_reexports() {
 #[test]
 fn live_broker_bridge_is_present_only_with_core_live_accounting() {
     let report = EffectiveMemoryBudgetReport::from_manifest(
-        MemoryBudgetManifest::new(
-            MemoryPreset::Production,
-            ExecutionBudget::default(),
-            ResidencyPolicy::new(1_000_000),
-        ),
+        MemoryBudgetManifest::for_preset(MemoryPreset::Production),
         vec!["public-api-surface".to_string()],
     );
     let broker = LiveProcessMemoryBroker::from_report(report).expect("valid broker");
@@ -69,11 +63,7 @@ fn live_broker_bridge_is_present_only_with_core_live_accounting() {
 #[cfg(feature = "core-live-accounting")]
 fn public_test_broker() -> LiveProcessMemoryBroker {
     let report = EffectiveMemoryBudgetReport::from_manifest(
-        MemoryBudgetManifest::new(
-            MemoryPreset::Production,
-            ExecutionBudget::default(),
-            ResidencyPolicy::new(1_000_000),
-        ),
+        MemoryBudgetManifest::for_preset(MemoryPreset::Production),
         vec!["public-api-surface".to_string()],
     );
     LiveProcessMemoryBroker::from_report(report).expect("valid broker")

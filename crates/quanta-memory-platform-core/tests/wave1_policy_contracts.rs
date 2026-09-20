@@ -1,7 +1,7 @@
 use quanta_memory_platform_core::{
-    ExecutionBudget, MemoryClass, MemoryClassBudget, MemoryError, MemoryPreset, OwnerQuota,
-    PressureState, ProcessMemoryBroker, ProcessMemoryBrokerBuilder, ReclaimPriority,
-    ResidencyPolicy, ResourceGroup,
+    ExecutionBudget, MemoryBudgetManifest, MemoryClass, MemoryClassBudget, MemoryError,
+    MemoryPreset, OwnerQuota, PressureState, ProcessMemoryBroker, ProcessMemoryBrokerBuilder,
+    ReclaimPriority, ResidencyPolicy, ResourceGroup, ValidatedResidencyPolicy,
 };
 
 #[test]
@@ -30,6 +30,27 @@ fn memory_class_taxonomy_keeps_mandatory_and_future_classes_split() {
     assert!(future.contains(&MemoryClass::ParserResidency));
     assert!(future.contains(&MemoryClass::IdeWorkingSet));
     assert!(!mandatory.iter().any(|class| future.contains(class)));
+}
+
+#[test]
+fn every_preset_and_custom_validated_policy_is_total_over_mandatory_classes() {
+    let policies = [
+        MemoryBudgetManifest::for_preset(MemoryPreset::Development).residency,
+        MemoryBudgetManifest::for_preset(MemoryPreset::Ci).residency,
+        MemoryBudgetManifest::for_preset(MemoryPreset::Production).residency,
+        MemoryBudgetManifest::for_preset(MemoryPreset::Interactive).residency,
+        ResidencyPolicy::new(123_456),
+    ];
+
+    for policy in policies {
+        let validated = ValidatedResidencyPolicy::try_from(policy).expect("policy validates");
+        for class in MemoryClass::mandatory() {
+            assert!(
+                validated.as_policy().classes.contains_key(&class),
+                "validated policy has an explicit entry for {class:?}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -98,8 +119,7 @@ fn memory_error_has_typed_config_and_report_variants() {
 mod live_control_contracts {
     use super::*;
     use quanta_memory_platform_core::{
-        ChargeKind, EffectiveMemoryBudgetReport, LiveProcessMemoryBroker, MemoryBudgetManifest,
-        MemoryContextKind,
+        ChargeKind, EffectiveMemoryBudgetReport, LiveProcessMemoryBroker, MemoryContextKind,
     };
 
     // ============================================================================
@@ -122,6 +142,12 @@ mod live_control_contracts {
         }
     }
 
+    fn permissive_policy(global: u64) -> ResidencyPolicy {
+        MemoryClass::mandatory().into_iter().fold(ResidencyPolicy::new(global), |policy, class| {
+            policy.with_class_budget(class, class_budget(0, global, global, false))
+        })
+    }
+
     fn broker_from_residency(residency: ResidencyPolicy) -> LiveProcessMemoryBroker {
         let report = EffectiveMemoryBudgetReport::from_manifest(
             MemoryBudgetManifest::new(MemoryPreset::Ci, ExecutionBudget::default(), residency),
@@ -141,7 +167,7 @@ mod live_control_contracts {
 
     #[test]
     fn global_hard_limit_denies_reserve_through_public_broker_and_is_fail_closed() {
-        let b = broker_from_residency(ResidencyPolicy::new(1_000));
+        let b = broker_from_residency(permissive_policy(1_000));
         let t = b
             .reserve(
                 MemoryClass::ArtifactCache,
@@ -178,7 +204,7 @@ mod live_control_contracts {
 
     #[test]
     fn headroom_band_is_reserved_for_headroom_class_at_public_surface() {
-        let b = broker_from_residency(ResidencyPolicy::new(1_000).with_headroom_bytes(200));
+        let b = broker_from_residency(permissive_policy(1_000).with_headroom_bytes(200));
 
         let denied = b.reserve(
             MemoryClass::ArtifactCache,
@@ -283,7 +309,7 @@ mod live_control_contracts {
 
     #[test]
     fn double_release_of_cloned_ticket_rejected_through_public_broker() {
-        let b = broker_from_residency(ResidencyPolicy::new(1_000_000));
+        let b = broker_from_residency(permissive_policy(1_000_000));
         let ticket = b
             .reserve(
                 MemoryClass::ArtifactCache,
@@ -322,7 +348,7 @@ mod live_control_contracts {
 
     #[test]
     fn commit_after_release_rejected_through_public_broker() {
-        let b = broker_from_residency(ResidencyPolicy::new(1_000_000));
+        let b = broker_from_residency(permissive_policy(1_000_000));
         let ticket = b
             .reserve(
                 MemoryClass::ArtifactCache,

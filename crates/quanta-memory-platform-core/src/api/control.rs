@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::application::controller::LadderPressureController;
 use crate::application::scheduler::WeightedResourceGroupScheduler;
-use crate::domain::config::validate_residency;
+use crate::domain::config::ValidatedResidencyPolicy;
 use crate::domain::context::{MemoryContextKind, OwnerKey};
 use crate::domain::errors::{MemoryError, MemoryResult};
 use crate::domain::ledger::{AccountingLedger, ChargeKind, LedgerSnapshot, ReservationTicket};
@@ -47,8 +47,8 @@ impl LiveProcessMemoryBroker {
     /// policy is re-validated here so a broker can never come up on an invalid
     /// policy.
     pub fn from_report(report: EffectiveMemoryBudgetReport) -> MemoryResult<Self> {
-        validate_residency(&report.residency)?;
-        let residency = report.residency.clone();
+        let validated = ValidatedResidencyPolicy::try_from(report.residency.clone())?;
+        let residency = validated.as_policy();
         let scheduler = WeightedResourceGroupScheduler::new(
             residency.resource_groups.clone(),
             residency.shared_burst_pool_bytes,
@@ -58,7 +58,7 @@ impl LiveProcessMemoryBroker {
             crate::application::controller::PressureThresholds::default(),
             residency.initial_pressure,
         ));
-        let ledger = AccountingLedger::new(residency);
+        let ledger = AccountingLedger::new(validated);
         Ok(Self {
             inner: Arc::new(Mutex::new(BrokerCore {
                 ledger,
@@ -378,9 +378,9 @@ impl LiveProcessMemoryBroker {
     /// Allowed: raising caps, adding headroom, owner-quota / reclaim-priority
     /// adjustments that still honor live usage without remapping live owners.
     pub fn try_live_reconfigure(&self, new_policy: ResidencyPolicy) -> MemoryResult<()> {
+        let validated = ValidatedResidencyPolicy::try_from(new_policy)?;
+        let new_policy = validated.as_policy();
         let mut core = self.lock()?;
-        // First, the new policy must be structurally valid on its own.
-        validate_residency(&new_policy)?;
 
         let snapshot = core.ledger.snapshot();
         let current_total = snapshot.total_owner_bytes();
@@ -488,7 +488,7 @@ impl LiveProcessMemoryBroker {
 
         // Accepted: install the new policy by rebuilding the ledger's view while
         // preserving usage counters.
-        core.install_policy(new_policy);
+        core.install_policy(validated);
         Ok(())
     }
 
@@ -518,13 +518,14 @@ impl BrokerCore {
     /// only swaps the active policy in place, so all accounting invariants hold
     /// across the reconfiguration. The scheduler and controller are rebuilt
     /// from the new policy.
-    fn install_policy(&mut self, new_policy: ResidencyPolicy) {
+    fn install_policy(&mut self, validated: ValidatedResidencyPolicy) {
         // Snapshot live usage BEFORE the swap so the rebuilt scheduler can be
         // re-seeded from it (a fresh scheduler starts at zero usage, which would
         // otherwise make post-reconfigure admission see phantom-empty groups and
         // silently drop the anti-starvation guarantee).
         let snapshot = self.ledger.snapshot();
-        self.ledger.swap_policy(new_policy.clone());
+        let new_policy = validated.as_policy().clone();
+        self.ledger.swap_policy(validated);
         let mut scheduler = WeightedResourceGroupScheduler::new(
             new_policy.resource_groups.clone(),
             new_policy.shared_burst_pool_bytes,
@@ -585,7 +586,20 @@ mod tests {
     };
     use crate::domain::stats::PressureState;
 
-    fn report_with(residency: ResidencyPolicy) -> EffectiveMemoryBudgetReport {
+    fn report_with(mut residency: ResidencyPolicy) -> EffectiveMemoryBudgetReport {
+        // Most control-plane tests isolate global/owner/group behavior. Expand
+        // only the constructor's explicit zero defaults into permissive test
+        // caps; a removed class stays removed so totality tests still bite.
+        let global = residency.global_hard_limit_bytes;
+        for budget in residency.classes.values_mut() {
+            if budget.reserved_bytes == 0
+                && budget.soft_cap_bytes == 0
+                && budget.hard_cap_bytes == 0
+            {
+                budget.soft_cap_bytes = global;
+                budget.hard_cap_bytes = global;
+            }
+        }
         EffectiveMemoryBudgetReport {
             preset: crate::domain::policy::MemoryPreset::Production,
             execution: crate::domain::policy::ExecutionBudget::default(),
@@ -1271,6 +1285,47 @@ mod tests {
             4_000_000,
             "report residency reflects the accepted new global limit"
         );
+    }
+
+    #[test]
+    fn reconfigure_rejects_policy_missing_drained_mandatory_class() {
+        let b = broker();
+        let before = b.effective_report().expect("report");
+        let mut incomplete = ResidencyPolicy::new(2_000_000);
+        incomplete.classes.remove(&MemoryClass::GenerationMetadata);
+
+        let result = b.try_live_reconfigure(incomplete);
+
+        assert!(matches!(result, Err(MemoryError::Config(_))));
+        assert_eq!(b.effective_report().expect("report"), before);
+        assert_eq!(b.ledger_snapshot().expect("snapshot").total_owner_bytes(), 0);
+    }
+
+    #[test]
+    fn reconfigure_missing_class_denial_preserves_policy_scheduler_and_usage() {
+        let b = broker();
+        let ticket = b
+            .reserve(
+                MemoryClass::ArtifactCache,
+                "owner:a".to_string(),
+                MemoryContextKind::Request,
+                ChargeKind::RetainedPayload,
+                100_000,
+            )
+            .expect("seed live usage");
+        b.commit(&ticket).expect("commit");
+        let report_before = b.effective_report().expect("report");
+        let snapshot_before = b.ledger_snapshot().expect("snapshot");
+        let admission_before = b.admits_group("absent", 1).expect("admission probe");
+
+        let mut incomplete = ResidencyPolicy::new(2_000_000);
+        incomplete.classes.remove(&MemoryClass::ArtifactCache);
+        let result = b.try_live_reconfigure(incomplete);
+
+        assert!(matches!(result, Err(MemoryError::Config(_))));
+        assert_eq!(b.effective_report().expect("report"), report_before);
+        assert_eq!(b.ledger_snapshot().expect("snapshot"), snapshot_before);
+        assert_eq!(b.admits_group("absent", 1).expect("admission probe"), admission_before);
     }
 
     // scenario C: pressure threshold boundaries. Default thresholds are

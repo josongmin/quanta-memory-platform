@@ -145,6 +145,9 @@ pub enum MemoryClass {
 }
 
 impl MemoryClass {
+    /// Classes every valid residency policy must contain explicitly.
+    /// `ResidencyPolicy::new` materializes these with zero capacity; presets or
+    /// callers then opt individual classes into non-zero budgets.
     #[must_use]
     pub fn mandatory() -> Vec<Self> {
         vec![
@@ -165,6 +168,9 @@ impl MemoryClass {
         ]
     }
 
+    /// Optional taxonomy reserved for opt-in capabilities. These classes are
+    /// not materialized by `ResidencyPolicy::new`; reserving against one before
+    /// an explicit budget is configured is denied by the ledger.
     #[must_use]
     pub fn future() -> Vec<Self> {
         vec![
@@ -237,13 +243,26 @@ pub struct ResidencyPolicy {
 }
 
 impl ResidencyPolicy {
+    /// Construct a total, fail-closed policy.
+    ///
+    /// Every mandatory class is present with an explicit zero budget. Future
+    /// classes remain absent and unusable until configured with
+    /// [`Self::with_class_budget`].
     #[must_use]
     pub fn new(global_hard_limit_bytes: u64) -> Self {
+        // A raw policy is structurally total over every currently mandatory
+        // class. Zero is deliberately fail-closed: callers must opt classes
+        // into capacity explicitly, while future classes remain absent and are
+        // denied by the ledger until they are configured.
+        let classes = MemoryClass::mandatory()
+            .into_iter()
+            .map(|class| (class, MemoryClassBudget::zero(ReclaimPriority::Normal)))
+            .collect();
         Self {
             global_hard_limit_bytes,
             headroom_bytes: 0,
             shared_burst_pool_bytes: 0,
-            classes: BTreeMap::new(),
+            classes,
             owner_quotas: BTreeMap::new(),
             resource_groups: BTreeMap::new(),
             owner_groups: BTreeMap::new(),

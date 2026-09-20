@@ -27,6 +27,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::domain::config::ValidatedResidencyPolicy;
 use crate::domain::context::{MemoryContextKind, OwnerKey};
 use crate::domain::errors::{MemoryError, MemoryResult};
 use crate::domain::policy::{MemoryClass, ResidencyPolicy};
@@ -221,7 +222,7 @@ impl LedgerSnapshot {
 /// replay hazards.
 #[derive(Debug)]
 pub struct AccountingLedger {
-    policy: ResidencyPolicy,
+    policy: ValidatedResidencyPolicy,
     class_usage: BTreeMap<MemoryClass, UsageBreakdown>,
     owner_usage: BTreeMap<OwnerKey, UsageBreakdown>,
     context_usage: BTreeMap<MemoryContextKind, UsageBreakdown>,
@@ -236,7 +237,7 @@ pub struct AccountingLedger {
 
 impl AccountingLedger {
     #[must_use]
-    pub fn new(policy: ResidencyPolicy) -> Self {
+    pub(crate) fn new(policy: ValidatedResidencyPolicy) -> Self {
         Self {
             policy,
             class_usage: BTreeMap::new(),
@@ -251,7 +252,7 @@ impl AccountingLedger {
 
     #[must_use]
     pub fn policy(&self) -> &ResidencyPolicy {
-        &self.policy
+        self.policy.as_policy()
     }
 
     /// Swap the active residency policy in place, preserving all live usage
@@ -260,7 +261,7 @@ impl AccountingLedger {
     /// shrink any cap below current usage. Counters (class/owner/context) are
     /// left byte-for-byte unchanged, so all accounting invariants are preserved
     /// across the swap.
-    pub fn swap_policy(&mut self, new_policy: ResidencyPolicy) {
+    pub(crate) fn swap_policy(&mut self, new_policy: ValidatedResidencyPolicy) {
         self.policy = new_policy;
     }
 
@@ -320,21 +321,22 @@ impl AccountingLedger {
         // free; only the `Headroom` class may draw into it.
         let global_total_after = self.snapshot().total_owner_bytes().saturating_add(bytes);
         let global_ceiling = if class == MemoryClass::Headroom {
-            self.policy.global_hard_limit_bytes
+            self.policy().global_hard_limit_bytes
         } else {
-            self.policy.global_hard_limit_bytes.saturating_sub(self.policy.headroom_bytes)
+            self.policy().global_hard_limit_bytes.saturating_sub(self.policy().headroom_bytes)
         };
         if global_total_after > global_ceiling {
             return Err(MemoryError::capacity(format!(
                 "global ceiling {global_ceiling} exceeded by reserve to {global_total_after} \
                  (class {class:?}, global hard limit {}, headroom {})",
-                self.policy.global_hard_limit_bytes, self.policy.headroom_bytes
+                self.policy().global_hard_limit_bytes,
+                self.policy().headroom_bytes
             )));
         }
 
         let owner_current = self.owner_usage(&owner).total();
         let owner_after = owner_current.saturating_add(bytes);
-        if let Some(quota) = self.policy.owner_quotas.get(&owner) {
+        if let Some(quota) = self.policy().owner_quotas.get(&owner) {
             if owner_after > quota.hard_cap_bytes {
                 return Err(MemoryError::capacity(format!(
                     "owner {owner} hard cap {} exceeded by reserve to {owner_after}",
@@ -345,27 +347,30 @@ impl AccountingLedger {
 
         let class_current = self.class_usage(&class).total();
         let class_after = class_current.saturating_add(bytes);
-        if let Some(budget) = self.policy.classes.get(&class) {
-            if class_after > budget.hard_cap_bytes {
-                if !budget.borrow_from_shared_pool {
-                    return Err(MemoryError::capacity(format!(
-                        "class {class:?} hard cap {} exceeded by reserve to {class_after} and class may not borrow",
-                        budget.hard_cap_bytes
-                    )));
-                }
-                // Invariant 6: the over-cap remainder is borrowed from the shared
-                // burst pool, which is finite and shared across all borrowing
-                // classes. Recompute total borrow with this class's prospective
-                // usage and reject if it would overdraw the pool.
-                let total_borrow_after = self.total_borrow_with(&class, class_after);
-                if total_borrow_after > self.policy.shared_burst_pool_bytes {
-                    return Err(MemoryError::capacity(format!(
-                        "class {class:?} borrow would draw total {total_borrow_after} from shared \
-                         burst pool {} (over cap by {})",
-                        self.policy.shared_burst_pool_bytes,
-                        class_after.saturating_sub(budget.hard_cap_bytes)
-                    )));
-                }
+        let Some(budget) = self.policy().classes.get(&class) else {
+            return Err(MemoryError::capacity(format!(
+                "class {class:?} is not configured in the active residency policy"
+            )));
+        };
+        if class_after > budget.hard_cap_bytes {
+            if !budget.borrow_from_shared_pool {
+                return Err(MemoryError::capacity(format!(
+                    "class {class:?} hard cap {} exceeded by reserve to {class_after} and class may not borrow",
+                    budget.hard_cap_bytes
+                )));
+            }
+            // Invariant 6: the over-cap remainder is borrowed from the shared
+            // burst pool, which is finite and shared across all borrowing
+            // classes. Recompute total borrow with this class's prospective
+            // usage and reject if it would overdraw the pool.
+            let total_borrow_after = self.total_borrow_with(&class, class_after);
+            if total_borrow_after > self.policy().shared_burst_pool_bytes {
+                return Err(MemoryError::capacity(format!(
+                    "class {class:?} borrow would draw total {total_borrow_after} from shared \
+                     burst pool {} (over cap by {})",
+                    self.policy().shared_burst_pool_bytes,
+                    class_after.saturating_sub(budget.hard_cap_bytes)
+                )));
             }
         }
 
@@ -393,7 +398,7 @@ impl AccountingLedger {
     /// its own hard cap.
     fn total_borrow_with(&self, probe_class: &MemoryClass, probe_usage: u64) -> u64 {
         let mut total: u64 = 0;
-        for (class, budget) in &self.policy.classes {
+        for (class, budget) in &self.policy().classes {
             if !budget.borrow_from_shared_pool {
                 continue;
             }
@@ -589,6 +594,7 @@ impl AccountingLedger {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::config::ValidatedResidencyPolicy;
     use crate::domain::policy::{MemoryClassBudget, OwnerQuota, ReclaimPriority, ResidencyPolicy};
 
     fn class_budget(soft: u64, hard: u64, borrow: bool) -> MemoryClassBudget {
@@ -599,6 +605,22 @@ mod tests {
             borrow_from_shared_pool: borrow,
             reclaim_priority: ReclaimPriority::Normal,
         }
+    }
+
+    /// Ledger unit tests that are not testing class admission use an explicitly
+    /// permissive class map. Production `ResidencyPolicy::new` is fail-closed
+    /// with zero budgets and never receives this test-only expansion.
+    fn ledger_from_policy(mut policy: ResidencyPolicy) -> AccountingLedger {
+        let global = policy.global_hard_limit_bytes;
+        for class in MemoryClass::mandatory() {
+            let budget = policy.classes.get_mut(&class).expect("mandatory class materialized");
+            if budget.hard_cap_bytes == 0 {
+                budget.soft_cap_bytes = global;
+                budget.hard_cap_bytes = global;
+            }
+        }
+        let validated = ValidatedResidencyPolicy::try_from(policy).expect("valid test policy");
+        AccountingLedger::new(validated)
     }
 
     fn reserve(
@@ -620,8 +642,8 @@ mod tests {
 
     #[test]
     fn reserve_denied_when_global_hard_limit_would_be_exceeded() {
-        // No class budgets and no owner quota: ONLY the global ceiling can deny.
-        let mut ledger = AccountingLedger::new(ResidencyPolicy::new(1_000));
+        // Permissive class budgets and no owner quota: only global can deny.
+        let mut ledger = ledger_from_policy(ResidencyPolicy::new(1_000));
         reserve(&mut ledger, MemoryClass::ArtifactCache, "o", 600).expect("fits under global");
         let before = ledger.snapshot();
 
@@ -636,11 +658,23 @@ mod tests {
     }
 
     #[test]
+    fn reserve_for_unconfigured_class_is_denied_without_mutation() {
+        let validated = ValidatedResidencyPolicy::try_from(ResidencyPolicy::new(1_000))
+            .expect("mandatory classes are total");
+        let mut ledger = AccountingLedger::new(validated);
+        let before = ledger.snapshot();
+
+        let denied = reserve(&mut ledger, MemoryClass::SpillFileCache, "future", 1);
+
+        assert!(matches!(denied, Err(MemoryError::Capacity(_))));
+        assert_eq!(ledger.snapshot(), before, "unconfigured-class denial must not mutate");
+    }
+
+    #[test]
     fn global_ceiling_reserves_headroom_for_non_headroom_classes() {
         // global 1000, headroom 200 -> non-headroom classes share at most 800,
         // but the Headroom class itself may draw into the reserved band.
-        let mut ledger =
-            AccountingLedger::new(ResidencyPolicy::new(1_000).with_headroom_bytes(200));
+        let mut ledger = ledger_from_policy(ResidencyPolicy::new(1_000).with_headroom_bytes(200));
 
         let denied = reserve(&mut ledger, MemoryClass::ArtifactCache, "o", 900);
         assert!(
@@ -659,7 +693,7 @@ mod tests {
 
     #[test]
     fn double_release_of_a_cloned_ticket_is_rejected_and_does_not_corrupt() {
-        let mut ledger = AccountingLedger::new(ResidencyPolicy::new(1_000_000));
+        let mut ledger = ledger_from_policy(ResidencyPolicy::new(1_000_000));
         let ticket =
             reserve(&mut ledger, MemoryClass::ArtifactCache, "o", 100_000).expect("reserve");
         ledger.commit(&ticket).expect("commit");
@@ -684,7 +718,7 @@ mod tests {
 
     #[test]
     fn commit_after_release_is_rejected() {
-        let mut ledger = AccountingLedger::new(ResidencyPolicy::new(1_000_000));
+        let mut ledger = ledger_from_policy(ResidencyPolicy::new(1_000_000));
         let ticket =
             reserve(&mut ledger, MemoryClass::ArtifactCache, "o", 10_000).expect("reserve");
         ledger.release(&ticket).expect("release uncommitted reservation");
@@ -700,7 +734,7 @@ mod tests {
     #[test]
     fn borrow_over_class_cap_is_bounded_by_shared_burst_pool() {
         // global is roomy so only the class cap / burst pool gate the reserve.
-        let mut ledger = AccountingLedger::new(
+        let mut ledger = ledger_from_policy(
             ResidencyPolicy::new(10_000_000)
                 .with_shared_burst_pool_bytes(100)
                 .with_class_budget(MemoryClass::ArtifactCache, class_budget(400, 600, true)),
@@ -721,7 +755,7 @@ mod tests {
 
     #[test]
     fn shared_burst_pool_is_shared_across_borrowing_classes() {
-        let mut ledger = AccountingLedger::new(
+        let mut ledger = ledger_from_policy(
             ResidencyPolicy::new(10_000_000)
                 .with_shared_burst_pool_bytes(100)
                 .with_class_budget(MemoryClass::ArtifactCache, class_budget(400, 600, true))
@@ -741,7 +775,7 @@ mod tests {
 
     #[test]
     fn borrow_false_still_denies_over_cap_regardless_of_pool() {
-        let mut ledger = AccountingLedger::new(
+        let mut ledger = ledger_from_policy(
             ResidencyPolicy::new(10_000_000)
                 .with_shared_burst_pool_bytes(10_000)
                 .with_class_budget(MemoryClass::ArtifactCache, class_budget(400, 600, false)),
@@ -756,7 +790,7 @@ mod tests {
     // sanity: an owner quota still trips independently of the new ceilings.
     #[test]
     fn owner_hard_cap_still_enforced() {
-        let mut ledger = AccountingLedger::new(
+        let mut ledger = ledger_from_policy(
             ResidencyPolicy::new(10_000_000)
                 .with_owner_quota("o", OwnerQuota { soft_cap_bytes: 300, hard_cap_bytes: 500 }),
         );
@@ -772,7 +806,7 @@ mod tests {
     // wrongly rejected mid-rebuild), while a NON-empty batch stays rebuild-fenced.
     #[test]
     fn empty_release_batch_is_a_noop_even_during_rebuild() {
-        let mut ledger = AccountingLedger::new(ResidencyPolicy::new(1_000_000));
+        let mut ledger = ledger_from_policy(ResidencyPolicy::new(1_000_000));
         let t = reserve(&mut ledger, MemoryClass::ArtifactCache, "o", 1_000).expect("reserve");
         ledger.commit(&t).expect("commit");
         ledger.begin_rebuild();
@@ -831,7 +865,7 @@ mod tests {
         // scenario A: a 0-byte ticket is a real, live, single-use ticket. It
         // must commit (return 0), release once, and stay invariant-balanced;
         // its second release is rejected (invariant 7 idempotency).
-        let mut ledger = AccountingLedger::new(ResidencyPolicy::new(1_000));
+        let mut ledger = ledger_from_policy(ResidencyPolicy::new(1_000));
         let before = ledger.snapshot();
 
         let ticket = reserve(&mut ledger, MemoryClass::ArtifactCache, "o", 0)
@@ -866,7 +900,7 @@ mod tests {
         // scenario A: with a global limit at u64::MAX, two large reserves whose
         // sum saturates must saturate class AND owner identically, so invariant
         // 1 (class==owner) survives saturation rather than skewing one axis.
-        let mut ledger = AccountingLedger::new(ResidencyPolicy::new(u64::MAX));
+        let mut ledger = ledger_from_policy(ResidencyPolicy::new(u64::MAX));
 
         reserve(&mut ledger, MemoryClass::ArtifactCache, "o", u64::MAX - 10)
             .expect("first huge reserve fits under u64::MAX global");
@@ -890,7 +924,7 @@ mod tests {
         // and SUBTRACTS — silently corrupting the counters. The fixed path adds
         // the full u64 magnitude.
         let big: u64 = (i64::MAX as u64) + 12_345; // > i64::MAX, fits in u64
-        let mut ledger = AccountingLedger::new(ResidencyPolicy::new(u64::MAX));
+        let mut ledger = ledger_from_policy(ResidencyPolicy::new(u64::MAX));
 
         let ticket = reserve(&mut ledger, MemoryClass::ArtifactCache, "o", big)
             .expect("reserve of bytes>i64::MAX is admitted under a u64::MAX global");
@@ -923,8 +957,8 @@ mod tests {
         // scenario A: ledgers A and B have overlapping id spaces (both start at
         // 1). A ticket issued by A is not live in B, so releasing it on B must be
         // rejected (invariant 7) and must leave B byte-for-byte unchanged.
-        let mut ledger_a = AccountingLedger::new(ResidencyPolicy::new(1_000_000));
-        let mut ledger_b = AccountingLedger::new(ResidencyPolicy::new(1_000_000));
+        let mut ledger_a = ledger_from_policy(ResidencyPolicy::new(1_000_000));
+        let mut ledger_b = ledger_from_policy(ResidencyPolicy::new(1_000_000));
 
         let a_ticket = reserve(&mut ledger_a, MemoryClass::ArtifactCache, "o", 500).expect("A");
         // Give B its own state with the SAME id (1), so this is not merely an
@@ -950,7 +984,7 @@ mod tests {
     fn ticket_ids_are_monotonic_and_unique_across_many_reserves() {
         // scenario A: every reserve must mint a fresh, strictly increasing id so
         // the idempotency set can never confuse two distinct reservations.
-        let mut ledger = AccountingLedger::new(ResidencyPolicy::new(10_000_000));
+        let mut ledger = ledger_from_policy(ResidencyPolicy::new(10_000_000));
         let mut ids = Vec::new();
         let mut prev: Option<u64> = None;
         for i in 0..64u64 {
@@ -972,7 +1006,7 @@ mod tests {
         // scenario A: the third axis. After a mix of reserves across different
         // contexts/owners/classes (and one release), total context usage must
         // equal total owner usage at every step.
-        let mut ledger = AccountingLedger::new(ResidencyPolicy::new(10_000_000));
+        let mut ledger = ledger_from_policy(ResidencyPolicy::new(10_000_000));
 
         let steps: &[(MemoryClass, &str, MemoryContextKind, ChargeKind, u64)] = &[
             (
@@ -1032,7 +1066,7 @@ mod tests {
         // slots (invariant 2). Releasing the metadata ticket must subtract ONLY
         // from the metadata slot, leaving the payload slot intact and the
         // partition exact.
-        let mut ledger = AccountingLedger::new(ResidencyPolicy::new(10_000_000));
+        let mut ledger = ledger_from_policy(ResidencyPolicy::new(10_000_000));
         let payload = reserve_kind(
             &mut ledger,
             MemoryClass::ArtifactCache,
@@ -1084,7 +1118,7 @@ mod tests {
         // 1, 2, 5 (<= global) and 6 (within burst pool) must hold at EVERY step,
         // and releasing every live ticket must return all totals to exactly 0.
         let global = 10_000_000u64;
-        let mut ledger = AccountingLedger::new(
+        let mut ledger = ledger_from_policy(
             ResidencyPolicy::new(global)
                 .with_shared_burst_pool_bytes(50_000)
                 .with_class_budget(MemoryClass::ArtifactCache, class_budget(40_000, 60_000, true))

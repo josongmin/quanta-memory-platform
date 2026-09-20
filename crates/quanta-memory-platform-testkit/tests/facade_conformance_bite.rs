@@ -15,9 +15,9 @@
 use std::sync::Arc;
 
 use quanta_memory_platform_core::{
-    ChargeKind, EffectiveMemoryBudgetReport, ExecutionBudget, LiveProcessMemoryBroker,
-    MemoryBudgetManifest, MemoryClass, MemoryContextKind, MemoryPreset, MemoryResult, OwnerKey,
-    RechargeError, RechargeRecoveryV1, ReservationTicket, ResidencyPolicy, StoreBindingHandle,
+    ChargeKind, EffectiveMemoryBudgetReport, LiveProcessMemoryBroker, MemoryBudgetManifest,
+    MemoryClass, MemoryContextKind, MemoryPreset, MemoryResult, OwnerKey, RechargeError,
+    RechargeRecoveryV1, ReservationTicket, StoreBindingHandle,
 };
 use quanta_memory_platform_facade::shared::accounting::RechargeDenied;
 use quanta_memory_platform_facade::{
@@ -26,9 +26,8 @@ use quanta_memory_platform_facade::{
 };
 
 fn broker() -> LiveProcessMemoryBroker {
-    let residency = ResidencyPolicy::new(10_000_000);
     let report = EffectiveMemoryBudgetReport::from_manifest(
-        MemoryBudgetManifest::new(MemoryPreset::Production, ExecutionBudget::default(), residency),
+        MemoryBudgetManifest::for_preset(MemoryPreset::Production),
         vec!["bite".to_string()],
     );
     LiveProcessMemoryBroker::from_report(report).expect("valid broker")

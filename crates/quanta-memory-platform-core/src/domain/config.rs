@@ -14,7 +14,7 @@
 //! ordered layer set produces the same provenance and the same residency policy.
 
 use crate::domain::errors::{MemoryError, MemoryResult};
-use crate::domain::policy::{MemoryBudgetManifest, MemoryPreset, ResidencyPolicy};
+use crate::domain::policy::{MemoryBudgetManifest, MemoryClass, MemoryPreset, ResidencyPolicy};
 
 /// The authority layer that produced or last mutated a budget value.
 ///
@@ -121,6 +121,33 @@ pub struct ResolvedBudget {
     pub provenance: Vec<OverrideRecord>,
 }
 
+/// A residency policy that has crossed the canonical structural validation
+/// boundary. The inner policy is intentionally private so accounting state
+/// cannot be constructed or reconfigured from an unchecked value.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ValidatedResidencyPolicy(ResidencyPolicy);
+
+impl ValidatedResidencyPolicy {
+    #[must_use]
+    pub fn as_policy(&self) -> &ResidencyPolicy {
+        &self.0
+    }
+
+    #[must_use]
+    pub fn into_inner(self) -> ResidencyPolicy {
+        self.0
+    }
+}
+
+impl TryFrom<ResidencyPolicy> for ValidatedResidencyPolicy {
+    type Error = MemoryError;
+
+    fn try_from(residency: ResidencyPolicy) -> Result<Self, Self::Error> {
+        validate_residency_inner(&residency)?;
+        Ok(Self(residency))
+    }
+}
+
 impl EffectiveBudgetResolver {
     /// Start resolution from a base manifest (preset + workload profile already
     /// materialized into default class budgets by the caller).
@@ -173,7 +200,7 @@ impl EffectiveBudgetResolver {
             }
         }
 
-        validate_residency(&residency)?;
+        let residency = ValidatedResidencyPolicy::try_from(residency)?.into_inner();
 
         Ok(ResolvedBudget { preset, residency, provenance })
     }
@@ -189,6 +216,18 @@ impl EffectiveBudgetResolver {
 /// the playbook (section 2.2) requires before
 /// `ProcessMemoryBrokerBuilder::build()`.
 pub fn validate_residency(residency: &ResidencyPolicy) -> MemoryResult<()> {
+    validate_residency_inner(residency)
+}
+
+fn validate_residency_inner(residency: &ResidencyPolicy) -> MemoryResult<()> {
+    for class in MemoryClass::mandatory() {
+        if !residency.classes.contains_key(&class) {
+            return Err(MemoryError::config(format!(
+                "mandatory memory class {class:?} is absent from residency policy"
+            )));
+        }
+    }
+
     let mut total_reserved: u64 = 0;
     for (class, budget) in &residency.classes {
         if budget.reserved_bytes > budget.soft_cap_bytes {
@@ -211,7 +250,9 @@ pub fn validate_residency(residency: &ResidencyPolicy) -> MemoryResult<()> {
                 budget.hard_cap_bytes, residency.global_hard_limit_bytes
             )));
         }
-        total_reserved = total_reserved.saturating_add(budget.reserved_bytes);
+        total_reserved = total_reserved
+            .checked_add(budget.reserved_bytes)
+            .ok_or_else(|| MemoryError::config("sum of class reserved bytes overflowed u64"))?;
     }
 
     for (owner, quota) in &residency.owner_quotas {
@@ -271,7 +312,9 @@ pub fn validate_residency(residency: &ResidencyPolicy) -> MemoryResult<()> {
         }
     }
 
-    let floor = total_reserved.saturating_add(residency.headroom_bytes);
+    let floor = total_reserved
+        .checked_add(residency.headroom_bytes)
+        .ok_or_else(|| MemoryError::config("reserved+headroom floor overflowed u64"))?;
     if residency.global_hard_limit_bytes < floor {
         return Err(MemoryError::config(format!(
             "global hard limit {} below reserved+headroom floor {floor}",
@@ -459,6 +502,52 @@ mod tests {
                 },
             );
         assert!(validate_residency(&residency).is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_missing_each_mandatory_class() {
+        for class in MemoryClass::mandatory() {
+            let mut residency = ResidencyPolicy::new(10_000);
+            assert!(residency.classes.remove(&class).is_some());
+
+            let result = validate_residency(&residency);
+            assert!(
+                matches!(result, Err(MemoryError::Config(_))),
+                "missing mandatory class {class:?} must be rejected, got {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn validated_policy_materializes_no_implicit_class_holes() {
+        let validated = ValidatedResidencyPolicy::try_from(ResidencyPolicy::new(10_000))
+            .expect("constructor materializes every mandatory class");
+
+        for class in MemoryClass::mandatory() {
+            assert!(
+                validated.as_policy().classes.contains_key(&class),
+                "validated policy must explicitly contain {class:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn reserved_floor_checked_add_overflow_is_config_error() {
+        let mut residency = ResidencyPolicy::new(u64::MAX);
+        for class in [MemoryClass::ArtifactCache, MemoryClass::EvidenceCache] {
+            residency.classes.insert(
+                class,
+                MemoryClassBudget {
+                    reserved_bytes: u64::MAX,
+                    soft_cap_bytes: u64::MAX,
+                    hard_cap_bytes: u64::MAX,
+                    borrow_from_shared_pool: false,
+                    reclaim_priority: ReclaimPriority::Normal,
+                },
+            );
+        }
+
+        assert!(matches!(validate_residency(&residency), Err(MemoryError::Config(_))));
     }
 
     // ---- scenario B: resource_group structural validation ----

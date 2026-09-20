@@ -178,4 +178,20 @@ mod tests {
             "class caps survive the build verbatim"
         );
     }
+
+    #[test]
+    fn builder_rejects_manifest_missing_mandatory_class() {
+        let mut residency = ResidencyPolicy::new(1_000_000);
+        residency.classes.remove(&MemoryClass::ArtifactCache);
+        let manifest = MemoryBudgetManifest::new(
+            MemoryPreset::Production,
+            ExecutionBudget::default(),
+            residency,
+        );
+
+        assert!(matches!(
+            ProcessMemoryBrokerBuilder::new().with_manifest(manifest).build(),
+            Err(MemoryError::Config(_))
+        ));
+    }
 }

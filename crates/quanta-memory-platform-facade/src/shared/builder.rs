@@ -507,8 +507,7 @@ impl<SessionId, MessageId, Message> SessionTranscriptStoreBuilder<SessionId, Mes
 mod tests {
     use super::*;
     use quanta_memory_platform_core::{
-        EffectiveMemoryBudgetReport, ExecutionBudget, LiveProcessMemoryBroker,
-        MemoryBudgetManifest, MemoryClass, ResidencyPolicy,
+        EffectiveMemoryBudgetReport, LiveProcessMemoryBroker, MemoryBudgetManifest, MemoryClass,
     };
 
     fn binding() -> StoreBindingHandle {
@@ -517,11 +516,7 @@ mod tests {
 
     fn live_broker() -> LiveProcessMemoryBroker {
         let report = EffectiveMemoryBudgetReport::from_manifest(
-            MemoryBudgetManifest::new(
-                MemoryPreset::Development,
-                ExecutionBudget::default(),
-                ResidencyPolicy::new(1_000_000),
-            ),
+            MemoryBudgetManifest::for_preset(MemoryPreset::Development),
             vec!["builder-tests".to_string()],
         );
         LiveProcessMemoryBroker::from_report(report).expect("valid broker")
