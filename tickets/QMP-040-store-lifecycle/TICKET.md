@@ -314,9 +314,16 @@ numbers must be re-frozen with the final product SHA.
 | P1, repaired locally, not yet qualified | transcript append at `e047215` published session version and charged row before client `MessageId::clone` and `MessageId::Ord` (`transcript_store/service.rs:520-536`) | Old code failed panic-on-Clone/Ord version-postimage tests; preflight two clones and index vacancies, then publish only infallible owned values; single-callback panic releases the lease outside the mutex and preserves readable preimage. Re-run exact-source qualification. |
 | P2, unresolved exceptional abort | `BTreeMap::entry` takes a generic session/message key; if its `Ord` panics while the state mutex is held, a second panic in the owned key's `Drop` can abort before an outer `catch_unwind` regains control | Single-callback panic must preserve the ledger/store and keep the mutex readable. Full double-panic containment requires a different index ownership/layout (for example, an outside `Arc` owner) or a documented key contract; do not claim arbitrary adversarial `Ord`+`Drop` safety from the current catch boundary. |
 
-These are implementation-blocking checks, not a claim of `IMPLEMENTED` or
-`QUALIFIED`. Preserve QMP-040 as `IN_PROGRESS` until the explicit acceptance
-and receipt gates above are satisfied.
+The P0/P1 implementation blockers above were repaired at `85cbd81` and the
+internal acceptance/receipt gates passed on clean `eb58374`; see
+`receipts/2026-09-20T231633Z-eb58374.md`. QMP-040 is `IMPLEMENTED`, **not**
+`QUALIFIED` or production-ready. The P2 double-panic case is an explicit
+generic-key contract boundary: stable `Ord`, and no panicking key `Drop` during
+unwind. A blanket guarantee for arbitrary adversarial `Ord`+`Drop` requires
+index ownership redesign, not another catch shim. QMP-140 must carry this
+limitation into public documentation; QMP-100 must measure the indexing and
+contention tradeoff. QMP-120 actual extraction and QMP-130 host adoption remain
+separate terminal gates.
 
 ### Host adapter migration dependency (coordination, not qualification)
 
