@@ -1,4 +1,4 @@
-pub mod prepared_publication;
+pub(crate) mod prepared_publication;
 pub mod service;
 
 use quanta_memory_platform_core::{PublishError, StagedHandle, StoreBindingHandle};

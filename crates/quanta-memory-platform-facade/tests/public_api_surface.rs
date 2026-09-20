@@ -9,9 +9,9 @@
 //!    regression signal, not a runtime assertion;
 //!  - each item is gated by the `#[cfg(feature = …)]` that owns it, so the guard
 //!    is exact under any feature slice and `--no-default-features` still compiles;
-//!  - if a stable SHAPE fact changes (a builder no longer yields its store, a
-//!    spill target stops round-tripping, `charged_against` is dropped from a
-//!    builder), the `#[test]` functions below fail.
+//!  - if a stable SHAPE fact changes (a platform factory no longer yields a
+//!    budgeted store, an unset builder gains `build`, or a spill target stops
+//!    round-tripping), the tests below fail.
 //!
 //! It is deliberately NOT a string snapshot: it references the real items so the
 //! compiler is the guard, and exercises a few load-bearing facts the host adapter
@@ -22,15 +22,24 @@
 // ---------------------------------------------------------------------------
 
 use quanta_memory_platform_facade::{
-    AccountingSink, ByteSized, CanonicalKey, MeasuredValue, MemoryPlatformBuilder,
-    PortableMemoryPresets, SharedAccountingSink,
+    AccountingUnset, ByteSized, CanonicalKey, MeasuredValue, MemoryPlatformBuilder,
+    PortableMemoryPresets,
 };
+
+#[cfg(any(
+    feature = "payload_store",
+    feature = "retained_map",
+    feature = "revocable_store",
+    feature = "transcript",
+    feature = "publish_pipeline"
+))]
+use quanta_memory_platform_facade::Budgeted;
+#[cfg(feature = "core-live-accounting")]
+use quanta_memory_platform_facade::LiveMemoryPlatform;
 
 // Core types the facade surface is expressed in terms of (used by the shape
 // assertions below). These are core re-exports consumed through the facade's
 // public dependency, not facade internals.
-#[cfg(feature = "core-live-accounting")]
-use quanta_memory_platform_core::{LiveProcessMemoryBroker, ProcessMemoryBrokerBuilder};
 use quanta_memory_platform_core::{MemoryBudgetManifest, MemoryClass, MemoryPreset};
 
 /// Names EVERY always-on facade re-export in type position. Never called; its only
@@ -39,16 +48,25 @@ use quanta_memory_platform_core::{MemoryBudgetManifest, MemoryClass, MemoryPrese
 #[allow(dead_code, clippy::type_complexity)] // -- reason: compile-time surface pin; never executed, the tuple only forces path resolution.
 fn names_always_on_reexports() {
     type _Glue = (MemoryPlatformBuilder, PortableMemoryPresets);
-    type _Accounting = (Box<dyn AccountingSink>, SharedAccountingSink);
+    type _Unset = AccountingUnset;
+    #[cfg(feature = "core-live-accounting")]
+    type _Live = LiveMemoryPlatform;
+    #[cfg(any(
+        feature = "payload_store",
+        feature = "retained_map",
+        feature = "revocable_store",
+        feature = "transcript",
+        feature = "publish_pipeline"
+    ))]
+    type _Budgeted = Budgeted;
     // `ByteSized` and `CanonicalKey` are object-safe-by-name traits; reference
     // them as trait bounds via a dyn box / fn so a rename breaks compilation.
     type _Measure = (MeasuredValue<u8>, Box<dyn ByteSized>);
     let _canonical_key: fn(&dyn CanonicalKey) = |_k| {};
 }
 
-/// The accounting seam is always exported, but the facade-to-live-broker bridge
-/// exists only when `core-live-accounting` forwards core's `live_control`
-/// surface. This pins that feature-specific coercion in public API terms.
+/// Live accounting exposes one sealed platform factory and its broker view, not
+/// a user-implemented callback or a detachable sink.
 #[cfg(feature = "core-live-accounting")]
 #[test]
 fn live_broker_bridge_is_present_only_with_core_live_accounting() {
@@ -56,16 +74,68 @@ fn live_broker_bridge_is_present_only_with_core_live_accounting() {
         .with_preset(MemoryPreset::Production)
         .build()
         .expect("valid platform");
-    let _sink: SharedAccountingSink = platform.sink();
+    let _broker = platform.broker();
+}
+
+/// Negative API contracts are exercised by rustdoc's `compile_fail` examples
+/// on the exported builders/modes; this source gate prevents accidentally
+/// deleting the examples or reintroducing the old public callback seam.
+#[test]
+fn accounting_mode_negative_contracts_remain_in_the_public_source() {
+    let builder = include_str!("../src/shared/builder.rs");
+    let accounting = include_str!("../src/shared/accounting.rs");
+    let root = include_str!("../src/lib.rs");
+    assert!(builder.contains("```compile_fail"), "unset builder build must be rejected");
+    assert!(accounting.contains("```compile_fail"), "mode mismatch must be rejected");
+    assert!(!builder.contains("pub fn charged_against"), "no public late/rebinding seam");
+    assert!(!accounting.contains("pub trait AccountingSink"), "no user callback authority");
+    assert!(!root.contains("pub use shared::accounting::AccountingSink"));
+    assert!(!root.contains("pub use shared::accounting::SharedAccountingSink"));
+    for service in [
+        include_str!("../src/payload_store/service.rs"),
+        include_str!("../src/retained_map/service.rs"),
+        include_str!("../src/revocable_store/service.rs"),
+        include_str!("../src/transcript_store/service.rs"),
+        include_str!("../src/publish_pipeline/prepared_publication.rs"),
+    ] {
+        assert!(
+            !service.lines().any(|line| line.trim_start().starts_with("pub fn charged_against")),
+            "no late store attach"
+        );
+    }
+}
+
+#[test]
+fn full_and_default_features_do_not_enable_unbudgeted_stores() {
+    let manifest = include_str!("../Cargo.toml");
+    let default = manifest.lines().find(|line| line.starts_with("default = ")).expect("default");
+    let full = manifest
+        .split_once("\nfull = [")
+        .expect("full feature")
+        .1
+        .split_once("\n]")
+        .expect("full feature end")
+        .0;
+    let full_backings =
+        manifest.lines().find(|line| line.starts_with("full-backings = ")).expect("full-backings");
+    assert!(!default.contains("unbudgeted-stores"));
+    assert!(!full.contains("unbudgeted-stores"));
+    assert!(!full_backings.contains("unbudgeted-stores"));
+    assert!(manifest.contains("unbudgeted-stores = ["), "explicit feature exists");
+    let readme = include_str!("../../../README.md");
+    assert!(
+        readme.contains("absent from\n  `default`, `full`, and `full-backings`"),
+        "README must not imply aggregate feature enables the escape hatch"
+    );
 }
 
 #[cfg(feature = "core-live-accounting")]
 #[allow(dead_code)] // some isolated feature slices enable the bridge without a store test consumer.
-fn public_test_broker() -> LiveProcessMemoryBroker {
-    ProcessMemoryBrokerBuilder::new()
+fn public_test_platform() -> LiveMemoryPlatform {
+    MemoryPlatformBuilder::new()
         .with_preset(MemoryPreset::Production)
         .build()
-        .expect("valid broker")
+        .expect("valid platform")
 }
 
 #[cfg(feature = "payload_store")]
@@ -76,8 +146,8 @@ use quanta_memory_platform_facade::{PayloadStore, PayloadStoreBuilder, SimplePay
 #[allow(dead_code, clippy::type_complexity)] // -- reason: compile-time surface pin; never executed.
 fn names_payload_store_reexports() {
     type _Trait = Box<dyn PayloadStore<String, Vec<u8>>>;
-    type _Impl = SimplePayloadStore<String, Vec<u8>>;
-    type _Builder = PayloadStoreBuilder<String, Vec<u8>>;
+    type _Impl = SimplePayloadStore<String, Vec<u8>, Budgeted>;
+    type _Builder = PayloadStoreBuilder<String, Vec<u8>, AccountingUnset>;
 }
 
 #[cfg(feature = "retained_map")]
@@ -91,9 +161,9 @@ use quanta_memory_platform_facade::{
 #[allow(dead_code, clippy::type_complexity)] // -- reason: compile-time surface pin; never executed.
 fn names_retained_map_reexports() {
     type _Trait = Box<dyn RetainedMapStore<String, Vec<u8>>>;
-    type _Impl = SimpleRetainedMapStore<String, Vec<u8>>;
-    type _Builder = RetainedMapStoreBuilder<String, Vec<u8>>;
-    type _BoundBuilder = BoundRetainedMapStoreBuilder<String, Vec<u8>>;
+    type _Impl = SimpleRetainedMapStore<String, Vec<u8>, Budgeted>;
+    type _Builder = RetainedMapStoreBuilder<String, Vec<u8>, AccountingUnset>;
+    type _BoundBuilder = BoundRetainedMapStoreBuilder<String, Vec<u8>, Budgeted>;
     type _AtomicInsertOutcome = RetainedMapInsertOutcomeV1;
     type _AtomicInsertOrExisting = RetainedMapInsertOrExistingV1<Vec<u8>>;
 }
@@ -106,8 +176,8 @@ use quanta_memory_platform_facade::{RevocableStore, RevocableStoreBuilder, Simpl
 #[allow(dead_code, clippy::type_complexity)] // -- reason: compile-time surface pin; never executed.
 fn names_revocable_store_reexports() {
     type _Trait = Box<dyn RevocableStore<String, Vec<u8>>>;
-    type _Impl = SimpleRevocableStore<String, Vec<u8>>;
-    type _Builder = RevocableStoreBuilder<String, Vec<u8>>;
+    type _Impl = SimpleRevocableStore<String, Vec<u8>, Budgeted>;
+    type _Builder = RevocableStoreBuilder<String, Vec<u8>, AccountingUnset>;
 }
 
 #[cfg(feature = "transcript")]
@@ -122,8 +192,8 @@ use quanta_memory_platform_facade::{
 #[allow(dead_code, clippy::type_complexity)] // -- reason: compile-time surface pin; never executed.
 fn names_transcript_reexports() {
     type _Trait = Box<dyn SessionTranscriptStore<String, String, String>>;
-    type _Impl = SimpleSessionTranscriptStore<String, String, String>;
-    type _Builder = SessionTranscriptStoreBuilder<String, String, String>;
+    type _Impl = SimpleSessionTranscriptStore<String, String, String, Budgeted>;
+    type _Builder = SessionTranscriptStoreBuilder<String, String, String, AccountingUnset>;
     type _Identity = TranscriptAppendIdentityV1<String, String>;
     type _Request = TranscriptAppendRequestV1<String, String, String>;
     type _Record = TranscriptRecordV1<String, String>;
@@ -149,8 +219,8 @@ fn names_publish_pipeline_reexports() {
     type _DefaultTransition = DefaultCommitTransition;
     type _Impl = SimplePublishPipeline<String, String, String>;
     type _Builder = PublishPipelineBuilder<String, String, String>;
-    type _Prepared = PreparedPublicationService<Vec<u8>>;
-    type _PreparedBuilder = PreparedPublicationServiceBuilder<Vec<u8>>;
+    type _Prepared = PreparedPublicationService<Vec<u8>, Budgeted>;
+    type _PreparedBuilder = PreparedPublicationServiceBuilder<Vec<u8>, AccountingUnset>;
     type _PreparedError = PreparedPublicationErrorV1;
     type _PreparedStats = PreparedPublicationStatsV1;
     type _PreparedToken = PreparedPublicationTokenV1;
@@ -162,7 +232,9 @@ fn names_publish_pipeline_reexports() {
 fn prepared_publication_builder_exposes_root_bound_resolution_contract() {
     use quanta_memory_platform_core::{MemoryClass, StoreBindingHandle};
 
-    let service = PreparedPublicationServiceBuilder::<Vec<u8>>::new()
+    let platform = public_test_platform();
+    let service = platform
+        .prepared_publication_builder::<Vec<u8>>()
         .bind(StoreBindingHandle::new(
             MemoryClass::ManifestResidency,
             "public-prepared-publication".to_string(),
@@ -324,7 +396,10 @@ fn default_builder_over_cap_store_mutation_is_denied() {
         "cap+1 store mutation must return typed Capacity denial"
     );
     assert_eq!(platform.broker().ledger_snapshot().expect("after denial"), before);
-    assert!(store.get(&"over".to_string()).is_none(), "denied value was not retained");
+    assert!(
+        store.get_checked(&"over".to_string()).expect("checked read").is_none(),
+        "denied value was not retained"
+    );
 }
 
 #[cfg(feature = "core-live-accounting")]
@@ -375,14 +450,19 @@ fn default_builder_and_report_only_share_override_resolution() {
 fn payload_store_builder_yields_a_queryable_store() {
     use quanta_memory_platform_core::StoreBindingHandle;
 
+    let platform = public_test_platform();
     let binding = StoreBindingHandle::new(MemoryClass::ArtifactCache, "owner-a".to_string(), None);
-    let store: SimplePayloadStore<String, Vec<u8>> =
-        PayloadStoreBuilder::<String, Vec<u8>>::new().bind(binding).build().expect("store builds");
+    let store: SimplePayloadStore<String, Vec<u8>, Budgeted> = platform
+        .payload_store_builder::<String, Vec<u8>>()
+        .bind(binding)
+        .build()
+        .expect("store builds");
     assert_eq!(
         store.charged_bytes().expect("charged_bytes is queryable"),
         0,
         "a fresh payload store has charged zero bytes"
     );
+    assert_eq!(store.stats().expect("checked payload stats").item_count, 0);
 }
 
 #[cfg(all(feature = "core-live-accounting", feature = "retained_map"))]
@@ -390,18 +470,42 @@ fn payload_store_builder_yields_a_queryable_store() {
 fn retained_map_builder_exposes_public_charged_path() {
     use quanta_memory_platform_core::StoreBindingHandle;
 
-    let broker = public_test_broker();
-    let sink: SharedAccountingSink = std::sync::Arc::new(broker.clone());
+    let platform = public_test_platform();
     let binding =
         StoreBindingHandle::new(MemoryClass::ArtifactCache, "owner-retained".to_string(), None);
-    let store: SimpleRetainedMapStore<String, Vec<u8>> =
-        RetainedMapStoreBuilder::<String, Vec<u8>>::new()
-            .bind(binding)
-            .charged_against(sink)
-            .build();
+    let store: SimpleRetainedMapStore<String, Vec<u8>, Budgeted> =
+        platform.retained_map_store_builder::<String, Vec<u8>>().bind(binding).build();
 
     store.insert_checked("k".to_string(), vec![0u8; 32]).expect("insert");
-    assert_eq!(broker.ledger_snapshot().expect("snap").total_owner_bytes(), 32);
+    assert_eq!(platform.broker().ledger_snapshot().expect("snap").total_owner_bytes(), 32);
+}
+
+#[cfg(all(feature = "retained_map", feature = "unbudgeted-stores"))]
+#[test]
+fn explicit_unbudgeted_store_is_a_distinct_product_and_does_not_charge_the_platform() {
+    use quanta_memory_platform_core::StoreBindingHandle;
+    use quanta_memory_platform_facade::Unbudgeted;
+
+    fn only_budgeted(_: &SimpleRetainedMapStore<String, Vec<u8>, Budgeted>) {}
+    fn only_unbudgeted(_: &SimpleRetainedMapStore<String, Vec<u8>, Unbudgeted>) {}
+
+    let platform = public_test_platform();
+    let binding =
+        StoreBindingHandle::new(MemoryClass::ArtifactCache, "mode-owner".to_string(), None);
+    let budgeted =
+        platform.retained_map_store_builder::<String, Vec<u8>>().bind(binding.clone()).build();
+    let unbudgeted = RetainedMapStoreBuilder::<String, Vec<u8>, AccountingUnset>::new()
+        .unbudgeted()
+        .bind(binding)
+        .build();
+    only_budgeted(&budgeted);
+    only_unbudgeted(&unbudgeted);
+
+    unbudgeted.insert_checked("fixture".to_string(), vec![0; 7]).expect("explicit fixture write");
+    assert_eq!(unbudgeted.stats_checked().expect("fixture stats").estimated_bytes, 7);
+    assert_eq!(platform.broker().ledger_snapshot().expect("ledger").total_owner_bytes(), 0);
+    budgeted.insert_checked("production".to_string(), vec![0; 11]).expect("charged write");
+    assert_eq!(platform.broker().ledger_snapshot().expect("ledger").total_owner_bytes(), 11);
 }
 
 #[cfg(feature = "retained_map")]
@@ -411,10 +515,11 @@ fn retained_map_atomic_insert_returns_occupied_value_without_overwrite() {
 
     use quanta_memory_platform_core::StoreBindingHandle;
 
+    let platform = public_test_platform();
     let binding =
         StoreBindingHandle::new(MemoryClass::ArtifactCache, "owner-occupied".to_string(), None);
-    let store: SimpleRetainedMapStore<String, Arc<Vec<u8>>> =
-        RetainedMapStoreBuilder::<String, Arc<Vec<u8>>>::new().bind(binding).build();
+    let store: SimpleRetainedMapStore<String, Arc<Vec<u8>>, Budgeted> =
+        platform.retained_map_store_builder::<String, Arc<Vec<u8>>>().bind(binding).build();
     let retained = Arc::new(vec![1, 2, 3]);
 
     let first = store
@@ -432,12 +537,12 @@ fn retained_map_atomic_insert_returns_occupied_value_without_overwrite() {
         Arc::ptr_eq(&existing, &retained),
         "occupied result must share the retained payload allocation"
     );
-    let stored = store.get(&"k".to_string()).expect("stored value");
+    let stored = store.get_checked(&"k".to_string()).expect("checked read").expect("stored value");
     assert!(
         Arc::ptr_eq(&stored, &retained),
         "occupied insert must preserve the original allocation"
     );
-    assert_eq!(store.stats().estimated_bytes, 3);
+    assert_eq!(store.stats_checked().expect("stats").estimated_bytes, 3);
 }
 
 #[cfg(all(feature = "core-live-accounting", feature = "revocable_store"))]
@@ -445,19 +550,18 @@ fn retained_map_atomic_insert_returns_occupied_value_without_overwrite() {
 fn revocable_builder_exposes_public_charged_path() {
     use quanta_memory_platform_core::StoreBindingHandle;
 
-    let broker = public_test_broker();
-    let sink: SharedAccountingSink = std::sync::Arc::new(broker.clone());
+    let platform = public_test_platform();
     let binding =
         StoreBindingHandle::new(MemoryClass::ArtifactCache, "owner-revocable".to_string(), None);
-    let store: SimpleRevocableStore<String, Vec<u8>> =
-        RevocableStoreBuilder::<String, Vec<u8>>::new()
-            .bind(binding)
-            .charged_against(sink)
-            .build()
-            .expect("charged revocable builder must build");
+    let store: SimpleRevocableStore<String, Vec<u8>, Budgeted> = platform
+        .revocable_store_builder::<String, Vec<u8>>()
+        .bind(binding)
+        .build()
+        .expect("budgeted revocable builder must build");
 
     store.insert_checked("k".to_string(), vec![0u8; 24]).expect("insert");
-    assert_eq!(broker.ledger_snapshot().expect("snap").total_owner_bytes(), 24);
+    assert_eq!(store.stats().expect("checked revocable stats").estimated_bytes, 24);
+    assert_eq!(platform.broker().ledger_snapshot().expect("snap").total_owner_bytes(), 24);
 }
 
 #[cfg(all(feature = "core-live-accounting", feature = "transcript"))]
@@ -465,17 +569,15 @@ fn revocable_builder_exposes_public_charged_path() {
 fn transcript_builder_exposes_public_charged_path() {
     use quanta_memory_platform_core::StoreBindingHandle;
 
-    let broker = public_test_broker();
-    let sink: SharedAccountingSink = std::sync::Arc::new(broker.clone());
+    let platform = public_test_platform();
     let binding =
         StoreBindingHandle::new(MemoryClass::ArtifactCache, "owner-transcript".to_string(), None);
-    let store: SimpleSessionTranscriptStore<String, String, String> =
-        SessionTranscriptStoreBuilder::<String, String, String>::new()
-            .bind(binding)
-            .charged_against(sink)
-            .with_retention_policy(TranscriptRetentionPolicyV1::process_lifetime())
-            .build()
-            .expect("charged transcript builder must build");
+    let store: SimpleSessionTranscriptStore<String, String, String, Budgeted> = platform
+        .transcript_store_builder::<String, String, String>()
+        .bind(binding)
+        .with_retention_policy(TranscriptRetentionPolicyV1::process_lifetime())
+        .build()
+        .expect("budgeted transcript builder must build");
 
     let disposition = store
         .append(TranscriptAppendRequestV1::new(
@@ -485,7 +587,8 @@ fn transcript_builder_exposes_public_charged_path() {
         .expect("append");
     assert_eq!(disposition, TranscriptAppendDispositionV1::Applied);
     assert_eq!(store.load(&"s".to_string()).expect("load").len(), 1);
-    assert_eq!(broker.ledger_snapshot().expect("snap").total_owner_bytes(), 5);
+    assert_eq!(store.stats().expect("checked transcript stats").estimated_bytes, 5);
+    assert_eq!(platform.broker().ledger_snapshot().expect("snap").total_owner_bytes(), 5);
 }
 
 /// The `spill` slice is a genuine two-way tier: a routed controller over a

@@ -41,7 +41,26 @@ pub mod spill;
 pub mod transcript_store;
 
 pub use presets::PortableMemoryPresets;
-pub use shared::accounting::{AccountingSink, SharedAccountingSink};
+pub use shared::accounting::AccountingUnset;
+#[cfg(any(
+    feature = "payload_store",
+    feature = "retained_map",
+    feature = "revocable_store",
+    feature = "transcript",
+    feature = "publish_pipeline"
+))]
+pub use shared::accounting::Budgeted;
+#[cfg(all(
+    feature = "unbudgeted-stores",
+    any(
+        feature = "payload_store",
+        feature = "retained_map",
+        feature = "revocable_store",
+        feature = "transcript",
+        feature = "publish_pipeline"
+    )
+))]
+pub use shared::accounting::Unbudgeted;
 #[cfg(feature = "core-live-accounting")]
 pub use shared::builder::LiveMemoryPlatform;
 pub use shared::builder::MemoryPlatformBuilder;

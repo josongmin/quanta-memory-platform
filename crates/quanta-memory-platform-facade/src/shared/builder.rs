@@ -39,6 +39,17 @@ use crate::publish_pipeline::{
 use crate::retained_map::service::SimpleRetainedMapStore;
 #[cfg(feature = "revocable_store")]
 use crate::revocable_store::service::SimpleRevocableStore;
+#[cfg(all(
+    feature = "unbudgeted-stores",
+    any(
+        feature = "payload_store",
+        feature = "publish_pipeline",
+        feature = "retained_map",
+        feature = "revocable_store",
+        feature = "transcript"
+    )
+))]
+use crate::shared::accounting::Unbudgeted;
 #[cfg(any(
     feature = "payload_store",
     feature = "publish_pipeline",
@@ -46,7 +57,7 @@ use crate::revocable_store::service::SimpleRevocableStore;
     feature = "revocable_store",
     feature = "transcript"
 ))]
-use crate::shared::accounting::SharedAccountingSink;
+use crate::shared::accounting::{AccountingUnset, Budgeted};
 #[cfg(feature = "transcript")]
 use crate::transcript_store::{service::SimpleSessionTranscriptStore, TranscriptRetentionPolicyV1};
 #[cfg(feature = "payload_store")]
@@ -102,16 +113,13 @@ impl MemoryPlatformBuilder {
 
 /// A live, accounting-backed memory platform built via [`MemoryPlatformBuilder::build`].
 ///
-/// It owns the live broker (the accounting SSOT) and the single shared accounting
-/// sink derived from it, and exposes pre-charged store builders so every store is
-/// wired to the ledger builder-first — closing the DIP gap where consumers
-/// previously had to name the concrete broker and compose `Arc::new(broker.clone())`
-/// by hand.
+/// It owns the live broker (the accounting SSOT) and is the only public factory
+/// for budgeted store builders. No public callback seam or post-construction
+/// accounting attachment exists.
 #[cfg(feature = "core-live-accounting")]
 #[derive(Clone)]
 pub struct LiveMemoryPlatform {
     broker: quanta_memory_platform_core::LiveProcessMemoryBroker,
-    sink: crate::shared::accounting::SharedAccountingSink,
 }
 
 #[cfg(feature = "core-live-accounting")]
@@ -124,9 +132,7 @@ impl std::fmt::Debug for LiveMemoryPlatform {
 #[cfg(feature = "core-live-accounting")]
 impl LiveMemoryPlatform {
     fn new(broker: quanta_memory_platform_core::LiveProcessMemoryBroker) -> Self {
-        let sink: crate::shared::accounting::SharedAccountingSink =
-            std::sync::Arc::new(broker.clone());
-        Self { broker, sink }
+        Self { broker }
     }
 
     /// The live broker (accounting SSOT) for snapshots, reconfigure, rebuild, etc.
@@ -135,34 +141,31 @@ impl LiveMemoryPlatform {
         &self.broker
     }
 
-    /// A cloneable handle to this platform's accounting sink. Encapsulates the
-    /// `Arc::new(broker.clone())` glue so consumers never write it.
-    #[must_use]
-    pub fn sink(&self) -> crate::shared::accounting::SharedAccountingSink {
-        std::sync::Arc::clone(&self.sink)
-    }
-
     /// A payload-store builder already charged against this platform's ledger.
     #[cfg(feature = "payload_store")]
     #[must_use]
     pub fn payload_store_builder<PayloadRef, Bytes>(
         &self,
-    ) -> PayloadStoreBuilder<PayloadRef, Bytes> {
-        PayloadStoreBuilder::new().charged_against(self.sink())
+    ) -> PayloadStoreBuilder<PayloadRef, Bytes, Budgeted> {
+        PayloadStoreBuilder::new_budgeted(self.broker.clone())
     }
 
     /// A retained-map-store builder already charged against this platform's ledger.
     #[cfg(feature = "retained_map")]
     #[must_use]
-    pub fn retained_map_store_builder<Key, Value>(&self) -> RetainedMapStoreBuilder<Key, Value> {
-        RetainedMapStoreBuilder::new().charged_against(self.sink())
+    pub fn retained_map_store_builder<Key, Value>(
+        &self,
+    ) -> RetainedMapStoreBuilder<Key, Value, Budgeted> {
+        RetainedMapStoreBuilder::new_budgeted(self.broker.clone())
     }
 
     /// A revocable-store builder already charged against this platform's ledger.
     #[cfg(feature = "revocable_store")]
     #[must_use]
-    pub fn revocable_store_builder<Key, Value>(&self) -> RevocableStoreBuilder<Key, Value> {
-        RevocableStoreBuilder::new().charged_against(self.sink())
+    pub fn revocable_store_builder<Key, Value>(
+        &self,
+    ) -> RevocableStoreBuilder<Key, Value, Budgeted> {
+        RevocableStoreBuilder::new_budgeted(self.broker.clone())
     }
 
     /// A session-transcript-store builder already charged against this platform's ledger.
@@ -170,8 +173,8 @@ impl LiveMemoryPlatform {
     #[must_use]
     pub fn transcript_store_builder<SessionId, MessageId, Message>(
         &self,
-    ) -> SessionTranscriptStoreBuilder<SessionId, MessageId, Message> {
-        SessionTranscriptStoreBuilder::new().charged_against(self.sink())
+    ) -> SessionTranscriptStoreBuilder<SessionId, MessageId, Message, Budgeted> {
+        SessionTranscriptStoreBuilder::new_budgeted(self.broker.clone())
     }
 
     /// A prepared-publication builder already charged against this platform's ledger.
@@ -179,8 +182,8 @@ impl LiveMemoryPlatform {
     #[must_use]
     pub fn prepared_publication_builder<Payload>(
         &self,
-    ) -> PreparedPublicationServiceBuilder<Payload> {
-        PreparedPublicationServiceBuilder::new().charged_against(self.sink())
+    ) -> PreparedPublicationServiceBuilder<Payload, Budgeted> {
+        PreparedPublicationServiceBuilder::new_budgeted(self.broker.clone())
     }
 }
 
@@ -205,26 +208,78 @@ impl quanta_memory_platform_core::ProcessMemoryBroker for LiveMemoryPlatform {
 
 #[cfg(feature = "payload_store")]
 #[derive(Clone, Debug)]
-pub struct PayloadStoreBuilder<PayloadRef, Bytes> {
+/// Payload-store builder branded by its accounting state.
+///
+/// The unset state deliberately has no `build` method:
+///
+/// ```compile_fail
+/// use quanta_memory_platform_facade::{AccountingUnset, PayloadStoreBuilder};
+///
+/// let _ = PayloadStoreBuilder::<String, Vec<u8>, AccountingUnset>::new().build();
+/// ```
+pub struct PayloadStoreBuilder<PayloadRef, Bytes, Mode> {
     binding: Option<StoreBindingHandle>,
     context: Option<MemoryContextHandle>,
-    charger: Option<SharedAccountingSink>,
-    _marker: PhantomData<(PayloadRef, Bytes)>,
+    accounting: Mode,
+    _marker: PhantomData<fn() -> (PayloadRef, Bytes)>,
 }
 
 #[cfg(feature = "payload_store")]
-impl<PayloadRef, Bytes> Default for PayloadStoreBuilder<PayloadRef, Bytes> {
+impl<PayloadRef, Bytes> Default for PayloadStoreBuilder<PayloadRef, Bytes, AccountingUnset> {
     fn default() -> Self {
-        Self { binding: None, context: None, charger: None, _marker: PhantomData }
+        Self {
+            binding: None,
+            context: None,
+            accounting: AccountingUnset::default(),
+            _marker: PhantomData,
+        }
     }
 }
 
 #[cfg(feature = "payload_store")]
-impl<PayloadRef, Bytes> PayloadStoreBuilder<PayloadRef, Bytes> {
+impl<PayloadRef, Bytes> PayloadStoreBuilder<PayloadRef, Bytes, AccountingUnset> {
     pub fn new() -> Self {
         Self::default()
     }
 
+    #[cfg(feature = "unbudgeted-stores")]
+    pub fn unbudgeted(self) -> PayloadStoreBuilder<PayloadRef, Bytes, Unbudgeted> {
+        PayloadStoreBuilder {
+            binding: self.binding,
+            context: self.context,
+            accounting: Unbudgeted::new(),
+            _marker: PhantomData,
+        }
+    }
+}
+
+#[cfg(feature = "payload_store")]
+impl<PayloadRef, Bytes> PayloadStoreBuilder<PayloadRef, Bytes, Budgeted> {
+    fn new_budgeted(broker: quanta_memory_platform_core::LiveProcessMemoryBroker) -> Self {
+        Self {
+            binding: None,
+            context: None,
+            accounting: Budgeted::new(broker),
+            _marker: PhantomData,
+        }
+    }
+
+    pub fn build(self) -> MemoryResult<SimplePayloadStore<PayloadRef, Bytes, Budgeted>> {
+        let binding = self.binding.ok_or_else(missing_binding)?;
+        Ok(SimplePayloadStore::new_budgeted(binding, self.context, self.accounting.into_broker()))
+    }
+}
+
+#[cfg(all(feature = "payload_store", feature = "unbudgeted-stores"))]
+impl<PayloadRef, Bytes> PayloadStoreBuilder<PayloadRef, Bytes, Unbudgeted> {
+    pub fn build(self) -> MemoryResult<SimplePayloadStore<PayloadRef, Bytes, Unbudgeted>> {
+        let binding = self.binding.ok_or_else(missing_binding)?;
+        Ok(SimplePayloadStore::new_unbudgeted(binding, self.context))
+    }
+}
+
+#[cfg(feature = "payload_store")]
+impl<PayloadRef, Bytes, Mode> PayloadStoreBuilder<PayloadRef, Bytes, Mode> {
     pub fn bind(mut self, binding: StoreBindingHandle) -> Self {
         self.binding = Some(binding);
         self
@@ -233,22 +288,6 @@ impl<PayloadRef, Bytes> PayloadStoreBuilder<PayloadRef, Bytes> {
     pub fn with_context(mut self, context: MemoryContextHandle) -> Self {
         self.context = Some(context);
         self
-    }
-
-    /// Charge the built store's bytes against a broker ledger (accounting SSOT).
-    #[must_use]
-    pub fn charged_against(mut self, sink: SharedAccountingSink) -> Self {
-        self.charger = Some(sink);
-        self
-    }
-
-    pub fn build(self) -> MemoryResult<SimplePayloadStore<PayloadRef, Bytes>> {
-        let binding = self.binding.ok_or_else(missing_binding)?;
-        let mut store = SimplePayloadStore::new(binding, self.context);
-        if let Some(sink) = self.charger {
-            store = store.charged_against(sink);
-        }
-        Ok(store)
     }
 }
 
@@ -271,105 +310,132 @@ fn missing_binding() -> MemoryError {
 /// has no `build` method.
 ///
 /// ```compile_fail
-/// use quanta_memory_platform_facade::RetainedMapStoreBuilder;
+/// use quanta_memory_platform_facade::{AccountingUnset, RetainedMapStoreBuilder};
 ///
-/// let _ = RetainedMapStoreBuilder::<String, Vec<u8>>::new().build();
+/// let _ = RetainedMapStoreBuilder::<String, Vec<u8>, AccountingUnset>::new().build();
 /// ```
 #[derive(Clone, Debug)]
-pub struct RetainedMapStoreBuilder<Key, Value> {
-    charger: Option<SharedAccountingSink>,
-    _marker: PhantomData<(Key, Value)>,
+pub struct RetainedMapStoreBuilder<Key, Value, Mode> {
+    accounting: Mode,
+    _marker: PhantomData<fn() -> (Key, Value)>,
 }
 
 /// Bound retained-map builder state. Only this state can build a store, and the
 /// build is infallible because its required binding is owned, not optional.
 #[cfg(feature = "retained_map")]
 #[derive(Clone, Debug)]
-pub struct BoundRetainedMapStoreBuilder<Key, Value> {
+pub struct BoundRetainedMapStoreBuilder<Key, Value, Mode> {
     binding: StoreBindingHandle,
-    charger: Option<SharedAccountingSink>,
-    _marker: PhantomData<(Key, Value)>,
+    accounting: Mode,
+    _marker: PhantomData<fn() -> (Key, Value)>,
 }
 
 #[cfg(feature = "retained_map")]
-impl<Key, Value> Default for RetainedMapStoreBuilder<Key, Value> {
+impl<Key, Value> Default for RetainedMapStoreBuilder<Key, Value, AccountingUnset> {
     fn default() -> Self {
-        Self { charger: None, _marker: PhantomData }
+        Self { accounting: AccountingUnset::default(), _marker: PhantomData }
     }
 }
 
 #[cfg(feature = "retained_map")]
-impl<Key, Value> RetainedMapStoreBuilder<Key, Value> {
+impl<Key, Value> RetainedMapStoreBuilder<Key, Value, AccountingUnset> {
     pub fn new() -> Self {
         Self::default()
     }
 
-    pub fn bind(self, binding: StoreBindingHandle) -> BoundRetainedMapStoreBuilder<Key, Value> {
-        BoundRetainedMapStoreBuilder { binding, charger: self.charger, _marker: PhantomData }
-    }
-
-    #[must_use]
-    pub fn charged_against(mut self, sink: SharedAccountingSink) -> Self {
-        self.charger = Some(sink);
-        self
+    #[cfg(feature = "unbudgeted-stores")]
+    pub fn unbudgeted(self) -> RetainedMapStoreBuilder<Key, Value, Unbudgeted> {
+        RetainedMapStoreBuilder { accounting: Unbudgeted::new(), _marker: PhantomData }
     }
 }
 
 #[cfg(feature = "retained_map")]
-impl<Key, Value> BoundRetainedMapStoreBuilder<Key, Value> {
-    #[must_use]
-    pub fn charged_against(mut self, sink: SharedAccountingSink) -> Self {
-        self.charger = Some(sink);
-        self
+impl<Key, Value> RetainedMapStoreBuilder<Key, Value, Budgeted> {
+    fn new_budgeted(broker: quanta_memory_platform_core::LiveProcessMemoryBroker) -> Self {
+        Self { accounting: Budgeted::new(broker), _marker: PhantomData }
     }
+}
 
-    pub fn build(self) -> SimpleRetainedMapStore<Key, Value> {
-        match self.charger {
-            Some(sink) => SimpleRetainedMapStore::new_charged(self.binding, sink),
-            None => SimpleRetainedMapStore::new(self.binding),
-        }
+#[cfg(feature = "retained_map")]
+impl<Key, Value, Mode> RetainedMapStoreBuilder<Key, Value, Mode> {
+    pub fn bind(
+        self,
+        binding: StoreBindingHandle,
+    ) -> BoundRetainedMapStoreBuilder<Key, Value, Mode> {
+        BoundRetainedMapStoreBuilder { binding, accounting: self.accounting, _marker: PhantomData }
+    }
+}
+
+#[cfg(feature = "retained_map")]
+impl<Key, Value> BoundRetainedMapStoreBuilder<Key, Value, Budgeted> {
+    pub fn build(self) -> SimpleRetainedMapStore<Key, Value, Budgeted> {
+        SimpleRetainedMapStore::new_budgeted(self.binding, self.accounting.into_broker())
+    }
+}
+
+#[cfg(all(feature = "retained_map", feature = "unbudgeted-stores"))]
+impl<Key, Value> BoundRetainedMapStoreBuilder<Key, Value, Unbudgeted> {
+    pub fn build(self) -> SimpleRetainedMapStore<Key, Value, Unbudgeted> {
+        SimpleRetainedMapStore::new_unbudgeted(self.binding)
     }
 }
 
 #[cfg(feature = "revocable_store")]
 #[derive(Clone, Debug)]
-pub struct RevocableStoreBuilder<Key, Value> {
+pub struct RevocableStoreBuilder<Key, Value, Mode> {
     binding: Option<StoreBindingHandle>,
-    charger: Option<SharedAccountingSink>,
-    _marker: PhantomData<(Key, Value)>,
+    accounting: Mode,
+    _marker: PhantomData<fn() -> (Key, Value)>,
 }
 
 #[cfg(feature = "revocable_store")]
-impl<Key, Value> Default for RevocableStoreBuilder<Key, Value> {
+impl<Key, Value> Default for RevocableStoreBuilder<Key, Value, AccountingUnset> {
     fn default() -> Self {
-        Self { binding: None, charger: None, _marker: PhantomData }
+        Self { binding: None, accounting: AccountingUnset::default(), _marker: PhantomData }
     }
 }
 
 #[cfg(feature = "revocable_store")]
-impl<Key, Value> RevocableStoreBuilder<Key, Value> {
+impl<Key, Value> RevocableStoreBuilder<Key, Value, AccountingUnset> {
     pub fn new() -> Self {
         Self::default()
     }
 
+    #[cfg(feature = "unbudgeted-stores")]
+    pub fn unbudgeted(self) -> RevocableStoreBuilder<Key, Value, Unbudgeted> {
+        RevocableStoreBuilder {
+            binding: self.binding,
+            accounting: Unbudgeted::new(),
+            _marker: PhantomData,
+        }
+    }
+}
+
+#[cfg(feature = "revocable_store")]
+impl<Key, Value> RevocableStoreBuilder<Key, Value, Budgeted> {
+    fn new_budgeted(broker: quanta_memory_platform_core::LiveProcessMemoryBroker) -> Self {
+        Self { binding: None, accounting: Budgeted::new(broker), _marker: PhantomData }
+    }
+
+    pub fn build(self) -> MemoryResult<SimpleRevocableStore<Key, Value, Budgeted>> {
+        let binding = self.binding.ok_or_else(missing_binding)?;
+        Ok(SimpleRevocableStore::new_budgeted(binding, self.accounting.into_broker()))
+    }
+}
+
+#[cfg(all(feature = "revocable_store", feature = "unbudgeted-stores"))]
+impl<Key, Value> RevocableStoreBuilder<Key, Value, Unbudgeted> {
+    pub fn build(self) -> MemoryResult<SimpleRevocableStore<Key, Value, Unbudgeted>> {
+        let binding = self.binding.ok_or_else(missing_binding)?;
+        Ok(SimpleRevocableStore::new_unbudgeted(binding))
+    }
+}
+
+#[cfg(feature = "revocable_store")]
+impl<Key, Value, Mode> RevocableStoreBuilder<Key, Value, Mode> {
     pub fn bind(mut self, binding: StoreBindingHandle) -> Self {
         self.binding = Some(binding);
         self
-    }
-
-    #[must_use]
-    pub fn charged_against(mut self, sink: SharedAccountingSink) -> Self {
-        self.charger = Some(sink);
-        self
-    }
-
-    pub fn build(self) -> MemoryResult<SimpleRevocableStore<Key, Value>> {
-        let binding = self.binding.ok_or_else(missing_binding)?;
-        let mut store = SimpleRevocableStore::new(binding);
-        if let Some(sink) = self.charger {
-            store = store.charged_against(sink);
-        }
-        Ok(store)
     }
 }
 
@@ -413,33 +479,82 @@ impl<Stage, Commit, Published> PublishPipelineBuilder<Stage, Commit, Published> 
 
 #[cfg(feature = "publish_pipeline")]
 #[derive(Clone, Debug)]
-pub struct PreparedPublicationServiceBuilder<Payload> {
+pub struct PreparedPublicationServiceBuilder<Payload, Mode> {
     binding: Option<StoreBindingHandle>,
     capacity_bytes: Option<u64>,
     tombstone_limits: Option<(usize, u64)>,
-    charger: Option<SharedAccountingSink>,
-    _marker: PhantomData<Payload>,
+    accounting: Mode,
+    _marker: PhantomData<fn() -> Payload>,
 }
 
 #[cfg(feature = "publish_pipeline")]
-impl<Payload> Default for PreparedPublicationServiceBuilder<Payload> {
+impl<Payload> Default for PreparedPublicationServiceBuilder<Payload, AccountingUnset> {
     fn default() -> Self {
         Self {
             binding: None,
             capacity_bytes: None,
             tombstone_limits: None,
-            charger: None,
+            accounting: AccountingUnset::default(),
             _marker: PhantomData,
         }
     }
 }
 
 #[cfg(feature = "publish_pipeline")]
-impl<Payload> PreparedPublicationServiceBuilder<Payload> {
+impl<Payload> PreparedPublicationServiceBuilder<Payload, AccountingUnset> {
     pub fn new() -> Self {
         Self::default()
     }
 
+    #[cfg(feature = "unbudgeted-stores")]
+    pub fn unbudgeted(self) -> PreparedPublicationServiceBuilder<Payload, Unbudgeted> {
+        PreparedPublicationServiceBuilder {
+            binding: self.binding,
+            capacity_bytes: self.capacity_bytes,
+            tombstone_limits: self.tombstone_limits,
+            accounting: Unbudgeted::new(),
+            _marker: PhantomData,
+        }
+    }
+}
+
+#[cfg(feature = "publish_pipeline")]
+impl<Payload> PreparedPublicationServiceBuilder<Payload, Budgeted> {
+    fn new_budgeted(broker: quanta_memory_platform_core::LiveProcessMemoryBroker) -> Self {
+        Self {
+            binding: None,
+            capacity_bytes: None,
+            tombstone_limits: None,
+            accounting: Budgeted::new(broker),
+            _marker: PhantomData,
+        }
+    }
+
+    pub fn build(self) -> MemoryResult<PreparedPublicationService<Payload, Budgeted>> {
+        let binding = self.binding.ok_or_else(missing_binding)?;
+        Ok(PreparedPublicationService::new_budgeted(
+            binding,
+            self.capacity_bytes,
+            self.tombstone_limits,
+            self.accounting.into_broker(),
+        ))
+    }
+}
+
+#[cfg(all(feature = "publish_pipeline", feature = "unbudgeted-stores"))]
+impl<Payload> PreparedPublicationServiceBuilder<Payload, Unbudgeted> {
+    pub fn build(self) -> MemoryResult<PreparedPublicationService<Payload, Unbudgeted>> {
+        let binding = self.binding.ok_or_else(missing_binding)?;
+        Ok(PreparedPublicationService::new_unbudgeted(
+            binding,
+            self.capacity_bytes,
+            self.tombstone_limits,
+        ))
+    }
+}
+
+#[cfg(feature = "publish_pipeline")]
+impl<Payload, Mode> PreparedPublicationServiceBuilder<Payload, Mode> {
     pub fn bind(mut self, binding: StoreBindingHandle) -> Self {
         self.binding = Some(binding);
         self
@@ -458,43 +573,25 @@ impl<Payload> PreparedPublicationServiceBuilder<Payload> {
         self.tombstone_limits = Some((max_count, max_bytes));
         self
     }
-
-    #[must_use]
-    pub fn charged_against(mut self, sink: SharedAccountingSink) -> Self {
-        self.charger = Some(sink);
-        self
-    }
-
-    pub fn build(self) -> MemoryResult<PreparedPublicationService<Payload>> {
-        let binding = self.binding.ok_or_else(missing_binding)?;
-        let mut service = PreparedPublicationService::new(binding, self.capacity_bytes);
-        if let Some((max_count, max_bytes)) = self.tombstone_limits {
-            service = service.with_tombstone_limits(max_count, max_bytes);
-        }
-        if let Some(sink) = self.charger {
-            service = service.charged_against(sink);
-        }
-        Ok(service)
-    }
 }
 
 #[cfg(feature = "transcript")]
 #[derive(Clone, Debug)]
-pub struct SessionTranscriptStoreBuilder<SessionId, MessageId, Message> {
+pub struct SessionTranscriptStoreBuilder<SessionId, MessageId, Message, Mode> {
     binding: Option<StoreBindingHandle>,
-    charger: Option<SharedAccountingSink>,
+    accounting: Mode,
     retention: TranscriptRetentionPolicyV1,
-    _marker: PhantomData<(SessionId, MessageId, Message)>,
+    _marker: PhantomData<fn() -> (SessionId, MessageId, Message)>,
 }
 
 #[cfg(feature = "transcript")]
 impl<SessionId, MessageId, Message> Default
-    for SessionTranscriptStoreBuilder<SessionId, MessageId, Message>
+    for SessionTranscriptStoreBuilder<SessionId, MessageId, Message, AccountingUnset>
 {
     fn default() -> Self {
         Self {
             binding: None,
-            charger: None,
+            accounting: AccountingUnset::default(),
             retention: TranscriptRetentionPolicyV1::process_lifetime(),
             _marker: PhantomData,
         }
@@ -502,19 +599,69 @@ impl<SessionId, MessageId, Message> Default
 }
 
 #[cfg(feature = "transcript")]
-impl<SessionId, MessageId, Message> SessionTranscriptStoreBuilder<SessionId, MessageId, Message> {
+impl<SessionId, MessageId, Message>
+    SessionTranscriptStoreBuilder<SessionId, MessageId, Message, AccountingUnset>
+{
     pub fn new() -> Self {
         Self::default()
     }
 
-    pub fn bind(mut self, binding: StoreBindingHandle) -> Self {
-        self.binding = Some(binding);
-        self
+    #[cfg(feature = "unbudgeted-stores")]
+    pub fn unbudgeted(
+        self,
+    ) -> SessionTranscriptStoreBuilder<SessionId, MessageId, Message, Unbudgeted> {
+        SessionTranscriptStoreBuilder {
+            binding: self.binding,
+            accounting: Unbudgeted::new(),
+            retention: self.retention,
+            _marker: PhantomData,
+        }
+    }
+}
+
+#[cfg(feature = "transcript")]
+impl<SessionId, MessageId, Message>
+    SessionTranscriptStoreBuilder<SessionId, MessageId, Message, Budgeted>
+{
+    fn new_budgeted(broker: quanta_memory_platform_core::LiveProcessMemoryBroker) -> Self {
+        Self {
+            binding: None,
+            accounting: Budgeted::new(broker),
+            retention: TranscriptRetentionPolicyV1::process_lifetime(),
+            _marker: PhantomData,
+        }
     }
 
-    #[must_use]
-    pub fn charged_against(mut self, sink: SharedAccountingSink) -> Self {
-        self.charger = Some(sink);
+    pub fn build(
+        self,
+    ) -> MemoryResult<SimpleSessionTranscriptStore<SessionId, MessageId, Message, Budgeted>> {
+        let binding = self.binding.ok_or_else(missing_binding)?;
+        Ok(SimpleSessionTranscriptStore::new_budgeted(
+            binding,
+            self.retention,
+            self.accounting.into_broker(),
+        ))
+    }
+}
+
+#[cfg(all(feature = "transcript", feature = "unbudgeted-stores"))]
+impl<SessionId, MessageId, Message>
+    SessionTranscriptStoreBuilder<SessionId, MessageId, Message, Unbudgeted>
+{
+    pub fn build(
+        self,
+    ) -> MemoryResult<SimpleSessionTranscriptStore<SessionId, MessageId, Message, Unbudgeted>> {
+        let binding = self.binding.ok_or_else(missing_binding)?;
+        Ok(SimpleSessionTranscriptStore::new_unbudgeted(binding, self.retention))
+    }
+}
+
+#[cfg(feature = "transcript")]
+impl<SessionId, MessageId, Message, Mode>
+    SessionTranscriptStoreBuilder<SessionId, MessageId, Message, Mode>
+{
+    pub fn bind(mut self, binding: StoreBindingHandle) -> Self {
+        self.binding = Some(binding);
         self
     }
 
@@ -523,33 +670,22 @@ impl<SessionId, MessageId, Message> SessionTranscriptStoreBuilder<SessionId, Mes
         self.retention = retention;
         self
     }
-
-    pub fn build(
-        self,
-    ) -> MemoryResult<SimpleSessionTranscriptStore<SessionId, MessageId, Message>> {
-        let binding = self.binding.ok_or_else(missing_binding)?;
-        let mut store = SimpleSessionTranscriptStore::new(binding, self.retention);
-        if let Some(sink) = self.charger {
-            store = store.charged_against(sink);
-        }
-        Ok(store)
-    }
 }
 
 #[cfg(all(test, feature = "full"))]
 mod tests {
     use super::*;
-    use quanta_memory_platform_core::{LiveProcessMemoryBroker, MemoryClass};
+    use quanta_memory_platform_core::MemoryClass;
 
     fn binding() -> StoreBindingHandle {
         StoreBindingHandle::new(MemoryClass::ArtifactCache, "owner".to_string(), None)
     }
 
-    fn live_broker() -> LiveProcessMemoryBroker {
-        quanta_memory_platform_core::ProcessMemoryBrokerBuilder::new()
+    fn platform() -> LiveMemoryPlatform {
+        MemoryPlatformBuilder::new()
             .with_preset(MemoryPreset::Development)
             .build()
-            .expect("valid broker")
+            .expect("valid live platform")
     }
 
     #[test]
@@ -557,39 +693,39 @@ mod tests {
         use crate::payload_store::PayloadStore;
         use quanta_memory_platform_core::RetainedEnvelope;
 
-        let store = PayloadStoreBuilder::<String, Vec<u8>>::new()
+        let platform = platform();
+        let store = platform
+            .payload_store_builder::<String, Vec<u8>>()
             .bind(binding())
             .build()
             .expect("builder-first happy path must succeed");
         // The built store actually works.
         let published =
             store.put_canonical(RetainedEnvelope::new(b"x".to_vec())).expect("put via built store");
-        assert_eq!(store.stats().item_count, 1);
+        assert_eq!(store.stats().expect("stats").item_count, 1);
         assert_eq!(published.payload_ref(), &"payload-0".to_string());
     }
 
     #[test]
     fn payload_builder_without_binding_fails_with_build_error() {
         // NEGATIVE-PAIR: missing required binding is a typed Build error, not a panic.
-        let err = PayloadStoreBuilder::<String, Vec<u8>>::new()
+        let err = platform()
+            .payload_store_builder::<String, Vec<u8>>()
             .build()
             .expect_err("missing binding must fail");
         assert!(matches!(err, MemoryError::Build(_)), "got {err:?}");
     }
 
     #[test]
-    fn retained_map_builder_charged_against_routes_bytes_through_the_ledger() {
+    fn retained_map_platform_builder_routes_bytes_through_the_ledger() {
         use crate::retained_map::RetainedMapStore;
 
-        let broker = live_broker();
-        let sink: SharedAccountingSink = std::sync::Arc::new(broker.clone());
-        let store = RetainedMapStoreBuilder::<String, Vec<u8>>::new()
-            .bind(binding())
-            .charged_against(sink)
-            .build();
+        let platform = platform();
+        let store =
+            platform.retained_map_store_builder::<String, Vec<u8>>().bind(binding()).build();
 
         store.insert_checked("k".to_string(), vec![0u8; 64]).expect("insert");
-        assert_eq!(broker.ledger_snapshot().expect("snap").total_owner_bytes(), 64);
+        assert_eq!(platform.broker().ledger_snapshot().expect("snap").total_owner_bytes(), 64);
     }
 
     #[test]
@@ -602,23 +738,23 @@ mod tests {
 
     #[test]
     fn transcript_builder_without_binding_fails_with_build_error() {
-        let err = SessionTranscriptStoreBuilder::<String, String, String>::new()
+        let err = platform()
+            .transcript_store_builder::<String, String, String>()
             .build()
             .expect_err("missing binding");
         assert!(matches!(err, MemoryError::Build(_)), "got {err:?}");
     }
 
     #[test]
-    fn transcript_builder_charged_against_routes_bytes_through_the_ledger() {
+    fn transcript_platform_builder_routes_bytes_through_the_ledger() {
         use crate::transcript_store::{
             SessionTranscriptStore, TranscriptAppendIdentityV1, TranscriptAppendRequestV1,
         };
 
-        let broker = live_broker();
-        let sink: SharedAccountingSink = std::sync::Arc::new(broker.clone());
-        let store = SessionTranscriptStoreBuilder::<String, String, String>::new()
+        let platform = platform();
+        let store = platform
+            .transcript_store_builder::<String, String, String>()
             .bind(binding())
-            .charged_against(sink)
             .build()
             .expect("builder charged transcript store");
 
@@ -628,30 +764,31 @@ mod tests {
                 "hello".to_string(),
             ))
             .expect("append");
-        assert_eq!(broker.ledger_snapshot().expect("snap").total_owner_bytes(), 5);
+        assert_eq!(platform.broker().ledger_snapshot().expect("snap").total_owner_bytes(), 5);
     }
 
     #[test]
     fn revocable_builder_without_binding_fails_with_build_error() {
-        let err =
-            RevocableStoreBuilder::<String, Vec<u8>>::new().build().expect_err("missing binding");
+        let err = platform()
+            .revocable_store_builder::<String, Vec<u8>>()
+            .build()
+            .expect_err("missing binding");
         assert!(matches!(err, MemoryError::Build(_)), "got {err:?}");
     }
 
     #[test]
-    fn revocable_builder_charged_against_routes_bytes_through_the_ledger() {
+    fn revocable_platform_builder_routes_bytes_through_the_ledger() {
         use crate::revocable_store::RevocableStore;
 
-        let broker = live_broker();
-        let sink: SharedAccountingSink = std::sync::Arc::new(broker.clone());
-        let store = RevocableStoreBuilder::<String, Vec<u8>>::new()
+        let platform = platform();
+        let store = platform
+            .revocable_store_builder::<String, Vec<u8>>()
             .bind(binding())
-            .charged_against(sink)
             .build()
             .expect("builder charged revocable store");
 
         store.insert_checked("k".to_string(), vec![0u8; 16]).expect("insert");
-        assert_eq!(broker.ledger_snapshot().expect("snap").total_owner_bytes(), 16);
+        assert_eq!(platform.broker().ledger_snapshot().expect("snap").total_owner_bytes(), 16);
     }
 
     #[test]
@@ -682,9 +819,8 @@ mod tests {
             .with_preset(MemoryPreset::Development)
             .build()
             .expect("live platform");
-        // TWO distinct stores from the SAME platform must share ONE ledger via
-        // platform.sink(): the broker sees the SUM of both. A regression where
-        // sink() handed out independent sinks would make the total 25, not 35.
+        // TWO distinct stores from the SAME platform share ONE concrete broker
+        // authority. The broker sees the SUM of both.
         use crate::retained_map::RetainedMapStore;
         let a = platform
             .retained_map_store_builder::<String, Vec<u8>>()

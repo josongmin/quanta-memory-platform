@@ -133,3 +133,197 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 - tombstone retention policy: QMP-060
 - spill ownership transfer: QMP-070
 - performance container rewrite: QMP-100
+
+## Frozen audit receipt (2026-09-21)
+
+Audit base: `f0841e5d9d77114e0a50ca69ddafa1cd47599e73`
+Implementation prerequisite checkpoint: `ecbeacb` (`ManagedCharge` + shared lifecycle gate)
+
+### Confirmed blockers at the frozen base
+
+| Severity | Finding | Reachable evidence | Required owner fix |
+| --- | --- | --- | --- |
+| P0 | accounting mode can change after materialization | public `Simple*::new` plus `charged_against(self, ...)` in payload/revocable/transcript/prepared | construction typestate; no `build` before mode selection; no late attach |
+| P0 | store destruction strands committed ledger bytes | every charged entry owns a clonable receipt, but no store `close`/`Drop` owns refund | broker-bound non-Clone RAII lease; explicit batch close; Drop cleanup |
+| P1 | arbitrary public callback runs under non-reentrant store mutex | `AccountingSink` is public and all five stores call charge/refund/recharge under their container lock | remove dyn callback seam; concrete sealed broker authority only |
+| P1 | naive unlock/callback/relock would lose linearizability | duplicate insert, overwrite/remove, sweep, transcript append and prepare can race between planning and apply | one nonblocking lifecycle mutation lane; accounting outside container mutex; typed busy |
+| P1 | close/mutation behavior is unspecified | no `Open/Closing/Closed` authority and ticket selectors execute zero tests | shared lifecycle gate and owner tests on all five stores |
+| P1 | stats can fabricate empty truth after poison | payload/revocable/transcript infallible projections default to zero | checked trait surface returning typed error |
+| P1 | local counters can silently drift | payload/revocable saturating arithmetic | checked preimage/postimage before any payload or ledger mutation |
+| P1 | public conformance does not cover the lifecycle | testkit omits revocable lifecycle and has no common close/drop oracle | five adapters plus broken leak/state-loss/double-refund fakes |
+
+The exact callback-under-lock base paths were:
+
+- payload insert/delete: `payload_store/service.rs:166-191`, `:210-230`
+- retained insert/overwrite/remove/sweep: `retained_map/service.rs:151-186`, `:201-234`, `:329-343`, `:352-393`
+- revocable batch/insert/reclaim: `revocable_store/service.rs:79-107`, `:124-151`
+- transcript retain/append/truncate: `transcript_store/service.rs:192-198`, `:253`, `:288-342`, `:391-396`
+- prepared prepare/abort/GC: `publish_pipeline/prepared_publication.rs:288-351`, `:386-397`, `:440-472`
+
+These line references are evidence for the frozen base, not the post-fix tree.
+
+### Selected implementation architecture
+
+```text
+LiveMemoryPlatform
+  -> budgeted builder state (contains concrete broker authority)
+  -> budgeted store type
+  -> one ManagedCharge per live entry
+
+explicit close:
+  lifecycle Open -> Closing
+  -> detach entries under container mutex
+  -> release_managed_many outside container mutex
+  -> success: Closed
+  -> failure: restore exact entries/leases, reopen Open
+
+implicit Drop:
+  -> detach entries with Mutex::get_mut
+  -> ManagedCharge::drop
+  -> normal: exact release
+  -> rebuild active: broker-owned deferred queue
+  -> finish_rebuild: atomic deferred drain
+```
+
+Decisions:
+
+1. Delete `AccountingSink`, `SharedAccountingSink`, and `LiveMemoryPlatform::sink()` from the public surface.
+2. A budgeted builder is issued only by `LiveMemoryPlatform`; it cannot be rebound.
+3. `AccountingUnset` deliberately has no `build` method.
+4. `Unbudgeted` is a different product type, available only through the non-default `unbudgeted-stores` feature. `default` and `full` must not enable it.
+5. Store mutations acquire the shared atomic lifecycle permit before touching state. Reentry or close contention returns `MemoryError::OperationInProgress`; post-close mutation returns `MemoryError::Closed`.
+6. Every entry and its `ManagedCharge` move together. No ticket clone is an ownership authority.
+7. Drop never panics. During rebuild it preserves conservative accounting until `finish_rebuild` drains the broker queue.
+
+### Industry reference alignment
+
+- Apache DataFusion models retained memory with `MemoryReservation`, explicitly releases the reservation on Drop, and makes the consumer responsible for reserving bytes before retaining producer output: <https://docs.rs/datafusion/latest/datafusion/execution/memory_pool/trait.MemoryPool.html>
+- Tokio's `OwnedSemaphorePermit` is an owned, non-borrowed capacity authority whose Drop releases permits, and batch ownership is expressed by consuming/merging owned permits: <https://docs.rs/tokio/latest/tokio/sync/struct.OwnedSemaphorePermit.html>
+- Rust's `Drop` guidance treats memory/capacity as owned resources and warns destructors not to panic, especially during unwind: <https://doc.rust-lang.org/std/ops/trait.Drop.html>
+
+The selected design follows those ownership properties but adds a repo-specific
+fail-closed rebuild rule: Drop during a closed rebuild fence defers the exact
+ticket instead of mutating counters or losing authority.
+
+## Execution tickets
+
+### QMP-040A — Core ownership primitive — checkpointed
+
+Write set:
+
+- `core/src/api/control.rs`
+- `core/src/lib.rs`
+
+Deliverables:
+
+- non-Clone `ManagedCharge`
+- failure-preserving explicit release/recharge
+- same-broker atomic batch release
+- rebuild-safe deferred Drop queue and finish drain
+- poison recovery restricted to exact cleanup
+
+Checkpoint: `ecbeacb`
+
+### QMP-040B — Construction boundary
+
+Write set:
+
+- `facade/Cargo.toml`
+- `facade/src/shared/{accounting,builder}.rs`
+- facade root/module exports
+- public compile-fail surface tests
+
+Hellgates:
+
+- `budgeted_builder_requires_platform_authority`
+- `cannot_attach_accounting_after_materialization`
+- `unbudgeted_store_type_cannot_be_passed_as_budgeted_store`
+- feature graph proves `full` excludes `unbudgeted-stores`
+
+### QMP-040C — Five owner migrations
+
+Each of payload, retained map, revocable, transcript, and prepared publication
+must independently prove:
+
+- `close_refunds_every_live_entry_exactly_once`
+- `close_refund_failure_preserves_store_and_ledger_ownership`
+- `drop_without_explicit_close_does_not_strand_capacity`
+- `drop_during_rebuild_defers_until_finish`
+- `mutation_after_close_is_rejected`
+- `double_close_does_not_double_refund`
+- `concurrent_mutation_and_close_has_one_linearized_outcome`
+- `counter_overflow_is_rejected_without_mutation`
+- `poisoned_stats_is_error_not_empty`
+
+### QMP-040D — Public conformance bite
+
+Write set:
+
+- `testkit/src/conformance/**`
+- `testkit/tests/facade_conformance_bite.rs`
+- `testkit/Cargo.toml`
+
+Required oracle:
+
+1. populate: broker bytes equal store bytes;
+2. close: broker zero and store closed;
+3. double close: still zero;
+4. post-close mutation: typed `Closed`;
+5. rebuild close failure: store and broker postimage unchanged;
+6. rebuild finish + retry: zero;
+7. last-owner Drop: zero;
+8. rebuild-time Drop: conservative until finish, then zero.
+
+Required broken fakes:
+
+- `LeakingCloseFake`
+- `StateLosingCloseFake`
+- `DoubleRefundFake`
+
+The suite is not accepted merely because honest targets pass; every broken fake
+must produce a conformance violation.
+
+## Qualification receipt requirements
+
+QMP-040 may move to `IMPLEMENTED` only with all of the following recorded under
+`receipts/`:
+
+- frozen product commit and clean dirty fingerprint;
+- non-zero owner selector counts for all five stores;
+- full facade and testkit results;
+- clippy `-D warnings`, feature matrix, doctor, deny, examples;
+- detached-worktree RED mutation that removes one close/Drop release and is caught by the named semantic oracle;
+- exact remaining gap to `QUALIFIED` (standalone extraction and external host adoption remain QMP-120/QMP-130).
+
+## Adversarial delta audit — current dirty implementation (2026-09-21)
+
+The five owner tests passing is not terminal proof. During implementation, a
+separate read-only adversarial pass found panic/reentrancy paths missed by the
+original checklist. Paths below refer to the current implementation; line
+numbers must be re-frozen with the final product SHA.
+
+| Severity | Reachable failure mode | Current action / exit gate |
+| --- | --- | --- |
+| P0, repaired locally, not yet qualified | `retained_map/service.rs` overwrite dropped old `Value` after broker recharge but before the committed-byte postimage; `Value::drop` panic left ledger and store divergent | Publish the full new state before retiring old value; `panic_in_old_value_drop_cannot_split_committed_bytes_from_ledger` must pass. |
+| P0, repaired locally, not yet qualified | retained-map `close` released all leases then cleared entries before committing Closed; a panicking `Value::drop` reopened a ticketless partial map | Commit empty terminal state and Closed before retiring old map; `panic_in_close_value_drop_keeps_terminal_image_and_zero_ledger` must pass. |
+| P0, repaired locally, not yet qualified | retained-map `sweep` extracted charges and restored/removed entries through `Key::Hash/Eq` after the plan began; callback panic caused partial lease Drop or ticketless entries | Positional selection, validation, extraction and rollback, then callback-free `retain` after broker release; panic-key and panic-value semantic oracles must pass. |
+| P1, repaired locally, not yet qualified | transcript retain invoked user `SessionId::Ord` for map lookup after detaching charged rows, including broker-denied rollback | Stable session ordinal under mutation permit; positional lookup after broker call, with panic-Ord negative and full row/ledger postimage tests. This changes retain lookup to O(session count), requiring QMP-100 workload review. |
+| P1, repaired locally, not yet qualified | store `Drop` paths invoked arbitrary client destructors; multiple panicking fields during an existing unwind could abort the process | Shared per-field `retire_client_value`, with managed charges dropped first, applied to all five store owners. Require owner tests for multiple panicking fields during outer unwind on every generic store before receipt; a single `catch_unwind` over a whole collection is insufficient. |
+| P1, repaired locally, not yet qualified | generic `Hash/Eq/Clone/CanonicalKey/Ord` callbacks still execute under some store mutexes (e.g. retained `get_checked`, payload duplicate scan, transcript snapshot/replay, prepared resolve) | Shared nonblocking state-lock entry makes any same-store callback reentry return typed `OperationInProgress`, including read→read/close; owner-local callback tests are required on all affected paths. Ordinary lock contention now also returns Busy, an explicit API/scaling tradeoff to revisit in QMP-100. Accounting callback elimination alone was insufficient. |
+| P1, unresolved | `retained_map::sweep` now uses hashlink's `retain` after refund; hashlink can run multiple client destructors from one filtered collection | Multi-panic during an existing unwind may abort despite store-level Drop hardening. Consider key/value ownership wrapper or owner-local retirement before invoking a batch collection destructor; execute bounded subprocess stress. This is distinct from ledger/postimage consistency. |
+
+These are implementation-blocking checks, not a claim of `IMPLEMENTED` or
+`QUALIFIED`. Preserve QMP-040 as `IN_PROGRESS` until the explicit acceptance
+and receipt gates above are satisfied.
+
+### Host adapter migration dependency (coordination, not qualification)
+
+The external Semantica `quanta-memory-host` owner reported 37 compile errors
+while consuming the in-progress public API cutover, before its owner-local QBC
+could execute. That count is an external report, not independently reproduced
+in this repository. Do not restore `SharedAccountingSink`/late attachment to
+make the old adapter compile. After this ticket has a frozen product SHA,
+migrate the host adapter to platform-issued budgeted builders, mandatory mode
+types, typed close/stats, and the feature-gated pin boundary. QMP-130 owns the
+separate exact-head host qualification; this report is neither QMP-040 product
+failure proof nor host-adoption closure.

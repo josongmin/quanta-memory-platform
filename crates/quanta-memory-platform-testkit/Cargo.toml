@@ -13,6 +13,7 @@ conformance = [
     "quanta-memory-platform-facade/payload_store",
     "quanta-memory-platform-facade/publish_pipeline",
     "quanta-memory-platform-facade/retained_map",
+    "quanta-memory-platform-facade/revocable_store",
     "quanta-memory-platform-facade/transcript",
     "quanta-memory-platform-facade/spill",
 ]

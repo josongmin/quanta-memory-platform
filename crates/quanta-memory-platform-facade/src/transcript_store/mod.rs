@@ -218,5 +218,8 @@ pub trait SessionTranscriptStore<SessionId, MessageId, Message> {
         retained_sequences: &[u64],
     ) -> MemoryResult<()>;
     fn truncate_to(&self, session_id: &SessionId, max_messages: usize) -> MemoryResult<()>;
-    fn stats(&self) -> StoreStats;
+    /// Checked statistics: a poisoned backing cannot appear as an empty store.
+    fn stats(&self) -> MemoryResult<StoreStats>;
+    /// Terminal, idempotent release of all active rows and managed charges.
+    fn close(&self) -> MemoryResult<()>;
 }

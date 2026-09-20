@@ -77,25 +77,12 @@ where
     fn get_checked(&self, key: &Key) -> MemoryResult<Option<Value>>
     where
         Value: Clone;
-    /// Compatibility projection for advisory callers that cannot carry a
-    /// storage error. Correctness-sensitive paths MUST use `get_checked`.
-    fn get(&self, key: &Key) -> Option<Value>
-    where
-        Value: Clone,
-    {
-        self.get_checked(key).ok().flatten()
-    }
     fn remove(&self, key: &Key) -> MemoryResult<Option<Value>>
     where
         Value: Clone;
     fn sweep(&self, hint: SweepHint) -> MemoryResult<SweepStats>;
     /// Checked statistics read. A poisoned store is not an empty store.
     fn stats_checked(&self) -> MemoryResult<StoreStats>;
-    /// Advisory compatibility projection. Admission and consistency checks
-    /// MUST use `stats_checked`.
-    fn stats(&self) -> StoreStats {
-        self.stats_checked().unwrap_or_default()
-    }
 
     /// Checked enumeration of every live key in deterministic key order.
     ///
@@ -107,28 +94,13 @@ where
     where
         Key: Clone + Ord;
 
-    /// Advisory compatibility projection. Correctness-sensitive enumeration
-    /// such as GC MUST use [`RetainedMapStore::keys_checked`].
-    fn keys(&self) -> Vec<Key>
-    where
-        Key: Clone + Ord,
-    {
-        self.keys_checked().unwrap_or_default()
-    }
-
     /// Checked enumeration of every live `(key, value)` pair.
     fn entries_checked(&self) -> MemoryResult<Vec<(Key, Value)>>
     where
         Key: Clone + Ord,
         Value: Clone;
 
-    /// Advisory compatibility projection. Correctness-sensitive callers MUST
-    /// use [`RetainedMapStore::entries_checked`].
-    fn entries(&self) -> Vec<(Key, Value)>
-    where
-        Key: Clone + Ord,
-        Value: Clone,
-    {
-        self.entries_checked().unwrap_or_default()
-    }
+    /// Atomically release every live accounting authority and terminally close
+    /// this store. Repeated close is idempotent; later mutation is rejected.
+    fn close(&self) -> MemoryResult<()>;
 }

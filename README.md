@@ -46,9 +46,11 @@ public:
   override chain but returns only `EffectiveMemoryBudgetReport`; it cannot
   attach a runtime, allocate scratch, or construct charged stores.
 - `PortableMemoryPresets` for named budget manifests.
-- Store/pipeline builders (`PayloadStoreBuilder`, `RetainedMapStoreBuilder`,
-  `RevocableStoreBuilder`, `PreparedPublicationServiceBuilder`,
-  `SessionTranscriptStoreBuilder`).
+- `LiveMemoryPlatform::{payload_store_builder,retained_map_store_builder,
+  revocable_store_builder,prepared_publication_builder,
+  transcript_store_builder}` issues already-budgeted builders. Each retaining
+  store has a different concrete type from its unbudgeted counterpart; an
+  unset builder cannot `build()` or acquire a sink after construction.
 - `PublishPipelineBuilder` and its non-retaining `stage`/`commit` transition are
   legacy compatibility surfaces. New retaining publication code uses
   `PreparedPublicationServiceBuilder`; the QMP publish-pipeline migration owns
@@ -57,11 +59,18 @@ public:
   canonical-root token snapshot, stabilized against concurrent activation for
   the duration of the call. QMP validates and excludes referenced tokens; it
   never invents or owns the caller's activation state.
-- Charged store assembly stays builder-first too. For retained maps,
-  `RetainedMapStoreBuilder::bind(...)` moves into a bound typestate whose
-  `build()` is infallible; `charged_against(...)` is available on either builder
-  state. `SimpleRetainedMapStore` deliberately exposes no late sink attachment,
-  so uncharged entries can never be reclassified as ledger-backed.
+- For retained maps, `LiveMemoryPlatform::retained_map_store_builder()` returns
+  the budgeted builder; `bind(...)` moves into a bound typestate whose `build()`
+  is infallible. No store has a late accounting attachment or user-supplied
+  accounting callback. The explicit `unbudgeted-stores` feature permits a
+  distinct `Unbudgeted` store via `.unbudgeted()`, but it is absent from
+  `default`, `full`, and `full-backings`. `--all-features` enables it for coverage;
+  that does not change the budgeted platform factories or their product types.
+- Store reads, writes, and `close()` return typed `OperationInProgress` on
+  lifecycle or container-lock contention. This deliberately fails fast on
+  same-store reentry from client `Hash`/`Clone`/`CanonicalKey` callbacks;
+  callers may retry after the in-flight operation. A successful `close()` is
+  terminal and repeated close is idempotent; later writes return `Closed`.
 - Runtime scratch obtained through `LiveMemoryPlatform::attach_runtime` is
   charged against the same broker ledger, execution-scratch cap, class cap,
   owner/group admission, and release lifecycle as direct broker charges.

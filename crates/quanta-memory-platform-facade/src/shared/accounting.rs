@@ -1,117 +1,229 @@
-//! The facade-level accounting seam.
+//! Sealed accounting modes for facade stores.
 //!
-//! Portable stores must charge their bytes against the broker's ledger (the
-//! accounting SSOT) rather than tracking a private counter that no cap can see —
-//! the latter is two parallel accounting universes where global/owner/class caps
-//! never gate real store bytes. [`AccountingSink`] is the seam that closes that
-//! gap: a store holds an optional sink and, when present, every retained byte is
-//! reserved+committed through it on write and released on delete, so the broker's
-//! caps actually control store residency.
-//!
-//! When `core-live-accounting` is enabled, the blanket impl wires the live
-//! broker in as a sink. A store with no sink stays a self-accounting in-memory
-//! structure (explicit non-budgeted mode), which keeps the builder-first happy
-//! path and unit fixtures dependency-free.
+//! Production stores never invoke a user-provided callback. A budgeted builder
+//! carries the concrete live broker that issued every entry's non-clone
+//! [`ManagedCharge`]. This fixes one global lock order (`store -> broker`) and
+//! prevents reentrant accounting callbacks from entering a locked store.
 
-use std::sync::Arc;
-
-#[cfg(feature = "core-live-accounting")]
-use quanta_memory_platform_core::LiveProcessMemoryBroker;
+#[cfg(any(
+    feature = "payload_store",
+    feature = "retained_map",
+    feature = "revocable_store",
+    feature = "transcript",
+    feature = "publish_pipeline"
+))]
 use quanta_memory_platform_core::{
-    ChargeKind, MemoryClass, MemoryContextKind, MemoryResult, OwnerKey, RechargeError,
-    ReservationTicket,
+    ChargeKind, LiveProcessMemoryBroker, ManagedCharge, MemoryClass, MemoryContextKind,
+    MemoryResult, OwnerKey,
 };
 
-/// Outcome of a denied [`AccountingSink::recharge`]. The typed recovery state
-/// cannot conflate an untouched old ticket with a failed rollback.
-pub type RechargeDenied = RechargeError;
-
-/// A charge/refund seam against the broker's accounting ledger.
+/// Builder state before accounting policy has been selected.
 ///
-/// Implementors route store bytes through the real ledger. The receipt returned
-/// by [`Self::charge`] is the ledger's own [`ReservationTicket`], so refunds are
-/// idempotent and double-refund is rejected by the ledger (invariant 7).
-///
-/// `recharge` is a REQUIRED atomic contract: the facade no longer provides a
-/// refund-old-then-charge-new fallback because that shape cannot fail closed for
-/// a generic sink. Implementors must return the exact typed disposition of the
-/// old charge when the new charge is denied.
-pub trait AccountingSink: std::fmt::Debug + Send + Sync {
-    /// Reserve and commit `bytes` against (class, owner, context, kind). Fails
-    /// closed: a cap denial returns `Err` and charges nothing.
-    fn charge(
-        &self,
-        class: MemoryClass,
-        owner: OwnerKey,
-        context: MemoryContextKind,
-        kind: ChargeKind,
-        bytes: u64,
-    ) -> MemoryResult<ReservationTicket>;
-
-    /// Return previously charged bytes to the ledger.
-    fn refund(&self, ticket: &ReservationTicket) -> MemoryResult<()>;
-
-    /// Return a batch of previously charged tickets to the ledger atomically.
-    ///
-    /// A charged store uses this for multi-item mutations (truncate / sweep) so a
-    /// rebuild cannot partially refund the ledger before the store mutation is
-    /// known to succeed. On error, no ticket in the batch is refunded.
-    fn refund_many(&self, tickets: &[ReservationTicket]) -> MemoryResult<()>;
-
-    /// Atomically swap `old`'s charge for a new charge of `bytes` (an in-place
-    /// overwrite). On success the old receipt is consumed and the new receipt is
-    /// returned. On denial the caller receives the exact recovery disposition —
-    /// see [`RechargeDenied`].
-    ///
-    fn recharge(
-        &self,
-        old: &ReservationTicket,
-        class: MemoryClass,
-        owner: OwnerKey,
-        context: MemoryContextKind,
-        kind: ChargeKind,
-        bytes: u64,
-    ) -> Result<ReservationTicket, RechargeDenied>;
+/// This state intentionally has no `build` method.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AccountingUnset {
+    _private: (),
 }
 
-/// The shared, cloneable handle a store holds to charge against the ledger.
-pub type SharedAccountingSink = Arc<dyn AccountingSink>;
+/// Production accounting mode. Values are issued only by [`LiveMemoryPlatform`]
+/// store factories; consumers cannot fabricate or rebind this authority.
+///
+/// [`LiveMemoryPlatform`]: crate::shared::builder::LiveMemoryPlatform
+#[cfg(any(
+    feature = "payload_store",
+    feature = "retained_map",
+    feature = "revocable_store",
+    feature = "transcript",
+    feature = "publish_pipeline"
+))]
+#[derive(Clone)]
+pub struct Budgeted {
+    broker: LiveProcessMemoryBroker,
+}
 
-#[cfg(feature = "core-live-accounting")]
-impl AccountingSink for LiveProcessMemoryBroker {
-    fn charge(
+#[cfg(any(
+    feature = "payload_store",
+    feature = "retained_map",
+    feature = "revocable_store",
+    feature = "transcript",
+    feature = "publish_pipeline"
+))]
+impl std::fmt::Debug for Budgeted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Budgeted").finish_non_exhaustive()
+    }
+}
+
+#[cfg(any(
+    feature = "payload_store",
+    feature = "retained_map",
+    feature = "revocable_store",
+    feature = "transcript",
+    feature = "publish_pipeline"
+))]
+impl Budgeted {
+    pub(crate) fn new(broker: LiveProcessMemoryBroker) -> Self {
+        Self { broker }
+    }
+
+    pub(crate) fn into_broker(self) -> LiveProcessMemoryBroker {
+        self.broker
+    }
+}
+
+/// Explicit escape hatch for fixtures and consumers that intentionally opt out
+/// of ledger enforcement. It exists only with the non-default
+/// `unbudgeted-stores` feature and is a different product type from [`Budgeted`].
+///
+/// ```compile_fail
+/// use quanta_memory_platform_facade::{
+///     AccountingUnset, Budgeted, PayloadStoreBuilder, SimplePayloadStore,
+/// };
+/// use quanta_memory_platform_core::{MemoryClass, StoreBindingHandle};
+///
+/// fn requires_budgeted(_: SimplePayloadStore<String, Vec<u8>, Budgeted>) {}
+/// let binding = StoreBindingHandle::new(MemoryClass::ArtifactCache, "owner".into(), None);
+/// let unbudgeted = PayloadStoreBuilder::<String, Vec<u8>, AccountingUnset>::new()
+///     .unbudgeted()
+///     .bind(binding)
+///     .build()
+///     .unwrap();
+/// requires_budgeted(unbudgeted);
+/// ```
+#[cfg(all(
+    feature = "unbudgeted-stores",
+    any(
+        feature = "payload_store",
+        feature = "retained_map",
+        feature = "revocable_store",
+        feature = "transcript",
+        feature = "publish_pipeline"
+    )
+))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Unbudgeted {
+    _private: (),
+}
+
+#[cfg(all(
+    feature = "unbudgeted-stores",
+    any(
+        feature = "payload_store",
+        feature = "retained_map",
+        feature = "revocable_store",
+        feature = "transcript",
+        feature = "publish_pipeline"
+    )
+))]
+impl Unbudgeted {
+    pub(crate) const fn new() -> Self {
+        Self { _private: () }
+    }
+}
+
+/// Concrete, crate-owned accounting authority embedded in every store.
+#[cfg(any(
+    feature = "payload_store",
+    feature = "retained_map",
+    feature = "revocable_store",
+    feature = "transcript",
+    feature = "publish_pipeline"
+))]
+#[derive(Clone, Debug)]
+pub(crate) enum StoreAccounting {
+    Budgeted(LiveProcessMemoryBroker),
+    #[cfg(any(
+        feature = "unbudgeted-stores",
+        all(
+            test,
+            any(feature = "retained_map", feature = "transcript", feature = "publish_pipeline")
+        )
+    ))]
+    Unbudgeted,
+}
+
+#[cfg(any(
+    feature = "payload_store",
+    feature = "retained_map",
+    feature = "revocable_store",
+    feature = "transcript",
+    feature = "publish_pipeline"
+))]
+impl StoreAccounting {
+    pub(crate) fn charge(
         &self,
         class: MemoryClass,
         owner: OwnerKey,
         context: MemoryContextKind,
         kind: ChargeKind,
         bytes: u64,
-    ) -> MemoryResult<ReservationTicket> {
-        // A retained store byte is a committed charge. Use the broker's atomic
-        // reserve+commit primitive so the reservation and its commit happen under
-        // ONE lock: a rebuild can never interleave between them and strand the
-        // reserved bytes behind a discarded ticket (fail-closed on a cap breach).
-        self.reserve_committed(class, owner, context, kind, bytes)
+    ) -> MemoryResult<Option<ManagedCharge>> {
+        match self {
+            Self::Budgeted(broker) => {
+                broker.reserve_managed_charge(class, owner, context, kind, bytes).map(Some)
+            }
+            #[cfg(any(
+                feature = "unbudgeted-stores",
+                all(
+                    test,
+                    any(
+                        feature = "retained_map",
+                        feature = "transcript",
+                        feature = "publish_pipeline"
+                    )
+                )
+            ))]
+            Self::Unbudgeted => Ok(None),
+        }
     }
 
-    fn refund(&self, ticket: &ReservationTicket) -> MemoryResult<()> {
-        self.release(ticket)
+    pub(crate) fn release_many(&self, charges: &mut [ManagedCharge]) -> MemoryResult<()> {
+        match self {
+            Self::Budgeted(broker) => broker.release_managed_many(charges),
+            #[cfg(any(
+                feature = "unbudgeted-stores",
+                all(
+                    test,
+                    any(
+                        feature = "retained_map",
+                        feature = "transcript",
+                        feature = "publish_pipeline"
+                    )
+                )
+            ))]
+            Self::Unbudgeted => {
+                if charges.is_empty() {
+                    Ok(())
+                } else {
+                    Err(quanta_memory_platform_core::MemoryError::InvalidState(
+                        "unbudgeted store cannot own managed charges".to_string(),
+                    ))
+                }
+            }
+        }
     }
 
-    fn refund_many(&self, tickets: &[ReservationTicket]) -> MemoryResult<()> {
-        self.release_many(tickets)
-    }
-
-    fn recharge(
-        &self,
-        old: &ReservationTicket,
-        class: MemoryClass,
-        owner: OwnerKey,
-        context: MemoryContextKind,
-        kind: ChargeKind,
-        bytes: u64,
-    ) -> Result<ReservationTicket, RechargeDenied> {
-        // Single-lock atomic swap: no transient double-count, no mid-rebuild strand.
-        LiveProcessMemoryBroker::recharge(self, old, class, owner, context, kind, bytes)
+    #[cfg(any(
+        feature = "retained_map",
+        feature = "revocable_store",
+        feature = "transcript",
+        feature = "publish_pipeline"
+    ))]
+    pub(crate) fn broker(&self) -> Option<&LiveProcessMemoryBroker> {
+        match self {
+            Self::Budgeted(broker) => Some(broker),
+            #[cfg(any(
+                feature = "unbudgeted-stores",
+                all(
+                    test,
+                    any(
+                        feature = "retained_map",
+                        feature = "transcript",
+                        feature = "publish_pipeline"
+                    )
+                )
+            ))]
+            Self::Unbudgeted => None,
+        }
     }
 }

@@ -15,19 +15,19 @@
 use std::sync::Arc;
 
 use quanta_memory_platform_core::{
-    ChargeKind, ExecutionBudget, LedgerSnapshot, LiveProcessMemoryBroker, MemoryBudgetManifest,
-    MemoryClass, MemoryClassBudget, MemoryContextKind, MemoryError, MemoryPreset, ReclaimPriority,
+    ChargeKind, ExecutionBudget, LedgerSnapshot, MemoryBudgetManifest, MemoryClass,
+    MemoryClassBudget, MemoryContextKind, MemoryError, MemoryPreset, ReclaimPriority,
     ResidencyPolicy, StoreBindingHandle,
 };
 use quanta_memory_platform_facade::{
-    RetainedMapStore, RetainedMapStoreBuilder, SharedAccountingSink, SimpleRetainedMapStore,
+    Budgeted, LiveMemoryPlatform, MemoryPlatformBuilder, RetainedMapStore, SimpleRetainedMapStore,
 };
 
 const OWNER: &str = "e2e-owner";
 
-/// A broker whose `MemoResidency` class is capped at `class_hard` and whose global
+/// A live platform whose `MemoResidency` class is capped at `class_hard` and whose global
 /// limit is `global`. Roomy elsewhere so the test controls exactly which cap bites.
-fn broker(global: u64, class_hard: u64) -> LiveProcessMemoryBroker {
+fn broker(global: u64, class_hard: u64) -> LiveMemoryPlatform {
     let residency = ResidencyPolicy::new(global).with_class_budget(
         MemoryClass::MemoResidency,
         MemoryClassBudget {
@@ -38,20 +38,19 @@ fn broker(global: u64, class_hard: u64) -> LiveProcessMemoryBroker {
             reclaim_priority: ReclaimPriority::Normal,
         },
     );
-    quanta_memory_platform_core::ProcessMemoryBrokerBuilder::new()
+    MemoryPlatformBuilder::new()
         .with_manifest(MemoryBudgetManifest::new(
             MemoryPreset::Production,
             ExecutionBudget::default(),
             residency,
         ))
         .build()
-        .expect("valid broker")
+        .expect("valid live platform")
 }
 
-fn charged_map(broker: &LiveProcessMemoryBroker) -> SimpleRetainedMapStore<String, Vec<u8>> {
-    let sink: SharedAccountingSink = Arc::new(broker.clone());
+fn charged_map(platform: &LiveMemoryPlatform) -> SimpleRetainedMapStore<String, Vec<u8>, Budgeted> {
     let binding = StoreBindingHandle::new(MemoryClass::MemoResidency, OWNER.to_string(), None);
-    RetainedMapStoreBuilder::new().bind(binding).charged_against(sink).build()
+    platform.retained_map_store_builder::<String, Vec<u8>>().bind(binding).build()
 }
 
 /// Assert the three accounting axes balance — the SSOT is internally consistent.
@@ -67,11 +66,11 @@ fn assert_balanced(snap: &LedgerSnapshot) {
 fn charged_store_bytes_flow_through_the_ledger_and_drain_to_zero() {
     let b = broker(10_000_000, 1_000_000);
     let store = charged_map(&b);
-    assert_eq!(b.ledger_snapshot().expect("snap").total_owner_bytes(), 0);
+    assert_eq!(b.broker().ledger_snapshot().expect("snap").total_owner_bytes(), 0);
 
     store.insert_checked("a".to_string(), vec![0u8; 100]).expect("insert a");
     store.insert_checked("b".to_string(), vec![0u8; 250]).expect("insert b");
-    let snap = b.ledger_snapshot().expect("snap");
+    let snap = b.broker().ledger_snapshot().expect("snap");
     assert_eq!(snap.total_owner_bytes(), 350, "store bytes are visible in the broker ledger");
     assert_eq!(
         store.committed_bytes().expect("committed"),
@@ -82,13 +81,72 @@ fn charged_store_bytes_flow_through_the_ledger_and_drain_to_zero() {
 
     // Overwrite 'a' smaller: the ledger re-charges to the new size, never doubles.
     store.insert_checked("a".to_string(), vec![0u8; 40]).expect("overwrite a");
-    assert_eq!(b.ledger_snapshot().expect("snap").total_owner_bytes(), 290);
+    assert_eq!(b.broker().ledger_snapshot().expect("snap").total_owner_bytes(), 290);
 
     store.remove(&"a".to_string()).expect("remove a");
     store.remove(&"b".to_string()).expect("remove b");
-    let snap = b.ledger_snapshot().expect("snap");
+    let snap = b.broker().ledger_snapshot().expect("snap");
     assert_eq!(snap.total_owner_bytes(), 0, "draining the store returns the ledger to zero");
     assert_balanced(&snap);
+}
+
+#[test]
+fn close_drains_all_charges_once_and_rejects_later_mutation() {
+    let platform = broker(10_000_000, 1_000_000);
+    let store = charged_map(&platform);
+    store.insert_checked("a".to_string(), vec![0; 100]).expect("a");
+    store.insert_checked("b".to_string(), vec![0; 250]).expect("b");
+    assert_eq!(platform.broker().ledger_snapshot().expect("before").total_owner_bytes(), 350);
+
+    store.close().expect("terminal close");
+    store.close().expect("idempotent close");
+    let snapshot = platform.broker().ledger_snapshot().expect("after");
+    assert_eq!(snapshot.total_owner_bytes(), 0);
+    assert_balanced(&snapshot);
+    let denied = store.insert_checked("late".to_string(), vec![1]);
+    assert!(
+        matches!(denied, Err(MemoryError::Closed(_))),
+        "closed store must reject writes: {denied:?}"
+    );
+}
+
+#[test]
+fn failed_close_during_rebuild_preserves_store_and_retries_after_fence() {
+    let platform = broker(10_000_000, 1_000_000);
+    let store = charged_map(&platform);
+    store.insert_checked("kept".to_string(), vec![0; 200]).expect("insert");
+    platform.broker().begin_rebuild().expect("begin fence");
+    let before = platform.broker().ledger_snapshot().expect("before");
+
+    let denied = store.close();
+    assert!(
+        matches!(denied, Err(MemoryError::InvalidState(_))),
+        "rebuild must reject close: {denied:?}"
+    );
+    assert_eq!(platform.broker().ledger_snapshot().expect("after denial"), before);
+    assert_eq!(store.get_checked(&"kept".to_string()).expect("checked read"), Some(vec![0; 200]));
+    assert_eq!(store.committed_bytes().expect("counter"), 200);
+
+    platform.broker().finish_rebuild().expect("end fence");
+    store.close().expect("retry close");
+    assert_eq!(platform.broker().ledger_snapshot().expect("after close").total_owner_bytes(), 0);
+}
+
+#[test]
+fn store_drop_during_rebuild_defers_refund_until_finish() {
+    let platform = broker(10_000_000, 1_000_000);
+    let store = charged_map(&platform);
+    store.insert_checked("dropped".to_string(), vec![0; 321]).expect("insert");
+    platform.broker().begin_rebuild().expect("begin fence");
+    drop(store);
+
+    let fenced = platform.broker().ledger_snapshot().expect("fenced snapshot");
+    assert_eq!(fenced.total_owner_bytes(), 321, "rebuild must not silently zero the ledger");
+    assert_balanced(&fenced);
+    platform.broker().finish_rebuild().expect("drain deferred cleanup");
+    let drained = platform.broker().ledger_snapshot().expect("drained snapshot");
+    assert_eq!(drained.total_owner_bytes(), 0);
+    assert_balanced(&drained);
 }
 
 // E2E: the spill tier (claimed in this file's header) actually round-trips end to
@@ -105,7 +163,7 @@ fn e2e_spill_tier_round_trips_fifo_and_never_touches_the_ledger() {
     let b = broker(10_000_000, 1_000_000);
     let store = charged_map(&b);
     store.insert_checked("resident".to_string(), vec![0u8; 500]).expect("insert");
-    let ledger_before = b.ledger_snapshot().expect("snap").total_owner_bytes();
+    let ledger_before = b.broker().ledger_snapshot().expect("snap").total_owner_bytes();
     assert_eq!(ledger_before, 500);
 
     let controller = RoutedSpillController::new(RetainingSpillTarget::available());
@@ -113,7 +171,7 @@ fn e2e_spill_tier_round_trips_fifo_and_never_touches_the_ledger() {
     controller.spill("h2".to_string()).expect("spill 2");
     assert_eq!(controller.spilled_count(), 2);
     // Accounting-neutral: routing handles to the spill tier moves no broker bytes.
-    assert_eq!(b.ledger_snapshot().expect("snap").total_owner_bytes(), ledger_before);
+    assert_eq!(b.broker().ledger_snapshot().expect("snap").total_owner_bytes(), ledger_before);
 
     // FIFO restore brings handles back oldest-first; the count balances to zero.
     assert_eq!(controller.restore().expect("r1"), Some("h1".to_string()));
@@ -121,7 +179,7 @@ fn e2e_spill_tier_round_trips_fifo_and_never_touches_the_ledger() {
     assert_eq!(controller.restore().expect("drained"), None);
     assert_eq!(controller.spilled_count(), 0);
     assert_eq!(
-        b.ledger_snapshot().expect("snap").total_owner_bytes(),
+        b.broker().ledger_snapshot().expect("snap").total_owner_bytes(),
         ledger_before,
         "the spill round-trip left the ledger untouched"
     );
@@ -134,7 +192,7 @@ fn class_cap_gates_store_bytes_fail_closed() {
     let b = broker(10_000_000, 1_000); // class cap 1_000
     let store = charged_map(&b);
     store.insert_checked("survivor".to_string(), vec![0u8; 800]).expect("under cap");
-    let before = b.ledger_snapshot().expect("snap");
+    let before = b.broker().ledger_snapshot().expect("snap");
     let store_before = store.committed_bytes().expect("committed");
 
     // 800 + 400 = 1_200 > 1_000 class cap -> denied.
@@ -144,7 +202,7 @@ fn class_cap_gates_store_bytes_fail_closed() {
         "over-cap charged insert must be a typed capacity error, got {denied:?}"
     );
     assert_eq!(
-        b.ledger_snapshot().expect("snap"),
+        b.broker().ledger_snapshot().expect("snap"),
         before,
         "denied insert must not move the ledger"
     );
@@ -153,8 +211,15 @@ fn class_cap_gates_store_bytes_fail_closed() {
         store_before,
         "denied insert must not move the store"
     );
-    assert_eq!(store.get(&"survivor".to_string()), Some(vec![0u8; 800]), "survivor intact");
-    assert!(store.get(&"overflow".to_string()).is_none(), "no phantom entry created");
+    assert_eq!(
+        store.get_checked(&"survivor".to_string()).expect("checked read"),
+        Some(vec![0u8; 800]),
+        "survivor intact"
+    );
+    assert!(
+        store.get_checked(&"overflow".to_string()).expect("checked read").is_none(),
+        "no phantom entry created"
+    );
 }
 
 // 3) Overwrite uses the atomic recharge: an in-place overwrite that NETS within
@@ -169,7 +234,7 @@ fn overwrite_recharge_admits_net_fitting_replacement() {
     store
         .insert_checked("k".to_string(), vec![0u8; 1_000])
         .expect("net-fitting overwrite via recharge");
-    assert_eq!(b.ledger_snapshot().expect("snap").total_owner_bytes(), 1_000);
+    assert_eq!(b.broker().ledger_snapshot().expect("snap").total_owner_bytes(), 1_000);
     assert_eq!(store.committed_bytes().expect("c"), 1_000);
 }
 
@@ -179,7 +244,7 @@ fn rebuild_fences_charged_store_writes_then_resumes() {
     let b = broker(10_000_000, 1_000_000);
     let store = charged_map(&b);
     store.insert_checked("pre".to_string(), vec![0u8; 500]).expect("pre-rebuild insert");
-    b.begin_rebuild().expect("begin rebuild");
+    b.broker().begin_rebuild().expect("begin rebuild");
 
     let during = store.insert_checked("during".to_string(), vec![0u8; 500]);
     assert!(
@@ -187,12 +252,12 @@ fn rebuild_fences_charged_store_writes_then_resumes() {
         "charged insert during rebuild must be rejected, got {during:?}"
     );
     // Fail-closed: nothing stranded, the pre-rebuild charge is intact.
-    assert_eq!(b.ledger_snapshot().expect("snap").total_owner_bytes(), 500);
+    assert_eq!(b.broker().ledger_snapshot().expect("snap").total_owner_bytes(), 500);
 
-    b.finish_rebuild().expect("finish rebuild");
+    b.broker().finish_rebuild().expect("finish rebuild");
     store.insert_checked("post".to_string(), vec![0u8; 300]).expect("writes resume after rebuild");
-    assert_eq!(b.ledger_snapshot().expect("snap").total_owner_bytes(), 800);
-    assert_balanced(&b.ledger_snapshot().expect("snap"));
+    assert_eq!(b.broker().ledger_snapshot().expect("snap").total_owner_bytes(), 800);
+    assert_balanced(&b.broker().ledger_snapshot().expect("snap"));
 }
 
 // 5) A legal live reconfigure (raising caps) preserves charged usage and the
@@ -213,15 +278,15 @@ fn reconfigure_raise_preserves_charged_usage() {
             reclaim_priority: ReclaimPriority::Normal,
         },
     );
-    b.try_live_reconfigure(raised).expect("raising caps is legal");
-    let snap = b.ledger_snapshot().expect("snap");
+    b.broker().try_live_reconfigure(raised).expect("raising caps is legal");
+    let snap = b.broker().ledger_snapshot().expect("snap");
     assert_eq!(snap.total_owner_bytes(), 600_000, "charged usage survives a legal reconfigure");
     assert_balanced(&snap);
     // The larger cap now admits what the old one would have denied.
     store
         .insert_checked("y".to_string(), vec![0u8; 3_000_000])
         .expect("admitted under the raised cap");
-    assert_eq!(b.ledger_snapshot().expect("snap").total_owner_bytes(), 3_600_000);
+    assert_eq!(b.broker().ledger_snapshot().expect("snap").total_owner_bytes(), 3_600_000);
 }
 
 // 6) Concurrency: many threads hammering one charged store (shared broker) never
@@ -239,7 +304,20 @@ fn concurrent_charged_inserts_never_exceed_global_and_stay_consistent() {
         handles.push(std::thread::spawn(move || {
             for i in 0..50 {
                 // Distinct keys so every attempt is a fresh 1_000-byte insert.
-                let _ = store.insert_checked(format!("k{t}-{i}"), vec![0u8; 1_000]);
+                // A competing store operation now returns typed busy instead of
+                // waiting; retry only that transient state. Capacity is terminal.
+                let mut busy_retries = 0usize;
+                loop {
+                    match store.insert_checked(format!("k{t}-{i}"), vec![0u8; 1_000]) {
+                        Ok(()) | Err(MemoryError::Capacity(_)) => break,
+                        Err(MemoryError::OperationInProgress(_)) => {
+                            busy_retries += 1;
+                            assert!(busy_retries < 100_000, "store never left busy phase");
+                            std::thread::yield_now();
+                        }
+                        Err(error) => panic!("unexpected concurrent store failure: {error:?}"),
+                    }
+                }
             }
         }));
     }
@@ -247,7 +325,7 @@ fn concurrent_charged_inserts_never_exceed_global_and_stay_consistent() {
         h.join().expect("thread panicked");
     }
 
-    let snap = b.ledger_snapshot().expect("snap");
+    let snap = b.broker().ledger_snapshot().expect("snap");
     assert!(
         snap.total_owner_bytes() <= global,
         "global limit must hold under concurrent charged inserts: {}",
@@ -270,7 +348,7 @@ fn double_remove_does_not_double_refund_the_ledger() {
     let b = broker(10_000_000, 1_000_000);
     let store = charged_map(&b);
     store.insert_checked("k".to_string(), vec![0u8; 1_000]).expect("insert");
-    assert_eq!(b.ledger_snapshot().expect("snap").total_owner_bytes(), 1_000);
+    assert_eq!(b.broker().ledger_snapshot().expect("snap").total_owner_bytes(), 1_000);
 
     assert_eq!(
         store.remove(&"k".to_string()).expect("first remove"),
@@ -278,7 +356,7 @@ fn double_remove_does_not_double_refund_the_ledger() {
         "first remove returns value"
     );
     assert_eq!(
-        b.ledger_snapshot().expect("snap").total_owner_bytes(),
+        b.broker().ledger_snapshot().expect("snap").total_owner_bytes(),
         0,
         "first remove refunds once"
     );
@@ -286,7 +364,7 @@ fn double_remove_does_not_double_refund_the_ledger() {
         store.remove(&"k".to_string()).expect("second remove").is_none(),
         "second remove finds nothing"
     );
-    let snap = b.ledger_snapshot().expect("snap");
+    let snap = b.broker().ledger_snapshot().expect("snap");
     assert_eq!(snap.total_owner_bytes(), 0, "second remove cannot drive the ledger negative");
     assert_balanced(&snap);
 }
@@ -297,6 +375,7 @@ fn double_remove_does_not_double_refund_the_ledger() {
 fn broker_recharge_denied_preserves_old_ticket() {
     let b = broker(10_000_000, 1_000);
     let old = b
+        .broker()
         .reserve_committed(
             MemoryClass::MemoResidency,
             OWNER.to_string(),
@@ -306,6 +385,7 @@ fn broker_recharge_denied_preserves_old_ticket() {
         )
         .expect("charge 800 of 1000");
     let err = b
+        .broker()
         .recharge(
             &old,
             MemoryClass::MemoResidency,
@@ -317,26 +397,28 @@ fn broker_recharge_denied_preserves_old_ticket() {
         .expect_err("over-cap recharge denied");
     assert!(matches!(err.error, MemoryError::Capacity(_)));
     assert_eq!(err.recovery, quanta_memory_platform_core::RechargeRecoveryV1::OldChargePreserved);
-    assert_eq!(b.ledger_snapshot().expect("snap").total_owner_bytes(), 800, "old charge preserved");
-    b.release(&old).expect("preserved ticket releases the old bytes");
-    assert_eq!(b.ledger_snapshot().expect("snap").total_owner_bytes(), 0);
+    assert_eq!(
+        b.broker().ledger_snapshot().expect("snap").total_owner_bytes(),
+        800,
+        "old charge preserved"
+    );
+    b.broker().release(&old).expect("preserved ticket releases the old bytes");
+    assert_eq!(b.broker().ledger_snapshot().expect("snap").total_owner_bytes(), 0);
 }
 
 // --- batch release (release_many) atomicity + idempotency at the public surface ---
 // (the charged stores' sweep/truncate refund through this; audit findings [1]/[16])
 
-fn committed(
-    b: &LiveProcessMemoryBroker,
-    bytes: u64,
-) -> quanta_memory_platform_core::ReservationTicket {
-    b.reserve_committed(
-        MemoryClass::MemoResidency,
-        OWNER.to_string(),
-        MemoryContextKind::Request,
-        ChargeKind::RetainedMetadata,
-        bytes,
-    )
-    .expect("committed charge")
+fn committed(b: &LiveMemoryPlatform, bytes: u64) -> quanta_memory_platform_core::ReservationTicket {
+    b.broker()
+        .reserve_committed(
+            MemoryClass::MemoResidency,
+            OWNER.to_string(),
+            MemoryContextKind::Request,
+            ChargeKind::RetainedMetadata,
+            bytes,
+        )
+        .expect("committed charge")
 }
 
 #[test]
@@ -345,10 +427,10 @@ fn release_many_drains_a_batch_atomically() {
     let t1 = committed(&b, 100);
     let t2 = committed(&b, 200);
     let t3 = committed(&b, 300);
-    assert_eq!(b.ledger_snapshot().expect("snap").total_owner_bytes(), 600);
+    assert_eq!(b.broker().ledger_snapshot().expect("snap").total_owner_bytes(), 600);
 
-    b.release_many(&[t1, t2, t3]).expect("batch release drains all");
-    let snap = b.ledger_snapshot().expect("snap");
+    b.broker().release_many(&[t1, t2, t3]).expect("batch release drains all");
+    let snap = b.broker().ledger_snapshot().expect("snap");
     assert_eq!(snap.total_owner_bytes(), 0, "batch release returns every ticket's bytes");
     assert_balanced(&snap);
 }
@@ -358,22 +440,22 @@ fn release_many_with_a_duplicate_is_fail_closed() {
     let b = broker(10_000_000, 1_000_000);
     let t1 = committed(&b, 100);
     let t2 = committed(&b, 200);
-    let before = b.ledger_snapshot().expect("snap");
+    let before = b.broker().ledger_snapshot().expect("snap");
 
     // A duplicate ticket in one batch is rejected BEFORE any counter moves.
-    let denied = b.release_many(&[t1.clone(), t1.clone(), t2.clone()]);
+    let denied = b.broker().release_many(&[t1.clone(), t1.clone(), t2.clone()]);
     assert!(
         matches!(denied, Err(MemoryError::InvalidState(_))),
         "a duplicate in the batch must be rejected, got {denied:?}"
     );
     assert_eq!(
-        b.ledger_snapshot().expect("snap"),
+        b.broker().ledger_snapshot().expect("snap"),
         before,
         "a rejected batch must leave every ticket charged (all-or-none)"
     );
     // The batch is still releasable cleanly once de-duplicated.
-    b.release_many(&[t1, t2]).expect("de-duplicated batch releases");
-    assert_eq!(b.ledger_snapshot().expect("snap").total_owner_bytes(), 0);
+    b.broker().release_many(&[t1, t2]).expect("de-duplicated batch releases");
+    assert_eq!(b.broker().ledger_snapshot().expect("snap").total_owner_bytes(), 0);
 }
 
 #[test]
@@ -381,24 +463,24 @@ fn release_many_with_an_already_released_ticket_is_fail_closed() {
     let b = broker(10_000_000, 1_000_000);
     let t1 = committed(&b, 100);
     let t2 = committed(&b, 200);
-    b.release(&t1).expect("release t1 individually");
-    let before = b.ledger_snapshot().expect("snap");
+    b.broker().release(&t1).expect("release t1 individually");
+    let before = b.broker().ledger_snapshot().expect("snap");
     assert_eq!(before.total_owner_bytes(), 200, "only t2 remains charged");
 
     // Batch containing the already-released t1 must fail closed, NOT partially
     // refund t2 (which would strand/lose accounting).
-    let denied = b.release_many(&[t1, t2.clone()]);
+    let denied = b.broker().release_many(&[t1, t2.clone()]);
     assert!(
         matches!(denied, Err(MemoryError::InvalidState(_))),
         "a batch with an already-released ticket must be rejected, got {denied:?}"
     );
     assert_eq!(
-        b.ledger_snapshot().expect("snap"),
+        b.broker().ledger_snapshot().expect("snap"),
         before,
         "the still-live ticket must not be partially refunded by a rejected batch"
     );
-    b.release(&t2).expect("t2 still releasable on its own");
-    assert_eq!(b.ledger_snapshot().expect("snap").total_owner_bytes(), 0);
+    b.broker().release(&t2).expect("t2 still releasable on its own");
+    assert_eq!(b.broker().ledger_snapshot().expect("snap").total_owner_bytes(), 0);
 }
 
 #[test]
@@ -406,15 +488,15 @@ fn release_many_during_rebuild_is_fail_closed() {
     let b = broker(10_000_000, 1_000_000);
     let t1 = committed(&b, 100);
     let t2 = committed(&b, 200);
-    b.begin_rebuild().expect("begin rebuild");
-    let before = b.ledger_snapshot().expect("snap");
-    let denied = b.release_many(&[t1, t2]);
+    b.broker().begin_rebuild().expect("begin rebuild");
+    let before = b.broker().ledger_snapshot().expect("snap");
+    let denied = b.broker().release_many(&[t1, t2]);
     assert!(
         matches!(denied, Err(MemoryError::InvalidState(_))),
         "batch release during rebuild is rejected, got {denied:?}"
     );
     assert_eq!(
-        b.ledger_snapshot().expect("snap"),
+        b.broker().ledger_snapshot().expect("snap"),
         before,
         "a rebuild-rejected batch strands nothing",
     );
@@ -424,23 +506,23 @@ fn release_many_during_rebuild_is_fail_closed() {
 #[cfg(feature = "payload_store")]
 mod payload_e2e {
     use super::{broker, OWNER};
-    use std::sync::Arc;
-
     use quanta_memory_platform_core::{
         MemoryClass, MemoryError, RetainedEnvelope, StoreBindingHandle,
     };
-    use quanta_memory_platform_facade::{PayloadStore, SharedAccountingSink, SimplePayloadStore};
+    use quanta_memory_platform_facade::{
+        Budgeted, LiveMemoryPlatform, PayloadStore, SimplePayloadStore,
+    };
 
-    fn charged_payload(
-        b: &quanta_memory_platform_core::LiveProcessMemoryBroker,
-    ) -> SimplePayloadStore<String, Vec<u8>> {
-        let sink: SharedAccountingSink = Arc::new(b.clone());
+    fn charged_payload(b: &LiveMemoryPlatform) -> SimplePayloadStore<String, Vec<u8>, Budgeted> {
         let binding = StoreBindingHandle::new(MemoryClass::MemoResidency, OWNER.to_string(), None);
-        SimplePayloadStore::new(binding, None).charged_against(sink)
+        b.payload_store_builder::<String, Vec<u8>>()
+            .bind(binding)
+            .build()
+            .expect("budgeted payload store")
     }
 
-    fn ledger(b: &quanta_memory_platform_core::LiveProcessMemoryBroker) -> u64 {
-        b.ledger_snapshot().expect("snap").total_owner_bytes()
+    fn ledger(b: &LiveMemoryPlatform) -> u64 {
+        b.broker().ledger_snapshot().expect("snap").total_owner_bytes()
     }
 
     #[test]

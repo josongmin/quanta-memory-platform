@@ -39,6 +39,7 @@ CORE_FEATURES=(pressure scheduler live_control unbudgeted_pin telemetry)
 # Names are taken verbatim from facade/Cargo.toml — no invented variants.
 FACADE_FEATURES=(
   core-live-accounting
+  unbudgeted-stores
   payload_store
   retained_map
   revocable_store
@@ -102,6 +103,15 @@ facade_bare_tree="$(cargo tree -p "${FACADE_CRATE}" --no-default-features -e fea
 if rg -q 'quanta-memory-platform-core feature "(default|live_control)"' <<<"${facade_bare_tree}"; then
   echo "feature-matrix: facade --no-default-features leaked core default/live_control" >&2
   printf '%s\n' "${facade_bare_tree}" >&2
+  exit 1
+fi
+
+# The documented production aggregate must not expose the explicit unbudgeted
+# escape hatch. `--all-features` covers its compilation separately.
+facade_full_tree="$(cargo tree -p "${FACADE_CRATE}" --no-default-features --features full \
+  -e features -i "${FACADE_CRATE}")"
+if rg -q 'quanta-memory-platform-facade feature "unbudgeted-stores"' <<<"${facade_full_tree}"; then
+  echo "feature-matrix: facade feature 'full' must not enable unbudgeted-stores" >&2
   exit 1
 fi
 

@@ -7,8 +7,34 @@
 
 pub mod accounting;
 pub mod builder;
+#[cfg(any(
+    feature = "payload_store",
+    feature = "retained_map",
+    feature = "revocable_store",
+    feature = "transcript",
+    feature = "publish_pipeline"
+))]
 pub(crate) mod lifecycle;
 pub mod measure;
 
-pub use accounting::{AccountingSink, SharedAccountingSink};
+pub use accounting::AccountingUnset;
+#[cfg(any(
+    feature = "payload_store",
+    feature = "retained_map",
+    feature = "revocable_store",
+    feature = "transcript",
+    feature = "publish_pipeline"
+))]
+pub use accounting::Budgeted;
+#[cfg(all(
+    feature = "unbudgeted-stores",
+    any(
+        feature = "payload_store",
+        feature = "retained_map",
+        feature = "revocable_store",
+        feature = "transcript",
+        feature = "publish_pipeline"
+    )
+))]
+pub use accounting::Unbudgeted;
 pub use measure::{ByteSized, CanonicalKey, MeasuredValue};

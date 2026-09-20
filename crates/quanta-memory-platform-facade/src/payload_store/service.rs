@@ -1,20 +1,19 @@
-use std::sync::Mutex;
+use std::marker::PhantomData;
+use std::sync::{Mutex, PoisonError};
 
 use quanta_memory_platform_core::{
-    ChargeKind, MemoryContextHandle, MemoryContextKind, MemoryError, PublishedPayload,
-    ReservationTicket, RetainedEnvelope, StoreBindingHandle, StoreDeleteError, StoreStats,
-    StoreWriteError,
+    ChargeKind, LiveProcessMemoryBroker, ManagedCharge, MemoryContextHandle, MemoryContextKind,
+    MemoryError, MemoryResult, PublishedPayload, RetainedEnvelope, StoreBindingHandle,
+    StoreDeleteError, StoreStats, StoreWriteError,
 };
 
 use crate::payload_store::PayloadStore;
-use crate::shared::accounting::SharedAccountingSink;
+#[cfg(feature = "unbudgeted-stores")]
+use crate::shared::accounting::Unbudgeted;
+use crate::shared::accounting::{Budgeted, StoreAccounting};
+use crate::shared::lifecycle::{retire_client_value, BeginClose, DropTransition, StoreLifecycle};
 use crate::shared::measure::{ByteSized, CanonicalKey};
 
-/// A fixed-size digest of a canonical key, used as the dedup fast-path so the
-/// store does not retain a full second copy of every payload's bytes (the old
-/// `canonical_key: Vec<u8>` doubled resident memory). Digest collisions are
-/// resolved exactly by re-deriving and comparing the colliding entry's canonical
-/// key, so dedup stays correct, never hash-approximate.
 fn canonical_digest(key: &[u8]) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -22,68 +21,110 @@ fn canonical_digest(key: &[u8]) -> u64 {
     hasher.finish()
 }
 
-/// One retained canonical payload: its publish ref, charged bytes, canonical
-/// identity digest, and current pin count (metadata only).
 #[derive(Debug)]
 struct PayloadEntry<PayloadRef, Bytes> {
     payload_ref: PayloadRef,
     canonical_digest: u64,
     charged_bytes: u64,
     pin_count: u64,
-    /// Ledger receipt when the store is charged against a broker; `None` in
-    /// non-budgeted mode. Refunded exactly once on delete.
-    ticket: Option<ReservationTicket>,
+    charge: Option<ManagedCharge>,
     bytes: Bytes,
+}
+
+fn retire_entries<PayloadRef, Bytes>(entries: Vec<PayloadEntry<PayloadRef, Bytes>>) {
+    for entry in entries {
+        let PayloadEntry { payload_ref, bytes, charge, .. } = entry;
+        drop(charge);
+        retire_client_value(payload_ref);
+        retire_client_value(bytes);
+    }
 }
 
 #[derive(Debug)]
 struct PayloadState<PayloadRef, Bytes> {
     entries: Vec<PayloadEntry<PayloadRef, Bytes>>,
     next_ref: u64,
-    /// Sum of charged payload bytes. Charged exactly once per canonical payload.
     charged_total: u64,
 }
 
-/// Portable canonical payload store.
+/// Canonical payload store branded by its construction-time accounting mode.
 ///
-/// Owns charge-once payload semantics (playbook 4.2, 5.1) and the pin-safe delete
-/// path (playbook 4.3): canonical payload bytes are charged exactly once, a second
-/// `put_canonical` of the same canonical key returns the existing ref without
-/// re-charging, and a pinned payload cannot be deleted.
+/// Materialized stores expose neither raw construction nor late accounting
+/// attachment:
 ///
-/// Pin counts are metadata only; they never re-charge payload bytes.
+/// ```compile_fail
+/// # use quanta_memory_platform_facade::{Budgeted, SimplePayloadStore};
+/// # use quanta_memory_platform_core::LiveProcessMemoryBroker;
+/// # fn late_attach(store: SimplePayloadStore<String, Vec<u8>, Budgeted>, broker: LiveProcessMemoryBroker) {
+/// let rebound = store.charged_against(broker);
+/// # }
+/// ```
 ///
-/// When built `charged_against` a broker, every distinct canonical payload is
-/// reserved+committed through the broker's ledger (the accounting SSOT) and
-/// refunded on delete, so global/owner/class caps gate real store bytes. Without
-/// a sink the store self-accounts (explicit non-budgeted mode).
+/// ```compile_fail
+/// # use quanta_memory_platform_facade::{Budgeted, SimplePayloadStore};
+/// # use quanta_memory_platform_core::{MemoryClass, StoreBindingHandle};
+/// let binding = StoreBindingHandle::new(MemoryClass::ArtifactCache, "owner".into(), None);
+/// let store = SimplePayloadStore::<String, Vec<u8>, Budgeted>::new(binding, None);
+/// ```
 #[derive(Debug)]
-pub struct SimplePayloadStore<PayloadRef, Bytes> {
+pub struct SimplePayloadStore<PayloadRef, Bytes, Mode> {
     binding: StoreBindingHandle,
     context: Option<MemoryContextHandle>,
-    charger: Option<SharedAccountingSink>,
+    accounting: StoreAccounting,
+    lifecycle: StoreLifecycle,
     state: Mutex<PayloadState<PayloadRef, Bytes>>,
+    _mode: PhantomData<fn() -> Mode>,
 }
 
-impl<PayloadRef, Bytes> SimplePayloadStore<PayloadRef, Bytes> {
-    pub fn new(binding: StoreBindingHandle, context: Option<MemoryContextHandle>) -> Self {
+impl<PayloadRef, Bytes> SimplePayloadStore<PayloadRef, Bytes, Budgeted> {
+    pub(crate) fn new_budgeted(
+        binding: StoreBindingHandle,
+        context: Option<MemoryContextHandle>,
+        broker: LiveProcessMemoryBroker,
+    ) -> Self {
+        Self::with_accounting(binding, context, StoreAccounting::Budgeted(broker))
+    }
+}
+
+#[cfg(feature = "unbudgeted-stores")]
+impl<PayloadRef, Bytes> SimplePayloadStore<PayloadRef, Bytes, Unbudgeted> {
+    pub(crate) fn new_unbudgeted(
+        binding: StoreBindingHandle,
+        context: Option<MemoryContextHandle>,
+    ) -> Self {
+        Self::with_accounting(binding, context, StoreAccounting::Unbudgeted)
+    }
+}
+
+impl<PayloadRef, Bytes, Mode> SimplePayloadStore<PayloadRef, Bytes, Mode> {
+    fn with_accounting(
+        binding: StoreBindingHandle,
+        context: Option<MemoryContextHandle>,
+        accounting: StoreAccounting,
+    ) -> Self {
         Self {
             binding,
             context,
-            charger: None,
+            accounting,
+            lifecycle: StoreLifecycle::new("payload store"),
             state: Mutex::new(PayloadState { entries: Vec::new(), next_ref: 0, charged_total: 0 }),
+            _mode: PhantomData,
         }
     }
 
-    /// Charge this store's bytes against a broker ledger (the accounting SSOT).
-    /// Without this, the store self-accounts and no cap controls its bytes.
-    #[must_use]
-    pub fn charged_against(mut self, sink: SharedAccountingSink) -> Self {
-        self.charger = Some(sink);
-        self
+    fn lock(&self) -> MemoryResult<std::sync::MutexGuard<'_, PayloadState<PayloadRef, Bytes>>> {
+        self.lifecycle.try_lock_state(&self.state)
     }
 
-    /// The context kind charges are attributed to (defaults to `Request`).
+    fn lock_read(
+        &self,
+    ) -> MemoryResult<std::sync::MutexGuard<'_, PayloadState<PayloadRef, Bytes>>> {
+        self.lifecycle.ensure_readable()?;
+        let state = self.lock()?;
+        self.lifecycle.ensure_readable()?;
+        Ok(state)
+    }
+
     fn context_kind(&self, value: &RetainedEnvelope<Bytes>) -> MemoryContextKind {
         value
             .context
@@ -91,57 +132,92 @@ impl<PayloadRef, Bytes> SimplePayloadStore<PayloadRef, Bytes> {
             .or(self.context.as_ref())
             .map_or(MemoryContextKind::Request, |handle| handle.kind)
     }
+
+    pub fn charged_bytes(&self) -> MemoryResult<u64> {
+        Ok(self.lock_read()?.charged_total)
+    }
+
+    /// Release every live charge and enter the terminal closed state. A repeated
+    /// close after success is an idempotent no-op.
+    pub fn close(&self) -> MemoryResult<()> {
+        let close = match self.lifecycle.begin_close()? {
+            BeginClose::AlreadyClosed => return Ok(()),
+            BeginClose::Acquired(close) => close,
+        };
+
+        let (indices, mut charges) = {
+            let mut state = self.lock()?;
+            let mut indices = Vec::new();
+            let mut charges = Vec::new();
+            for (index, entry) in state.entries.iter_mut().enumerate() {
+                if let Some(charge) = entry.charge.take() {
+                    indices.push(index);
+                    charges.push(charge);
+                }
+            }
+            (indices, charges)
+        };
+
+        if let Err(error) = self.accounting.release_many(&mut charges) {
+            let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            for (index, charge) in indices.into_iter().zip(charges) {
+                state.entries[index].charge = Some(charge);
+            }
+            close.rollback();
+            return Err(error);
+        }
+
+        let entries = {
+            let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            state.charged_total = 0;
+            std::mem::take(&mut state.entries)
+        };
+        close.commit();
+        // User payload destructors run after both store and broker state reach
+        // their terminal, mutually consistent postimage.
+        retire_entries(entries);
+        Ok(())
+    }
 }
 
-impl<PayloadRef, Bytes> SimplePayloadStore<PayloadRef, Bytes>
+impl<PayloadRef, Bytes, Mode> SimplePayloadStore<PayloadRef, Bytes, Mode>
 where
     PayloadRef: Clone + From<String> + PartialEq,
     Bytes: Clone + ByteSized + CanonicalKey,
 {
-    fn lock(
-        &self,
-    ) -> Result<std::sync::MutexGuard<'_, PayloadState<PayloadRef, Bytes>>, MemoryError> {
-        self.state
-            .lock()
-            .map_err(|_| MemoryError::InvalidState("payload store lock poisoned".to_string()))
-    }
-
-    /// Total payload bytes charged. Equals the sum of distinct canonical payloads.
-    pub fn charged_bytes(&self) -> Result<u64, MemoryError> {
-        Ok(self.lock()?.charged_total)
-    }
-
-    /// Pin a payload (metadata only; does not re-charge bytes).
-    pub fn pin(&self, payload_ref: &PayloadRef) -> Result<(), MemoryError> {
+    pub fn pin(&self, payload_ref: &PayloadRef) -> MemoryResult<()> {
+        let _permit = self.lifecycle.begin_mutation()?;
         let mut state = self.lock()?;
         let entry = state
             .entries
             .iter_mut()
             .find(|entry| &entry.payload_ref == payload_ref)
             .ok_or_else(|| MemoryError::InvalidState("pin: payload not found".to_string()))?;
-        entry.pin_count = entry.pin_count.saturating_add(1);
+        entry.pin_count = entry
+            .pin_count
+            .checked_add(1)
+            .ok_or_else(|| MemoryError::capacity("payload pin count overflow"))?;
         Ok(())
     }
 
-    /// Release one pin. Errors if the payload has no live pins.
-    pub fn unpin(&self, payload_ref: &PayloadRef) -> Result<(), MemoryError> {
+    pub fn unpin(&self, payload_ref: &PayloadRef) -> MemoryResult<()> {
+        let _permit = self.lifecycle.begin_mutation()?;
         let mut state = self.lock()?;
         let entry = state
             .entries
             .iter_mut()
             .find(|entry| &entry.payload_ref == payload_ref)
             .ok_or_else(|| MemoryError::InvalidState("unpin: payload not found".to_string()))?;
-        if entry.pin_count == 0 {
-            return Err(MemoryError::InvalidState("unpin: payload not pinned".to_string()));
-        }
-        entry.pin_count -= 1;
+        entry.pin_count = entry
+            .pin_count
+            .checked_sub(1)
+            .ok_or_else(|| MemoryError::InvalidState("unpin: payload not pinned".to_string()))?;
         Ok(())
     }
 
-    /// Current pin count for a payload (0 if absent).
-    pub fn pin_count(&self, payload_ref: &PayloadRef) -> Result<u64, MemoryError> {
+    pub fn pin_count(&self, payload_ref: &PayloadRef) -> MemoryResult<u64> {
         Ok(self
-            .lock()?
+            .lock_read()?
             .entries
             .iter()
             .find(|entry| &entry.payload_ref == payload_ref)
@@ -149,7 +225,8 @@ where
     }
 }
 
-impl<PayloadRef, Bytes> PayloadStore<PayloadRef, Bytes> for SimplePayloadStore<PayloadRef, Bytes>
+impl<PayloadRef, Bytes, Mode> PayloadStore<PayloadRef, Bytes>
+    for SimplePayloadStore<PayloadRef, Bytes, Mode>
 where
     PayloadRef: Clone + From<String> + PartialEq,
     Bytes: Clone + ByteSized + CanonicalKey,
@@ -162,160 +239,262 @@ where
         &self,
         value: RetainedEnvelope<Bytes>,
     ) -> Result<PublishedPayload<PayloadRef>, StoreWriteError> {
+        let _permit = self.lifecycle.begin_mutation()?;
         let context_kind = self.context_kind(&value);
-        let mut state = self.lock()?;
         let canonical_key = value.bytes.canonical_key();
         let digest = canonical_digest(&canonical_key);
-
-        // Charge-once: if the canonical payload already exists, return the existing
-        // ref WITHOUT re-charging (playbook 4.2 step 4 / 5.1). The digest is the
-        // fast path; on a digest hit the full canonical key is re-derived and
-        // compared so dedup is exact, never collision-approximate.
-        if let Some(existing) = state.entries.iter().find(|entry| {
-            entry.canonical_digest == digest && entry.bytes.canonical_key() == canonical_key
-        }) {
-            return Ok(PublishedPayload::new(existing.payload_ref.clone()));
-        }
-
         let charged_bytes = value.bytes.byte_size();
 
-        // Charge the ledger BEFORE allocating a ref or mutating state, so a cap
-        // denial fails closed: nothing stored, no ref consumed (fail-closed).
-        let ticket = match &self.charger {
-            Some(sink) => Some(sink.charge(
-                self.binding.class.clone(),
-                self.binding.owner.clone(),
-                context_kind,
-                ChargeKind::RetainedPayload,
-                charged_bytes,
-            )?),
-            None => None,
+        let (payload_ref, next_ref, next_total) = {
+            let state = self.lock()?;
+            if let Some(existing) = state.entries.iter().find(|entry| {
+                entry.canonical_digest == digest && entry.bytes.canonical_key() == canonical_key
+            }) {
+                return Ok(PublishedPayload::new(existing.payload_ref.clone()));
+            }
+            let next_ref = state
+                .next_ref
+                .checked_add(1)
+                .ok_or_else(|| MemoryError::capacity("payload reference counter overflow"))?;
+            let next_total = state
+                .charged_total
+                .checked_add(charged_bytes)
+                .ok_or_else(|| MemoryError::capacity("payload byte counter overflow"))?;
+            (PayloadRef::from(format!("payload-{}", state.next_ref)), next_ref, next_total)
         };
 
-        let payload_ref = PayloadRef::from(format!("payload-{}", state.next_ref));
-        state.next_ref = state.next_ref.saturating_add(1);
-        state.charged_total = state.charged_total.saturating_add(charged_bytes);
+        let charge = self.accounting.charge(
+            self.binding.class.clone(),
+            self.binding.owner.clone(),
+            context_kind,
+            ChargeKind::RetainedPayload,
+            charged_bytes,
+        )?;
+
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(_) => {
+                drop(charge);
+                return Err(MemoryError::InvalidState(
+                    "payload store lock poisoned after accounting".to_string(),
+                ));
+            }
+        };
         state.entries.push(PayloadEntry {
             payload_ref: payload_ref.clone(),
             canonical_digest: digest,
             charged_bytes,
             pin_count: 0,
-            ticket,
+            charge,
             bytes: value.bytes,
         });
+        state.next_ref = next_ref;
+        state.charged_total = next_total;
         Ok(PublishedPayload::new(payload_ref))
     }
 
     fn delete_if_unpinned(&self, payload_ref: &PayloadRef) -> Result<(), StoreDeleteError> {
-        let mut state = self.lock()?;
-        let index =
-            state.entries.iter().position(|entry| &entry.payload_ref == payload_ref).ok_or_else(
-                || MemoryError::InvalidState("delete: payload not found".to_string()),
-            )?;
+        let _permit = self.lifecycle.begin_mutation()?;
+        let (index, next_total, mut charge) = {
+            let mut state = self.lock()?;
+            let index = state
+                .entries
+                .iter()
+                .position(|entry| &entry.payload_ref == payload_ref)
+                .ok_or_else(|| {
+                    MemoryError::InvalidState("delete: payload not found".to_string())
+                })?;
+            if state.entries[index].pin_count > 0 {
+                return Err(MemoryError::InvalidState(format!(
+                    "delete rejected: payload still pinned ({} dependents)",
+                    state.entries[index].pin_count
+                )));
+            }
+            let next_total =
+                state.charged_total.checked_sub(state.entries[index].charged_bytes).ok_or_else(
+                    || MemoryError::InvalidState("payload byte counter underflow".to_string()),
+                )?;
+            (index, next_total, state.entries[index].charge.take())
+        };
 
-        // Pin-safe delete (playbook 4.3 step 4): a pinned payload is never removed.
-        if state.entries[index].pin_count > 0 {
-            return Err(MemoryError::InvalidState(format!(
-                "delete rejected: payload still pinned ({} dependents)",
-                state.entries[index].pin_count
-            )));
-        }
-
-        // Refund the ledger BEFORE removing the entry: a refund error leaves the
-        // entry intact (fail-closed). The ticket is single-use, so removing the
-        // entry right after prevents any replay.
-        if let Some(sink) = &self.charger {
-            if let Some(ticket) = state.entries[index].ticket.clone() {
-                sink.refund(&ticket)?;
+        if let Some(active) = charge.as_mut() {
+            if let Err(error) = self.accounting.release_many(std::slice::from_mut(active)) {
+                let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+                state.entries[index].charge = charge;
+                return Err(error);
             }
         }
 
-        let removed = state.entries.remove(index);
-        // Release bytes exactly once, matching the single charge.
-        state.charged_total = state.charged_total.saturating_sub(removed.charged_bytes);
-        drop(removed.bytes);
+        let removed = {
+            let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            let removed = state.entries.remove(index);
+            state.charged_total = next_total;
+            removed
+        };
+        drop(removed);
         Ok(())
     }
 
-    fn stats(&self) -> StoreStats {
-        match self.lock() {
-            Ok(state) => {
-                StoreStats { item_count: state.entries.len(), estimated_bytes: state.charged_total }
-            }
-            // A poisoned lock cannot fabricate usage; report empty fail-closed.
-            Err(_) => StoreStats::default(),
+    fn stats(&self) -> MemoryResult<StoreStats> {
+        let state = self.lock_read()?;
+        Ok(StoreStats { item_count: state.entries.len(), estimated_bytes: state.charged_total })
+    }
+
+    fn close(&self) -> MemoryResult<()> {
+        SimplePayloadStore::close(self)
+    }
+}
+
+impl<PayloadRef, Bytes, Mode> Drop for SimplePayloadStore<PayloadRef, Bytes, Mode> {
+    fn drop(&mut self) {
+        if self.lifecycle.transition_to_closed_for_drop() == DropTransition::AlreadyClosed {
+            return;
         }
+        let state = self.state.get_mut().unwrap_or_else(PoisonError::into_inner);
+        let entries = std::mem::take(&mut state.entries);
+        state.charged_total = 0;
+        retire_entries(entries);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use quanta_memory_platform_core::{MemoryClass, StoreBindingHandle};
+    use std::cell::{Cell, RefCell};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Barrier, OnceLock, Weak};
+
+    use quanta_memory_platform_core::{
+        ExecutionBudget, MemoryBudgetManifest, MemoryClass, MemoryClassBudget, MemoryPreset,
+        ReclaimPriority, ResidencyPolicy,
+    };
 
     fn binding() -> StoreBindingHandle {
         StoreBindingHandle::new(MemoryClass::ArtifactCache, "owner-a".to_string(), None)
     }
 
-    fn store() -> SimplePayloadStore<String, Vec<u8>> {
-        SimplePayloadStore::new(binding(), None)
+    fn live_broker(global: u64, class_hard: u64) -> LiveProcessMemoryBroker {
+        let residency = ResidencyPolicy::new(global).with_class_budget(
+            MemoryClass::ArtifactCache,
+            MemoryClassBudget {
+                reserved_bytes: 0,
+                soft_cap_bytes: class_hard,
+                hard_cap_bytes: class_hard,
+                borrow_from_shared_pool: false,
+                reclaim_priority: ReclaimPriority::Normal,
+            },
+        );
+        quanta_memory_platform_core::ProcessMemoryBrokerBuilder::new()
+            .with_manifest(MemoryBudgetManifest::new(
+                MemoryPreset::Production,
+                ExecutionBudget::default(),
+                residency,
+            ))
+            .build()
+            .expect("valid broker")
+    }
+
+    fn store_with(
+        broker: &LiveProcessMemoryBroker,
+    ) -> SimplePayloadStore<String, Vec<u8>, Budgeted> {
+        SimplePayloadStore::new_budgeted(binding(), None, broker.clone())
+    }
+
+    fn store() -> (LiveProcessMemoryBroker, SimplePayloadStore<String, Vec<u8>, Budgeted>) {
+        let broker = live_broker(1_000_000, 600_000);
+        let store = store_with(&broker);
+        (broker, store)
     }
 
     fn envelope(bytes: &[u8]) -> RetainedEnvelope<Vec<u8>> {
         RetainedEnvelope::new(bytes.to_vec())
     }
 
-    #[test]
-    fn put_canonical_charges_payload_bytes_exactly_once() {
-        let store = store();
-        let published = store.put_canonical(envelope(b"hello-payload")).expect("first put");
-        // Bytes charged once == exact byte size of the payload.
-        assert_eq!(store.charged_bytes().expect("charged"), b"hello-payload".len() as u64);
-        assert_eq!(store.stats().item_count, 1);
-
-        // NEGATIVE-PAIR / NEGATIVE-PATH 1: canonical payload already exists.
-        // A second put of the same canonical bytes must NOT re-charge and must
-        // return the SAME ref.
-        let again = store.put_canonical(envelope(b"hello-payload")).expect("dedup put");
-        assert_eq!(
-            again.payload_ref(),
-            published.payload_ref(),
-            "duplicate canonical put must return the existing ref"
-        );
-        assert_eq!(
-            store.charged_bytes().expect("charged after dedup"),
-            b"hello-payload".len() as u64,
-            "duplicate canonical payload must be charged exactly once"
-        );
-        assert_eq!(store.stats().item_count, 1, "dedup must not create a second entry");
+    #[derive(Clone)]
+    struct PanickingBytes {
+        bytes: Vec<u8>,
+        drops: Arc<AtomicUsize>,
     }
 
-    #[test]
-    fn dedup_hit_returns_existing_ref_without_storing_a_second_entry() {
-        // scenario F (dedup-hit no re-clone / context preserved): a second
-        // put_canonical of the same canonical bytes returns the FIRST entry's ref
-        // and stores nothing new — the second envelope (and its distinct context)
-        // is dropped, leaving the original entry and its accounting untouched.
-        let store = store();
-        let first = store
-            .put_canonical(
-                envelope(b"same-bytes").with_context(context_handle(MemoryContextKind::Session)),
-            )
-            .expect("first put");
-        let item_count_before = store.stats().item_count;
-        let bytes_before = store.charged_bytes().expect("bytes before");
+    impl ByteSized for PanickingBytes {
+        fn byte_size(&self) -> u64 {
+            self.bytes.len() as u64
+        }
+    }
 
-        // Second put: identical canonical bytes, but a DIFFERENT context. The dedup
-        // hit must not create a new entry, not re-charge, and not mutate state.
-        let second = store
-            .put_canonical(
-                envelope(b"same-bytes").with_context(context_handle(MemoryContextKind::Request)),
-            )
-            .expect("dedup put");
+    impl CanonicalKey for PanickingBytes {
+        fn canonical_key(&self) -> Vec<u8> {
+            self.bytes.clone()
+        }
+    }
 
-        assert_eq!(second.payload_ref(), first.payload_ref(), "dedup returns the existing ref");
-        assert_eq!(store.stats().item_count, item_count_before, "no second entry on dedup");
-        assert_eq!(store.charged_bytes().expect("bytes after"), bytes_before, "no re-charge");
+    impl Drop for PanickingBytes {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::SeqCst);
+            panic!("client payload destructor panic");
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct ReentrantPayloadRef(String);
+
+    type ReentrantRefStore = SimplePayloadStore<ReentrantPayloadRef, Vec<u8>, Budgeted>;
+
+    impl From<String> for ReentrantPayloadRef {
+        fn from(value: String) -> Self {
+            Self(value)
+        }
+    }
+
+    thread_local! {
+        static REF_REENTRY_STORE: RefCell<Option<Weak<ReentrantRefStore>>> = const { RefCell::new(None) };
+        static REF_REENTRY_HITS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    impl PartialEq for ReentrantPayloadRef {
+        fn eq(&self, other: &Self) -> bool {
+            REF_REENTRY_STORE.with(|slot| {
+                if let Some(store) = slot.borrow().as_ref().and_then(Weak::upgrade) {
+                    assert!(matches!(
+                        store.stats(),
+                        Err(MemoryError::OperationInProgress(resource)) if resource == "payload store"
+                    ));
+                    REF_REENTRY_HITS.with(|hits| hits.set(hits.get() + 1));
+                }
+            });
+            self.0 == other.0
+        }
+    }
+
+    #[derive(Clone)]
+    struct ReentrantCanonicalBytes {
+        bytes: Vec<u8>,
+        probe: Option<ReentrantByteProbe>,
+        hits: Arc<AtomicUsize>,
+    }
+
+    type ReentrantByteStore = SimplePayloadStore<String, ReentrantCanonicalBytes, Budgeted>;
+    type ReentrantByteProbe = Arc<OnceLock<Weak<ReentrantByteStore>>>;
+
+    impl ByteSized for ReentrantCanonicalBytes {
+        fn byte_size(&self) -> u64 {
+            self.bytes.len() as u64
+        }
+    }
+
+    impl CanonicalKey for ReentrantCanonicalBytes {
+        fn canonical_key(&self) -> Vec<u8> {
+            if let Some(store) =
+                self.probe.as_ref().and_then(|probe| probe.get()).and_then(Weak::upgrade)
+            {
+                assert!(matches!(
+                    store.stats(),
+                    Err(MemoryError::OperationInProgress(resource)) if resource == "payload store"
+                ));
+                self.hits.fetch_add(1, Ordering::SeqCst);
+            }
+            self.bytes.clone()
+        }
     }
 
     fn context_handle(kind: MemoryContextKind) -> MemoryContextHandle {
@@ -323,211 +502,367 @@ mod tests {
     }
 
     #[test]
+    fn canonical_put_deduplicates_and_charges_once() {
+        let (broker, store) = store();
+        let first = store.put_canonical(envelope(b"same")).expect("first");
+        let second = store.put_canonical(envelope(b"same")).expect("dedup");
+        assert_eq!(first.payload_ref(), second.payload_ref());
+        assert_eq!(store.stats().expect("stats").item_count, 1);
+        assert_eq!(store.charged_bytes().expect("bytes"), 4);
+        assert_eq!(broker.ledger_snapshot().expect("ledger").total_owner_bytes(), 4);
+    }
+
+    #[test]
+    fn metadata_equality_reentry_under_read_lock_is_typed_busy_and_preserves_charge() {
+        let broker = live_broker(1_000_000, 600_000);
+        let store =
+            Arc::new(SimplePayloadStore::<ReentrantPayloadRef, Vec<u8>, Budgeted>::new_budgeted(
+                binding(),
+                None,
+                broker.clone(),
+            ));
+        let published = store.put_canonical(envelope(b"metadata")).expect("put");
+        REF_REENTRY_STORE.with(|slot| *slot.borrow_mut() = Some(Arc::downgrade(&store)));
+        REF_REENTRY_HITS.with(|hits| hits.set(0));
+
+        assert_eq!(store.pin_count(published.payload_ref()).expect("read metadata"), 0);
+        REF_REENTRY_HITS.with(|hits| assert_eq!(hits.get(), 1));
+        REF_REENTRY_STORE.with(|slot| *slot.borrow_mut() = None);
+        assert_eq!(store.stats().expect("complete state").item_count, 1);
+        assert_eq!(broker.ledger_snapshot().expect("ledger").total_owner_bytes(), 8);
+        store.close().expect("close");
+        assert_eq!(broker.ledger_snapshot().expect("refunded").total_owner_bytes(), 0);
+    }
+
+    #[test]
+    fn duplicate_canonical_callback_reentry_under_lock_is_typed_busy_and_charges_once() {
+        let broker = live_broker(1_000_000, 600_000);
+        let store = Arc::new(
+            SimplePayloadStore::<String, ReentrantCanonicalBytes, Budgeted>::new_budgeted(
+                binding(),
+                None,
+                broker.clone(),
+            ),
+        );
+        let probe = Arc::new(OnceLock::new());
+        let hits = Arc::new(AtomicUsize::new(0));
+        let first = store
+            .put_canonical(RetainedEnvelope::new(ReentrantCanonicalBytes {
+                bytes: b"same".to_vec(),
+                probe: Some(Arc::clone(&probe)),
+                hits: Arc::clone(&hits),
+            }))
+            .expect("first");
+        assert!(probe.set(Arc::downgrade(&store)).is_ok());
+
+        let replay = store
+            .put_canonical(RetainedEnvelope::new(ReentrantCanonicalBytes {
+                bytes: b"same".to_vec(),
+                probe: None,
+                hits: Arc::clone(&hits),
+            }))
+            .expect("deduplicated replay");
+        assert_eq!(first.payload_ref(), replay.payload_ref());
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        assert_eq!(store.stats().expect("complete state").item_count, 1);
+        assert_eq!(broker.ledger_snapshot().expect("charged once").total_owner_bytes(), 4);
+        store.close().expect("close");
+        assert_eq!(broker.ledger_snapshot().expect("refunded").total_owner_bytes(), 0);
+    }
+
+    #[test]
+    fn dedup_hit_preserves_first_context_and_stores_no_second_entry() {
+        let (broker, store) = store();
+        let first = store
+            .put_canonical(
+                envelope(b"same-bytes").with_context(context_handle(MemoryContextKind::Session)),
+            )
+            .expect("first");
+        let bytes_before = store.charged_bytes().expect("bytes before");
+        let second = store
+            .put_canonical(
+                envelope(b"same-bytes").with_context(context_handle(MemoryContextKind::Request)),
+            )
+            .expect("dedup");
+
+        assert_eq!(second.payload_ref(), first.payload_ref());
+        assert_eq!(store.stats().expect("stats").item_count, 1);
+        assert_eq!(store.charged_bytes().expect("bytes after"), bytes_before);
+        let snapshot = broker.ledger_snapshot().expect("ledger");
+        assert_eq!(snapshot.total_owner_bytes(), bytes_before);
+        assert_eq!(
+            snapshot
+                .context_usage
+                .get(&MemoryContextKind::Session)
+                .map_or(0, |usage| usage.total()),
+            bytes_before
+        );
+        assert_eq!(
+            snapshot
+                .context_usage
+                .get(&MemoryContextKind::Request)
+                .map_or(0, |usage| usage.total()),
+            0
+        );
+    }
+
+    #[test]
     fn distinct_payloads_each_charge_once() {
-        let store = store();
+        let (broker, store) = store();
         store.put_canonical(envelope(b"aa")).expect("a");
         store.put_canonical(envelope(b"bbbb")).expect("b");
-        assert_eq!(store.charged_bytes().expect("total"), (2 + 4) as u64);
-        assert_eq!(store.stats().item_count, 2);
+        assert_eq!(store.charged_bytes().expect("bytes"), 6);
+        assert_eq!(store.stats().expect("stats").item_count, 2);
+        assert_eq!(broker.ledger_snapshot().expect("ledger").total_owner_bytes(), 6);
     }
 
     #[test]
-    fn delete_unpinned_releases_bytes_once() {
-        let store = store();
+    fn delete_unpinned_releases_bytes_exactly_once() {
+        let (broker, store) = store();
         let published = store.put_canonical(envelope(b"deleteme")).expect("put");
-        assert_eq!(store.charged_bytes().expect("charged"), 8);
-        store.delete_if_unpinned(published.payload_ref()).expect("delete unpinned");
-        assert_eq!(store.charged_bytes().expect("after delete"), 0);
-        assert_eq!(store.stats().item_count, 0);
+        store.delete_if_unpinned(published.payload_ref()).expect("delete");
+        assert_eq!(store.charged_bytes().expect("bytes"), 0);
+        assert_eq!(store.stats().expect("stats").item_count, 0);
+        assert_eq!(broker.ledger_snapshot().expect("ledger").total_owner_bytes(), 0);
+        assert!(matches!(
+            store.delete_if_unpinned(published.payload_ref()),
+            Err(MemoryError::InvalidState(_))
+        ));
     }
 
     #[test]
-    fn delete_while_pinned_is_rejected_with_invalid_state() {
-        let store = store();
-        let published = store.put_canonical(envelope(b"pinned")).expect("put");
-        store.pin(published.payload_ref()).expect("pin");
-        assert_eq!(store.pin_count(published.payload_ref()).expect("count"), 1);
-
-        // NEGATIVE-PATH 2: delete attempted while pinned must fail-closed.
-        let err = store
-            .delete_if_unpinned(published.payload_ref())
-            .expect_err("pinned delete must be rejected");
-        assert!(
-            matches!(err, MemoryError::InvalidState(_)),
-            "pinned delete must be InvalidState, got {err:?}"
-        );
-        // Payload and its bytes survive the rejected delete.
-        assert_eq!(store.charged_bytes().expect("charged"), b"pinned".len() as u64);
-        assert_eq!(store.stats().item_count, 1);
-
-        // Positive correction: after unpinning, delete succeeds and releases bytes.
-        store.unpin(published.payload_ref()).expect("unpin");
-        store.delete_if_unpinned(published.payload_ref()).expect("delete after unpin");
-        assert_eq!(store.charged_bytes().expect("charged"), 0);
+    fn over_cap_put_is_fail_closed_and_does_not_consume_ref() {
+        let broker = live_broker(1_000, 50);
+        let store = store_with(&broker);
+        assert!(matches!(store.put_canonical(envelope(&[0; 100])), Err(MemoryError::Capacity(_))));
+        assert_eq!(store.stats().expect("stats").item_count, 0);
+        let published = store.put_canonical(envelope(&[0; 40])).expect("within cap");
+        assert_eq!(published.payload_ref(), &"payload-0".to_string());
+        assert_eq!(broker.ledger_snapshot().expect("ledger").total_owner_bytes(), 40);
     }
 
     #[test]
-    fn pin_is_metadata_only_and_does_not_recharge_bytes() {
-        let store = store();
-        let published = store.put_canonical(envelope(b"meta")).expect("put");
-        let before = store.charged_bytes().expect("before");
+    fn pin_is_metadata_only_and_pinned_delete_is_rejected() {
+        let (broker, store) = store();
+        let published = store.put_canonical(envelope(b"payload")).expect("put");
         store.pin(published.payload_ref()).expect("pin");
         store.pin(published.payload_ref()).expect("pin again");
-        // Invariant 5.1: pin counts are metadata; bytes unchanged.
-        assert_eq!(store.charged_bytes().expect("after pins"), before);
         assert_eq!(store.pin_count(published.payload_ref()).expect("count"), 2);
+        assert!(matches!(
+            store.delete_if_unpinned(published.payload_ref()),
+            Err(MemoryError::InvalidState(_))
+        ));
+        assert_eq!(broker.ledger_snapshot().expect("ledger").total_owner_bytes(), 7);
+        store.unpin(published.payload_ref()).expect("unpin");
+        store.unpin(published.payload_ref()).expect("unpin again");
+        store.delete_if_unpinned(published.payload_ref()).expect("delete");
+        assert_eq!(broker.ledger_snapshot().expect("ledger").total_owner_bytes(), 0);
     }
 
     #[test]
-    fn delete_missing_payload_is_invalid_state() {
-        let store = store();
-        let err = store
-            .delete_if_unpinned(&"payload-404".to_string())
-            .expect_err("missing delete must fail");
-        assert!(matches!(err, MemoryError::InvalidState(_)), "got {err:?}");
-    }
-
-    #[test]
-    fn unpin_unpinned_payload_is_invalid_state() {
-        let store = store();
+    fn missing_delete_and_unpin_without_pin_are_invalid_state() {
+        let (_broker, store) = store();
+        assert!(matches!(
+            store.delete_if_unpinned(&"payload-404".to_string()),
+            Err(MemoryError::InvalidState(_))
+        ));
         let published = store.put_canonical(envelope(b"x")).expect("put");
-        let err = store.unpin(published.payload_ref()).expect_err("unpin without pin must fail");
-        assert!(matches!(err, MemoryError::InvalidState(_)), "got {err:?}");
+        assert!(matches!(store.unpin(published.payload_ref()), Err(MemoryError::InvalidState(_))));
     }
 
-    // ---- #3: a charged store routes real bytes through the broker ledger ----
+    #[test]
+    fn put_and_delete_during_rebuild_are_fail_closed_then_resume() {
+        let (broker, store) = store();
+        let published = store.put_canonical(envelope(&[0; 80])).expect("seed");
+        broker.begin_rebuild().expect("begin rebuild");
 
-    #[cfg(feature = "core-live-accounting")]
-    mod charged {
-        use super::*;
-        use std::sync::Arc;
+        assert!(matches!(
+            store.put_canonical(envelope(&[1; 40])),
+            Err(MemoryError::InvalidState(_))
+        ));
+        assert!(matches!(
+            store.delete_if_unpinned(published.payload_ref()),
+            Err(MemoryError::InvalidState(_))
+        ));
+        assert_eq!(store.stats().expect("preserved stats").item_count, 1);
+        assert_eq!(store.charged_bytes().expect("preserved bytes"), 80);
+        assert_eq!(broker.ledger_snapshot().expect("preserved ledger").total_owner_bytes(), 80);
 
-        use crate::shared::accounting::SharedAccountingSink;
-        use quanta_memory_platform_core::{
-            ExecutionBudget, LiveProcessMemoryBroker, MemoryBudgetManifest, MemoryClassBudget,
-            MemoryPreset, ReclaimPriority, ResidencyPolicy,
-        };
+        broker.finish_rebuild().expect("finish rebuild");
+        store.delete_if_unpinned(published.payload_ref()).expect("delete resumes");
+        assert_eq!(broker.ledger_snapshot().expect("released").total_owner_bytes(), 0);
+    }
 
-        fn live_broker(global: u64, class_hard: u64) -> LiveProcessMemoryBroker {
-            let residency = ResidencyPolicy::new(global).with_class_budget(
-                MemoryClass::ArtifactCache,
-                MemoryClassBudget {
-                    reserved_bytes: 0,
-                    soft_cap_bytes: class_hard,
-                    hard_cap_bytes: class_hard,
-                    borrow_from_shared_pool: false,
-                    reclaim_priority: ReclaimPriority::Normal,
-                },
-            );
-            quanta_memory_platform_core::ProcessMemoryBrokerBuilder::new()
-                .with_manifest(MemoryBudgetManifest::new(
-                    MemoryPreset::Production,
-                    ExecutionBudget::default(),
-                    residency,
-                ))
-                .build()
-                .expect("valid broker")
-        }
+    #[cfg(feature = "unbudgeted-stores")]
+    #[test]
+    fn explicit_unbudgeted_store_is_a_distinct_non_ledger_mode() {
+        let store =
+            SimplePayloadStore::<String, Vec<u8>, Unbudgeted>::new_unbudgeted(binding(), None);
+        store.put_canonical(envelope(b"free")).expect("put");
+        assert_eq!(store.charged_bytes().expect("bytes"), 4);
+        assert_eq!(store.stats().expect("stats").item_count, 1);
+        store.close().expect("close unbudgeted");
+    }
 
-        fn charged_store(broker: &LiveProcessMemoryBroker) -> SimplePayloadStore<String, Vec<u8>> {
-            let sink: SharedAccountingSink = Arc::new(broker.clone());
-            SimplePayloadStore::<String, Vec<u8>>::new(binding(), None).charged_against(sink)
-        }
+    #[test]
+    fn close_refunds_every_live_entry_exactly_once() {
+        let (broker, store) = store();
+        store.put_canonical(envelope(b"aa")).expect("a");
+        store.put_canonical(envelope(b"bbbb")).expect("b");
+        assert_eq!(broker.ledger_snapshot().expect("before").total_owner_bytes(), 6);
+        store.close().expect("close");
+        assert_eq!(broker.ledger_snapshot().expect("after").total_owner_bytes(), 0);
+        assert_eq!(store.stats().expect("stats").item_count, 0);
+    }
 
-        #[test]
-        fn charged_store_routes_bytes_through_the_ledger() {
-            let broker = live_broker(1_000_000, 600_000);
-            let store = charged_store(&broker);
+    #[test]
+    fn close_refund_failure_preserves_entries_and_charge_ownership() {
+        let (broker, store) = store();
+        store.put_canonical(envelope(b"owned")).expect("put");
+        broker.begin_rebuild().expect("begin rebuild");
+        assert!(matches!(store.close(), Err(MemoryError::InvalidState(_))));
+        assert_eq!(store.stats().expect("preserved stats").item_count, 1);
+        assert_eq!(store.charged_bytes().expect("preserved bytes"), 5);
+        assert_eq!(broker.ledger_snapshot().expect("preserved ledger").total_owner_bytes(), 5);
+        broker.finish_rebuild().expect("finish rebuild");
+        store.close().expect("retry close");
+        assert_eq!(broker.ledger_snapshot().expect("released").total_owner_bytes(), 0);
+    }
 
-            let published = store.put_canonical(envelope(&[7u8; 100])).expect("put within cap");
-            assert_eq!(
-                broker.ledger_snapshot().expect("snap").total_owner_bytes(),
-                100,
-                "the ledger (SSOT) must see the store's bytes"
-            );
+    #[test]
+    fn drop_during_rebuild_defers_then_finish_drains_capacity() {
+        let (broker, store) = store();
+        store.put_canonical(envelope(b"owned")).expect("put");
+        broker.begin_rebuild().expect("begin rebuild");
+        drop(store);
+        assert_eq!(broker.ledger_snapshot().expect("deferred").total_owner_bytes(), 5);
+        broker.finish_rebuild().expect("finish drains");
+        assert_eq!(broker.ledger_snapshot().expect("drained").total_owner_bytes(), 0);
+    }
 
-            // dedup-hit: same canonical bytes -> no second charge against the ledger.
-            store.put_canonical(envelope(&[7u8; 100])).expect("dedup put");
-            assert_eq!(
-                broker.ledger_snapshot().expect("snap").total_owner_bytes(),
-                100,
-                "a canonical dedup must not double-charge the ledger"
-            );
-
-            // delete refunds the ledger exactly once.
-            store.delete_if_unpinned(published.payload_ref()).expect("delete");
-            assert_eq!(
-                broker.ledger_snapshot().expect("snap").total_owner_bytes(),
-                0,
-                "delete must refund the ledger"
-            );
-        }
-
-        #[test]
-        fn charged_store_put_over_cap_is_denied_and_fails_closed() {
-            let broker = live_broker(1_000, 50); // ArtifactCache hard cap 50 bytes
-            let store = charged_store(&broker);
-
-            let denied = store.put_canonical(envelope(&[0u8; 100])); // 100 > 50
-            assert!(
-                matches!(denied, Err(MemoryError::Capacity(_))),
-                "an over-cap put must be a typed capacity error, got {denied:?}"
-            );
-            // Fail-closed: nothing stored, store counter untouched, ledger untouched.
-            assert_eq!(store.stats().item_count, 0, "denied put must not store an entry");
-            assert_eq!(store.charged_bytes().expect("charged"), 0);
-            assert_eq!(broker.ledger_snapshot().expect("snap").total_owner_bytes(), 0);
-
-            // A denied put must not consume a payload ref (no ref leak).
-            let ok = store.put_canonical(envelope(&[0u8; 40])).expect("within cap");
-            assert_eq!(
-                ok.payload_ref(),
-                &"payload-0".to_string(),
-                "a denied put must not advance the ref counter"
-            );
-            assert_eq!(broker.ledger_snapshot().expect("snap").total_owner_bytes(), 40);
-        }
-
-        #[test]
-        fn charged_store_put_and_delete_during_rebuild_are_fail_closed() {
-            // Parity with the other charged stores: a charged put/delete while the
-            // broker is rebuilding must fail closed (the charge/refund hits the
-            // rebuild gate), leaving the ledger and store byte-for-byte unchanged,
-            // and resume cleanly once the rebuild window closes. Exercises both the
-            // put charge path and delete_if_unpinned's refund-during-rebuild branch.
-            let broker = live_broker(1_000_000, 600_000);
-            let store = charged_store(&broker);
-            let published = store.put_canonical(envelope(&[0u8; 80])).expect("seed");
-            let before = broker.ledger_snapshot().expect("snap").total_owner_bytes();
-            assert_eq!(before, 80);
-
-            broker.begin_rebuild().expect("begin rebuild");
-            let put_denied = store.put_canonical(envelope(&[1u8; 40]));
-            assert!(put_denied.is_err(), "put during rebuild must fail closed, got {put_denied:?}");
-            let del_denied = store.delete_if_unpinned(published.payload_ref());
-            assert!(
-                del_denied.is_err(),
-                "delete during rebuild must fail closed, got {del_denied:?}"
-            );
-            assert_eq!(
-                broker.ledger_snapshot().expect("snap").total_owner_bytes(),
-                before,
-                "neither the denied put nor the denied delete moved the ledger"
-            );
-
-            broker.finish_rebuild().expect("finish");
+    #[test]
+    fn drop_during_outer_unwind_contains_two_client_panics_and_refunds_all_charges() {
+        let broker = live_broker(1_000_000, 600_000);
+        let drops = Arc::new(AtomicUsize::new(0));
+        let store = SimplePayloadStore::<String, PanickingBytes, Budgeted>::new_budgeted(
+            binding(),
+            None,
+            broker.clone(),
+        );
+        for bytes in [b"four".as_slice(), b"sixsix".as_slice()] {
             store
-                .delete_if_unpinned(published.payload_ref())
-                .expect("delete resumes after rebuild");
-            assert_eq!(broker.ledger_snapshot().expect("snap").total_owner_bytes(), 0);
+                .put_canonical(RetainedEnvelope::new(PanickingBytes {
+                    bytes: bytes.to_vec(),
+                    drops: Arc::clone(&drops),
+                }))
+                .expect("put before unwind");
         }
+        assert_eq!(broker.ledger_snapshot().expect("before").total_owner_bytes(), 10);
 
-        #[test]
-        fn uncharged_store_is_explicit_non_budgeted_mode() {
-            // No sink: the store self-accounts and never touches a ledger.
-            let store = SimplePayloadStore::<String, Vec<u8>>::new(binding(), None);
-            store.put_canonical(envelope(b"free")).expect("put");
-            assert_eq!(store.charged_bytes().expect("charged"), 4);
+        let outer = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _store = store;
+            panic!("outer unwind");
+        }))
+        .expect_err("outer panic must propagate");
+
+        assert_eq!(outer.downcast_ref::<&str>(), Some(&"outer unwind"));
+        assert_eq!(drops.load(Ordering::SeqCst), 2, "both client values must be retired");
+        assert_eq!(broker.ledger_snapshot().expect("after").total_owner_bytes(), 0);
+    }
+
+    #[test]
+    fn mutation_after_close_is_typed_closed() {
+        let (_broker, store) = store();
+        store.close().expect("close");
+        assert!(matches!(
+            store.put_canonical(envelope(b"late")),
+            Err(MemoryError::Closed(resource)) if resource == "payload store"
+        ));
+        assert!(matches!(
+            store.pin(&"payload-0".to_string()),
+            Err(MemoryError::Closed(resource)) if resource == "payload store"
+        ));
+    }
+
+    #[test]
+    fn double_close_is_idempotent_without_double_refund() {
+        let (broker, store) = store();
+        store.put_canonical(envelope(b"once")).expect("put");
+        store.close().expect("first close");
+        store.close().expect("second close");
+        assert_eq!(broker.ledger_snapshot().expect("ledger").total_owner_bytes(), 0);
+    }
+
+    #[test]
+    fn concurrent_mutation_and_close_has_one_typed_linearized_outcome() {
+        let broker = live_broker(1_000_000, 600_000);
+        let store = Arc::new(store_with(&broker));
+        let barrier = Arc::new(Barrier::new(3));
+        let close_store = Arc::clone(&store);
+        let close_barrier = Arc::clone(&barrier);
+        let close = std::thread::spawn(move || {
+            close_barrier.wait();
+            close_store.close()
+        });
+        let put_store = Arc::clone(&store);
+        let put_barrier = Arc::clone(&barrier);
+        let put = std::thread::spawn(move || {
+            put_barrier.wait();
+            put_store.put_canonical(envelope(b"race"))
+        });
+        barrier.wait();
+
+        let close = close.join().expect("close thread");
+        let put = put.join().expect("put thread");
+        assert!(matches!(&close, Ok(()) | Err(MemoryError::OperationInProgress(_))));
+        assert!(matches!(
+            put,
+            Ok(_) | Err(MemoryError::Closed(_)) | Err(MemoryError::OperationInProgress(_))
+        ));
+        if close.is_err() {
+            store.close().expect("retry close after winning mutation");
         }
+        assert_eq!(broker.ledger_snapshot().expect("linearized ledger").total_owner_bytes(), 0);
+        assert_eq!(store.stats().expect("linearized stats").item_count, 0);
+    }
+
+    #[test]
+    fn counter_overflow_is_rejected_without_accounting_or_entry_mutation() {
+        let (broker, store) = store();
+        store.state.lock().expect("state").charged_total = u64::MAX;
+        assert!(matches!(store.put_canonical(envelope(b"x")), Err(MemoryError::Capacity(_))));
+        let state = store.state.lock().expect("state");
+        assert_eq!(state.charged_total, u64::MAX);
+        assert!(state.entries.is_empty());
+        drop(state);
+        assert_eq!(broker.ledger_snapshot().expect("ledger").total_owner_bytes(), 0);
+    }
+
+    #[test]
+    fn poisoned_stats_is_error_not_empty() {
+        let (_broker, store) = store();
+        let store = Arc::new(store);
+        let poison = Arc::clone(&store);
+        assert!(std::thread::spawn(move || {
+            let _guard = poison.state.lock().expect("lock");
+            panic!("poison payload state");
+        })
+        .join()
+        .is_err());
+        assert!(matches!(store.stats(), Err(MemoryError::InvalidState(_))));
+    }
+
+    #[test]
+    fn source_has_no_public_raw_constructor_or_late_attach() {
+        let source = include_str!("service.rs");
+        assert!(!source.lines().any(|line| line.trim_start().starts_with("pub fn new(")));
+        assert!(!source
+            .lines()
+            .any(|line| line.trim_start().starts_with("pub fn charged_against(")));
+        assert!(!source.lines().any(|line| {
+            let line = line.trim_start();
+            line.starts_with("pub struct SimplePayloadStore<") && line.contains("Mode = Budgeted")
+        }));
+        assert!(source.contains("pub(crate) fn new_budgeted"));
     }
 }

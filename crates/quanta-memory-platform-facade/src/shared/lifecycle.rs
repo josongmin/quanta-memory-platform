@@ -4,11 +4,8 @@
 //! a store/container mutex while an accounting callback runs. Reentrant callers
 //! receive a typed error instead of waiting on the in-flight operation.
 
-// This owner module lands before the five store migrations that consume it in
-// QMP-040. Remove this staging allowance once the first store embeds the gate.
-#![allow(dead_code)]
-
 use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{Mutex, MutexGuard, TryLockError};
 
 use quanta_memory_platform_core::{MemoryError, MemoryResult};
 
@@ -16,6 +13,14 @@ const OPEN: u8 = 0;
 const OPERATION_IN_PROGRESS: u8 = 1;
 const CLOSING: u8 = 2;
 const CLOSED: u8 = 3;
+
+/// Never let an arbitrary client's destructor unwind from a store destructor.
+/// Call once per client-owned field, after releasing its managed charge. Catching
+/// a whole collection is insufficient: two field panics during collection
+/// unwinding would abort the process before the second could be contained.
+pub(crate) fn retire_client_value<T>(value: T) {
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(value)));
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum StoreLifecyclePhase {
@@ -54,6 +59,36 @@ impl StoreLifecycle {
 
     pub(crate) fn phase(&self) -> StoreLifecyclePhase {
         StoreLifecyclePhase::from_raw(self.phase.load(Ordering::Acquire))
+    }
+
+    /// A client-supplied Clone/Hash/Eq/Ord/CanonicalKey may execute while a
+    /// container mutex is held. A callback that reenters the same store must
+    /// fail with typed contention, never block on its own mutex. This applies
+    /// to both reads and mutations; the lifecycle phase alone cannot exclude
+    /// callbacks reached by a read-only operation.
+    pub(crate) fn try_lock_state<'a, T>(
+        &self,
+        state: &'a Mutex<T>,
+    ) -> MemoryResult<MutexGuard<'a, T>> {
+        match state.try_lock() {
+            Ok(guard) => Ok(guard),
+            Err(TryLockError::WouldBlock) => Err(MemoryError::operation_in_progress(self.resource)),
+            Err(TryLockError::Poisoned(_)) => {
+                Err(MemoryError::InvalidState(format!("{} lock poisoned", self.resource)))
+            }
+        }
+    }
+
+    /// Read either a complete open-state image or the terminal empty image.
+    /// A store calls this before and after acquiring its container lock, so a
+    /// temporarily detached accounting plan is never mistaken for empty data.
+    pub(crate) fn ensure_readable(&self) -> MemoryResult<()> {
+        match self.phase() {
+            StoreLifecyclePhase::Open | StoreLifecyclePhase::Closed => Ok(()),
+            StoreLifecyclePhase::OperationInProgress | StoreLifecyclePhase::Closing => {
+                Err(MemoryError::operation_in_progress(self.resource))
+            }
+        }
     }
 
     /// Acquire the sole mutation lane without waiting.
@@ -153,6 +188,12 @@ impl ClosePermit<'_> {
     }
 
     /// Explicit failure path. Dropping without commit has the same behavior.
+    #[cfg(any(
+        test,
+        feature = "payload_store",
+        feature = "retained_map",
+        feature = "publish_pipeline"
+    ))]
     pub(crate) fn rollback(mut self) {
         self.lifecycle.reopen(CLOSING);
         self.active = false;
@@ -173,6 +214,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn client_callback_reentry_on_held_container_lock_is_typed_busy() {
+        let lifecycle = StoreLifecycle::new("callback owner");
+        let state = Mutex::new(7u64);
+        let held = state.lock().expect("outer read holds state");
+        assert!(matches!(
+            lifecycle.try_lock_state(&state),
+            Err(MemoryError::OperationInProgress(resource)) if resource == "callback owner"
+        ));
+        drop(held);
+        assert_eq!(*lifecycle.try_lock_state(&state).expect("reentrant call ended"), 7);
+    }
+
+    #[test]
     fn reentry_returns_typed_busy_without_blocking() {
         let lifecycle = StoreLifecycle::new("payload store");
         let permit = lifecycle.begin_mutation().expect("first mutation owns lane");
@@ -180,6 +234,10 @@ mod tests {
         let reentrant = lifecycle.begin_mutation();
         assert!(matches!(
             reentrant,
+            Err(MemoryError::OperationInProgress(resource)) if resource == "payload store"
+        ));
+        assert!(matches!(
+            lifecycle.ensure_readable(),
             Err(MemoryError::OperationInProgress(resource)) if resource == "payload store"
         ));
         assert!(matches!(
@@ -234,6 +292,7 @@ mod tests {
         close.commit();
 
         assert_eq!(lifecycle.phase(), StoreLifecyclePhase::Closed);
+        lifecycle.ensure_readable().expect("terminal empty image is readable");
         assert!(matches!(
             lifecycle.begin_mutation(),
             Err(MemoryError::Closed(resource)) if resource == "prepared publication"

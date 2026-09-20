@@ -11,15 +11,18 @@ default = ["core-live-accounting"]
 # `live_control` feature so the live broker type and controller surfaces are
 # present whenever the facade wires the broker in as an accounting sink.
 core-live-accounting = ["quanta-memory-platform-core/live_control"]
-payload_store = []
-retained_map = ["dep:hashlink"]
+# Explicit non-production escape hatch. This feature is intentionally absent
+# from `default` and `full`; `--all-features` still proves the isolated surface.
+unbudgeted-stores = ["core-live-accounting"]
+payload_store = ["core-live-accounting"]
+retained_map = ["core-live-accounting", "dep:hashlink"]
 # Base store/pipeline slices are pure-Rust in-memory and carry NO third-party
 # (copyleft) backing deps. Durable/concurrent backings are opt-in via the
 # `*-redb` / `*-moka` / `*-scc` features below, so a consumer that does not ask
 # for a heavy backing never links one (and `full` stays copyleft-free).
-revocable_store = []
-transcript = ["dep:blake3"]
-publish_pipeline = ["dep:blake3"]
+revocable_store = ["core-live-accounting"]
+transcript = ["core-live-accounting", "dep:blake3"]
+publish_pipeline = ["core-live-accounting", "dep:blake3"]
 spill = []
 
 # Opt-in heavy backings (each pulls one third-party crate).

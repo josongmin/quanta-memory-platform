@@ -6,9 +6,12 @@
 //! than with sleeps. Every driver returns a typed [`FaultOutcome`] the harness
 //! folds into an assertion.
 
-use quanta_memory_platform_core::{ChargeKind, MemoryClass, RetainedEnvelope, StoreBindingHandle};
+use quanta_memory_platform_core::{
+    ChargeKind, MemoryClass, MemoryPreset, RetainedEnvelope, StoreBindingHandle,
+};
 use quanta_memory_platform_facade::{
-    InMemorySpillTarget, PayloadStore, RoutedSpillController, SimplePayloadStore, SpillController,
+    InMemorySpillTarget, MemoryPlatformBuilder, PayloadStore, RoutedSpillController,
+    SpillController,
 };
 
 use crate::fake::FakeProcessBroker;
@@ -83,8 +86,20 @@ pub fn drive_reclaim_returns_zero() -> FaultOutcome {
 /// the delete failed closed AND the bytes/entry survived.
 #[must_use]
 pub fn drive_pin_invalidation_failure() -> FaultOutcome {
-    let store: SimplePayloadStore<String, Vec<u8>> =
-        SimplePayloadStore::new(payload_binding(), None);
+    let platform = match MemoryPlatformBuilder::new().with_preset(MemoryPreset::Production).build()
+    {
+        Ok(platform) => platform,
+        Err(error) => {
+            return FaultOutcome::Escaped { evidence: format!("platform failed: {error}") }
+        }
+    };
+    let store =
+        match platform.payload_store_builder::<String, Vec<u8>>().bind(payload_binding()).build() {
+            Ok(store) => store,
+            Err(error) => {
+                return FaultOutcome::Escaped { evidence: format!("store failed: {error}") }
+            }
+        };
     let published = match store.put_canonical(RetainedEnvelope::new(b"pinned-payload".to_vec())) {
         Ok(p) => p,
         Err(e) => return FaultOutcome::Escaped { evidence: format!("put failed: {e}") },

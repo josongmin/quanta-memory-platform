@@ -15,7 +15,7 @@ use crate::conformance::target::{AllocatorObservation, BrokerConformanceTarget, 
 use crate::fixtures::{MemoryFixture, MemoryTestKit};
 use quanta_memory_platform_core::MemoryError;
 use quanta_memory_platform_facade::{
-    AbortDispositionV1, PrepareDispositionV1, PreparedPublicationErrorV1,
+    AbortDispositionV1, Budgeted, PrepareDispositionV1, PreparedPublicationErrorV1,
     PreparedPublicationIdentityV1, PreparedPublicationRequestV1, PreparedPublicationService,
     PreparedPublicationStatsV1, PreparedPublicationTokenV1, SessionTranscriptStore,
     SimpleSessionTranscriptStore, TranscriptAppendDispositionV1, TranscriptAppendErrorV1,
@@ -24,17 +24,15 @@ use quanta_memory_platform_facade::{
 
 #[cfg(feature = "fixtures")]
 use quanta_memory_platform_core::{
-    ChargeKind, LiveProcessMemoryBroker, MemoryClass, MemoryClassBudget, MemoryContextKind,
-    MemoryResult, ReclaimPriority, ReservationTicket, StoreBindingHandle, SweepHint,
+    LiveProcessMemoryBroker, MemoryClass, MemoryClassBudget, ReclaimPriority, StoreBindingHandle,
+    SweepHint,
 };
 #[cfg(feature = "fixtures")]
 use quanta_memory_platform_facade::{
-    AccountingSink, InMemorySpillTarget, PayloadStore, RetainedMapStore, RetainedMapStoreBuilder,
-    RoutedSpillController, SimplePayloadStore, SpillController, SpillTarget,
-    TranscriptRetentionPolicyV1,
+    InMemorySpillTarget, LiveMemoryPlatform, MemoryPlatformBuilder, PayloadStore, RetainedMapStore,
+    RevocableStore, RoutedSpillController, SimplePayloadStore, SimpleRetainedMapStore,
+    SimpleRevocableStore, SpillController, SpillTarget,
 };
-#[cfg(feature = "fixtures")]
-use std::sync::Arc;
 
 /// Stable suite identifiers (kept for the public test-entry surface and for
 /// host fixtures that select a named suite).
@@ -64,7 +62,7 @@ pub trait PreparedPublicationConformanceTarget {
     fn stats(&self) -> Result<PreparedPublicationStatsV1, PreparedPublicationErrorV1>;
 }
 
-impl PreparedPublicationConformanceTarget for PreparedPublicationService<Vec<u8>> {
+impl PreparedPublicationConformanceTarget for PreparedPublicationService<Vec<u8>, Budgeted> {
     type Token = PreparedPublicationTokenV1;
 
     fn prepare(
@@ -235,7 +233,9 @@ pub trait TranscriptAppendConformanceTarget {
     fn retained_bytes(&self) -> Result<u64, MemoryError>;
 }
 
-impl TranscriptAppendConformanceTarget for SimpleSessionTranscriptStore<Vec<u8>, Vec<u8>, Vec<u8>> {
+impl TranscriptAppendConformanceTarget
+    for SimpleSessionTranscriptStore<Vec<u8>, Vec<u8>, Vec<u8>, Budgeted>
+{
     fn append(
         &self,
         session_id: &[u8],
@@ -500,51 +500,11 @@ where
 }
 
 #[cfg(feature = "fixtures")]
-#[derive(Clone, Debug)]
-struct LiveBrokerAccountingSink {
-    broker: LiveProcessMemoryBroker,
-}
-
-#[cfg(feature = "fixtures")]
-impl LiveBrokerAccountingSink {
-    fn shared(broker: LiveProcessMemoryBroker) -> Arc<dyn AccountingSink> {
-        Arc::new(Self { broker })
-    }
-}
-
-#[cfg(feature = "fixtures")]
-impl AccountingSink for LiveBrokerAccountingSink {
-    fn charge(
-        &self,
-        class: MemoryClass,
-        owner: String,
-        context: MemoryContextKind,
-        kind: ChargeKind,
-        bytes: u64,
-    ) -> MemoryResult<ReservationTicket> {
-        self.broker.reserve_committed(class, owner, context, kind, bytes)
-    }
-
-    fn refund(&self, ticket: &ReservationTicket) -> MemoryResult<()> {
-        self.broker.release(ticket)
-    }
-
-    fn refund_many(&self, tickets: &[ReservationTicket]) -> MemoryResult<()> {
-        self.broker.release_many(tickets)
-    }
-
-    fn recharge(
-        &self,
-        old: &ReservationTicket,
-        class: MemoryClass,
-        owner: String,
-        context: MemoryContextKind,
-        kind: ChargeKind,
-        bytes: u64,
-    ) -> Result<ReservationTicket, quanta_memory_platform_facade::shared::accounting::RechargeDenied>
-    {
-        self.broker.recharge(old, class, owner, context, kind, bytes)
-    }
+fn make_platform(kit: &MemoryTestKit) -> Result<LiveMemoryPlatform, String> {
+    MemoryPlatformBuilder::new()
+        .with_manifest(kit.fixture.manifest.clone())
+        .build()
+        .map_err(|error| error.to_string())
 }
 
 #[cfg(feature = "fixtures")]
@@ -615,6 +575,308 @@ pub fn run_facade_store_suite(kit: &MemoryTestKit) -> Vec<AssertionVerdict> {
     verdicts.extend(run_retained_map_slice(kit));
     verdicts.extend(run_transcript_slice(kit));
     verdicts.extend(run_spill_slice());
+    verdicts.extend(run_all_store_lifecycle_suites(kit));
+    verdicts
+}
+
+/// A backend-neutral, destructive lifecycle target. Each scenario receives a
+/// fresh target from the factory; the oracle never reaches into a store's
+/// private accounting or implementation state.
+#[cfg(feature = "fixtures")]
+pub trait StoreLifecycleConformanceTarget {
+    fn populate(&mut self) -> Result<(), String>;
+    fn retained_bytes(&self) -> Result<u64, String>;
+    fn ledger_bytes(&self) -> Result<u64, String>;
+    fn close(&mut self) -> Result<(), String>;
+    fn post_close_mutation_is_typed_closed(&mut self) -> bool;
+    fn begin_rebuild(&mut self) -> Result<(), String>;
+    fn finish_rebuild(&mut self) -> Result<(), String>;
+    fn drop_store(&mut self);
+}
+
+/// Public semantic oracle shared by honest five-store adapters and broken
+/// lifecycle fakes. A passing result requires exact store/ledger agreement at
+/// every observable transition, not merely a successful method return.
+#[cfg(feature = "fixtures")]
+pub fn run_store_lifecycle_suite<T, F>(name: &str, mut factory: F) -> Vec<AssertionVerdict>
+where
+    T: StoreLifecycleConformanceTarget,
+    F: FnMut() -> Result<T, String>,
+{
+    let assertion = |suffix| {
+        InvariantAssertion::new(ContractFamily::ReclaimAccounting, format!("{name}_{suffix}"))
+    };
+    let mut verdicts = Vec::new();
+
+    let close_case = (|| {
+        let mut target = factory()?;
+        target.populate()?;
+        let before = (target.retained_bytes()?, target.ledger_bytes()?);
+        target.close()?;
+        let after = (target.retained_bytes()?, target.ledger_bytes()?);
+        let typed_closed = target.post_close_mutation_is_typed_closed();
+        target.close()?;
+        let twice = (target.retained_bytes()?, target.ledger_bytes()?);
+        Ok::<_, String>((before, after, typed_closed, twice))
+    })();
+    verdicts.push(assertion("close_exactly_once").assert_that(
+        matches!(&close_case, Ok(((store, ledger), (0, 0), true, (0, 0))) if *store > 0 && store == ledger),
+        format!("{close_case:?}"),
+    ));
+
+    let rebuild_case = (|| {
+        let mut target = factory()?;
+        target.populate()?;
+        let before = (target.retained_bytes()?, target.ledger_bytes()?);
+        target.begin_rebuild()?;
+        let denied = target.close().is_err();
+        let during = (target.retained_bytes()?, target.ledger_bytes()?);
+        target.finish_rebuild()?;
+        target.close()?;
+        let after = (target.retained_bytes()?, target.ledger_bytes()?);
+        Ok::<_, String>((before, denied, during, after))
+    })();
+    verdicts.push(assertion("rebuild_close_fail_closed").assert_that(
+        matches!(&rebuild_case, Ok(((store, ledger), true, during, (0, 0)))
+            if *store > 0 && store == ledger && during == &(*store, *ledger)),
+        format!("{rebuild_case:?}"),
+    ));
+
+    let drop_case = (|| {
+        let mut target = factory()?;
+        target.populate()?;
+        let before = (target.retained_bytes()?, target.ledger_bytes()?);
+        target.drop_store();
+        Ok::<_, String>((before, target.ledger_bytes()?))
+    })();
+    verdicts.push(assertion("last_owner_drop_releases").assert_that(
+        matches!(&drop_case, Ok(((store, ledger), 0)) if *store > 0 && store == ledger),
+        format!("{drop_case:?}"),
+    ));
+
+    let rebuild_drop_case = (|| {
+        let mut target = factory()?;
+        target.populate()?;
+        let before = (target.retained_bytes()?, target.ledger_bytes()?);
+        target.begin_rebuild()?;
+        target.drop_store();
+        let during = target.ledger_bytes()?;
+        target.finish_rebuild()?;
+        Ok::<_, String>((before, during, target.ledger_bytes()?))
+    })();
+    verdicts.push(assertion("rebuild_drop_defers_until_finish").assert_that(
+        matches!(&rebuild_drop_case, Ok(((store, ledger), during, 0))
+                if *store > 0 && store == ledger && ledger == during),
+        format!("{rebuild_drop_case:?}"),
+    ));
+    verdicts
+}
+
+#[cfg(feature = "fixtures")]
+enum LifecycleStore {
+    Payload(SimplePayloadStore<String, Vec<u8>, Budgeted>),
+    Retained(SimpleRetainedMapStore<String, Vec<u8>, Budgeted>),
+    Revocable(SimpleRevocableStore<String, Vec<u8>, Budgeted>),
+    Transcript(SimpleSessionTranscriptStore<String, String, Vec<u8>, Budgeted>),
+    Prepared(PreparedPublicationService<Vec<u8>, Budgeted>),
+}
+
+#[cfg(feature = "fixtures")]
+struct FacadeLifecycleTarget {
+    platform: LiveMemoryPlatform,
+    store: Option<LifecycleStore>,
+}
+
+#[cfg(feature = "fixtures")]
+impl FacadeLifecycleTarget {
+    fn new(kit: &MemoryTestKit, name: &str) -> Result<Self, String> {
+        let platform = make_platform(kit)?;
+        let store = match name {
+            "payload" => LifecycleStore::Payload(
+                platform
+                    .payload_store_builder::<String, Vec<u8>>()
+                    .bind(binding(MemoryClass::ArtifactCache, "lifecycle:payload"))
+                    .build()
+                    .map_err(|error| error.to_string())?,
+            ),
+            "retained" => LifecycleStore::Retained(
+                platform
+                    .retained_map_store_builder::<String, Vec<u8>>()
+                    .bind(binding(MemoryClass::MemoResidency, "lifecycle:retained"))
+                    .build(),
+            ),
+            "revocable" => LifecycleStore::Revocable(
+                platform
+                    .revocable_store_builder::<String, Vec<u8>>()
+                    .bind(binding(MemoryClass::MemoResidency, "lifecycle:revocable"))
+                    .build()
+                    .map_err(|error| error.to_string())?,
+            ),
+            "transcript" => LifecycleStore::Transcript(
+                platform
+                    .transcript_store_builder::<String, String, Vec<u8>>()
+                    .bind(binding(MemoryClass::SessionTranscript, "lifecycle:transcript"))
+                    .build()
+                    .map_err(|error| error.to_string())?,
+            ),
+            "prepared" => LifecycleStore::Prepared(
+                platform
+                    .prepared_publication_builder::<Vec<u8>>()
+                    .bind(binding(MemoryClass::ArtifactCache, "lifecycle:prepared"))
+                    .build()
+                    .map_err(|error| error.to_string())?,
+            ),
+            _ => return Err(format!("unknown lifecycle store: {name}")),
+        };
+        Ok(Self { platform, store: Some(store) })
+    }
+
+    fn store(&self) -> Result<&LifecycleStore, String> {
+        self.store.as_ref().ok_or_else(|| "store already dropped".to_string())
+    }
+}
+
+#[cfg(feature = "fixtures")]
+impl StoreLifecycleConformanceTarget for FacadeLifecycleTarget {
+    fn populate(&mut self) -> Result<(), String> {
+        match self.store()? {
+            LifecycleStore::Payload(store) => {
+                for bytes in [vec![1; 8], vec![2; 13]] {
+                    store
+                        .put_canonical(quanta_memory_platform_core::RetainedEnvelope::new(bytes))
+                        .map_err(|error| error.to_string())?;
+                }
+            }
+            LifecycleStore::Retained(store) => {
+                for (key, bytes) in [("a", vec![1; 8]), ("b", vec![2; 13])] {
+                    store
+                        .insert_checked(key.to_string(), bytes)
+                        .map_err(|error| error.to_string())?;
+                }
+            }
+            LifecycleStore::Revocable(store) => {
+                for (key, bytes) in [("a", vec![1; 8]), ("b", vec![2; 13])] {
+                    store
+                        .insert_checked(key.to_string(), bytes)
+                        .map_err(|error| error.to_string())?;
+                }
+            }
+            LifecycleStore::Transcript(store) => {
+                for (sequence, bytes) in [(0, vec![1; 8]), (1, vec![2; 13])] {
+                    store
+                        .append(TranscriptAppendRequestV1::new(
+                            TranscriptAppendIdentityV1::new(
+                                "s".to_string(),
+                                sequence,
+                                format!("m{sequence}"),
+                            ),
+                            bytes,
+                        ))
+                        .map_err(|error| error.to_string())?;
+                }
+            }
+            LifecycleStore::Prepared(store) => {
+                for (identity, bytes) in
+                    [(b"a".as_slice(), vec![1; 8]), (b"b".as_slice(), vec![2; 13])]
+                {
+                    store
+                        .prepare(PreparedPublicationRequestV1::new(
+                            PreparedPublicationIdentityV1::new(identity.to_vec())
+                                .map_err(|error| error.to_string())?,
+                            bytes,
+                        ))
+                        .map_err(|error| error.to_string())?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn retained_bytes(&self) -> Result<u64, String> {
+        match self.store()? {
+            LifecycleStore::Payload(store) => {
+                store.charged_bytes().map_err(|error| error.to_string())
+            }
+            LifecycleStore::Retained(store) => {
+                store.committed_bytes().map_err(|error| error.to_string())
+            }
+            LifecycleStore::Revocable(store) => {
+                store.committed_bytes().map_err(|error| error.to_string())
+            }
+            LifecycleStore::Transcript(store) => {
+                store.retained_bytes().map_err(|error| error.to_string())
+            }
+            LifecycleStore::Prepared(store) => {
+                store.stats().map(|stats| stats.charged_bytes).map_err(|error| error.to_string())
+            }
+        }
+    }
+
+    fn ledger_bytes(&self) -> Result<u64, String> {
+        broker_bytes(self.platform.broker())
+    }
+
+    fn close(&mut self) -> Result<(), String> {
+        match self.store()? {
+            LifecycleStore::Payload(store) => store.close().map_err(|error| error.to_string()),
+            LifecycleStore::Retained(store) => store.close().map_err(|error| error.to_string()),
+            LifecycleStore::Revocable(store) => store.close().map_err(|error| error.to_string()),
+            LifecycleStore::Transcript(store) => store.close().map_err(|error| error.to_string()),
+            LifecycleStore::Prepared(store) => store.close().map_err(|error| error.to_string()),
+        }
+    }
+
+    fn post_close_mutation_is_typed_closed(&mut self) -> bool {
+        match self.store() {
+            Ok(LifecycleStore::Payload(store)) => matches!(
+                store.put_canonical(quanta_memory_platform_core::RetainedEnvelope::new(vec![3; 1])),
+                Err(MemoryError::Closed(_))
+            ),
+            Ok(LifecycleStore::Retained(store)) => matches!(
+                store.insert_checked("after".to_string(), vec![3; 1]),
+                Err(MemoryError::Closed(_))
+            ),
+            Ok(LifecycleStore::Revocable(store)) => matches!(
+                store.insert_checked("after".to_string(), vec![3; 1]),
+                Err(MemoryError::Closed(_))
+            ),
+            Ok(LifecycleStore::Transcript(store)) => matches!(
+                store.append(TranscriptAppendRequestV1::new(
+                    TranscriptAppendIdentityV1::new("s".to_string(), 3, "after".to_string()),
+                    vec![3; 1],
+                )),
+                Err(TranscriptAppendErrorV1::Storage(MemoryError::Closed(_)))
+            ),
+            Ok(LifecycleStore::Prepared(store)) => matches!(
+                store.prepare(PreparedPublicationRequestV1::new(
+                    PreparedPublicationIdentityV1::new(b"after".to_vec()).expect("valid identity"),
+                    vec![3; 1],
+                )),
+                Err(PreparedPublicationErrorV1::Storage(MemoryError::Closed(_)))
+            ),
+            Err(_) => false,
+        }
+    }
+
+    fn begin_rebuild(&mut self) -> Result<(), String> {
+        self.platform.broker().begin_rebuild().map_err(|error| error.to_string())
+    }
+
+    fn finish_rebuild(&mut self) -> Result<(), String> {
+        self.platform.broker().finish_rebuild().map_err(|error| error.to_string())
+    }
+
+    fn drop_store(&mut self) {
+        drop(self.store.take());
+    }
+}
+
+#[cfg(feature = "fixtures")]
+fn run_all_store_lifecycle_suites(kit: &MemoryTestKit) -> Vec<AssertionVerdict> {
+    let mut verdicts = Vec::new();
+    for name in ["payload", "retained", "revocable", "transcript", "prepared"] {
+        verdicts.extend(run_store_lifecycle_suite(name, || FacadeLifecycleTarget::new(kit, name)));
+    }
     verdicts
 }
 
@@ -623,8 +885,8 @@ fn run_payload_store_slice(kit: &MemoryTestKit) -> Vec<AssertionVerdict> {
     let accounting =
         InvariantAssertion::new(ContractFamily::ReclaimAccounting, "payload_dedup_refund");
     let pin_discipline = InvariantAssertion::new(ContractFamily::PinDiscipline, "pin_safe_delete");
-    let broker = match kit.live_broker() {
-        Ok(broker) => broker,
+    let platform = match make_platform(kit) {
+        Ok(platform) => platform,
         Err(err) => {
             return vec![
                 accounting.assert_that(false, format!("payload broker setup failed: {err}")),
@@ -633,12 +895,12 @@ fn run_payload_store_slice(kit: &MemoryTestKit) -> Vec<AssertionVerdict> {
             ];
         }
     };
-    let sink = LiveBrokerAccountingSink::shared(broker.clone());
-    let store = SimplePayloadStore::<String, Vec<u8>>::new(
-        binding(MemoryClass::ArtifactCache, "conformance:payload"),
-        None,
-    )
-    .charged_against(sink);
+    let broker = platform.broker().clone();
+    let store = platform
+        .payload_store_builder::<String, Vec<u8>>()
+        .bind(binding(MemoryClass::ArtifactCache, "conformance:payload"))
+        .build()
+        .expect("bound payload builder");
     let payload = vec![7u8; 32];
     let first = match store
         .put_canonical(quanta_memory_platform_core::RetainedEnvelope::new(payload.clone()))
@@ -710,32 +972,28 @@ fn run_payload_store_slice(kit: &MemoryTestKit) -> Vec<AssertionVerdict> {
 fn run_retained_map_slice(kit: &MemoryTestKit) -> Vec<AssertionVerdict> {
     let accounting =
         InvariantAssertion::new(ContractFamily::ReclaimAccounting, "retained_map_refunds");
-    let broker = match kit.live_broker() {
-        Ok(broker) => broker,
+    let platform = match make_platform(kit) {
+        Ok(platform) => platform,
         Err(err) => {
             return vec![
                 accounting.assert_that(false, format!("retained-map broker setup failed: {err}"))
             ]
         }
     };
-    let sink = LiveBrokerAccountingSink::shared(broker.clone());
-    run_retained_map_slice_with_sink(kit, &broker, sink)
+    run_retained_map_slice_with_platform(kit, &platform)
 }
 
-/// The retained-map slice over an INJECTED sink, so the suite can be driven
-/// against a deliberately broken sink and proven to BITE (see the suite-rejects
-/// self-test), not merely accept the honest live broker.
 #[cfg(feature = "fixtures")]
-fn run_retained_map_slice_with_sink(
+fn run_retained_map_slice_with_platform(
     kit: &MemoryTestKit,
-    broker: &LiveProcessMemoryBroker,
-    sink: std::sync::Arc<dyn AccountingSink>,
+    platform: &LiveMemoryPlatform,
 ) -> Vec<AssertionVerdict> {
     let accounting =
         InvariantAssertion::new(ContractFamily::ReclaimAccounting, "retained_map_refunds");
-    let store = RetainedMapStoreBuilder::<String, Vec<u8>>::new()
+    let broker = platform.broker();
+    let store = platform
+        .retained_map_store_builder::<String, Vec<u8>>()
         .bind(binding(MemoryClass::MemoResidency, "conformance:map"))
-        .charged_against(sink)
         .build();
 
     let overwrite = store
@@ -758,29 +1016,29 @@ fn run_retained_map_slice_with_sink(
         ContractFamily::ReclaimAccounting,
         "retained_atomic_recharge_overwrite",
     );
-    let recharge_verdict = match class_capped_kit(kit, MemoryClass::MemoResidency, 30).live_broker()
-    {
-        Ok(tight_broker) => {
-            let tight_sink = LiveBrokerAccountingSink::shared(tight_broker.clone());
-            let tight_store = RetainedMapStoreBuilder::<String, Vec<u8>>::new()
-                .bind(binding(MemoryClass::MemoResidency, "conformance:map-tight"))
-                .charged_against(tight_sink)
-                .build();
-            let seed = tight_store.insert_checked("k".to_string(), vec![0u8; 24]); // 24 of 30
-                                                                                   // old(24) + new(20) = 44 > 30 cap, but net 20 <= 30: atomic recharge only.
-            let net_fit = tight_store.insert_checked("k".to_string(), vec![0u8; 20]);
-            let tight_ledger = broker_bytes(&tight_broker);
-            recharge.assert_that(
-                seed.is_ok()
-                    && net_fit.is_ok()
-                    && matches!(&tight_ledger, Ok(bytes) if *bytes == 20),
-                format!("seed={seed:?} net_fit={net_fit:?} tight_ledger={tight_ledger:?}"),
-            )
-        }
-        Err(err) => {
-            recharge.assert_that(false, format!("tight retained broker setup failed: {err}"))
-        }
-    };
+    let recharge_verdict =
+        match make_platform(&class_capped_kit(kit, MemoryClass::MemoResidency, 30)) {
+            Ok(tight_platform) => {
+                let tight_broker = tight_platform.broker();
+                let tight_store = tight_platform
+                    .retained_map_store_builder::<String, Vec<u8>>()
+                    .bind(binding(MemoryClass::MemoResidency, "conformance:map-tight"))
+                    .build();
+                let seed = tight_store.insert_checked("k".to_string(), vec![0u8; 24]); // 24 of 30
+                                                                                       // old(24) + new(20) = 44 > 30 cap, but net 20 <= 30: atomic recharge only.
+                let net_fit = tight_store.insert_checked("k".to_string(), vec![0u8; 20]);
+                let tight_ledger = broker_bytes(tight_broker);
+                recharge.assert_that(
+                    seed.is_ok()
+                        && net_fit.is_ok()
+                        && matches!(&tight_ledger, Ok(bytes) if *bytes == 20),
+                    format!("seed={seed:?} net_fit={net_fit:?} tight_ledger={tight_ledger:?}"),
+                )
+            }
+            Err(err) => {
+                recharge.assert_that(false, format!("tight retained broker setup failed: {err}"))
+            }
+        };
 
     vec![
         accounting.assert_that(
@@ -791,10 +1049,10 @@ fn run_retained_map_slice_with_sink(
                 && matches!(&sweep_stats, Ok(stats) if stats.reclaimed_items == 2 && stats.reclaimed_bytes == 12)
                 && matches!(&after_sweep, Ok(bytes) if *bytes == 10)
                 && matches!(&committed_after_sweep, Ok(bytes) if *bytes == 10)
-                && store.get(&"k".to_string()) == Some(vec![1u8; 10]),
+                && matches!(store.get_checked(&"k".to_string()), Ok(Some(value)) if value == vec![1u8; 10]),
             format!(
                 "overwrite={overwrite:?} after_overwrite={after_overwrite:?} committed_after_overwrite={committed_after_overwrite:?} seed_sweep={seed_sweep:?} sweep_stats={sweep_stats:?} after_sweep={after_sweep:?} committed_after_sweep={committed_after_sweep:?} remaining_keys={:?}",
-                store.keys()
+                store.keys_checked()
             ),
         ),
         recharge_verdict,
@@ -810,8 +1068,8 @@ fn run_transcript_slice(kit: &MemoryTestKit) -> Vec<AssertionVerdict> {
         "transcript_over_cap_fail_closed",
     );
 
-    let broker = match kit.live_broker() {
-        Ok(broker) => broker,
+    let platform = match make_platform(kit) {
+        Ok(platform) => platform,
         Err(err) => {
             return vec![
                 accounting.assert_that(false, format!("transcript broker setup failed: {err}")),
@@ -820,12 +1078,12 @@ fn run_transcript_slice(kit: &MemoryTestKit) -> Vec<AssertionVerdict> {
             ];
         }
     };
-    let sink = LiveBrokerAccountingSink::shared(broker.clone());
-    let store = SimpleSessionTranscriptStore::<String, String, String>::new(
-        binding(MemoryClass::SessionTranscript, "conformance:transcript"),
-        TranscriptRetentionPolicyV1::process_lifetime(),
-    )
-    .charged_against(sink);
+    let broker = platform.broker().clone();
+    let store = platform
+        .transcript_store_builder::<String, String, String>()
+        .bind(binding(MemoryClass::SessionTranscript, "conformance:transcript"))
+        .build()
+        .expect("bound transcript builder");
     let truncate = store
         .append(TranscriptAppendRequestV1::new(
             TranscriptAppendIdentityV1::new("s".to_string(), 0, "m0".to_string()),
@@ -843,8 +1101,8 @@ fn run_transcript_slice(kit: &MemoryTestKit) -> Vec<AssertionVerdict> {
     let retained_after_truncate = store.retained_bytes().map_err(|e| e.to_string());
 
     let tiny_kit = session_transcript_budget(kit, 4);
-    let tiny_broker = match tiny_kit.live_broker() {
-        Ok(broker) => broker,
+    let tiny_platform = match make_platform(&tiny_kit) {
+        Ok(platform) => platform,
         Err(err) => {
             return vec![
                 accounting.assert_that(
@@ -861,12 +1119,12 @@ fn run_transcript_slice(kit: &MemoryTestKit) -> Vec<AssertionVerdict> {
             ];
         }
     };
-    let tiny_sink = LiveBrokerAccountingSink::shared(tiny_broker.clone());
-    let tiny_store = SimpleSessionTranscriptStore::<String, String, String>::new(
-        binding(MemoryClass::SessionTranscript, "conformance:transcript-tight"),
-        TranscriptRetentionPolicyV1::process_lifetime(),
-    )
-    .charged_against(tiny_sink);
+    let tiny_broker = tiny_platform.broker().clone();
+    let tiny_store = tiny_platform
+        .transcript_store_builder::<String, String, String>()
+        .bind(binding(MemoryClass::SessionTranscript, "conformance:transcript-tight"))
+        .build()
+        .expect("bound transcript builder");
     let over_cap = tiny_store.append(TranscriptAppendRequestV1::new(
         TranscriptAppendIdentityV1::new("s".to_string(), 0, "m0".to_string()),
         "toolong".to_string(),
@@ -892,7 +1150,7 @@ fn run_transcript_slice(kit: &MemoryTestKit) -> Vec<AssertionVerdict> {
             )
                 && matches!(&tiny_ledger_after, Ok(bytes) if *bytes == 0)
                 && matches!(&tiny_retained_after, Ok(bytes) if *bytes == 0)
-                && tiny_store.stats().item_count == 0,
+                && matches!(tiny_store.stats(), Ok(stats) if stats.item_count == 0),
             format!(
                 "over_cap={over_cap:?} tiny_ledger_after={tiny_ledger_after:?} tiny_retained_after={tiny_retained_after:?} tiny_stats={:?}",
                 tiny_store.stats()
@@ -955,13 +1213,13 @@ mod tests {
     use super::*;
     use crate::conformance::target::{AccountingView, AllocatorAdvisoryView};
     use crate::fake::{AccountingFidelity, FakeProcessBroker};
+    #[cfg(feature = "fixtures")]
+    use quanta_memory_platform_core::MemoryResult;
     use quanta_memory_platform_core::{
         LiveProcessMemoryBroker, MemoryBudgetManifest, MemoryClass, MemoryClassBudget,
         MemoryPreset, ReclaimPriority, ResidencyPolicy, StoreBindingHandle,
     };
-    #[cfg(feature = "fixtures")]
-    use quanta_memory_platform_core::{RechargeError, RechargeRecoveryV1};
-    use quanta_memory_platform_facade::TranscriptRetentionPolicyV1;
+    use quanta_memory_platform_facade::MemoryPlatformBuilder;
 
     fn all_held(verdicts: &[AssertionVerdict]) -> bool {
         verdicts.iter().all(AssertionVerdict::held)
@@ -980,14 +1238,19 @@ mod tests {
 
     #[test]
     fn prepared_publication_suite_accepts_honest_service() {
-        let service = PreparedPublicationService::<Vec<u8>>::new(
-            StoreBindingHandle::new(
+        let platform = MemoryPlatformBuilder::new()
+            .with_preset(MemoryPreset::Development)
+            .build()
+            .expect("platform");
+        let service = platform
+            .prepared_publication_builder::<Vec<u8>>()
+            .bind(StoreBindingHandle::new(
                 MemoryClass::ManifestResidency,
                 "prepared-conformance".to_string(),
                 None,
-            ),
-            None,
-        );
+            ))
+            .build()
+            .expect("bound prepared builder");
         let verdicts = run_prepared_publication_suite(&service);
         assert!(all_held(&verdicts), "honest prepared service failed: {verdicts:?}");
     }
@@ -1066,20 +1329,25 @@ mod tests {
 
     #[derive(Debug)]
     struct RootBlindPreparedTarget {
-        service: PreparedPublicationService<Vec<u8>>,
+        service: PreparedPublicationService<Vec<u8>, Budgeted>,
     }
 
     impl RootBlindPreparedTarget {
         fn new() -> Self {
+            let platform = MemoryPlatformBuilder::new()
+                .with_preset(MemoryPreset::Development)
+                .build()
+                .expect("platform");
             Self {
-                service: PreparedPublicationService::new(
-                    StoreBindingHandle::new(
+                service: platform
+                    .prepared_publication_builder::<Vec<u8>>()
+                    .bind(StoreBindingHandle::new(
                         MemoryClass::ManifestResidency,
                         "root-blind-prepared-conformance".to_string(),
                         None,
-                    ),
-                    None,
-                ),
+                    ))
+                    .build()
+                    .expect("bound prepared builder"),
             }
         }
     }
@@ -1138,14 +1406,19 @@ mod tests {
 
     #[test]
     fn transcript_append_suite_accepts_honest_service() {
-        let store = SimpleSessionTranscriptStore::<Vec<u8>, Vec<u8>, Vec<u8>>::new(
-            StoreBindingHandle::new(
+        let platform = MemoryPlatformBuilder::new()
+            .with_preset(MemoryPreset::Development)
+            .build()
+            .expect("platform");
+        let store = platform
+            .transcript_store_builder::<Vec<u8>, Vec<u8>, Vec<u8>>()
+            .bind(StoreBindingHandle::new(
                 MemoryClass::SessionTranscript,
                 "transcript-conformance".to_string(),
                 None,
-            ),
-            TranscriptRetentionPolicyV1::process_lifetime(),
-        );
+            ))
+            .build()
+            .expect("bound transcript builder");
         let verdicts = run_transcript_append_suite(&store);
         assert!(all_held(&verdicts), "honest transcript store failed: {verdicts:?}");
     }
@@ -1738,84 +2011,6 @@ mod tests {
         let mut real = live_broker();
         let real_verdicts = run_broker_accounting_suite(&mut real);
         assert!(all_held(&real_verdicts), "real broker: {:?}", violated(&real_verdicts));
-    }
-
-    // -----------------------------------------------------------------------
-    // The FACADE-STORE suite itself must BITE: driving a slice against a broken
-    // sink must flip the suite's own verdict to violated (not just a standalone
-    // assertion). Mirrors suite_rejects_* for the core accounting suite.
-    // -----------------------------------------------------------------------
-
-    /// A sink that charges honestly but SWALLOWS refunds and leaks on recharge —
-    /// exactly the ReclaimAccounting fault the facade-store suite must reject.
-    #[cfg(feature = "fixtures")]
-    #[derive(Debug)]
-    struct SwallowRefundSink(LiveProcessMemoryBroker);
-
-    #[cfg(feature = "fixtures")]
-    impl AccountingSink for SwallowRefundSink {
-        fn charge(
-            &self,
-            class: MemoryClass,
-            owner: String,
-            context: MemoryContextKind,
-            kind: ChargeKind,
-            bytes: u64,
-        ) -> MemoryResult<ReservationTicket> {
-            self.0.reserve_committed(class, owner, context, kind, bytes)
-        }
-        fn refund(&self, _ticket: &ReservationTicket) -> MemoryResult<()> {
-            Ok(()) // BUG under test: never refunds.
-        }
-        fn refund_many(&self, _tickets: &[ReservationTicket]) -> MemoryResult<()> {
-            Ok(()) // BUG under test.
-        }
-        fn recharge(
-            &self,
-            _old: &ReservationTicket,
-            class: MemoryClass,
-            owner: String,
-            context: MemoryContextKind,
-            kind: ChargeKind,
-            bytes: u64,
-        ) -> Result<
-            ReservationTicket,
-            quanta_memory_platform_facade::shared::accounting::RechargeDenied,
-        > {
-            // Charges the new value but never releases the old: a leaking overwrite.
-            self.charge(class, owner, context, kind, bytes).map_err(|error| RechargeError {
-                error,
-                recovery: RechargeRecoveryV1::OldChargePreserved,
-            })
-        }
-    }
-
-    #[cfg(feature = "fixtures")]
-    #[test]
-    fn facade_store_suite_rejects_a_refund_swallowing_sink_localized_to_reclaim_accounting() {
-        let kit = MemoryTestKit::ci();
-
-        // Positive pole: the honest live sink passes the slice's own checks.
-        let honest_broker = kit.live_broker().expect("honest broker");
-        let honest = run_retained_map_slice_with_sink(
-            &kit,
-            &honest_broker,
-            LiveBrokerAccountingSink::shared(honest_broker.clone()),
-        );
-        assert!(all_held(&honest), "honest sink must pass the slice: {:?}", violated(&honest));
-
-        // Bite: a refund-swallowing sink must make the SUITE slice VIOLATE, localized
-        // to ReclaimAccounting — a check that passed this would be a rubber stamp.
-        let broken_broker = kit.live_broker().expect("broken broker");
-        let broken: std::sync::Arc<dyn AccountingSink> =
-            std::sync::Arc::new(SwallowRefundSink(broken_broker.clone()));
-        let verdicts = run_retained_map_slice_with_sink(&kit, &broken_broker, broken);
-        assert!(!all_held(&verdicts), "a refund-swallowing sink must make the slice violate");
-        assert!(
-            violated(&verdicts).contains(&ContractFamily::ReclaimAccounting),
-            "the violation must localize to ReclaimAccounting, got {:?}",
-            violated(&verdicts)
-        );
     }
 
     /// A spill target that CLAIMS to accept but retains nothing (drops the handle),

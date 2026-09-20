@@ -10,5 +10,9 @@ pub trait RevocableStore<Key, Value> {
     fn binding(&self) -> &StoreBindingHandle;
     fn insert_checked(&self, key: Key, value: Value) -> Result<(), StoreWriteError>;
     fn reclaim_one(&self) -> MemoryResult<Option<(Key, Value)>>;
-    fn stats(&self) -> StoreStats;
+    /// Checked statistics. Poison and lifecycle failures are never projected as
+    /// an empty store.
+    fn stats(&self) -> MemoryResult<StoreStats>;
+    /// Terminal, idempotent release of every live entry and accounting charge.
+    fn close(&self) -> MemoryResult<()>;
 }

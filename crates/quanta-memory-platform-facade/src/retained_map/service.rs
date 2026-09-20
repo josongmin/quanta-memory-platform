@@ -1,29 +1,36 @@
 use std::collections::hash_map::RandomState;
 use std::hash::Hash;
-use std::sync::Mutex;
+use std::marker::PhantomData;
+use std::ops::{Deref, DerefMut};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use hashlink::linked_hash_map::Entry;
 use hashlink::LinkedHashMap;
 
 use quanta_memory_platform_core::{
-    ChargeKind, MemoryContextKind, MemoryError, RechargeRecoveryV1, ReservationTicket,
-    StoreBindingHandle, StoreStats, StoreWriteError, SweepHint, SweepStats,
+    ChargeKind, LiveProcessMemoryBroker, ManagedCharge, ManagedChargeRechargeRecovery,
+    MemoryContextKind, MemoryError, StoreBindingHandle, StoreStats, StoreWriteError, SweepHint,
+    SweepStats,
 };
 
 use crate::retained_map::{
     RetainedMapInsertOrExistingV1, RetainedMapInsertOutcomeV1, RetainedMapStore,
 };
-use crate::shared::accounting::SharedAccountingSink;
+#[cfg(feature = "unbudgeted-stores")]
+use crate::shared::accounting::Unbudgeted;
+use crate::shared::accounting::{Budgeted, StoreAccounting};
+use crate::shared::lifecycle::{retire_client_value, BeginClose, DropTransition, StoreLifecycle};
 use crate::shared::measure::ByteSized;
 
 #[derive(Debug)]
 struct MapEntry<Value> {
     value: Value,
     charged_bytes: u64,
-    /// Ledger receipt when the store is charged against a broker; `None` in
-    /// non-budgeted mode. Refunded exactly once when the entry leaves the map
-    /// (remove / overwrite / sweep).
-    ticket: Option<ReservationTicket>,
+    /// Single-owner ledger authority in budgeted mode; absent only for the
+    /// explicitly distinct unbudgeted product type.
+    charge: Option<ManagedCharge>,
+    /// Private, mutation-lane-only sweep plan bit. Never exposed to readers.
+    sweep_selected: bool,
 }
 
 #[derive(Debug)]
@@ -35,6 +42,53 @@ struct MapState<Key, Value> {
     committed_bytes: u64,
 }
 
+fn retire_map_entries<Key, Value>(entries: LinkedHashMap<Key, MapEntry<Value>, RandomState>) {
+    for (key, entry) in entries {
+        let MapEntry { value, charge, .. } = entry;
+        drop(charge);
+        retire_client_value(key);
+        retire_client_value(value);
+    }
+}
+
+impl<Key, Value> MapState<Key, Value> {
+    fn empty() -> Self {
+        Self { entries: LinkedHashMap::with_hasher(RandomState::new()), committed_bytes: 0 }
+    }
+}
+
+/// Owns the canonical map while a broker operation runs outside its mutex.
+/// Unwinding through a user-defined Hash/Clone/Drop callback cannot discard
+/// entries or their non-clone accounting leases: the preimage is reinstalled
+/// before the lifecycle mutation permit reopens the store.
+struct MapStatePlan<'a, Key, Value> {
+    slot: &'a Mutex<MapState<Key, Value>>,
+    state: Option<MapState<Key, Value>>,
+}
+
+impl<Key, Value> Deref for MapStatePlan<'_, Key, Value> {
+    type Target = MapState<Key, Value>;
+
+    fn deref(&self) -> &Self::Target {
+        self.state.as_ref().expect("map plan owns the canonical state until drop")
+    }
+}
+
+impl<Key, Value> DerefMut for MapStatePlan<'_, Key, Value> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.state.as_mut().expect("map plan owns the canonical state until drop")
+    }
+}
+
+impl<Key, Value> Drop for MapStatePlan<'_, Key, Value> {
+    fn drop(&mut self) {
+        if let Some(state) = self.state.take() {
+            let mut slot = self.slot.lock().unwrap_or_else(PoisonError::into_inner);
+            *slot = state;
+        }
+    }
+}
+
 /// Portable retained map store.
 ///
 /// Owns the reserve -> mutate -> commit / release choreography (playbook 4.1):
@@ -42,69 +96,169 @@ struct MapState<Key, Value> {
 /// only a successful mutation commits the reservation; a failed mutation releases
 /// the tentative bytes so accounting never drifts.
 ///
-/// When built `charged_against` a broker, every live entry is reserved+committed
-/// through the broker's ledger (the accounting SSOT) on insert and refunded when
-/// the entry leaves the map (remove / overwrite-in-place / sweep), so
-/// global/owner/class caps gate real map bytes and a denied insert fails closed.
-/// Without a sink the store self-accounts (explicit non-budgeted mode) and never
-/// touches a ledger (invariant 2: it never requires full broker mutation access).
-///
-/// Charged construction is builder-only so a ledger sink can never be attached
-/// after uncharged entries already exist:
-///
-/// ```compile_fail
-/// use quanta_memory_platform_facade::{SharedAccountingSink, SimpleRetainedMapStore};
-/// use quanta_memory_platform_core::StoreBindingHandle;
-///
-/// fn attach_after_construction(
-///     store: SimpleRetainedMapStore<String, Vec<u8>>,
-///     sink: SharedAccountingSink,
-/// ) {
-///     let _ = store.charged_against(sink);
-/// }
-/// ```
+/// `Mode` is intentionally mandatory: budgeted and unbudgeted stores are
+/// different product types. Production construction starts at
+/// [`crate::MemoryPlatformBuilder`]; the raw concrete type has no public
+/// constructor and cannot acquire accounting authority after materialization.
 #[derive(Debug)]
-pub struct SimpleRetainedMapStore<Key, Value> {
+pub struct SimpleRetainedMapStore<Key, Value, Mode> {
     binding: StoreBindingHandle,
-    charger: Option<SharedAccountingSink>,
+    accounting: StoreAccounting,
+    lifecycle: StoreLifecycle,
     state: Mutex<MapState<Key, Value>>,
+    _mode: PhantomData<Mode>,
 }
 
-impl<Key, Value> SimpleRetainedMapStore<Key, Value> {
-    pub fn new(binding: StoreBindingHandle) -> Self {
-        Self::with_charger(binding, None)
+impl<Key, Value> SimpleRetainedMapStore<Key, Value, Budgeted> {
+    pub(crate) fn new_budgeted(
+        binding: StoreBindingHandle,
+        broker: LiveProcessMemoryBroker,
+    ) -> Self {
+        Self::with_accounting(binding, StoreAccounting::Budgeted(broker))
     }
+}
 
-    pub(crate) fn new_charged(binding: StoreBindingHandle, sink: SharedAccountingSink) -> Self {
-        Self::with_charger(binding, Some(sink))
+#[cfg(feature = "unbudgeted-stores")]
+impl<Key, Value> SimpleRetainedMapStore<Key, Value, Unbudgeted> {
+    pub(crate) fn new_unbudgeted(binding: StoreBindingHandle) -> Self {
+        Self::with_accounting(binding, StoreAccounting::Unbudgeted)
     }
+}
 
-    fn with_charger(binding: StoreBindingHandle, charger: Option<SharedAccountingSink>) -> Self {
+#[cfg(test)]
+#[derive(Debug)]
+struct TestUnbudgeted;
+
+#[cfg(test)]
+impl<Key, Value> SimpleRetainedMapStore<Key, Value, TestUnbudgeted> {
+    fn new_unbudgeted_fixture(binding: StoreBindingHandle) -> Self {
+        Self::with_accounting(binding, StoreAccounting::Unbudgeted)
+    }
+}
+
+impl<Key, Value, Mode> SimpleRetainedMapStore<Key, Value, Mode> {
+    fn with_accounting(binding: StoreBindingHandle, accounting: StoreAccounting) -> Self {
         Self {
             binding,
-            charger,
-            state: Mutex::new(MapState {
-                entries: LinkedHashMap::with_hasher(RandomState::new()),
-                committed_bytes: 0,
-            }),
+            accounting,
+            lifecycle: StoreLifecycle::new("retained map"),
+            state: Mutex::new(MapState::empty()),
+            _mode: PhantomData,
+        }
+    }
+
+    fn lock(&self) -> Result<MutexGuard<'_, MapState<Key, Value>>, MemoryError> {
+        self.lifecycle.try_lock_state(&self.state)
+    }
+
+    /// Return only a complete preimage or postimage. A read during an in-flight
+    /// accounting plan returns typed busy instead of spinning on reentry.
+    fn lock_for_read(&self) -> Result<MutexGuard<'_, MapState<Key, Value>>, MemoryError> {
+        self.lifecycle.ensure_readable()?;
+        let state = self.lock()?;
+        self.lifecycle.ensure_readable()?;
+        Ok(state)
+    }
+
+    fn take_state(&self) -> Result<MapStatePlan<'_, Key, Value>, MemoryError> {
+        let mut state = self.lock()?;
+        let owned = std::mem::replace(&mut *state, MapState::empty());
+        Ok(MapStatePlan { slot: &self.state, state: Some(owned) })
+    }
+
+    /// Preserve charge ownership even if a reader poisoned the mutex while the
+    /// canonical state was temporarily owned by a mutation plan.
+    fn restore_state(&self, state: MapStatePlan<'_, Key, Value>) {
+        drop(state);
+    }
+
+    fn require_charge_shape(
+        &self,
+        entry: &MapEntry<Value>,
+        operation: &str,
+    ) -> Result<(), MemoryError> {
+        if self.accounting.broker().is_some() == entry.charge.is_some() {
+            Ok(())
+        } else {
+            Err(MemoryError::InvalidState(format!(
+                "retained-map {operation} encountered an entry with mismatched accounting mode"
+            )))
+        }
+    }
+
+    /// Release all live charges atomically and terminally close the store.
+    /// Failure restores the exact entries, linked order, counters, and charge
+    /// authorities before reopening the lifecycle gate.
+    pub fn close(&self) -> Result<(), MemoryError> {
+        let close = match self.lifecycle.begin_close()? {
+            BeginClose::AlreadyClosed => return Ok(()),
+            BeginClose::Acquired(close) => close,
+        };
+        let mut state = match self.take_state() {
+            Ok(state) => state,
+            Err(error) => {
+                close.rollback();
+                return Err(error);
+            }
+        };
+
+        if let Some(error) =
+            state.entries.values().find_map(|entry| self.require_charge_shape(entry, "close").err())
+        {
+            self.restore_state(state);
+            close.rollback();
+            return Err(error);
+        }
+
+        let mut charges: Vec<ManagedCharge> =
+            state.entries.values_mut().filter_map(|entry| entry.charge.take()).collect();
+        if let Err(error) = self.accounting.release_many(&mut charges) {
+            let mut charges = charges.into_iter();
+            for entry in state.entries.values_mut() {
+                if entry.charge.is_none() {
+                    entry.charge = charges.next();
+                }
+            }
+            debug_assert!(charges.next().is_none());
+            self.restore_state(state);
+            close.rollback();
+            return Err(error);
+        }
+
+        // Commit the terminal image before user-defined Key/Value destructors
+        // run. A destructor panic must not reopen a ticketless live entry.
+        let retired_entries =
+            std::mem::replace(&mut state.entries, LinkedHashMap::with_hasher(RandomState::new()));
+        state.committed_bytes = 0;
+        self.restore_state(state);
+        close.commit();
+        retire_map_entries(retired_entries);
+        Ok(())
+    }
+}
+
+impl<Key, Value, Mode> Drop for SimpleRetainedMapStore<Key, Value, Mode> {
+    fn drop(&mut self) {
+        if self.lifecycle.transition_to_closed_for_drop() == DropTransition::CleanupRequired {
+            let state = self.state.get_mut().unwrap_or_else(PoisonError::into_inner);
+            let entries = std::mem::replace(
+                &mut state.entries,
+                LinkedHashMap::with_hasher(RandomState::new()),
+            );
+            state.committed_bytes = 0;
+            retire_map_entries(entries);
         }
     }
 }
 
-impl<Key, Value> SimpleRetainedMapStore<Key, Value>
+impl<Key, Value, Mode> SimpleRetainedMapStore<Key, Value, Mode>
 where
     Key: Clone + Eq + Hash,
     Value: Clone + ByteSized,
 {
-    fn lock(&self) -> Result<std::sync::MutexGuard<'_, MapState<Key, Value>>, MemoryError> {
-        self.state
-            .lock()
-            .map_err(|_| MemoryError::InvalidState("retained map lock poisoned".to_string()))
-    }
-
     /// Committed retained bytes (sum of live entry charges).
     pub fn committed_bytes(&self) -> Result<u64, MemoryError> {
-        Ok(self.lock()?.committed_bytes)
+        Ok(self.lock_for_read()?.committed_bytes)
     }
 
     fn committed_bytes_after_replace_v1(
@@ -148,46 +302,57 @@ where
         on_occupied: impl FnOnce(&Value) -> Outcome,
         inserted: Outcome,
     ) -> Result<Outcome, StoreWriteError> {
-        let mut state = self.lock()?;
-        let MapState { entries, committed_bytes } = &mut *state;
-        match entries.entry(key) {
-            Entry::Occupied(occupied) => Ok(on_occupied(&occupied.get().value)),
-            Entry::Vacant(vacant) => {
-                let reserved_bytes = value.byte_size();
-                let next_committed_bytes =
-                    Self::committed_bytes_after_replace_v1(*committed_bytes, 0, reserved_bytes)?;
-                let new_ticket = self.charge_new_entry_v1(reserved_bytes)?;
-                vacant.insert(MapEntry {
-                    value,
-                    charged_bytes: reserved_bytes,
-                    ticket: new_ticket,
-                });
-                *committed_bytes = next_committed_bytes;
-                Ok(inserted)
-            }
+        let _permit = self.lifecycle.begin_mutation()?;
+        let reserved_bytes = value.byte_size();
+        let mut state = self.take_state()?;
+        if let Some(entry) = state.entries.get(&key) {
+            let outcome = on_occupied(&entry.value);
+            self.restore_state(state);
+            return Ok(outcome);
         }
+
+        let next_committed_bytes = match Self::committed_bytes_after_replace_v1(
+            state.committed_bytes,
+            0,
+            reserved_bytes,
+        ) {
+            Ok(next) => next,
+            Err(error) => {
+                self.restore_state(state);
+                return Err(error);
+            }
+        };
+        let charge = match self.charge_new_entry_v1(reserved_bytes) {
+            Ok(charge) => charge,
+            Err(error) => {
+                self.restore_state(state);
+                return Err(error);
+            }
+        };
+        state.entries.insert(
+            key,
+            MapEntry { value, charged_bytes: reserved_bytes, charge, sweep_selected: false },
+        );
+        state.committed_bytes = next_committed_bytes;
+        self.restore_state(state);
+        Ok(inserted)
     }
 
     fn charge_new_entry_v1(
         &self,
         reserved_bytes: u64,
-    ) -> Result<Option<ReservationTicket>, StoreWriteError> {
-        self.charger
-            .as_ref()
-            .map(|sink| {
-                sink.charge(
-                    self.binding.class.clone(),
-                    self.binding.owner.clone(),
-                    MemoryContextKind::Request,
-                    ChargeKind::RetainedMetadata,
-                    reserved_bytes,
-                )
-            })
-            .transpose()
+    ) -> Result<Option<ManagedCharge>, StoreWriteError> {
+        self.accounting.charge(
+            self.binding.class.clone(),
+            self.binding.owner.clone(),
+            MemoryContextKind::Request,
+            ChargeKind::RetainedMetadata,
+            reserved_bytes,
+        )
     }
 }
 
-impl<Key, Value> RetainedMapStore<Key, Value> for SimpleRetainedMapStore<Key, Value>
+impl<Key, Value, Mode> RetainedMapStore<Key, Value> for SimpleRetainedMapStore<Key, Value, Mode>
 where
     Key: Clone + Eq + Hash,
     Value: Clone + ByteSized,
@@ -197,107 +362,75 @@ where
     }
 
     fn insert_checked(&self, key: Key, value: Value) -> Result<(), StoreWriteError> {
+        let _permit = self.lifecycle.begin_mutation()?;
         let reserved_bytes = value.byte_size();
-        let mut state = self.lock()?;
+        let mut state = self.take_state()?;
+        let mut retired_value = None;
         let MapState { entries, committed_bytes } = &mut *state;
-
+        // One keyed entry probe preserves the prior O(1) point-path contract.
+        // The entry borrow owns only the detached map, never the container mutex;
+        // broker admission/recharge is therefore safe outside the store lock.
         match entries.entry(key) {
             Entry::Occupied(mut occupied) => {
-                // Mutate an occupied value in place. Unlike an order-refreshing
-                // insert, this preserves the original insertion position and thus
-                // the store's established newest-first sweep contract.
-                let next_committed_bytes = Self::committed_bytes_after_replace_v1(
+                let old_bytes = occupied.get().charged_bytes;
+                let next = Self::committed_bytes_after_replace_v1(
                     *committed_bytes,
-                    occupied.get().charged_bytes,
+                    old_bytes,
                     reserved_bytes,
                 )?;
-                match &self.charger {
-                    Some(sink) => {
-                        let entry = occupied.get_mut();
-                        let old_ticket = match entry.ticket.take() {
-                            Some(ticket) => ticket,
-                            None => {
-                                return Err(MemoryError::InvalidState(
-                                    "charged retained-map entry has no ticket on overwrite: \
-                                     charge invariant broken"
-                                        .to_string(),
-                                ));
+                self.require_charge_shape(occupied.get(), "overwrite")?;
+                if let Some(charge) = occupied.get_mut().charge.as_mut() {
+                    if let Err(denied) = charge.recharge(
+                        self.binding.class.clone(),
+                        self.binding.owner.clone(),
+                        MemoryContextKind::Request,
+                        ChargeKind::RetainedMetadata,
+                        reserved_bytes,
+                    ) {
+                        match denied.recovery {
+                            ManagedChargeRechargeRecovery::ChargePreserved => {
+                                return Err(denied.error);
                             }
-                        };
-                        match sink.recharge(
-                            &old_ticket,
-                            self.binding.class.clone(),
-                            self.binding.owner.clone(),
-                            MemoryContextKind::Request,
-                            ChargeKind::RetainedMetadata,
-                            reserved_bytes,
-                        ) {
-                            Ok(new_ticket) => {
-                                *committed_bytes = next_committed_bytes;
-                                entry.value = value;
-                                entry.charged_bytes = reserved_bytes;
-                                entry.ticket = Some(new_ticket);
-                                Ok(())
-                            }
-                            Err(denied) => {
-                                match denied.recovery {
-                                    RechargeRecoveryV1::OldChargePreserved => {
-                                        entry.ticket = Some(old_ticket);
-                                    }
-                                    RechargeRecoveryV1::OldChargeRestored(restored) => {
-                                        entry.ticket = Some(restored);
-                                    }
-                                    RechargeRecoveryV1::RecoveryRequired { rollback_error } => {
-                                        // The accounting authority explicitly states
-                                        // that the old charge is gone. Keeping the old
-                                        // payload would create uncharged retained state,
-                                        // so remove it under this same map lock.
-                                        let removed_bytes = entry.charged_bytes;
-                                        let next_committed_bytes = committed_bytes
-                                            .checked_sub(removed_bytes)
-                                            .ok_or_else(|| {
-                                                MemoryError::InvalidState(
-                                                    "recharge recovery removal exceeded committed bytes"
-                                                        .to_string(),
-                                                )
-                                            })?;
-                                        let _ = entry;
-                                        occupied.remove();
-                                        *committed_bytes = next_committed_bytes;
-                                        return Err(MemoryError::InvalidState(format!(
-                                            "recharge rollback failed; uncharged retained payload was removed: primary=[{}], rollback=[{}]",
-                                            denied.error, rollback_error
-                                        )));
-                                    }
-                                }
-                                Err(denied.error)
+                            ManagedChargeRechargeRecovery::RecoveryRequired { rollback_error } => {
+                                *committed_bytes =
+                                    committed_bytes.checked_sub(old_bytes).ok_or_else(|| {
+                                        MemoryError::InvalidState(
+                                            "recharge recovery removal exceeded committed bytes"
+                                                .to_string(),
+                                        )
+                                    })?;
+                                occupied.remove();
+                                return Err(MemoryError::InvalidState(format!(
+                                    "recharge rollback failed; uncharged retained payload was removed: primary=[{}], rollback=[{}]",
+                                    denied.error, rollback_error
+                                )));
                             }
                         }
                     }
-                    None => {
-                        let entry = occupied.get_mut();
-                        *committed_bytes = next_committed_bytes;
-                        entry.value = value;
-                        entry.charged_bytes = reserved_bytes;
-                        Ok(())
-                    }
                 }
+                let entry = occupied.get_mut();
+                retired_value = Some(std::mem::replace(&mut entry.value, value));
+                entry.charged_bytes = reserved_bytes;
+                *committed_bytes = next;
             }
             Entry::Vacant(vacant) => {
-                // Charge before publication so a denied admission leaves payload,
-                // order, and local accounting unchanged.
-                let next_committed_bytes =
+                let next =
                     Self::committed_bytes_after_replace_v1(*committed_bytes, 0, reserved_bytes)?;
-                let new_ticket = self.charge_new_entry_v1(reserved_bytes)?;
+                let charge = self.charge_new_entry_v1(reserved_bytes)?;
                 vacant.insert(MapEntry {
                     value,
                     charged_bytes: reserved_bytes,
-                    ticket: new_ticket,
+                    charge,
+                    sweep_selected: false,
                 });
-                *committed_bytes = next_committed_bytes;
-                Ok(())
+                *committed_bytes = next;
             }
         }
+        self.restore_state(state);
+        // Value::drop is client code. It must observe a fully published
+        // postimage, never an in-flight accounting plan.
+        drop(retired_value);
+        Ok(())
     }
 
     fn insert_if_absent_or_get_checked(
@@ -322,42 +455,47 @@ where
     }
 
     fn get_checked(&self, key: &Key) -> Result<Option<Value>, MemoryError> {
-        let state = self.lock()?;
+        let state = self.lock_for_read()?;
         Ok(state.entries.get(key).map(|entry| entry.value.clone()))
     }
 
     fn remove(&self, key: &Key) -> Result<Option<Value>, MemoryError> {
-        let mut state = self.lock()?;
-        let Some(entry) = state.entries.get(key) else {
+        let _permit = self.lifecycle.begin_mutation()?;
+        let mut state = self.take_state()?;
+        let MapState { entries, committed_bytes } = &mut *state;
+        let Entry::Occupied(mut occupied) = entries.entry(key.clone()) else {
             return Ok(None);
         };
-        let next_committed_bytes =
-            Self::committed_bytes_after_replace_v1(state.committed_bytes, entry.charged_bytes, 0)?;
-        if let Some(sink) = &self.charger {
-            let ticket = entry.ticket.as_ref().ok_or_else(|| {
-                MemoryError::InvalidState(
-                    "charged retained-map entry has no ticket on remove: charge invariant broken"
-                        .to_string(),
-                )
-            })?;
-            sink.refund(ticket)?;
+        let next = Self::committed_bytes_after_replace_v1(
+            *committed_bytes,
+            occupied.get().charged_bytes,
+            0,
+        )?;
+        self.require_charge_shape(occupied.get(), "remove")?;
+        if let Some(charge) = occupied.get_mut().charge.take() {
+            let mut charges = [charge];
+            if let Err(error) = self.accounting.release_many(&mut charges) {
+                occupied.get_mut().charge = charges.into_iter().next();
+                return Err(error);
+            }
         }
-        let removed = state.entries.remove(key).ok_or_else(|| {
-            MemoryError::InvalidState("retained-map key disappeared during remove".to_string())
-        })?;
-        state.committed_bytes = next_committed_bytes;
+        let (retired_key, removed) = occupied.remove_entry();
+        *committed_bytes = next;
+        self.restore_state(state);
+        // Dropping an arbitrary client key may unwind. Publish the exact
+        // ledger-matching postimage before invoking that destructor.
+        drop(retired_key);
         Ok(Some(removed.value))
     }
 
     fn sweep(&self, hint: SweepHint) -> Result<SweepStats, MemoryError> {
-        let mut state = self.lock()?;
+        let _permit = self.lifecycle.begin_mutation()?;
+        let mut state = self.take_state()?;
         let mut reclaimed_items = 0usize;
         let mut reclaimed_bytes = 0u64;
-        let mut refunds: Vec<ReservationTicket> = Vec::new();
-        // Keys to evict, collected newest-first from the canonical linked order.
-        // Only selected keys are cloned; each publication remove is average O(1).
-        let mut evict_keys: Vec<Key> = Vec::new();
-        for (key, entry) in state.entries.iter().rev() {
+        // Select newest-first without cloning or rehashing client keys. All
+        // later charge extraction/rollback is positional and callback-free.
+        for (_, entry) in state.entries.iter().rev() {
             if reclaimed_bytes >= hint.target_bytes {
                 break;
             }
@@ -369,41 +507,72 @@ where
                 continue;
             }
             reclaimed_items += 1;
-            reclaimed_bytes =
-                reclaimed_bytes.checked_add(entry.charged_bytes).ok_or_else(|| {
-                    MemoryError::InvalidState(
+            reclaimed_bytes = match reclaimed_bytes.checked_add(entry.charged_bytes) {
+                Some(bytes) => bytes,
+                None => {
+                    self.restore_state(state);
+                    return Err(MemoryError::InvalidState(
                         "retained-map sweep byte total overflowed committed accounting".to_string(),
-                    )
-                })?;
-            if self.charger.is_some() {
-                let ticket = entry.ticket.as_ref().ok_or_else(|| {
-                    MemoryError::InvalidState(
-                        "charged retained-map entry has no ticket on sweep: charge invariant broken"
-                            .to_string(),
-                    )
-                })?;
-                refunds.push(ticket.clone());
-            }
-            evict_keys.push(key.clone());
+                    ));
+                }
+            };
         }
         let next_committed_bytes =
-            Self::committed_bytes_after_replace_v1(state.committed_bytes, reclaimed_bytes, 0)?;
-        if let Some(sink) = &self.charger {
-            sink.refund_many(&refunds)?;
+            match Self::committed_bytes_after_replace_v1(state.committed_bytes, reclaimed_bytes, 0)
+            {
+                Ok(next) => next,
+                Err(error) => {
+                    self.restore_state(state);
+                    return Err(error);
+                }
+            };
+        let mut remaining = reclaimed_items;
+        for entry in state.entries.values_mut().rev().filter(|entry| entry.charged_bytes > 0) {
+            if remaining == 0 {
+                break;
+            }
+            if let Err(error) = self.require_charge_shape(entry, "sweep") {
+                for entry in state.entries.values_mut() {
+                    entry.sweep_selected = false;
+                }
+                self.restore_state(state);
+                return Err(error);
+            }
+            entry.sweep_selected = true;
+            remaining -= 1;
         }
-        for key in &evict_keys {
-            state.entries.remove(key).ok_or_else(|| {
-                MemoryError::InvalidState(
-                    "retained-map sweep key disappeared while its state lock was held".to_string(),
-                )
-            })?;
+        // Validate the entire plan before moving any non-clone charge out of an
+        // entry. Otherwise a later corrupt candidate can drop an earlier lease
+        // on the error path and partially refund the broker.
+        let mut charges = Vec::new();
+        for entry in state.entries.values_mut().filter(|entry| entry.sweep_selected) {
+            if let Some(charge) = entry.charge.take() {
+                charges.push(charge);
+            }
+        }
+        if let Err(error) = self.accounting.release_many(&mut charges) {
+            let mut charges = charges.into_iter();
+            for entry in state.entries.values_mut().filter(|entry| entry.sweep_selected) {
+                if entry.charge.is_none() {
+                    entry.charge = charges.next();
+                }
+                entry.sweep_selected = false;
+            }
+            debug_assert!(charges.next().is_none());
+            self.restore_state(state);
+            return Err(error);
         }
         state.committed_bytes = next_committed_bytes;
+        // hashlink retain removes every selected key from its hash table before
+        // running any client Key/Value destructor; unlike remove(key), it does
+        // not call client Hash/Eq after the broker has committed the refund.
+        state.entries.retain(|_, entry| !entry.sweep_selected);
+        self.restore_state(state);
         Ok(SweepStats { reclaimed_items, reclaimed_bytes })
     }
 
     fn stats_checked(&self) -> Result<StoreStats, MemoryError> {
-        let state = self.lock()?;
+        let state = self.lock_for_read()?;
         Ok(StoreStats { item_count: state.entries.len(), estimated_bytes: state.committed_bytes })
     }
 
@@ -411,7 +580,7 @@ where
     where
         Key: Clone + Ord,
     {
-        let state = self.lock()?;
+        let state = self.lock_for_read()?;
         let mut keys: Vec<Key> = state.entries.keys().cloned().collect();
         // Deterministic, key-sorted order independent of insertion order.
         keys.sort();
@@ -423,12 +592,49 @@ where
         Key: Clone + Ord,
         Value: Clone,
     {
-        let state = self.lock()?;
+        let state = self.lock_for_read()?;
         let mut entries: Vec<(Key, Value)> =
             state.entries.iter().map(|(key, entry)| (key.clone(), entry.value.clone())).collect();
         // Same deterministic key order as `keys`.
         entries.sort_by(|a, b| a.0.cmp(&b.0));
         Ok(entries)
+    }
+
+    fn close(&self) -> Result<(), MemoryError> {
+        SimpleRetainedMapStore::close(self)
+    }
+}
+
+// Owner tests use concise projections while still failing loudly on poison.
+// These helpers are not part of the production/public API and never fabricate
+// empty state from an authoritative checked error.
+#[cfg(test)]
+impl<Key, Value, Mode> SimpleRetainedMapStore<Key, Value, Mode>
+where
+    Key: Clone + Eq + Hash,
+    Value: Clone + ByteSized,
+{
+    fn get(&self, key: &Key) -> Option<Value> {
+        self.get_checked(key).expect("checked retained-map get")
+    }
+
+    fn stats(&self) -> StoreStats {
+        self.stats_checked().expect("checked retained-map stats")
+    }
+}
+
+#[cfg(test)]
+impl<Key, Value, Mode> SimpleRetainedMapStore<Key, Value, Mode>
+where
+    Key: Clone + Eq + Hash + Ord,
+    Value: Clone + ByteSized,
+{
+    fn keys(&self) -> Vec<Key> {
+        self.keys_checked().expect("checked retained-map keys")
+    }
+
+    fn entries(&self) -> Vec<(Key, Value)> {
+        self.entries_checked().expect("checked retained-map entries")
     }
 }
 
@@ -438,12 +644,14 @@ mod tests {
     use quanta_memory_platform_core::{MemoryClass, StoreBindingHandle};
     use std::hash::{Hash, Hasher};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::sync::{Arc, Barrier};
+    use std::sync::{Arc, Barrier, OnceLock, Weak};
 
-    fn store() -> SimpleRetainedMapStore<String, Vec<u8>> {
+    type UnbudgetedTestStore<Key, Value> = SimpleRetainedMapStore<Key, Value, TestUnbudgeted>;
+
+    fn store() -> UnbudgetedTestStore<String, Vec<u8>> {
         let binding =
             StoreBindingHandle::new(MemoryClass::MemoResidency, "owner-map".to_string(), None);
-        SimpleRetainedMapStore::new(binding)
+        SimpleRetainedMapStore::new_unbudgeted_fixture(binding)
     }
 
     #[derive(Clone, Debug, PartialEq, Eq)]
@@ -458,13 +666,13 @@ mod tests {
         }
     }
 
-    fn declared_bytes_store_v1() -> SimpleRetainedMapStore<String, DeclaredBytesV1> {
+    fn declared_bytes_store_v1() -> UnbudgetedTestStore<String, DeclaredBytesV1> {
         let binding = StoreBindingHandle::new(
             MemoryClass::MemoResidency,
             "owner-map-declared-bytes".to_string(),
             None,
         );
-        SimpleRetainedMapStore::new(binding)
+        SimpleRetainedMapStore::new_unbudgeted_fixture(binding)
     }
 
     #[test]
@@ -484,7 +692,7 @@ mod tests {
             );
         }
         assert!(source.contains("LinkedHashMap<Key, MapEntry<Value>, RandomState>"));
-        assert!(source.contains("pub(crate) fn new_charged"));
+        assert!(source.contains("pub(crate) fn new_budgeted"));
     }
 
     #[test]
@@ -544,9 +752,15 @@ mod tests {
             joins.push(std::thread::spawn(move || {
                 barrier.wait();
                 let writer_byte = u8::try_from(writer).expect("writer index fits u8");
-                store
-                    .insert_if_absent_checked("canonical".to_string(), vec![writer_byte])
-                    .expect("atomic insert-if-absent")
+                for _ in 0..10_000 {
+                    match store.insert_if_absent_checked("canonical".to_string(), vec![writer_byte])
+                    {
+                        Ok(outcome) => return outcome,
+                        Err(MemoryError::OperationInProgress(_)) => std::thread::yield_now(),
+                        Err(error) => panic!("unexpected insert failure: {error}"),
+                    }
+                }
+                panic!("mutation lane never became available")
             }));
         }
         let outcomes: Vec<_> =
@@ -602,7 +816,19 @@ mod tests {
                     // Reusable two-phase barrier: every read races exactly one
                     // overwrite epoch instead of merely starting near the writer.
                     barrier.wait();
-                    match store.get_checked(&key) {
+                    let mut observed = None;
+                    for _ in 0..10_000 {
+                        match store.get_checked(&key) {
+                            Err(MemoryError::OperationInProgress(_)) => {
+                                std::thread::yield_now();
+                            }
+                            outcome => {
+                                observed = Some(outcome);
+                                break;
+                            }
+                        }
+                    }
+                    match observed.expect("checked read must leave the in-flight lane") {
                         Ok(Some(observed)) if observed == old => {
                             old_observations.fetch_add(1, Ordering::Relaxed);
                         }
@@ -622,7 +848,18 @@ mod tests {
         for iteration in 0..ITERATIONS {
             barrier.wait();
             let payload = if iteration % 2 == 0 { new.clone() } else { old.clone() };
-            if store.insert_checked(key.clone(), payload).is_err() {
+            let mut published = false;
+            for _ in 0..10_000 {
+                match store.insert_checked(key.clone(), payload.clone()) {
+                    Ok(()) => {
+                        published = true;
+                        break;
+                    }
+                    Err(MemoryError::OperationInProgress(_)) => std::thread::yield_now(),
+                    Err(_) => break,
+                }
+            }
+            if !published {
                 write_failures += 1;
             }
             barrier.wait();
@@ -647,6 +884,139 @@ mod tests {
                 && new_observations.load(Ordering::Relaxed) > 0,
             "the synchronized overwrite epochs must expose both complete generations"
         );
+    }
+
+    #[derive(Clone, Debug)]
+    struct PanickingHashKey {
+        id: u8,
+        armed: Arc<AtomicBool>,
+    }
+
+    impl PartialEq for PanickingHashKey {
+        fn eq(&self, other: &Self) -> bool {
+            self.id == other.id
+        }
+    }
+
+    impl Eq for PanickingHashKey {}
+
+    impl Hash for PanickingHashKey {
+        fn hash<H: Hasher>(&self, state: &mut H) {
+            assert!(!self.armed.load(Ordering::SeqCst), "injected hash unwind");
+            self.id.hash(state);
+        }
+    }
+
+    type ReentrantReadStore = SimpleRetainedMapStore<ReentrantReadKey, Vec<u8>, Budgeted>;
+
+    #[derive(Clone)]
+    struct ReentrantReadKey {
+        id: u8,
+        armed: Arc<AtomicBool>,
+        store: Arc<OnceLock<Weak<ReentrantReadStore>>>,
+        callbacks: Arc<AtomicUsize>,
+    }
+
+    impl PartialEq for ReentrantReadKey {
+        fn eq(&self, other: &Self) -> bool {
+            self.id == other.id
+        }
+    }
+
+    impl Eq for ReentrantReadKey {}
+
+    impl Hash for ReentrantReadKey {
+        fn hash<H: Hasher>(&self, state: &mut H) {
+            if self.armed.load(Ordering::SeqCst) {
+                let store = self.store.get().expect("store installed before read");
+                let store = store.upgrade().expect("store remains live during read");
+                assert!(
+                    matches!(store.stats_checked(), Err(MemoryError::OperationInProgress(resource)) if resource == "retained map"),
+                    "reentrant stats must report the held owner lock without blocking"
+                );
+                assert!(
+                    matches!(store.close(), Err(MemoryError::OperationInProgress(resource)) if resource == "retained map"),
+                    "reentrant close must roll back its closing phase without blocking"
+                );
+                self.callbacks.fetch_add(1, Ordering::SeqCst);
+            }
+            self.id.hash(state);
+        }
+    }
+
+    #[test]
+    fn read_hash_callback_reentry_is_typed_busy_and_preserves_exact_postimage() {
+        use quanta_memory_platform_core::{MemoryPreset, ProcessMemoryBrokerBuilder};
+
+        let broker = ProcessMemoryBrokerBuilder::new()
+            .with_preset(MemoryPreset::Development)
+            .build()
+            .expect("broker");
+        let binding = StoreBindingHandle::new(
+            MemoryClass::MemoResidency,
+            "owner-read-reentry".to_string(),
+            None,
+        );
+        let store = Arc::new(ReentrantReadStore::new_budgeted(binding, broker.clone()));
+        let armed = Arc::new(AtomicBool::new(false));
+        let callbacks = Arc::new(AtomicUsize::new(0));
+        let owner = Arc::new(OnceLock::new());
+        owner.set(Arc::downgrade(&store)).expect("install weak store once");
+        let key = ReentrantReadKey {
+            id: 7,
+            armed: Arc::clone(&armed),
+            store: owner,
+            callbacks: Arc::clone(&callbacks),
+        };
+        store.insert_checked(key.clone(), vec![1, 2, 3]).expect("seed");
+        assert_eq!(broker.ledger_snapshot().expect("ledger").total_owner_bytes(), 3);
+
+        armed.store(true, Ordering::SeqCst);
+        assert_eq!(store.get_checked(&key).expect("outer read"), Some(vec![1, 2, 3]));
+        armed.store(false, Ordering::SeqCst);
+        assert_eq!(callbacks.load(Ordering::SeqCst), 1, "lookup must invoke the client hash");
+        assert_eq!(
+            store.stats_checked().expect("published state"),
+            StoreStats { item_count: 1, estimated_bytes: 3 }
+        );
+        assert_eq!(broker.ledger_snapshot().expect("unchanged ledger").total_owner_bytes(), 3);
+        store.close().expect("closing phase restored after reentry");
+        assert_eq!(broker.ledger_snapshot().expect("released ledger").total_owner_bytes(), 0);
+    }
+
+    #[test]
+    fn hash_unwind_during_detached_mutation_restores_owned_state_and_charge() {
+        use quanta_memory_platform_core::{MemoryPreset, ProcessMemoryBrokerBuilder};
+
+        let broker = ProcessMemoryBrokerBuilder::new()
+            .with_preset(MemoryPreset::Development)
+            .build()
+            .expect("broker");
+        let binding = StoreBindingHandle::new(
+            MemoryClass::MemoResidency,
+            "owner-hash-unwind".to_string(),
+            None,
+        );
+        let store: SimpleRetainedMapStore<PanickingHashKey, Vec<u8>, Budgeted> =
+            SimpleRetainedMapStore::new_budgeted(binding, broker.clone());
+        let armed = Arc::new(AtomicBool::new(false));
+        let key = PanickingHashKey { id: 1, armed: Arc::clone(&armed) };
+        store.insert_checked(key.clone(), vec![1, 2, 3]).expect("seed");
+        armed.store(true, Ordering::SeqCst);
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = store.insert_if_absent_checked(
+                PanickingHashKey { id: 2, armed: Arc::clone(&armed) },
+                vec![9],
+            );
+        }));
+        assert!(panic.is_err(), "hash callback must unwind after state extraction");
+        armed.store(false, Ordering::SeqCst);
+
+        assert_eq!(store.get_checked(&key).expect("restored read"), Some(vec![1, 2, 3]));
+        assert_eq!(store.stats_checked().expect("restored stats").estimated_bytes, 3);
+        assert_eq!(broker.ledger_snapshot().expect("ledger").total_owner_bytes(), 3);
+        store.close().expect("terminal release");
+        assert_eq!(broker.ledger_snapshot().expect("released").total_owner_bytes(), 0);
     }
 
     #[derive(Debug)]
@@ -675,8 +1045,8 @@ mod tests {
     fn checked_reads_report_typed_invalid_state_after_owner_mutex_poison_v1() {
         let binding =
             StoreBindingHandle::new(MemoryClass::MemoResidency, "owner-poison".to_string(), None);
-        let store: SimpleRetainedMapStore<String, ClonePanicsWhenArmed> =
-            SimpleRetainedMapStore::new(binding);
+        let store: UnbudgetedTestStore<String, ClonePanicsWhenArmed> =
+            SimpleRetainedMapStore::new_unbudgeted_fixture(binding);
         let armed = Arc::new(AtomicBool::new(false));
         let key = "poison".to_string();
         store
@@ -708,16 +1078,10 @@ mod tests {
             matches!(store.entries_checked(), Err(MemoryError::InvalidState(message)) if message == "retained map lock poisoned"),
             "checked entry enumeration must preserve the typed poison failure"
         );
-        assert!(store.get(&key).is_none(), "advisory get must fail closed after poison");
-        assert_eq!(
-            store.stats(),
-            StoreStats::default(),
-            "advisory stats must not fabricate retained usage after poison"
-        );
-        assert!(store.keys().is_empty(), "advisory keys must expose no partial poisoned state");
+        let trait_source = include_str!("mod.rs");
         assert!(
-            store.entries().is_empty(),
-            "advisory entries must expose no partial poisoned state"
+            !trait_source.contains("unwrap_or_default"),
+            "the public trait must not fabricate empty observations after poison"
         );
     }
 
@@ -780,8 +1144,8 @@ mod tests {
             "owner-partialeq".to_string(),
             None,
         );
-        let store: SimpleRetainedMapStore<CaseInsensitiveKey, Vec<u8>> =
-            SimpleRetainedMapStore::new(binding);
+        let store: UnbudgetedTestStore<CaseInsensitiveKey, Vec<u8>> =
+            SimpleRetainedMapStore::new_unbudgeted_fixture(binding);
 
         store
             .insert_checked(CaseInsensitiveKey { raw: "Key".to_string() }, vec![0u8; 10])
@@ -841,8 +1205,8 @@ mod tests {
         );
         let equality_probes = Arc::new(AtomicUsize::new(0));
         let hash_probes = Arc::new(AtomicUsize::new(0));
-        let store: SimpleRetainedMapStore<LookupProbeKey, Vec<u8>> =
-            SimpleRetainedMapStore::new(binding);
+        let store: UnbudgetedTestStore<LookupProbeKey, Vec<u8>> =
+            SimpleRetainedMapStore::new_unbudgeted_fixture(binding);
 
         for id in 0..LIVE_ENTRIES {
             store
@@ -893,8 +1257,8 @@ mod tests {
         );
         assert_eq!(
             hash_probes.load(Ordering::Relaxed),
-            2,
-            "fail-closed remove validates then removes by exact key"
+            1,
+            "detached occupied entry validates and removes with one keyed probe"
         );
     }
 
@@ -1137,8 +1501,8 @@ mod tests {
     fn typed_value_round_trips_and_accounts_its_own_byte_size() {
         let binding =
             StoreBindingHandle::new(MemoryClass::MemoResidency, "owner-typed".to_string(), None);
-        let store: SimpleRetainedMapStore<String, TypedRecord> =
-            SimpleRetainedMapStore::new(binding);
+        let store: UnbudgetedTestStore<String, TypedRecord> =
+            SimpleRetainedMapStore::new_unbudgeted_fixture(binding);
         let record = TypedRecord { tag: 7, payload: vec![1u8, 2, 3, 4, 5] };
         store.insert_checked("rec".to_string(), record.clone()).expect("insert typed");
         // get returns the exact typed value (no codec needed).
@@ -1159,8 +1523,8 @@ mod tests {
 
         let binding =
             StoreBindingHandle::new(MemoryClass::MemoResidency, "owner-handle".to_string(), None);
-        let store: SimpleRetainedMapStore<String, MeasuredValue<Arc<dyn Any + Send + Sync>>> =
-            SimpleRetainedMapStore::new(binding);
+        let store: UnbudgetedTestStore<String, MeasuredValue<Arc<dyn Any + Send + Sync>>> =
+            SimpleRetainedMapStore::new_unbudgeted_fixture(binding);
 
         let handle: Arc<dyn Any + Send + Sync> = Arc::new(vec![10u32, 20, 30]);
         // Caller computes the size accounting explicitly (4096 bytes here).
@@ -1193,13 +1557,10 @@ mod tests {
     #[cfg(feature = "core-live-accounting")]
     mod charged {
         use super::*;
-        use crate::shared::accounting::{AccountingSink, SharedAccountingSink};
         use quanta_memory_platform_core::{
             ExecutionBudget, LiveProcessMemoryBroker, MemoryBudgetManifest, MemoryClassBudget,
-            MemoryPreset, MemoryResult, RechargeError, RechargeRecoveryV1, ReclaimPriority,
-            ResidencyPolicy,
+            MemoryPreset, ReclaimPriority, ResidencyPolicy,
         };
-        use std::sync::Arc;
 
         fn live_broker(class_hard: u64) -> LiveProcessMemoryBroker {
             let residency = ResidencyPolicy::new(10_000_000).with_class_budget(
@@ -1222,97 +1583,220 @@ mod tests {
                 .expect("valid broker")
         }
 
-        fn charged(broker: &LiveProcessMemoryBroker) -> SimpleRetainedMapStore<String, Vec<u8>> {
-            let sink: SharedAccountingSink = Arc::new(broker.clone());
+        fn charged(
+            broker: &LiveProcessMemoryBroker,
+        ) -> SimpleRetainedMapStore<String, Vec<u8>, Budgeted> {
             let binding =
                 StoreBindingHandle::new(MemoryClass::MemoResidency, "owner-map".to_string(), None);
-            SimpleRetainedMapStore::new_charged(binding, sink)
+            SimpleRetainedMapStore::new_budgeted(binding, broker.clone())
         }
 
-        #[derive(Clone)]
-        struct RollbackLosingSink {
-            broker: LiveProcessMemoryBroker,
+        #[derive(Clone, Debug)]
+        struct PanicOnRetire {
+            bytes: u64,
+            panic_once: Arc<AtomicBool>,
         }
 
-        impl std::fmt::Debug for RollbackLosingSink {
-            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_str("RollbackLosingSink")
+        impl ByteSized for PanicOnRetire {
+            fn byte_size(&self) -> u64 {
+                self.bytes
             }
         }
 
-        impl AccountingSink for RollbackLosingSink {
-            fn charge(
-                &self,
-                class: MemoryClass,
-                owner: String,
-                context: MemoryContextKind,
-                kind: ChargeKind,
-                bytes: u64,
-            ) -> MemoryResult<ReservationTicket> {
-                self.broker.reserve_committed(class, owner, context, kind, bytes)
-            }
-
-            fn refund(&self, ticket: &ReservationTicket) -> MemoryResult<()> {
-                self.broker.release(ticket)
-            }
-
-            fn refund_many(&self, tickets: &[ReservationTicket]) -> MemoryResult<()> {
-                self.broker.release_many(tickets)
-            }
-
-            fn recharge(
-                &self,
-                old: &ReservationTicket,
-                _class: MemoryClass,
-                _owner: String,
-                _context: MemoryContextKind,
-                _kind: ChargeKind,
-                _bytes: u64,
-            ) -> Result<ReservationTicket, RechargeError> {
-                self.broker.release(old).map_err(|error| RechargeError {
-                    error,
-                    recovery: RechargeRecoveryV1::OldChargePreserved,
-                })?;
-                Err(RechargeError {
-                    error: MemoryError::capacity("injected replacement denial"),
-                    recovery: RechargeRecoveryV1::RecoveryRequired {
-                        rollback_error: MemoryError::InvalidState(
-                            "injected rollback failure".to_string(),
-                        ),
-                    },
-                })
+        impl Drop for PanicOnRetire {
+            fn drop(&mut self) {
+                if self.panic_once.swap(false, Ordering::SeqCst) {
+                    panic!("client value destructor");
+                }
             }
         }
 
         #[test]
-        fn rollback_failure_removes_uncharged_payload_under_the_owner_lock_v1() {
+        fn panic_in_old_value_drop_cannot_split_committed_bytes_from_ledger() {
             let broker = live_broker(1_000);
-            let sink: SharedAccountingSink =
-                Arc::new(RollbackLosingSink { broker: broker.clone() });
             let binding =
-                StoreBindingHandle::new(MemoryClass::MemoResidency, "owner-map".to_string(), None);
-            let store: SimpleRetainedMapStore<String, Vec<u8>> =
-                SimpleRetainedMapStore::new_charged(binding, sink);
-            store.insert_checked("key".to_string(), vec![1u8; 30]).expect("seed charged entry");
+                StoreBindingHandle::new(MemoryClass::MemoResidency, "panic-owner".into(), None);
+            let store: SimpleRetainedMapStore<String, PanicOnRetire, Budgeted> =
+                SimpleRetainedMapStore::new_budgeted(binding, broker.clone());
+            let panic_once = Arc::new(AtomicBool::new(true));
+            store
+                .insert_checked(
+                    "key".into(),
+                    PanicOnRetire { bytes: 4, panic_once: Arc::clone(&panic_once) },
+                )
+                .expect("seed entry");
 
+            let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                store.insert_checked(
+                    "key".into(),
+                    PanicOnRetire { bytes: 8, panic_once: Arc::new(AtomicBool::new(false)) },
+                )
+            }));
+            assert!(caught.is_err(), "client destructor did panic");
+            assert_eq!(store.stats_checked().expect("complete postimage").estimated_bytes, 8);
+            assert_eq!(store.committed_bytes().expect("committed postimage"), 8);
+            assert_eq!(broker.ledger_snapshot().expect("ledger postimage").total_owner_bytes(), 8);
+            store.close().expect("close remains possible after client panic");
+            assert_eq!(broker.ledger_snapshot().expect("drained ledger").total_owner_bytes(), 0);
+        }
+
+        #[test]
+        fn close_contains_client_destructor_panic_and_keeps_terminal_image() {
+            let broker = live_broker(1_000);
+            let binding = StoreBindingHandle::new(
+                MemoryClass::MemoResidency,
+                "close-panic-owner".into(),
+                None,
+            );
+            let store: SimpleRetainedMapStore<String, PanicOnRetire, Budgeted> =
+                SimpleRetainedMapStore::new_budgeted(binding, broker.clone());
+            store
+                .insert_checked(
+                    "key".into(),
+                    PanicOnRetire { bytes: 9, panic_once: Arc::new(AtomicBool::new(true)) },
+                )
+                .expect("seed entry");
+            let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| store.close()));
+            assert!(caught.expect("client destructor must not escape close").is_ok());
+            assert_eq!(store.stats_checked().expect("terminal image").item_count, 0);
+            assert_eq!(store.committed_bytes().expect("terminal bytes"), 0);
+            assert_eq!(broker.ledger_snapshot().expect("drained ledger").total_owner_bytes(), 0);
+            store.close().expect("double close is idempotent after client panic");
+            assert!(matches!(
+                store.insert_checked(
+                    "late".into(),
+                    PanicOnRetire { bytes: 1, panic_once: Arc::new(AtomicBool::new(false)) }
+                ),
+                Err(MemoryError::Closed(_))
+            ));
+        }
+
+        #[test]
+        fn drop_during_unwind_contains_two_client_destructor_panics_and_releases_all() {
+            let broker = live_broker(1_000);
+            let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let binding = StoreBindingHandle::new(
+                    MemoryClass::MemoResidency,
+                    "double-panic-owner".into(),
+                    None,
+                );
+                let store: SimpleRetainedMapStore<String, PanicOnRetire, Budgeted> =
+                    SimpleRetainedMapStore::new_budgeted(binding, broker.clone());
+                for key in ["a", "b"] {
+                    store
+                        .insert_checked(
+                            key.into(),
+                            PanicOnRetire { bytes: 3, panic_once: Arc::new(AtomicBool::new(true)) },
+                        )
+                        .expect("charged entry");
+                }
+                panic!("outer unwind");
+            }));
+            assert!(caught.is_err());
+            assert_eq!(
+                broker.ledger_snapshot().expect("all leases released").total_owner_bytes(),
+                0
+            );
+        }
+
+        #[derive(Clone, Debug)]
+        struct PanicAfterSweepPlanKey {
+            id: u64,
+            hash_must_panic: Arc<AtomicBool>,
+        }
+
+        impl PartialEq for PanicAfterSweepPlanKey {
+            fn eq(&self, other: &Self) -> bool {
+                self.id == other.id
+            }
+        }
+
+        impl Eq for PanicAfterSweepPlanKey {}
+
+        impl Hash for PanicAfterSweepPlanKey {
+            fn hash<H: Hasher>(&self, state: &mut H) {
+                assert!(
+                    !self.hash_must_panic.load(Ordering::SeqCst),
+                    "post-plan client hash callback"
+                );
+                self.id.hash(state);
+            }
+        }
+
+        #[test]
+        fn sweep_after_planning_never_rehashes_client_keys_or_loses_charge() {
+            let broker = live_broker(1_000);
+            let binding = StoreBindingHandle::new(
+                MemoryClass::MemoResidency,
+                "sweep-panic-owner".into(),
+                None,
+            );
+            let store: SimpleRetainedMapStore<PanicAfterSweepPlanKey, Vec<u8>, Budgeted> =
+                SimpleRetainedMapStore::new_budgeted(binding, broker.clone());
+            let hash_must_panic = Arc::new(AtomicBool::new(false));
+            store
+                .insert_checked(
+                    PanicAfterSweepPlanKey { id: 1, hash_must_panic: Arc::clone(&hash_must_panic) },
+                    vec![7; 5],
+                )
+                .expect("charged insert");
+            hash_must_panic.store(true, Ordering::SeqCst);
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                store.sweep(SweepHint { target_bytes: 5 })
+            }));
+            let stats = result.expect("no post-plan Hash callback").expect("sweep succeeds");
+            assert_eq!(stats.reclaimed_bytes, 5);
+            assert_eq!(store.stats_checked().expect("postimage").estimated_bytes, 0);
+            assert_eq!(broker.ledger_snapshot().expect("postimage ledger").total_owner_bytes(), 0);
+        }
+
+        #[test]
+        fn panic_in_sweep_value_drop_keeps_exact_refund_and_empty_postimage() {
+            let broker = live_broker(1_000);
+            let binding = StoreBindingHandle::new(
+                MemoryClass::MemoResidency,
+                "sweep-value-panic-owner".into(),
+                None,
+            );
+            let store: SimpleRetainedMapStore<String, PanicOnRetire, Budgeted> =
+                SimpleRetainedMapStore::new_budgeted(binding, broker.clone());
+            store
+                .insert_checked(
+                    "key".into(),
+                    PanicOnRetire { bytes: 5, panic_once: Arc::new(AtomicBool::new(true)) },
+                )
+                .expect("charged insert");
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                store.sweep(SweepHint { target_bytes: 5 })
+            }));
+            assert!(result.is_err(), "client destructor did panic");
+            assert_eq!(store.stats_checked().expect("postimage").item_count, 0);
+            assert_eq!(store.committed_bytes().expect("postimage bytes"), 0);
+            assert_eq!(broker.ledger_snapshot().expect("postimage ledger").total_owner_bytes(), 0);
+        }
+
+        #[test]
+        fn rebuild_denied_recharge_preserves_charged_preimage_v1() {
+            let broker = live_broker(1_000);
+            let store = charged(&broker);
+            store.insert_checked("key".to_string(), vec![1u8; 30]).expect("seed charged entry");
+            broker.begin_rebuild().expect("begin rebuild");
             let error = store
                 .insert_checked("key".to_string(), vec![2u8; 20])
-                .expect_err("injected rollback loss must fail closed");
-            assert!(
-                matches!(error, MemoryError::InvalidState(message) if message.contains("uncharged retained payload was removed")),
-                "rollback loss must surface a recovery-required state"
-            );
+                .expect_err("fenced recharge must fail closed");
+            assert!(matches!(error, MemoryError::InvalidState(_)));
             assert_eq!(
                 store.get_checked(&"key".to_string()).expect("checked read after recovery"),
-                None,
-                "an uncharged payload must not remain readable"
+                Some(vec![1u8; 30]),
+                "managed recharge denial preserves the charged preimage"
             );
-            assert_eq!(store.stats_checked().expect("checked stats"), StoreStats::default());
+            assert_eq!(store.stats_checked().expect("checked stats").estimated_bytes, 30);
             assert_eq!(
                 broker.ledger_snapshot().expect("ledger after recovery").total_owner_bytes(),
-                0,
-                "the store and ledger must agree after quarantine removal"
+                30,
+                "store and ledger retain the same charge authority"
             );
+            broker.finish_rebuild().expect("finish rebuild");
         }
 
         #[test]
@@ -1581,13 +2065,25 @@ mod tests {
             let broker = live_broker(1_000_000);
             let store = charged(&broker);
             store.insert_checked("k".to_string(), vec![0u8; 7]).expect("seed");
-            store.state.lock().expect("state").entries.get_mut("k").expect("entry").ticket = None;
-
+            let held = store
+                .state
+                .lock()
+                .expect("state")
+                .entries
+                .get_mut("k")
+                .expect("entry")
+                .charge
+                .take()
+                .expect("budgeted charge");
             let denied = store.remove(&"k".to_string());
             assert!(matches!(denied, Err(MemoryError::InvalidState(_))), "got {denied:?}");
             assert_eq!(store.get(&"k".to_string()), Some(vec![0u8; 7]));
             assert_eq!(store.committed_bytes().expect("committed"), 7);
             assert_eq!(broker.ledger_snapshot().expect("snap").total_owner_bytes(), 7);
+            store.state.lock().expect("state").entries.get_mut("k").expect("entry").charge =
+                Some(held);
+            store.close().expect("cleanup recovered charge");
+            assert_eq!(broker.ledger_snapshot().expect("released").total_owner_bytes(), 0);
         }
 
         #[test]
@@ -1626,8 +2122,16 @@ mod tests {
             for key in ["a", "b", "c"] {
                 store.insert_checked(key.to_string(), vec![0u8; 5]).expect("seed");
             }
-            store.state.lock().expect("state").entries.get_mut("b").expect("entry").ticket = None;
-
+            let held = store
+                .state
+                .lock()
+                .expect("state")
+                .entries
+                .get_mut("b")
+                .expect("entry")
+                .charge
+                .take()
+                .expect("budgeted charge");
             // c is visited first and has a ticket, then b exposes corruption.
             // No refund_many call or keyed removal may happen before all selected
             // entries have proven their ticket invariant.
@@ -1643,6 +2147,10 @@ mod tests {
             assert_eq!(store.keys(), vec!["a".to_string(), "b".to_string(), "c".to_string()]);
             assert_eq!(store.committed_bytes().expect("committed"), 15);
             assert_eq!(broker.ledger_snapshot().expect("snap").total_owner_bytes(), 15);
+            store.state.lock().expect("state").entries.get_mut("b").expect("entry").charge =
+                Some(held);
+            store.close().expect("cleanup recovered charge");
+            assert_eq!(broker.ledger_snapshot().expect("released").total_owner_bytes(), 0);
         }
 
         #[test]
@@ -1650,8 +2158,8 @@ mod tests {
             // (c) no sink: the store self-accounts and never touches a ledger.
             let binding =
                 StoreBindingHandle::new(MemoryClass::MemoResidency, "owner-map".to_string(), None);
-            let store: SimpleRetainedMapStore<String, Vec<u8>> =
-                SimpleRetainedMapStore::new(binding);
+            let store: UnbudgetedTestStore<String, Vec<u8>> =
+                SimpleRetainedMapStore::new_unbudgeted_fixture(binding);
             store.insert_checked("k".to_string(), vec![0u8; 7]).expect("insert");
             assert_eq!(store.committed_bytes().expect("committed"), 7);
         }

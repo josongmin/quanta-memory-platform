@@ -151,7 +151,8 @@ rg -n 'Semantica|quanta_runtime|codegraph' crates --glob '*.rs'
 - [ ] public API test가 “builder가 존재함”뿐 아니라 금지된 우회가 불가능함을 검증한다.
 - [ ] `BasicProcessMemoryBroker`와 live broker의 의미 차이가 타입/이름/rustdoc에서 오해되지 않는다.
 - [ ] non-budgeted store는 명시적 opt-in이며 production preset에서 우발적으로 선택되지 않는다.
-- [ ] `AccountingSink` 구현이 `charge`, `refund`, `refund_many`, `recharge`의 atomic contract를 모두 지킨다.
+- [ ] 공개 `AccountingSink`/late `charged_against`/sink 재바인딩이 없다. `LiveMemoryPlatform`이 발급한 concrete broker authority만 budgeted store에 들어가며, store → broker lock 순서에서 사용자 callback이 실행되지 않는다.
+- [ ] unset builder에는 `build()`가 없고, `Budgeted`/`Unbudgeted` concrete product가 타입상 호환되지 않는다. `unbudgeted-stores`는 명시적 feature+method가 필요하며 `default`/`full`/`full-backings`에 포함되지 않는다.
 - [ ] `RuntimeMemoryView::bind_store`, `scratch`, `pins`가 live platform의 실제 authority와 연결되는지 검증한다.
 - [ ] deprecated legacy publish surface에 제거 계획, consumer census, migration gate가 있다.
 
@@ -242,7 +243,8 @@ rg -n 'Semantica|quanta_runtime|codegraph' crates --glob '*.rs'
 - [ ] overwrite: existing ticket 확인 -> atomic recharge -> value/ticket 교체. deny 시 old 유지.
 - [ ] delete/reclaim/truncate/abort/GC: candidate 고정 -> atomic refund -> container mutation.
 - [ ] multi-item mutation은 `refund_many` 성공 전에 하나도 제거하지 않는다.
-- [ ] local lock과 broker lock 획득 순서가 전 slice에서 일관되고 callback 아래 lock hold가 없다.
+- [ ] local lock과 broker lock 획득 순서가 전 slice에서 일관되고 외부/user callback 아래 lock hold가 없다. reentrant/multi-store 시나리오가 교착 대신 typed failure 또는 선형화된 완료를 보인다.
+- [ ] `close()`가 모든 live authority를 한번만 반환하고 terminal closed를 선언한다. 실패 시 entry/ticket/order/counter 원상을 보존하며, `Drop`과 rebuild 겹침에도 charge가 영구 유실되지 않는다.
 - [ ] overflow는 payload/index/accounting mutation 전에 검출된다.
 - [ ] poisoned lock이 empty/zero/NotFound 성공으로 위장되지 않는다.
 - [ ] store-local `charged_bytes`와 ledger ticket bytes가 일치한다.
@@ -309,7 +311,7 @@ rg -n 'Semantica|quanta_runtime|codegraph' crates --glob '*.rs'
 
 - [ ] `--no-default-features`가 slice public surface와 optional dependency를 실제로 제거한다.
 - [ ] leaf feature 각각이 단독으로 all-targets compile된다.
-- [ ] `full`에는 in-memory 기능만, `full-backings`에 heavy backing만 포함된다는 계약이 Cargo graph와 일치한다.
+- [ ] `full`에는 budgeted in-memory 기능만, `full-backings`에는 heavy backing만 추가된다. `unbudgeted-stores`는 두 aggregate에서 제외되지만 `--all-features`에서는 별도 opt-in 제품 타입으로 검증된다.
 - [ ] backing feature가 compile-only dead code가 아니라 선택/조립/trait contract로 연결된다.
 - [ ] third-party error type이 portable public API로 누출되지 않는다.
 - [ ] license/advisory/source 정책은 `cargo deny` config와 실제 lockfile에서 검증된다.
@@ -334,7 +336,7 @@ cargo deny --all-features check
 - [ ] honest fake와 real broker가 같은 portable suite를 통과한다.
 - [ ] 각 broken fake가 의도한 family에서 반드시 실패한다.
 - [ ] deny 시 mutate, under-report, class/owner divergence, allocator mutation, refund swallow, overwrite leak를 각각 잡는다.
-- [ ] facade suite가 실제 live broker sink와 store를 조립한다.
+- [ ] facade suite가 실제 `MemoryPlatformBuilder → LiveMemoryPlatform → Budgeted` store를 조립하고 ledger balance 및 close/drop을 검증한다. callback sink fake로 대체하지 않는다.
 - [ ] prepared-publication fake가 double-charge와 root-blind GC를 드러낸다.
 - [ ] transcript fake가 non-idempotent replay를 드러낸다.
 - [ ] fake가 real 구현의 버그를 그대로 복사해 동반 통과하지 않도록 독립 oracle을 사용한다.

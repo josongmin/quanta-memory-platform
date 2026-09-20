@@ -1,12 +1,16 @@
-use std::sync::Mutex;
+use std::marker::PhantomData;
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use quanta_memory_platform_core::{
-    ChargeKind, MemoryContextKind, MemoryError, ReservationTicket, StoreBindingHandle, StoreStats,
-    StoreWriteError, SweepStats,
+    ChargeKind, LiveProcessMemoryBroker, ManagedCharge, MemoryContextKind, MemoryError,
+    MemoryResult, StoreBindingHandle, StoreStats, StoreWriteError, SweepStats,
 };
 
 use crate::revocable_store::RevocableStore;
-use crate::shared::accounting::SharedAccountingSink;
+#[cfg(feature = "unbudgeted-stores")]
+use crate::shared::accounting::Unbudgeted;
+use crate::shared::accounting::{Budgeted, StoreAccounting};
+use crate::shared::lifecycle::{retire_client_value, BeginClose, StoreLifecycle};
 use crate::shared::measure::ByteSized;
 
 #[derive(Debug)]
@@ -14,8 +18,17 @@ struct RevocableEntry<Key, Value> {
     key: Key,
     value: Value,
     charged_bytes: u64,
-    /// Ledger receipt when charged against a broker; refunded on reclaim.
-    ticket: Option<ReservationTicket>,
+    /// Non-clone authority that always travels with its retained payload.
+    charge: Option<ManagedCharge>,
+}
+
+fn retire_entries<Key, Value>(entries: Vec<RevocableEntry<Key, Value>>) {
+    for entry in entries {
+        let RevocableEntry { key, value, charge, .. } = entry;
+        drop(charge);
+        retire_client_value(key);
+        retire_client_value(value);
+    }
 }
 
 #[derive(Debug)]
@@ -24,96 +37,187 @@ struct RevocableState<Key, Value> {
     committed_bytes: u64,
 }
 
-/// Portable revocable / spillable store.
+/// Portable FIFO revocable store with construction-time accounting branding.
 ///
-/// Owns reclaim hooks (playbook 1.2 step 4, 4.3) and reports reclaimed bytes via
-/// [`SweepStats`] for host telemetry.
+/// `Mode` is part of the product type. Raw construction and late accounting
+/// attachment are not public:
 ///
-/// When built `charged_against` a broker, insert reserves+commits the entry's
-/// bytes through the ledger (the accounting SSOT, fail-closed on a cap breach)
-/// and every reclaim path refunds them — so revocable bytes are gated by caps and
-/// returned automatically, never left to a host that might forget to release.
-/// Without a sink the store self-accounts (non-budgeted reporting mode).
+/// ```compile_fail
+/// use quanta_memory_platform_core::{MemoryClass, StoreBindingHandle};
+/// use quanta_memory_platform_facade::{Budgeted, SimpleRevocableStore};
+///
+/// let binding = StoreBindingHandle::new(MemoryClass::ExecutionScratchRevocable, "owner".into(), None);
+/// let _ = SimpleRevocableStore::<String, Vec<u8>, Budgeted>::new(binding);
+/// ```
+///
+/// ```compile_fail
+/// use quanta_memory_platform_facade::{Budgeted, SimpleRevocableStore};
+///
+/// fn late_attach(store: SimpleRevocableStore<String, Vec<u8>, Budgeted>) {
+///     let _ = store.charged_against;
+/// }
+/// ```
 #[derive(Debug)]
-pub struct SimpleRevocableStore<Key, Value> {
+pub struct SimpleRevocableStore<Key, Value, Mode> {
     binding: StoreBindingHandle,
-    charger: Option<SharedAccountingSink>,
+    accounting: StoreAccounting,
+    lifecycle: StoreLifecycle,
     state: Mutex<RevocableState<Key, Value>>,
+    _mode: PhantomData<fn() -> Mode>,
 }
 
-impl<Key, Value> SimpleRevocableStore<Key, Value> {
-    pub fn new(binding: StoreBindingHandle) -> Self {
+impl<Key, Value, Mode> SimpleRevocableStore<Key, Value, Mode> {
+    fn with_accounting(binding: StoreBindingHandle, accounting: StoreAccounting) -> Self {
         Self {
             binding,
-            charger: None,
+            accounting,
+            lifecycle: StoreLifecycle::new("revocable store"),
             state: Mutex::new(RevocableState { entries: Vec::new(), committed_bytes: 0 }),
+            _mode: PhantomData,
         }
     }
 
-    /// Charge this store's bytes against a broker ledger (the accounting SSOT).
-    #[must_use]
-    pub fn charged_against(mut self, sink: SharedAccountingSink) -> Self {
-        self.charger = Some(sink);
-        self
-    }
-}
-
-impl<Key, Value> SimpleRevocableStore<Key, Value>
-where
-    Value: ByteSized,
-{
-    fn lock(&self) -> Result<std::sync::MutexGuard<'_, RevocableState<Key, Value>>, MemoryError> {
-        self.state
-            .lock()
-            .map_err(|_| MemoryError::InvalidState("revocable store lock poisoned".to_string()))
+    fn lock_state(&self) -> MemoryResult<MutexGuard<'_, RevocableState<Key, Value>>> {
+        self.lifecycle.try_lock_state(&self.state)
     }
 
-    /// Currently retained (reclaimable) bytes.
-    pub fn committed_bytes(&self) -> Result<u64, MemoryError> {
-        Ok(self.lock()?.committed_bytes)
+    /// Once rows/leases have been detached, a transient stale reader must not
+    /// turn the broker's committed refund into an early-return with an
+    /// unpublished local counter. The mutation permit prevents new callbacks;
+    /// wait for any reader that crossed the phase check just before the permit.
+    fn lock_state_for_commit(&self) -> MutexGuard<'_, RevocableState<Key, Value>> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Reclaim entries (oldest first) until at least `target_bytes` are freed.
-    /// Returns the reclaim outcome so the caller can release the broker bytes.
-    /// This reports reclaimed bytes only; it does not touch quota authority.
-    pub fn reclaim_until(&self, target_bytes: u64) -> Result<SweepStats, MemoryError> {
-        let mut state = self.lock()?;
-        let mut reclaimed_items = 0usize;
-        let mut reclaimed_bytes = 0u64;
-        let mut refunds: Vec<ReservationTicket> = Vec::new();
-        // Indices to evict, collected oldest-first (FIFO). Ascending order, so we
-        // remove them in REVERSE below to keep the lower indices valid.
-        let mut evict_indices: Vec<usize> = Vec::new();
-        for (idx, entry) in state.entries.iter().enumerate() {
-            if reclaimed_bytes >= target_bytes {
-                break;
+    fn require_charge_shape(
+        &self,
+        entry: &RevocableEntry<Key, Value>,
+        operation: &str,
+    ) -> MemoryResult<()> {
+        match (self.accounting.broker().is_some(), entry.charge.is_some()) {
+            (true, false) => Err(MemoryError::InvalidState(format!(
+                "budgeted revocable entry has no managed charge during {operation}"
+            ))),
+            (false, true) => Err(MemoryError::InvalidState(format!(
+                "unbudgeted revocable entry owns a managed charge during {operation}"
+            ))),
+            _ => Ok(()),
+        }
+    }
+
+    /// Checked read that cannot observe a two-phase mutation plan while entries
+    /// and their leases are temporarily outside the container.
+    fn lock_read(&self) -> MemoryResult<MutexGuard<'_, RevocableState<Key, Value>>> {
+        self.lifecycle.ensure_readable()?;
+        let state = self.lock_state()?;
+        self.lifecycle.ensure_readable()?;
+        Ok(state)
+    }
+
+    pub fn committed_bytes(&self) -> MemoryResult<u64> {
+        Ok(self.lock_read()?.committed_bytes)
+    }
+
+    /// Reclaim oldest byte-bearing entries until `target_bytes` is satisfied.
+    /// Accounting executes outside the state mutex. Failure restores every
+    /// payload, FIFO position, byte counter, and live charge.
+    pub fn reclaim_until(&self, target_bytes: u64) -> MemoryResult<SweepStats> {
+        let _mutation = self.lifecycle.begin_mutation()?;
+        let (mut plan, next_committed, reclaimed_bytes) = {
+            let mut state = self.lock_state()?;
+            let mut selected = Vec::new();
+            let mut reclaimed_bytes = 0u64;
+            for (index, entry) in state.entries.iter().enumerate() {
+                if reclaimed_bytes >= target_bytes {
+                    break;
+                }
+                if entry.charged_bytes == 0 {
+                    continue;
+                }
+                self.require_charge_shape(entry, "reclaim")?;
+                reclaimed_bytes =
+                    reclaimed_bytes.checked_add(entry.charged_bytes).ok_or_else(|| {
+                        MemoryError::capacity("revocable reclaim byte accounting overflow")
+                    })?;
+                selected.push(index);
             }
-            // A zero-byte entry frees no memory toward a BYTE target; evicting it is
-            // pure data loss that never advances `reclaimed_bytes`. Skip it so a
-            // positive target can never wipe a store of zero-byte entries
-            // (over-eviction). Mirrors SimpleRetainedMapStore::sweep.
-            if entry.charged_bytes == 0 {
-                continue;
-            }
-            reclaimed_items += 1;
-            reclaimed_bytes = reclaimed_bytes.saturating_add(entry.charged_bytes);
-            if let Some(ticket) = &entry.ticket {
-                refunds.push(ticket.clone());
-            }
-            evict_indices.push(idx);
+            let next_committed =
+                state.committed_bytes.checked_sub(reclaimed_bytes).ok_or_else(|| {
+                    MemoryError::InvalidState(
+                        "revocable committed bytes are smaller than reclaimed bytes".to_string(),
+                    )
+                })?;
+            let plan = extract_entries(&mut state.entries, &selected);
+            (plan, next_committed, reclaimed_bytes)
+        };
+
+        if plan.is_empty() {
+            return Ok(SweepStats { reclaimed_items: 0, reclaimed_bytes: 0 });
         }
-        if let Some(sink) = &self.charger {
-            sink.refund_many(&refunds)?;
+
+        let reclaimed_items = plan.len();
+        let (charge_slots, mut charges) = take_charges(&mut plan);
+        if let Err(error) = self.accounting.release_many(&mut charges) {
+            restore_charges(&mut plan, &charge_slots, charges);
+            restore_entries(&mut self.lock_state_for_commit().entries, plan);
+            return Err(error);
         }
-        for idx in evict_indices.iter().rev() {
-            state.entries.remove(*idx);
-        }
-        state.committed_bytes = state.committed_bytes.saturating_sub(reclaimed_bytes);
+
+        self.lock_state_for_commit().committed_bytes = next_committed;
+        retire_entries(plan.into_iter().map(|(_, entry)| entry).collect());
         Ok(SweepStats { reclaimed_items, reclaimed_bytes })
     }
+
+    /// Atomically release every entry and enter the terminal closed state.
+    pub fn close(&self) -> MemoryResult<()> {
+        let close = match self.lifecycle.begin_close()? {
+            BeginClose::AlreadyClosed => return Ok(()),
+            BeginClose::Acquired(close) => close,
+        };
+
+        let mut plan = {
+            let mut state = self.lock_state()?;
+            for entry in &state.entries {
+                self.require_charge_shape(entry, "close")?;
+            }
+            std::mem::take(&mut state.entries).into_iter().enumerate().collect::<Vec<_>>()
+        };
+        let (charge_slots, mut charges) = take_charges(&mut plan);
+        if let Err(error) = self.accounting.release_many(&mut charges) {
+            restore_charges(&mut plan, &charge_slots, charges);
+            restore_entries(&mut self.lock_state_for_commit().entries, plan);
+            return Err(error);
+        }
+
+        self.lock_state_for_commit().committed_bytes = 0;
+        close.commit();
+        retire_entries(plan.into_iter().map(|(_, entry)| entry).collect());
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn broker(&self) -> Option<&LiveProcessMemoryBroker> {
+        self.accounting.broker()
+    }
 }
 
-impl<Key, Value> RevocableStore<Key, Value> for SimpleRevocableStore<Key, Value>
+impl<Key, Value> SimpleRevocableStore<Key, Value, Budgeted> {
+    pub(crate) fn new_budgeted(
+        binding: StoreBindingHandle,
+        broker: LiveProcessMemoryBroker,
+    ) -> Self {
+        Self::with_accounting(binding, StoreAccounting::Budgeted(broker))
+    }
+}
+
+#[cfg(feature = "unbudgeted-stores")]
+impl<Key, Value> SimpleRevocableStore<Key, Value, Unbudgeted> {
+    pub(crate) fn new_unbudgeted(binding: StoreBindingHandle) -> Self {
+        Self::with_accounting(binding, StoreAccounting::Unbudgeted)
+    }
+}
+
+impl<Key, Value, Mode> RevocableStore<Key, Value> for SimpleRevocableStore<Key, Value, Mode>
 where
     Value: ByteSized,
 {
@@ -122,326 +226,535 @@ where
     }
 
     fn insert_checked(&self, key: Key, value: Value) -> Result<(), StoreWriteError> {
+        let _mutation = self.lifecycle.begin_mutation()?;
         let charged_bytes = value.byte_size();
-        let mut state = self.lock()?;
-        // Charge the ledger BEFORE recording the entry so a cap denial fails
-        // closed: nothing stored, counter untouched.
-        let ticket = match &self.charger {
-            Some(sink) => Some(sink.charge(
-                self.binding.class.clone(),
-                self.binding.owner.clone(),
-                MemoryContextKind::Runtime,
-                ChargeKind::LiveScratch,
-                charged_bytes,
-            )?),
-            None => None,
-        };
-        state.entries.push(RevocableEntry { key, value, charged_bytes, ticket });
-        state.committed_bytes = state.committed_bytes.saturating_add(charged_bytes);
+        let next_committed =
+            self.lock_state()?.committed_bytes.checked_add(charged_bytes).ok_or_else(|| {
+                MemoryError::capacity("revocable committed byte accounting overflow")
+            })?;
+
+        let charge = self.accounting.charge(
+            self.binding.class.clone(),
+            self.binding.owner.clone(),
+            MemoryContextKind::Runtime,
+            ChargeKind::LiveScratch,
+            charged_bytes,
+        )?;
+
+        let mut state = self.lock_state()?;
+        state.entries.push(RevocableEntry { key, value, charged_bytes, charge });
+        state.committed_bytes = next_committed;
         Ok(())
     }
 
-    fn reclaim_one(&self) -> Result<Option<(Key, Value)>, MemoryError> {
-        let mut state = self.lock()?;
-        if state.entries.is_empty() {
-            return Ok(None);
+    fn reclaim_one(&self) -> MemoryResult<Option<(Key, Value)>> {
+        let _mutation = self.lifecycle.begin_mutation()?;
+        let (mut entry, next_committed) = {
+            let mut state = self.lock_state()?;
+            let Some(entry) = state.entries.first() else {
+                return Ok(None);
+            };
+            self.require_charge_shape(entry, "single reclaim")?;
+            let next_committed =
+                state.committed_bytes.checked_sub(entry.charged_bytes).ok_or_else(|| {
+                    MemoryError::InvalidState(
+                        "revocable committed bytes are smaller than reclaimed entry".to_string(),
+                    )
+                })?;
+            (state.entries.remove(0), next_committed)
+        };
+
+        let mut charges = entry.charge.take().into_iter().collect::<Vec<_>>();
+        if let Err(error) = self.accounting.release_many(&mut charges) {
+            entry.charge = charges.pop();
+            self.lock_state_for_commit().entries.insert(0, entry);
+            return Err(error);
         }
-        if let (Some(sink), Some(ticket)) = (&self.charger, state.entries[0].ticket.as_ref()) {
-            sink.refund(ticket)?;
-        }
-        let removed = state.entries.remove(0);
-        state.committed_bytes = state.committed_bytes.saturating_sub(removed.charged_bytes);
-        Ok(Some((removed.key, removed.value)))
+
+        self.lock_state_for_commit().committed_bytes = next_committed;
+        Ok(Some((entry.key, entry.value)))
     }
 
-    fn stats(&self) -> StoreStats {
-        match self.lock() {
-            Ok(state) => StoreStats {
-                item_count: state.entries.len(),
-                estimated_bytes: state.committed_bytes,
-            },
-            Err(_) => StoreStats::default(),
+    fn stats(&self) -> MemoryResult<StoreStats> {
+        let state = self.lock_read()?;
+        Ok(StoreStats { item_count: state.entries.len(), estimated_bytes: state.committed_bytes })
+    }
+
+    fn close(&self) -> MemoryResult<()> {
+        SimpleRevocableStore::close(self)
+    }
+}
+
+impl<Key, Value, Mode> Drop for SimpleRevocableStore<Key, Value, Mode> {
+    fn drop(&mut self) {
+        let _ = self.lifecycle.transition_to_closed_for_drop();
+        let state = self.state.get_mut().unwrap_or_else(PoisonError::into_inner);
+        let entries = std::mem::take(&mut state.entries);
+        state.committed_bytes = 0;
+        retire_entries(entries);
+    }
+}
+
+fn extract_entries<Key, Value>(
+    entries: &mut Vec<RevocableEntry<Key, Value>>,
+    indices: &[usize],
+) -> Vec<(usize, RevocableEntry<Key, Value>)> {
+    let mut plan =
+        indices.iter().rev().map(|index| (*index, entries.remove(*index))).collect::<Vec<_>>();
+    plan.reverse();
+    plan
+}
+
+fn restore_entries<Key, Value>(
+    entries: &mut Vec<RevocableEntry<Key, Value>>,
+    plan: Vec<(usize, RevocableEntry<Key, Value>)>,
+) {
+    for (index, entry) in plan {
+        entries.insert(index, entry);
+    }
+}
+
+fn take_charges<Key, Value>(
+    plan: &mut [(usize, RevocableEntry<Key, Value>)],
+) -> (Vec<usize>, Vec<ManagedCharge>) {
+    let mut slots = Vec::new();
+    let mut charges = Vec::new();
+    for (slot, (_, entry)) in plan.iter_mut().enumerate() {
+        if let Some(charge) = entry.charge.take() {
+            slots.push(slot);
+            charges.push(charge);
         }
+    }
+    (slots, charges)
+}
+
+fn restore_charges<Key, Value>(
+    plan: &mut [(usize, RevocableEntry<Key, Value>)],
+    slots: &[usize],
+    charges: Vec<ManagedCharge>,
+) {
+    for (slot, charge) in slots.iter().copied().zip(charges) {
+        plan[slot].1.charge = Some(charge);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use quanta_memory_platform_core::{MemoryClass, StoreBindingHandle};
+    use quanta_memory_platform_core::{
+        ExecutionBudget, MemoryBudgetManifest, MemoryClass, MemoryClassBudget, MemoryPreset,
+        ProcessMemoryBrokerBuilder, ReclaimPriority, ResidencyPolicy,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Barrier};
+    use std::thread;
 
-    fn store() -> SimpleRevocableStore<String, Vec<u8>> {
-        let binding = StoreBindingHandle::new(
+    type Store = SimpleRevocableStore<String, Vec<u8>, Budgeted>;
+
+    fn binding() -> StoreBindingHandle {
+        StoreBindingHandle::new(
             MemoryClass::ExecutionScratchRevocable,
             "owner-rev".to_string(),
             None,
+        )
+    }
+
+    fn live_broker(class_hard: u64) -> LiveProcessMemoryBroker {
+        let residency = ResidencyPolicy::new(10_000_000).with_class_budget(
+            MemoryClass::ExecutionScratchRevocable,
+            MemoryClassBudget {
+                reserved_bytes: 0,
+                soft_cap_bytes: class_hard,
+                hard_cap_bytes: class_hard,
+                borrow_from_shared_pool: false,
+                reclaim_priority: ReclaimPriority::First,
+            },
         );
-        SimpleRevocableStore::new(binding)
+        ProcessMemoryBrokerBuilder::new()
+            .with_manifest(MemoryBudgetManifest::new(
+                MemoryPreset::Production,
+                ExecutionBudget::default(),
+                residency,
+            ))
+            .build()
+            .expect("valid broker")
+    }
+
+    fn store_with_broker(broker: &LiveProcessMemoryBroker) -> Store {
+        SimpleRevocableStore::new_budgeted(binding(), broker.clone())
+    }
+
+    fn store() -> Store {
+        store_with_broker(&live_broker(1_000_000))
+    }
+
+    struct PanickingValue {
+        bytes: Vec<u8>,
+        drops: Arc<AtomicUsize>,
+    }
+
+    impl ByteSized for PanickingValue {
+        fn byte_size(&self) -> u64 {
+            self.bytes.len() as u64
+        }
+    }
+
+    impl Drop for PanickingValue {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::SeqCst);
+            panic!("client revocable destructor panic");
+        }
     }
 
     #[test]
     fn insert_tracks_reclaimable_bytes() {
         let store = store();
-        store.insert_checked("a".to_string(), vec![0u8; 4]).expect("a");
-        store.insert_checked("b".to_string(), vec![0u8; 6]).expect("b");
-        assert_eq!(store.committed_bytes().expect("committed"), 10);
-        assert_eq!(store.stats(), StoreStats { item_count: 2, estimated_bytes: 10 });
+        store.insert_checked("a".into(), vec![0; 4]).expect("a");
+        store.insert_checked("b".into(), vec![0; 6]).expect("b");
+        assert_eq!(store.committed_bytes().expect("bytes"), 10);
+        assert_eq!(
+            store.stats().expect("stats"),
+            StoreStats { item_count: 2, estimated_bytes: 10 }
+        );
     }
 
     #[test]
     fn reclaim_one_is_fifo_and_releases_its_bytes() {
-        let store = store();
-        store.insert_checked("first".to_string(), vec![0u8; 3]).expect("first");
-        store.insert_checked("second".to_string(), vec![0u8; 5]).expect("second");
-        let (key, value) = store.reclaim_one().expect("reclaim one").expect("entry present");
-        assert_eq!(key, "first", "reclaim must be FIFO (oldest first)");
-        assert_eq!(value.len(), 3);
-        assert_eq!(store.committed_bytes().expect("after reclaim"), 5);
+        let broker = live_broker(1_000_000);
+        let store = store_with_broker(&broker);
+        store.insert_checked("first".to_string(), vec![0; 4]).expect("first");
+        store.insert_checked("second".to_string(), vec![0; 6]).expect("second");
+        assert_eq!(store.stats().expect("stats").estimated_bytes, 10);
+        assert_eq!(broker.ledger_snapshot().expect("ledger").total_owner_bytes(), 10);
+
+        let (key, value) = store.reclaim_one().expect("reclaim").expect("entry");
+        assert_eq!((key.as_str(), value.len()), ("first", 4));
+        assert_eq!(store.committed_bytes().expect("bytes"), 6);
+        assert_eq!(broker.ledger_snapshot().expect("ledger").total_owner_bytes(), 6);
     }
 
     #[test]
     fn reclaim_one_on_empty_returns_none() {
         let store = store();
-        assert!(store.reclaim_one().expect("reclaim empty").is_none());
-        assert_eq!(store.committed_bytes().expect("empty"), 0);
+        assert!(store.reclaim_one().expect("empty").is_none());
+        assert_eq!(store.committed_bytes().expect("bytes"), 0);
     }
 
     #[test]
     fn reclaim_until_frees_at_least_target_and_reports_reclaimed_bytes() {
         let store = store();
-        store.insert_checked("a".to_string(), vec![0u8; 4]).expect("a");
-        store.insert_checked("b".to_string(), vec![0u8; 4]).expect("b");
-        store.insert_checked("c".to_string(), vec![0u8; 4]).expect("c");
-        assert_eq!(store.committed_bytes().expect("before"), 12);
-
-        // Reports reclaimed bytes for the caller to release against the broker; it
-        // never charges or redefines quota itself.
-        let outcome = store.reclaim_until(5).expect("reclaim until");
-        assert_eq!(outcome.reclaimed_items, 2, "two 4-byte entries cover a 5-byte target");
-        assert_eq!(outcome.reclaimed_bytes, 8);
-        assert_eq!(store.committed_bytes().expect("after"), 4);
+        for key in ["a", "b", "c"] {
+            store.insert_checked(key.into(), vec![0; 4]).expect("insert");
+        }
+        let outcome = store.reclaim_until(5).expect("reclaim");
+        assert_eq!(outcome, SweepStats { reclaimed_items: 2, reclaimed_bytes: 8 });
+        assert_eq!(store.committed_bytes().expect("bytes"), 4);
     }
 
     #[test]
     fn reclaim_until_on_empty_store_reports_zero() {
-        let store = store();
-        let outcome = store.reclaim_until(100).expect("reclaim empty");
-        assert_eq!(outcome.reclaimed_items, 0);
-        assert_eq!(outcome.reclaimed_bytes, 0);
+        assert_eq!(
+            store().reclaim_until(100).expect("empty"),
+            SweepStats { reclaimed_items: 0, reclaimed_bytes: 0 }
+        );
     }
 
     #[test]
     fn reclaim_until_does_not_over_evict_zero_byte_entries() {
-        // Mirror of the retained_map sweep regression: a byte-target reclaim must
-        // skip zero-byte entries (they free no memory) rather than draining them.
         let store = store();
-        store.insert_checked("a".to_string(), vec![]).expect("a"); // 0 bytes (FIFO oldest)
-        store.insert_checked("b".to_string(), vec![]).expect("b"); // 0 bytes
-        store.insert_checked("c".to_string(), vec![0u8; 8]).expect("c"); // 8 bytes
-        assert_eq!(store.committed_bytes().expect("before"), 8);
-
+        store.insert_checked("zero".into(), vec![]).expect("zero");
+        store.insert_checked("a".into(), vec![0; 4]).expect("a");
+        store.insert_checked("b".into(), vec![0; 4]).expect("b");
         let outcome = store.reclaim_until(5).expect("reclaim");
-        assert_eq!(outcome.reclaimed_items, 1, "only the byte-bearing entry is reclaimed");
-        assert_eq!(outcome.reclaimed_bytes, 8);
-        assert_eq!(store.stats().item_count, 2, "leading zero-byte entries are NOT over-evicted");
+        assert_eq!(outcome, SweepStats { reclaimed_items: 2, reclaimed_bytes: 8 });
+        assert_eq!(store.stats().expect("stats").item_count, 1);
+        assert_eq!(store.reclaim_one().expect("zero remains").expect("entry").0, "zero");
     }
 
     #[test]
     fn reclaim_until_of_all_zero_byte_entries_reclaims_nothing() {
-        // The pathological case: a store of only zero-byte entries can never reach a
-        // POSITIVE byte target, so the reclaim must free nothing — not wipe the store.
         let store = store();
-        for k in ["a", "b", "c"] {
-            store.insert_checked(k.to_string(), vec![]).expect("zero-byte insert");
+        for key in ["a", "b", "c"] {
+            store.insert_checked(key.into(), vec![]).expect("insert");
         }
-        let outcome = store.reclaim_until(5).expect("reclaim");
-        assert_eq!(outcome.reclaimed_items, 0, "zero-byte entries free no bytes; none reclaimed");
-        assert_eq!(store.stats().item_count, 3, "a positive byte target must not wipe the store");
+        assert_eq!(
+            store.reclaim_until(5).expect("reclaim"),
+            SweepStats { reclaimed_items: 0, reclaimed_bytes: 0 }
+        );
+        assert_eq!(store.stats().expect("stats").item_count, 3);
     }
 
     #[test]
     fn revoke_makes_entry_unretrievable_and_decrements_accounting() {
-        // scenario F: revocable revoke -> entry gone (get(None)-equivalent) and the
-        // store's reclaimable-byte accounting decrements by exactly that entry's
-        // charge. The store exposes no `get`, so absence is proven by reclaiming the
-        // ONLY remaining entry and by the byte/item counters.
         let store = store();
-        store.insert_checked("only".to_string(), vec![0u8; 9]).expect("insert");
-        assert_eq!(store.committed_bytes().expect("before"), 9);
-        assert_eq!(store.stats().item_count, 1);
-
-        // Revoke (reclaim) the entry.
-        let (key, value) = store.reclaim_one().expect("revoke").expect("entry present");
-        assert_eq!(key, "only");
-        assert_eq!(value.len(), 9);
-
-        // Accounting decremented to zero; the entry is no longer present.
-        assert_eq!(store.committed_bytes().expect("after revoke"), 0);
-        assert_eq!(store.stats(), StoreStats { item_count: 0, estimated_bytes: 0 });
-        // A second revoke finds nothing (the equivalent of get -> None) and does
-        // not drive accounting negative.
-        assert!(
-            store.reclaim_one().expect("reclaim after revoke").is_none(),
-            "revoked entry must not be retrievable again"
-        );
-        assert_eq!(store.committed_bytes().expect("still zero"), 0);
+        store.insert_checked("only".into(), vec![0; 9]).expect("insert");
+        let (key, value) = store.reclaim_one().expect("revoke").expect("entry");
+        assert_eq!((key.as_str(), value.len()), ("only", 9));
+        assert_eq!(store.committed_bytes().expect("bytes"), 0);
+        assert!(store.reclaim_one().expect("second revoke").is_none());
     }
 
     #[test]
     fn empty_reclaim_leaves_state_byte_for_byte_unchanged() {
-        // scenario F (fail-closed): a no-op reclaim on an empty store must not
-        // mutate any observable counter. Capture state BEFORE and assert it is
-        // identical AFTER.
         let store = store();
-        store.insert_checked("keep".to_string(), vec![0u8; 7]).expect("insert");
-        let bytes_before = store.committed_bytes().expect("before");
-        let stats_before = store.stats();
-
-        // reclaim_one on a store whose only entry we will NOT target: instead drain
-        // it, then prove a further reclaim is inert.
-        store.reclaim_one().expect("drain the one entry").expect("drain present");
-        let bytes_drained = store.committed_bytes().expect("drained");
-        let stats_drained = store.stats();
-        assert_eq!(bytes_drained, 0);
-
-        // Now the inert reclaim must leave the drained state untouched.
-        assert!(store.reclaim_one().expect("inert reclaim").is_none());
-        assert_eq!(store.committed_bytes().expect("after inert"), bytes_drained);
-        assert_eq!(store.stats(), stats_drained);
-
-        // Sanity: the pre-drain state was the 7-byte single entry.
-        assert_eq!(bytes_before, 7);
-        assert_eq!(stats_before, StoreStats { item_count: 1, estimated_bytes: 7 });
+        let before = store.stats().expect("before");
+        assert!(store.reclaim_one().expect("empty").is_none());
+        assert_eq!(store.stats().expect("after"), before);
     }
 
-    // ---- #3: a charged revocable store gates and refunds via the ledger ----
-    #[cfg(feature = "core-live-accounting")]
-    mod charged {
-        use super::*;
-        use crate::shared::accounting::SharedAccountingSink;
-        use quanta_memory_platform_core::{
-            ExecutionBudget, LiveProcessMemoryBroker, MemoryBudgetManifest, MemoryClassBudget,
-            MemoryPreset, ReclaimPriority, ResidencyPolicy,
-        };
-        use std::sync::Arc;
+    #[test]
+    fn insert_over_cap_is_denied_and_fails_closed() {
+        let broker = live_broker(5);
+        let store = store_with_broker(&broker);
+        let denied = store.insert_checked("big".into(), vec![0; 9]);
+        assert!(matches!(denied, Err(MemoryError::Capacity(_))));
+        assert_eq!(store.stats().expect("stats"), StoreStats::default());
+        assert_eq!(broker.ledger_snapshot().expect("ledger").total_owner_bytes(), 0);
+    }
 
-        fn live_broker(class_hard: u64) -> LiveProcessMemoryBroker {
-            let residency = ResidencyPolicy::new(10_000_000).with_class_budget(
-                MemoryClass::ExecutionScratchRevocable,
-                MemoryClassBudget {
-                    reserved_bytes: 0,
-                    soft_cap_bytes: class_hard,
-                    hard_cap_bytes: class_hard,
-                    borrow_from_shared_pool: false,
-                    reclaim_priority: ReclaimPriority::First,
-                },
-            );
-            quanta_memory_platform_core::ProcessMemoryBrokerBuilder::new()
-                .with_manifest(MemoryBudgetManifest::new(
-                    MemoryPreset::Production,
-                    ExecutionBudget::default(),
-                    residency,
-                ))
-                .build()
-                .expect("valid broker")
+    #[test]
+    fn insert_charges_and_reclaim_refunds_the_ledger() {
+        let broker = live_broker(1_000_000);
+        let store = store_with_broker(&broker);
+        store.insert_checked("a".into(), vec![0; 4]).expect("a");
+        store.insert_checked("b".into(), vec![0; 6]).expect("b");
+        assert_eq!(broker.ledger_snapshot().expect("ledger").total_owner_bytes(), 10);
+        store.reclaim_one().expect("one").expect("entry");
+        assert_eq!(broker.ledger_snapshot().expect("ledger").total_owner_bytes(), 6);
+        store.reclaim_until(100).expect("rest");
+        assert_eq!(broker.ledger_snapshot().expect("ledger").total_owner_bytes(), 0);
+    }
+
+    #[test]
+    fn close_refunds_every_live_entry_exactly_once_and_stays_closed() {
+        let broker = live_broker(1_000_000);
+        let store = store_with_broker(&broker);
+        store.insert_checked("a".into(), vec![0; 4]).expect("a");
+        store.insert_checked("b".into(), vec![0; 6]).expect("b");
+
+        store.close().expect("close");
+        assert_eq!(broker.ledger_snapshot().expect("ledger").total_owner_bytes(), 0);
+        store.close().expect("idempotent close");
+        assert!(matches!(
+            store.insert_checked("late".into(), vec![0; 1]),
+            Err(MemoryError::Closed(_))
+        ));
+        assert!(matches!(store.reclaim_one(), Err(MemoryError::Closed(_))));
+        assert_eq!(store.stats().expect("terminal stats"), StoreStats::default());
+    }
+
+    #[test]
+    fn close_release_failure_preserves_entries_fifo_and_ledger_authority() {
+        let broker = live_broker(1_000_000);
+        let store = store_with_broker(&broker);
+        store.insert_checked("a".into(), vec![0; 4]).expect("a");
+        store.insert_checked("b".into(), vec![0; 6]).expect("b");
+        broker.begin_rebuild().expect("begin rebuild");
+
+        assert!(matches!(store.close(), Err(MemoryError::InvalidState(_))));
+        assert_eq!(store.stats().expect("restored stats").item_count, 2);
+        assert_eq!(store.committed_bytes().expect("restored bytes"), 10);
+        assert_eq!(broker.ledger_snapshot().expect("ledger").total_owner_bytes(), 10);
+
+        broker.finish_rebuild().expect("finish rebuild");
+        assert_eq!(store.reclaim_one().expect("fifo").expect("entry").0, "a");
+        store.close().expect("retry close");
+        assert_eq!(broker.ledger_snapshot().expect("ledger").total_owner_bytes(), 0);
+    }
+
+    #[test]
+    fn reclaim_batch_failure_preserves_every_entry_and_charge() {
+        let broker = live_broker(1_000_000);
+        let store = store_with_broker(&broker);
+        for (key, bytes) in [("a", 4), ("b", 4), ("c", 4)] {
+            store.insert_checked(key.into(), vec![0; bytes]).expect("insert");
         }
+        broker.begin_rebuild().expect("begin rebuild");
+        assert!(matches!(store.reclaim_until(5), Err(MemoryError::InvalidState(_))));
+        assert_eq!(store.stats().expect("stats").item_count, 3);
+        assert_eq!(store.committed_bytes().expect("bytes"), 12);
+        assert_eq!(broker.ledger_snapshot().expect("ledger").total_owner_bytes(), 12);
+        broker.finish_rebuild().expect("finish rebuild");
+        assert_eq!(store.reclaim_one().expect("fifo").expect("entry").0, "a");
+    }
 
-        fn charged(broker: &LiveProcessMemoryBroker) -> SimpleRevocableStore<String, Vec<u8>> {
-            let sink: SharedAccountingSink = Arc::new(broker.clone());
-            let binding = StoreBindingHandle::new(
-                MemoryClass::ExecutionScratchRevocable,
-                "owner-rev".to_string(),
-                None,
-            );
-            SimpleRevocableStore::new(binding).charged_against(sink)
+    #[test]
+    fn reclaim_one_during_rebuild_is_fail_closed() {
+        let broker = live_broker(1_000_000);
+        let store = store_with_broker(&broker);
+        store.insert_checked("a".into(), vec![0; 4]).expect("a");
+        store.insert_checked("b".into(), vec![0; 6]).expect("b");
+        broker.begin_rebuild().expect("begin rebuild");
+        assert!(matches!(store.reclaim_one(), Err(MemoryError::InvalidState(_))));
+        assert_eq!(store.stats().expect("stats").item_count, 2);
+        assert_eq!(store.committed_bytes().expect("bytes"), 10);
+        assert_eq!(broker.ledger_snapshot().expect("ledger").total_owner_bytes(), 10);
+        broker.finish_rebuild().expect("finish rebuild");
+    }
+
+    #[test]
+    fn reclaim_until_during_rebuild_is_fail_closed() {
+        let broker = live_broker(1_000_000);
+        let store = store_with_broker(&broker);
+        for key in ["a", "b", "c"] {
+            store.insert_checked(key.into(), vec![0; 4]).expect("insert");
         }
+        broker.begin_rebuild().expect("begin rebuild");
+        assert!(matches!(store.reclaim_until(5), Err(MemoryError::InvalidState(_))));
+        assert_eq!(store.stats().expect("stats").item_count, 3);
+        assert_eq!(store.committed_bytes().expect("bytes"), 12);
+        assert_eq!(broker.ledger_snapshot().expect("ledger").total_owner_bytes(), 12);
+        broker.finish_rebuild().expect("finish rebuild");
+    }
 
-        #[test]
-        fn insert_charges_and_reclaim_refunds_the_ledger() {
-            let broker = live_broker(1_000_000);
-            let store = charged(&broker);
-            store.insert_checked("a".to_string(), vec![0u8; 4]).expect("a");
-            store.insert_checked("b".to_string(), vec![0u8; 6]).expect("b");
-            assert_eq!(broker.ledger_snapshot().expect("snap").total_owner_bytes(), 10);
-
-            // reclaim_one refunds the oldest entry (4 bytes).
-            store.reclaim_one().expect("reclaim").expect("entry present");
-            assert_eq!(broker.ledger_snapshot().expect("snap").total_owner_bytes(), 6);
-
-            // reclaim_until refunds the rest.
-            store.reclaim_until(100).expect("reclaim until");
-            assert_eq!(broker.ledger_snapshot().expect("snap").total_owner_bytes(), 0);
+    #[test]
+    fn drop_without_explicit_close_releases_capacity() {
+        let broker = live_broker(1_000_000);
+        {
+            let store = store_with_broker(&broker);
+            store.insert_checked("live".into(), vec![0; 9]).expect("insert");
+            assert_eq!(broker.ledger_snapshot().expect("ledger").total_owner_bytes(), 9);
         }
+        assert_eq!(broker.ledger_snapshot().expect("ledger").total_owner_bytes(), 0);
+    }
 
-        #[test]
-        fn insert_over_cap_is_denied_and_fails_closed() {
-            let broker = live_broker(5);
-            let store = charged(&broker);
-            let denied = store.insert_checked("big".to_string(), vec![0u8; 9]); // 9 > 5
-            assert!(
-                matches!(denied, Err(MemoryError::Capacity(_))),
-                "over-cap insert must be a typed capacity error, got {denied:?}"
-            );
-            assert_eq!(store.stats().item_count, 0);
-            assert_eq!(store.committed_bytes().expect("committed"), 0);
-            assert_eq!(broker.ledger_snapshot().expect("snap").total_owner_bytes(), 0);
+    #[test]
+    fn drop_during_rebuild_defers_exact_release_until_finish() {
+        let broker = live_broker(1_000_000);
+        let store = store_with_broker(&broker);
+        store.insert_checked("live".into(), vec![0; 9]).expect("insert");
+        broker.begin_rebuild().expect("begin rebuild");
+        drop(store);
+        assert_eq!(broker.ledger_snapshot().expect("conservative ledger").total_owner_bytes(), 9);
+        broker.finish_rebuild().expect("finish and drain");
+        assert_eq!(broker.ledger_snapshot().expect("ledger").total_owner_bytes(), 0);
+    }
+
+    #[test]
+    fn drop_during_outer_unwind_contains_two_client_panics_and_refunds_all_charges() {
+        let broker = live_broker(1_000_000);
+        let drops = Arc::new(AtomicUsize::new(0));
+        let store = SimpleRevocableStore::<String, PanickingValue, Budgeted>::new_budgeted(
+            binding(),
+            broker.clone(),
+        );
+        for (key, bytes) in [("first", 4), ("second", 6)] {
+            store
+                .insert_checked(
+                    key.into(),
+                    PanickingValue { bytes: vec![0; bytes], drops: Arc::clone(&drops) },
+                )
+                .expect("insert before unwind");
         }
+        assert_eq!(broker.ledger_snapshot().expect("before").total_owner_bytes(), 10);
 
-        #[test]
-        fn reclaim_one_during_rebuild_is_fail_closed() {
-            let broker = live_broker(1_000_000);
-            let store = charged(&broker);
-            store.insert_checked("a".to_string(), vec![0u8; 4]).expect("a");
-            store.insert_checked("b".to_string(), vec![0u8; 6]).expect("b");
-            broker.begin_rebuild().expect("begin rebuild");
+        let outer = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _store = store;
+            panic!("outer unwind");
+        }))
+        .expect_err("outer panic must propagate");
 
-            let denied = store.reclaim_one();
-            assert!(
-                matches!(denied, Err(MemoryError::InvalidState(_))),
-                "reclaim_one during rebuild must fail closed, got {denied:?}"
-            );
-            assert_eq!(store.committed_bytes().expect("committed"), 10);
-            assert_eq!(store.stats().item_count, 2);
-            assert_eq!(broker.ledger_snapshot().expect("snap").total_owner_bytes(), 10);
+        assert_eq!(outer.downcast_ref::<&str>(), Some(&"outer unwind"));
+        assert_eq!(drops.load(Ordering::SeqCst), 2, "both client values must be retired");
+        assert_eq!(broker.ledger_snapshot().expect("after").total_owner_bytes(), 0);
+    }
+
+    #[test]
+    fn concurrent_insert_and_close_have_one_linearized_outcome() {
+        let broker = live_broker(1_000_000);
+        let store = Arc::new(store_with_broker(&broker));
+        let barrier = Arc::new(Barrier::new(2));
+        let worker_store = Arc::clone(&store);
+        let worker_barrier = Arc::clone(&barrier);
+        let worker = thread::spawn(move || {
+            worker_barrier.wait();
+            worker_store.insert_checked("racing".into(), vec![0; 7])
+        });
+
+        barrier.wait();
+        loop {
+            match store.close() {
+                Ok(()) => break,
+                Err(MemoryError::OperationInProgress(_)) => thread::yield_now(),
+                Err(error) => panic!("unexpected close error: {error}"),
+            }
         }
+        let insert = worker.join().expect("worker");
+        assert!(insert.is_ok() || matches!(insert, Err(MemoryError::Closed(_))));
+        assert_eq!(broker.ledger_snapshot().expect("ledger").total_owner_bytes(), 0);
+        assert_eq!(store.stats().expect("terminal stats"), StoreStats::default());
+    }
 
-        #[test]
-        fn reclaim_until_during_rebuild_is_fail_closed() {
-            let broker = live_broker(1_000_000);
-            let store = charged(&broker);
-            store.insert_checked("a".to_string(), vec![0u8; 4]).expect("a");
-            store.insert_checked("b".to_string(), vec![0u8; 4]).expect("b");
-            store.insert_checked("c".to_string(), vec![0u8; 4]).expect("c");
-            broker.begin_rebuild().expect("begin rebuild");
+    #[test]
+    fn counter_overflow_is_rejected_before_broker_charge_or_mutation() {
+        let broker = live_broker(1_000_000);
+        let store = store_with_broker(&broker);
+        store.state.lock().expect("state").committed_bytes = u64::MAX;
 
-            let denied = store.reclaim_until(5);
-            assert!(
-                matches!(denied, Err(MemoryError::InvalidState(_))),
-                "reclaim_until during rebuild must fail closed, got {denied:?}"
-            );
-            assert_eq!(store.committed_bytes().expect("committed"), 12);
-            assert_eq!(store.stats().item_count, 3);
-            assert_eq!(broker.ledger_snapshot().expect("snap").total_owner_bytes(), 12);
-        }
+        let denied = store.insert_checked("overflow".into(), vec![0; 1]);
+        assert!(matches!(denied, Err(MemoryError::Capacity(_))));
+        assert_eq!(store.state.lock().expect("state").entries.len(), 0);
+        assert_eq!(broker.ledger_snapshot().expect("ledger").total_owner_bytes(), 0);
+    }
+
+    #[test]
+    fn poisoned_stats_is_error_not_empty_and_drop_still_releases() {
+        let broker = live_broker(1_000_000);
+        let store = Arc::new(store_with_broker(&broker));
+        store.insert_checked("live".into(), vec![0; 5]).expect("insert");
+        let poison = Arc::clone(&store);
+        assert!(thread::spawn(move || {
+            let _guard = poison.state.lock().expect("state");
+            panic!("intentional poison");
+        })
+        .join()
+        .is_err());
+
+        assert!(matches!(store.stats(), Err(MemoryError::InvalidState(_))));
+        drop(store);
+        assert_eq!(broker.ledger_snapshot().expect("ledger").total_owner_bytes(), 0);
+    }
+
+    #[test]
+    fn reentrant_read_and_close_under_state_lock_return_typed_busy() {
+        let broker = live_broker(1_000_000);
+        let store = store_with_broker(&broker);
+        store.insert_checked("live".into(), vec![0; 4]).expect("insert");
+        let held = store.state.lock().expect("simulated client callback holds state lock");
+        assert!(matches!(store.stats(), Err(MemoryError::OperationInProgress(_))));
+        assert!(matches!(store.close(), Err(MemoryError::OperationInProgress(_))));
+        drop(held);
+        assert_eq!(store.stats().expect("open postimage").estimated_bytes, 4);
+        store.close().expect("retry after callback");
+        assert_eq!(broker.ledger_snapshot().expect("drained").total_owner_bytes(), 0);
+    }
+
+    #[test]
+    fn constructed_budgeted_store_exposes_its_single_broker_authority() {
+        let broker = live_broker(1_000_000);
+        let store = store_with_broker(&broker);
+        assert!(store.broker().is_some());
     }
 
     #[test]
     fn reclaim_eviction_order_is_deterministic_fifo_at_capacity_boundary() {
-        // scenario F (eviction boundary): when reclaiming down to a byte target, the
-        // store evicts in a deterministic order (FIFO / oldest-first) so a host
-        // releasing bytes against the broker gets a reproducible reclaim sequence.
         let store = store();
-        store.insert_checked("oldest".to_string(), vec![0u8; 4]).expect("1");
-        store.insert_checked("middle".to_string(), vec![0u8; 4]).expect("2");
-        store.insert_checked("newest".to_string(), vec![0u8; 4]).expect("3");
+        store.insert_checked("oldest".into(), vec![0; 4]).expect("oldest");
+        store.insert_checked("middle".into(), vec![0; 4]).expect("middle");
+        store.insert_checked("newest".into(), vec![0; 4]).expect("newest");
+        assert_eq!(
+            store.reclaim_until(1).expect("reclaim"),
+            SweepStats { reclaimed_items: 1, reclaimed_bytes: 4 }
+        );
+        assert_eq!(store.reclaim_one().expect("next").expect("entry").0, "middle");
+    }
 
-        // Reclaim just enough to free 4 bytes: the single OLDEST entry must go.
-        let outcome = store.reclaim_until(1).expect("reclaim one entry worth");
-        assert_eq!(outcome.reclaimed_items, 1);
-        assert_eq!(outcome.reclaimed_bytes, 4);
-        // The survivor reclaimed next must be "middle" (FIFO), proving "oldest"
-        // was evicted first at the boundary.
-        let (next_key, _) = store.reclaim_one().expect("next oldest").expect("entry present");
-        assert_eq!(next_key, "middle", "eviction order must be deterministic FIFO");
+    #[cfg(feature = "unbudgeted-stores")]
+    #[test]
+    fn unbudgeted_store_is_a_distinct_explicit_product_type() {
+        let store = SimpleRevocableStore::<String, Vec<u8>, Unbudgeted>::new_unbudgeted(binding());
+        store.insert_checked("fixture".into(), vec![0; 3]).expect("insert");
+        assert_eq!(store.stats().expect("stats").estimated_bytes, 3);
+        store.close().expect("close");
     }
 }

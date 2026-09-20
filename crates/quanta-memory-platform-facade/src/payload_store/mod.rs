@@ -1,8 +1,8 @@
 pub mod service;
 
 use quanta_memory_platform_core::{
-    PublishedPayload, RetainedEnvelope, StoreBindingHandle, StoreDeleteError, StoreStats,
-    StoreWriteError,
+    MemoryResult, PublishedPayload, RetainedEnvelope, StoreBindingHandle, StoreDeleteError,
+    StoreStats, StoreWriteError,
 };
 
 pub use crate::shared::builder::PayloadStoreBuilder;
@@ -15,5 +15,6 @@ pub trait PayloadStore<PayloadRef, Bytes> {
         value: RetainedEnvelope<Bytes>,
     ) -> Result<PublishedPayload<PayloadRef>, StoreWriteError>;
     fn delete_if_unpinned(&self, payload_ref: &PayloadRef) -> Result<(), StoreDeleteError>;
-    fn stats(&self) -> StoreStats;
+    fn stats(&self) -> MemoryResult<StoreStats>;
+    fn close(&self) -> MemoryResult<()>;
 }

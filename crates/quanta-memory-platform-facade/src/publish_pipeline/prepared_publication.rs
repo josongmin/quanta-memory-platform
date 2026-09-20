@@ -1,12 +1,17 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{Display, Formatter};
-use std::sync::Mutex;
+use std::marker::PhantomData;
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use quanta_memory_platform_core::{
-    ChargeKind, MemoryContextKind, MemoryError, ReservationTicket, StoreBindingHandle,
+    ChargeKind, LiveProcessMemoryBroker, ManagedCharge, MemoryContextKind, MemoryError,
+    StoreBindingHandle,
 };
 
-use crate::shared::accounting::SharedAccountingSink;
+#[cfg(feature = "unbudgeted-stores")]
+use crate::shared::accounting::Unbudgeted;
+use crate::shared::accounting::{Budgeted, StoreAccounting};
+use crate::shared::lifecycle::{retire_client_value, BeginClose, DropTransition, StoreLifecycle};
 use crate::shared::measure::{ByteSized, CanonicalKey};
 
 const TOKEN_DOMAIN: &[u8] = b"qmp.prepared-publication.v1\0";
@@ -191,9 +196,23 @@ impl std::error::Error for PreparedPublicationErrorV1 {}
 #[derive(Debug)]
 struct PreparedEntry<Payload> {
     identity: PreparedPublicationIdentityV1,
+    canonical_key: Vec<u8>,
     payload: Payload,
     charged_bytes: u64,
-    ticket: Option<ReservationTicket>,
+    /// Single-owner accounting authority for this exact retained payload.
+    charge: Option<ManagedCharge>,
+}
+
+fn retire_entry<Payload>(entry: PreparedEntry<Payload>) {
+    let PreparedEntry { payload, charge, .. } = entry;
+    drop(charge);
+    retire_client_value(payload);
+}
+
+fn retire_entries<Payload>(entries: BTreeMap<PreparedPublicationTokenV1, PreparedEntry<Payload>>) {
+    for (_, entry) in entries {
+        retire_entry(entry);
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -211,52 +230,98 @@ struct PreparedState<Payload> {
     tombstone_bytes: u64,
 }
 
+impl<Payload> PreparedState<Payload> {
+    fn empty() -> Self {
+        Self {
+            entries: BTreeMap::new(),
+            identity_index: BTreeMap::new(),
+            aborted_tokens: BTreeSet::new(),
+            charged_bytes: 0,
+            tombstone_bytes: 0,
+        }
+    }
+}
+
 /// In-memory prepared-publication owner. It proves process-lifetime atomicity
 /// and idempotency only; it does not claim restart durability or activation
-/// ownership.
+/// ownership. `Mode` is mandatory and construction fixes the accounting policy:
+///
+/// ```compile_fail
+/// use quanta_memory_platform_core::{MemoryClass, StoreBindingHandle};
+/// use quanta_memory_platform_facade::{Budgeted, PreparedPublicationService};
+/// let binding = StoreBindingHandle::new(MemoryClass::ManifestResidency, "owner".into(), None);
+/// let _ = PreparedPublicationService::<Vec<u8>, Budgeted>::new(binding, None);
+/// ```
+///
+/// ```compile_fail
+/// use quanta_memory_platform_facade::{Budgeted, PreparedPublicationService};
+/// fn late_attach(service: PreparedPublicationService<Vec<u8>, Budgeted>) {
+///     let _ = service.charged_against;
+/// }
+/// ```
 #[derive(Debug)]
-pub struct PreparedPublicationService<Payload> {
+pub struct PreparedPublicationService<Payload, Mode> {
     binding: StoreBindingHandle,
     capacity_bytes: Option<u64>,
     tombstone_count_capacity: usize,
     tombstone_bytes_capacity: u64,
-    charger: Option<SharedAccountingSink>,
+    accounting: StoreAccounting,
+    lifecycle: StoreLifecycle,
     state: Mutex<PreparedState<Payload>>,
+    _mode: PhantomData<fn() -> Mode>,
 }
 
-impl<Payload> PreparedPublicationService<Payload> {
-    pub fn new(binding: StoreBindingHandle, capacity_bytes: Option<u64>) -> Self {
+impl<Payload> PreparedPublicationService<Payload, Budgeted> {
+    pub(crate) fn new_budgeted(
+        binding: StoreBindingHandle,
+        capacity_bytes: Option<u64>,
+        tombstone_limits: Option<(usize, u64)>,
+        broker: LiveProcessMemoryBroker,
+    ) -> Self {
+        Self::with_accounting(
+            binding,
+            capacity_bytes,
+            tombstone_limits,
+            StoreAccounting::Budgeted(broker),
+        )
+    }
+}
+
+#[cfg(feature = "unbudgeted-stores")]
+impl<Payload> PreparedPublicationService<Payload, Unbudgeted> {
+    pub(crate) fn new_unbudgeted(
+        binding: StoreBindingHandle,
+        capacity_bytes: Option<u64>,
+        tombstone_limits: Option<(usize, u64)>,
+    ) -> Self {
+        Self::with_accounting(
+            binding,
+            capacity_bytes,
+            tombstone_limits,
+            StoreAccounting::Unbudgeted,
+        )
+    }
+}
+
+impl<Payload, Mode> PreparedPublicationService<Payload, Mode> {
+    fn with_accounting(
+        binding: StoreBindingHandle,
+        capacity_bytes: Option<u64>,
+        tombstone_limits: Option<(usize, u64)>,
+        accounting: StoreAccounting,
+    ) -> Self {
+        let (tombstone_count_capacity, tombstone_bytes_capacity) = tombstone_limits
+            .unwrap_or((DEFAULT_TOMBSTONE_COUNT_CAPACITY, DEFAULT_TOMBSTONE_BYTES_CAPACITY));
         Self {
             binding,
             capacity_bytes,
-            charger: None,
-            state: Mutex::new(PreparedState {
-                entries: BTreeMap::new(),
-                identity_index: BTreeMap::new(),
-                aborted_tokens: BTreeSet::new(),
-                charged_bytes: 0,
-                tombstone_bytes: 0,
-            }),
-            tombstone_count_capacity: DEFAULT_TOMBSTONE_COUNT_CAPACITY,
-            tombstone_bytes_capacity: DEFAULT_TOMBSTONE_BYTES_CAPACITY,
+            tombstone_count_capacity,
+            tombstone_bytes_capacity,
+            accounting,
+            lifecycle: StoreLifecycle::new("prepared publication service"),
+            state: Mutex::new(PreparedState::empty()),
+            _mode: PhantomData,
         }
-    }
-
-    /// Bound process-lifetime retry tombstones by both cardinality and logical
-    /// key bytes. Saturation fails abort/GC before payload or accounting state
-    /// changes; it never forgets retry evidence and never resurrects an aborted
-    /// publication.
-    #[must_use]
-    pub fn with_tombstone_limits(mut self, max_count: usize, max_bytes: u64) -> Self {
-        self.tombstone_count_capacity = max_count;
-        self.tombstone_bytes_capacity = max_bytes;
-        self
-    }
-
-    #[must_use]
-    pub fn charged_against(mut self, sink: SharedAccountingSink) -> Self {
-        self.charger = Some(sink);
-        self
     }
 
     #[must_use]
@@ -264,18 +329,105 @@ impl<Payload> PreparedPublicationService<Payload> {
         &self.binding
     }
 
-    fn lock(
+    fn lock_state(
         &self,
-    ) -> Result<std::sync::MutexGuard<'_, PreparedState<Payload>>, PreparedPublicationErrorV1> {
-        self.state.lock().map_err(|_| {
-            PreparedPublicationErrorV1::Storage(MemoryError::InvalidState(
-                "prepared publication lock poisoned".to_string(),
-            ))
-        })
+    ) -> Result<MutexGuard<'_, PreparedState<Payload>>, PreparedPublicationErrorV1> {
+        self.lifecycle.try_lock_state(&self.state).map_err(PreparedPublicationErrorV1::Storage)
+    }
+
+    /// Readers never observe entries while their accounting authority is in an
+    /// out-of-lock release plan.
+    fn lock_read(
+        &self,
+    ) -> Result<MutexGuard<'_, PreparedState<Payload>>, PreparedPublicationErrorV1> {
+        self.lifecycle.ensure_readable().map_err(PreparedPublicationErrorV1::Storage)?;
+        let state = self.lock_state()?;
+        self.lifecycle.ensure_readable().map_err(PreparedPublicationErrorV1::Storage)?;
+        Ok(state)
+    }
+
+    fn require_charge_shape(
+        &self,
+        entry: &PreparedEntry<Payload>,
+        operation: &str,
+    ) -> Result<(), PreparedPublicationErrorV1> {
+        if self.accounting.broker().is_some() == entry.charge.is_some() {
+            Ok(())
+        } else {
+            Err(PreparedPublicationErrorV1::Storage(MemoryError::InvalidState(format!(
+                "prepared publication {operation} encountered mismatched accounting authority"
+            ))))
+        }
+    }
+
+    /// Release every live payload charge and enter the terminal closed state.
+    /// A failed release restores the exact preimage and reopens the service.
+    pub fn close(&self) -> Result<(), PreparedPublicationErrorV1> {
+        let close =
+            match self.lifecycle.begin_close().map_err(PreparedPublicationErrorV1::Storage)? {
+                BeginClose::AlreadyClosed => return Ok(()),
+                BeginClose::Acquired(close) => close,
+            };
+
+        let (tokens, mut charges) = {
+            let mut state = match self.lock_state() {
+                Ok(state) => state,
+                Err(error) => {
+                    close.rollback();
+                    return Err(error);
+                }
+            };
+            for entry in state.entries.values() {
+                if let Err(error) = self.require_charge_shape(entry, "close") {
+                    close.rollback();
+                    return Err(error);
+                }
+            }
+            let mut tokens = Vec::new();
+            let mut charges = Vec::new();
+            for (token, entry) in &mut state.entries {
+                if let Some(charge) = entry.charge.take() {
+                    tokens.push(token.clone());
+                    charges.push(charge);
+                }
+            }
+            (tokens, charges)
+        };
+
+        if let Err(error) = self.accounting.release_many(&mut charges) {
+            let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            for (token, charge) in tokens.into_iter().zip(charges) {
+                if let Some(entry) = state.entries.get_mut(&token) {
+                    entry.charge = Some(charge);
+                }
+            }
+            close.rollback();
+            return Err(PreparedPublicationErrorV1::Accounting(error));
+        }
+
+        let old_state = {
+            let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            std::mem::replace(&mut *state, PreparedState::empty())
+        };
+        close.commit();
+        retire_entries(old_state.entries);
+        Ok(())
     }
 }
 
-impl<Payload> PreparedPublicationService<Payload>
+impl<Payload, Mode> Drop for PreparedPublicationService<Payload, Mode> {
+    fn drop(&mut self) {
+        if self.lifecycle.transition_to_closed_for_drop() == DropTransition::AlreadyClosed {
+            return;
+        }
+        let state = self.state.get_mut().unwrap_or_else(PoisonError::into_inner);
+        let entries = std::mem::take(&mut state.entries);
+        state.charged_bytes = 0;
+        retire_entries(entries);
+    }
+}
+
+impl<Payload, Mode> PreparedPublicationService<Payload, Mode>
 where
     Payload: Clone + ByteSized + CanonicalKey,
 {
@@ -283,9 +435,12 @@ where
         &self,
         request: PreparedPublicationRequestV1<Payload>,
     ) -> Result<PreparedPublicationReceiptV1, PreparedPublicationErrorV1> {
+        let _permit =
+            self.lifecycle.begin_mutation().map_err(PreparedPublicationErrorV1::Storage)?;
         let payload_key = request.payload.canonical_key();
         let token = derive_token(&request.identity, &payload_key);
-        let mut state = self.lock()?;
+        let charged_bytes = request.payload.byte_size();
+        let state = self.lock_state()?;
 
         if let Some(identity_state) = state.identity_index.get(&request.identity) {
             return match identity_state {
@@ -295,7 +450,7 @@ where
                             "prepared identity index points to a missing token".to_string(),
                         ))
                     })?;
-                    if existing.payload.canonical_key() == payload_key {
+                    if existing.canonical_key == payload_key {
                         Ok(PreparedPublicationReceiptV1::new(
                             existing_token.clone(),
                             PrepareDispositionV1::Replayed,
@@ -319,7 +474,6 @@ where
             return Err(PreparedPublicationErrorV1::TokenCollision { token });
         }
 
-        let charged_bytes = request.payload.byte_size();
         let next_total = state.charged_bytes.checked_add(charged_bytes).ok_or(
             PreparedPublicationErrorV1::Capacity {
                 requested_bytes: charged_bytes,
@@ -335,29 +489,34 @@ where
             }
         }
 
-        let ticket = self
-            .charger
-            .as_ref()
-            .map(|sink| {
-                sink.charge(
-                    self.binding.class.clone(),
-                    self.binding.owner.clone(),
-                    MemoryContextKind::Request,
-                    ChargeKind::RetainedPayload,
-                    charged_bytes,
-                )
-            })
-            .transpose()
+        drop(state);
+        let charge = self
+            .accounting
+            .charge(
+                self.binding.class.clone(),
+                self.binding.owner.clone(),
+                MemoryContextKind::Request,
+                ChargeKind::RetainedPayload,
+                charged_bytes,
+            )
             .map_err(PreparedPublicationErrorV1::Accounting)?;
 
+        let mut state = match self.lock_state() {
+            Ok(state) => state,
+            Err(error) => {
+                drop(charge);
+                return Err(error);
+            }
+        };
         let identity = request.identity;
         state.entries.insert(
             token.clone(),
             PreparedEntry {
                 identity: identity.clone(),
+                canonical_key: payload_key,
                 payload: request.payload,
                 charged_bytes,
-                ticket,
+                charge,
             },
         );
         state.identity_index.insert(identity, IdentityState::Prepared(token.clone()));
@@ -369,7 +528,7 @@ where
         &self,
         token: &PreparedPublicationTokenV1,
     ) -> Result<Payload, PreparedPublicationErrorV1> {
-        let state = self.lock()?;
+        let state = self.lock_read()?;
         if let Some(entry) = state.entries.get(token) {
             return Ok(entry.payload.clone());
         }
@@ -383,32 +542,53 @@ where
         &self,
         token: &PreparedPublicationTokenV1,
     ) -> Result<AbortDispositionV1, PreparedPublicationErrorV1> {
-        let mut state = self.lock()?;
-        if state.aborted_tokens.contains(token) {
-            return Ok(AbortDispositionV1::Replayed);
+        let _permit =
+            self.lifecycle.begin_mutation().map_err(PreparedPublicationErrorV1::Storage)?;
+        let (next_total, next_tombstone_bytes, mut charge) = {
+            let mut state = self.lock_state()?;
+            if state.aborted_tokens.contains(token) {
+                return Ok(AbortDispositionV1::Replayed);
+            }
+            let entry = state
+                .entries
+                .get(token)
+                .ok_or_else(|| PreparedPublicationErrorV1::UnknownToken { token: token.clone() })?;
+            self.require_charge_shape(entry, "abort")?;
+            let tombstone_bytes = self.ensure_tombstone_capacity(&state, [entry])?;
+            let next_total =
+                state.charged_bytes.checked_sub(entry.charged_bytes).ok_or_else(|| {
+                    PreparedPublicationErrorV1::Storage(MemoryError::InvalidState(
+                        "prepared publication retained-byte counter underflow".to_string(),
+                    ))
+                })?;
+            let next_tombstone_bytes =
+                state.tombstone_bytes.checked_add(tombstone_bytes).ok_or_else(|| {
+                    PreparedPublicationErrorV1::Storage(MemoryError::InvalidState(
+                        "prepared publication tombstone-byte counter overflow".to_string(),
+                    ))
+                })?;
+            let charge = state.entries.get_mut(token).and_then(|entry| entry.charge.take());
+            (next_total, next_tombstone_bytes, charge)
+        };
+        if let Some(active) = charge.as_mut() {
+            if let Err(error) = self.accounting.release_many(std::slice::from_mut(active)) {
+                let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+                state.entries.get_mut(token).expect("mutation lane owns entry").charge = charge;
+                return Err(PreparedPublicationErrorV1::Accounting(error));
+            }
         }
-        let entry = state
-            .entries
-            .get(token)
-            .ok_or_else(|| PreparedPublicationErrorV1::UnknownToken { token: token.clone() })?;
-        let tombstone_bytes = self.ensure_tombstone_capacity(&state, [entry])?;
-        if let (Some(sink), Some(ticket)) = (&self.charger, &entry.ticket) {
-            sink.refund(ticket).map_err(PreparedPublicationErrorV1::Accounting)?;
-        }
-        let entry = state.entries.remove(token).ok_or_else(|| {
-            PreparedPublicationErrorV1::Storage(MemoryError::InvalidState(
-                "prepared token disappeared during abort".to_string(),
-            ))
-        })?;
-        state.charged_bytes = state.charged_bytes.saturating_sub(entry.charged_bytes);
-        state.identity_index.insert(entry.identity, IdentityState::Aborted(token.clone()));
-        state.aborted_tokens.insert(token.clone());
-        state.tombstone_bytes =
-            state.tombstone_bytes.checked_add(tombstone_bytes).ok_or_else(|| {
-                PreparedPublicationErrorV1::Storage(MemoryError::InvalidState(
-                    "prepared publication tombstone-byte counter overflow".to_string(),
-                ))
-            })?;
+        let entry = {
+            let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            let entry = state.entries.remove(token).expect("mutation lane owns entry");
+            state.charged_bytes = next_total;
+            state
+                .identity_index
+                .insert(entry.identity.clone(), IdentityState::Aborted(token.clone()));
+            state.aborted_tokens.insert(token.clone());
+            state.tombstone_bytes = next_tombstone_bytes;
+            entry
+        };
+        retire_entry(entry);
         Ok(AbortDispositionV1::Aborted)
     }
 
@@ -423,77 +603,96 @@ where
         &self,
         referenced_tokens: &[PreparedPublicationTokenV1],
     ) -> Result<Vec<PreparedPublicationTokenV1>, PreparedPublicationErrorV1> {
-        let state = self.lock()?;
+        let state = self.lock_read()?;
         classify_orphan_tokens(&state, referenced_tokens)
     }
 
     /// Collect every prepared entry absent from the caller's complete
     /// canonical-root snapshot.
     ///
-    /// Reference validation and the complete refund/removal batch happen under
-    /// one service lock. The caller must serialize root activation against this
-    /// call; QMP never infers or owns activation/publication itself.
+    /// Reference validation and the complete refund/removal batch are serialized
+    /// by the lifecycle mutation lane. Broker accounting runs outside the state
+    /// mutex. The caller must serialize root activation against this call; QMP
+    /// never infers or owns activation/publication itself.
     pub fn gc_orphans(
         &self,
         referenced_tokens: &[PreparedPublicationTokenV1],
     ) -> Result<usize, PreparedPublicationErrorV1> {
-        let mut state = self.lock()?;
-        let orphan_tokens = classify_orphan_tokens(&state, referenced_tokens)?;
-        let mut prepared_tokens = Vec::new();
-        let mut tickets = Vec::new();
-
-        for token in orphan_tokens {
-            let entry = state.entries.get(&token).ok_or_else(|| {
-                PreparedPublicationErrorV1::Storage(MemoryError::InvalidState(
-                    "classified orphan token disappeared before collection".to_string(),
-                ))
-            })?;
-            if let Some(ticket) = &entry.ticket {
-                tickets.push(ticket.clone());
+        let _permit =
+            self.lifecycle.begin_mutation().map_err(PreparedPublicationErrorV1::Storage)?;
+        let (prepared_tokens, charged_tokens, next_total, next_tombstone_bytes, mut charges) = {
+            let mut state = self.lock_state()?;
+            let prepared_tokens = classify_orphan_tokens(&state, referenced_tokens)?;
+            let tombstone_entries = prepared_tokens
+                .iter()
+                .map(|token| state.entries.get(token).expect("classified token is live"))
+                .collect::<Vec<_>>();
+            for entry in &tombstone_entries {
+                self.require_charge_shape(entry, "orphan GC")?;
             }
-            prepared_tokens.push(token);
-        }
-
-        let tombstone_entries = prepared_tokens
-            .iter()
-            .map(|token| {
-                state.entries.get(token).ok_or_else(|| {
+            let tombstone_bytes =
+                self.ensure_tombstone_capacity(&state, tombstone_entries.iter().copied())?;
+            let reclaimed_bytes = tombstone_entries.iter().try_fold(0u64, |total, entry| {
+                total.checked_add(entry.charged_bytes).ok_or_else(|| {
                     PreparedPublicationErrorV1::Storage(MemoryError::InvalidState(
-                        "classified prepared token disappeared before tombstone admission"
-                            .to_string(),
+                        "prepared publication reclaimed-byte counter overflow".to_string(),
                     ))
                 })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let tombstone_bytes = self.ensure_tombstone_capacity(&state, tombstone_entries)?;
-
-        if let Some(sink) = &self.charger {
-            sink.refund_many(&tickets).map_err(PreparedPublicationErrorV1::Accounting)?;
-        }
-
-        let mut reclaimed_bytes = 0u64;
-        for token in &prepared_tokens {
-            let entry = state.entries.remove(token).ok_or_else(|| {
+            })?;
+            let next_total = state.charged_bytes.checked_sub(reclaimed_bytes).ok_or_else(|| {
                 PreparedPublicationErrorV1::Storage(MemoryError::InvalidState(
-                    "prepared token disappeared during orphan GC".to_string(),
+                    "prepared publication retained-byte counter underflow".to_string(),
                 ))
             })?;
-            reclaimed_bytes = reclaimed_bytes.saturating_add(entry.charged_bytes);
-            state.identity_index.insert(entry.identity, IdentityState::Aborted(token.clone()));
-            state.aborted_tokens.insert(token.clone());
+            let next_tombstone_bytes =
+                state.tombstone_bytes.checked_add(tombstone_bytes).ok_or_else(|| {
+                    PreparedPublicationErrorV1::Storage(MemoryError::InvalidState(
+                        "prepared publication tombstone-byte counter overflow".to_string(),
+                    ))
+                })?;
+            let mut charged_tokens = Vec::new();
+            let mut charges = Vec::new();
+            for token in &prepared_tokens {
+                if let Some(charge) =
+                    state.entries.get_mut(token).expect("classified token is live").charge.take()
+                {
+                    charged_tokens.push(token.clone());
+                    charges.push(charge);
+                }
+            }
+            (prepared_tokens, charged_tokens, next_total, next_tombstone_bytes, charges)
+        };
+        if let Err(error) = self.accounting.release_many(&mut charges) {
+            let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            for (token, charge) in charged_tokens.into_iter().zip(charges) {
+                state.entries.get_mut(&token).expect("mutation lane owns entry").charge =
+                    Some(charge);
+            }
+            return Err(PreparedPublicationErrorV1::Accounting(error));
         }
-        state.charged_bytes = state.charged_bytes.saturating_sub(reclaimed_bytes);
-        state.tombstone_bytes =
-            state.tombstone_bytes.checked_add(tombstone_bytes).ok_or_else(|| {
-                PreparedPublicationErrorV1::Storage(MemoryError::InvalidState(
-                    "prepared publication tombstone-byte counter overflow".to_string(),
-                ))
-            })?;
+        let removed = {
+            let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut removed = Vec::with_capacity(prepared_tokens.len());
+            for token in &prepared_tokens {
+                let entry = state.entries.remove(token).expect("mutation lane owns entry");
+                state
+                    .identity_index
+                    .insert(entry.identity.clone(), IdentityState::Aborted(token.clone()));
+                state.aborted_tokens.insert(token.clone());
+                removed.push(entry);
+            }
+            state.charged_bytes = next_total;
+            state.tombstone_bytes = next_tombstone_bytes;
+            removed
+        };
+        for entry in removed {
+            retire_entry(entry);
+        }
         Ok(prepared_tokens.len())
     }
 
     pub fn stats(&self) -> Result<PreparedPublicationStatsV1, PreparedPublicationErrorV1> {
-        let state = self.lock()?;
+        let state = self.lock_read()?;
         Ok(PreparedPublicationStatsV1 {
             prepared_count: state.entries.len(),
             charged_bytes: state.charged_bytes,
@@ -584,15 +783,33 @@ mod tests {
     use std::sync::{Arc, Barrier};
     use std::thread;
 
-    fn service(capacity_bytes: Option<u64>) -> PreparedPublicationService<Vec<u8>> {
-        PreparedPublicationService::new(
-            StoreBindingHandle::new(
-                MemoryClass::ManifestResidency,
-                "prepared-publication-tests".to_string(),
-                None,
-            ),
-            capacity_bytes,
+    #[derive(Debug)]
+    struct TestUnbudgeted;
+
+    type TestService = PreparedPublicationService<Vec<u8>, TestUnbudgeted>;
+
+    fn binding() -> StoreBindingHandle {
+        StoreBindingHandle::new(
+            MemoryClass::ManifestResidency,
+            "prepared-publication-tests".to_string(),
+            None,
         )
+    }
+
+    fn service_with_limits(
+        capacity_bytes: Option<u64>,
+        limits: Option<(usize, u64)>,
+    ) -> TestService {
+        PreparedPublicationService::with_accounting(
+            binding(),
+            capacity_bytes,
+            limits,
+            StoreAccounting::Unbudgeted,
+        )
+    }
+
+    fn service(capacity_bytes: Option<u64>) -> TestService {
+        service_with_limits(capacity_bytes, None)
     }
 
     fn request(identity: &str, payload: &[u8]) -> PreparedPublicationRequestV1<Vec<u8>> {
@@ -600,6 +817,21 @@ mod tests {
             PreparedPublicationIdentityV1::new(identity.as_bytes().to_vec()).expect("identity"),
             payload.to_vec(),
         )
+    }
+
+    fn prepare_after_busy(
+        service: &TestService,
+        request: PreparedPublicationRequestV1<Vec<u8>>,
+    ) -> Result<PreparedPublicationReceiptV1, PreparedPublicationErrorV1> {
+        for _ in 0..10_000 {
+            match service.prepare(request.clone()) {
+                Err(PreparedPublicationErrorV1::Storage(MemoryError::OperationInProgress(_))) => {
+                    thread::yield_now();
+                }
+                result => return result,
+            }
+        }
+        panic!("prepared publication mutation lane failed to reopen")
     }
 
     #[test]
@@ -681,7 +913,7 @@ mod tests {
                 let barrier = Arc::clone(&barrier);
                 thread::spawn(move || {
                     barrier.wait();
-                    service.prepare(request("same", b"payload")).expect("prepare")
+                    prepare_after_busy(&service, request("same", b"payload")).expect("prepare")
                 })
             })
             .collect();
@@ -709,7 +941,7 @@ mod tests {
                 let barrier = Arc::clone(&barrier);
                 thread::spawn(move || {
                     barrier.wait();
-                    service.prepare(request("same", &payload))
+                    prepare_after_busy(&service, request("same", &payload))
                 })
             })
             .collect();
@@ -794,9 +1026,9 @@ mod tests {
     fn tombstone_limits_bound_n_cycle_churn_and_fail_closed_at_saturation() {
         const MAX_TOMBSTONES: usize = 4;
         const TOMBSTONE_BYTES_PER_CYCLE: u64 = 36;
-        let service = service(None).with_tombstone_limits(
-            MAX_TOMBSTONES,
-            MAX_TOMBSTONES as u64 * TOMBSTONE_BYTES_PER_CYCLE,
+        let service = service_with_limits(
+            None,
+            Some((MAX_TOMBSTONES, MAX_TOMBSTONES as u64 * TOMBSTONE_BYTES_PER_CYCLE)),
         );
 
         for cycle in 0..MAX_TOMBSTONES {
@@ -840,11 +1072,99 @@ mod tests {
     #[cfg(feature = "core-live-accounting")]
     mod accounting {
         use super::*;
-        use crate::SharedAccountingSink;
         use quanta_memory_platform_core::{
             ExecutionBudget, LiveProcessMemoryBroker, MemoryBudgetManifest, MemoryClassBudget,
             MemoryPreset, ReclaimPriority, ResidencyPolicy,
         };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{OnceLock, Weak};
+
+        #[derive(Clone, Debug)]
+        struct PanicOnDropPayload {
+            bytes: Vec<u8>,
+            drops: Arc<AtomicUsize>,
+        }
+
+        impl ByteSized for PanicOnDropPayload {
+            fn byte_size(&self) -> u64 {
+                self.bytes.len() as u64
+            }
+        }
+
+        impl CanonicalKey for PanicOnDropPayload {
+            fn canonical_key(&self) -> Vec<u8> {
+                self.bytes.clone()
+            }
+        }
+
+        impl Drop for PanicOnDropPayload {
+            fn drop(&mut self) {
+                self.drops.fetch_add(1, Ordering::SeqCst);
+                panic!("client payload destructor panic");
+            }
+        }
+
+        struct ReentrantClonePayload {
+            bytes: Vec<u8>,
+            service: Arc<OnceLock<Weak<PreparedPublicationService<Self, Budgeted>>>>,
+            clone_hits: Arc<AtomicUsize>,
+        }
+
+        impl Clone for ReentrantClonePayload {
+            fn clone(&self) -> Self {
+                if let Some(service) = self.service.get().and_then(Weak::upgrade) {
+                    assert!(matches!(
+                        service.stats(),
+                        Err(PreparedPublicationErrorV1::Storage(MemoryError::OperationInProgress(resource)))
+                            if resource == "prepared publication service"
+                    ));
+                    self.clone_hits.fetch_add(1, Ordering::SeqCst);
+                }
+                Self {
+                    bytes: self.bytes.clone(),
+                    service: Arc::clone(&self.service),
+                    clone_hits: Arc::clone(&self.clone_hits),
+                }
+            }
+        }
+
+        impl ByteSized for ReentrantClonePayload {
+            fn byte_size(&self) -> u64 {
+                self.bytes.len() as u64
+            }
+        }
+
+        impl CanonicalKey for ReentrantClonePayload {
+            fn canonical_key(&self) -> Vec<u8> {
+                self.bytes.clone()
+            }
+        }
+
+        fn panic_payload_request(
+            identity: &str,
+            bytes: &[u8],
+            drops: &Arc<AtomicUsize>,
+        ) -> PreparedPublicationRequestV1<PanicOnDropPayload> {
+            PreparedPublicationRequestV1::new(
+                PreparedPublicationIdentityV1::new(identity.as_bytes().to_vec()).expect("identity"),
+                PanicOnDropPayload { bytes: bytes.to_vec(), drops: Arc::clone(drops) },
+            )
+        }
+
+        struct RetireDuringUnwind<'a> {
+            service: &'a PreparedPublicationService<PanicOnDropPayload, Budgeted>,
+            gc: bool,
+        }
+
+        impl Drop for RetireDuringUnwind<'_> {
+            fn drop(&mut self) {
+                if self.gc {
+                    self.service.gc_orphans(&[]).expect("orphan GC during unwind");
+                } else {
+                    self.service.close().expect("close during unwind");
+                }
+            }
+        }
 
         fn broker(class_hard: u64) -> LiveProcessMemoryBroker {
             let residency = ResidencyPolicy::new(1_000_000).with_class_budget(
@@ -867,9 +1187,45 @@ mod tests {
                 .expect("valid broker")
         }
 
-        fn charged(broker: &LiveProcessMemoryBroker) -> PreparedPublicationService<Vec<u8>> {
-            let sink: SharedAccountingSink = Arc::new(broker.clone());
-            service(None).charged_against(sink)
+        fn charged(
+            broker: &LiveProcessMemoryBroker,
+        ) -> PreparedPublicationService<Vec<u8>, Budgeted> {
+            PreparedPublicationService::new_budgeted(binding(), None, None, broker.clone())
+        }
+
+        #[test]
+        fn resolve_clone_reentry_under_read_lock_is_typed_busy_and_preserves_charge() {
+            let broker = broker(1_000_000);
+            let service = Arc::new(
+                PreparedPublicationService::<ReentrantClonePayload, Budgeted>::new_budgeted(
+                    binding(),
+                    None,
+                    None,
+                    broker.clone(),
+                ),
+            );
+            let probe = Arc::new(OnceLock::new());
+            assert!(probe.set(Arc::downgrade(&service)).is_ok());
+            let clone_hits = Arc::new(AtomicUsize::new(0));
+            let receipt = service
+                .prepare(PreparedPublicationRequestV1::new(
+                    PreparedPublicationIdentityV1::new(b"clone-reentry".to_vec())
+                        .expect("identity"),
+                    ReentrantClonePayload {
+                        bytes: b"owned".to_vec(),
+                        service: Arc::clone(&probe),
+                        clone_hits: Arc::clone(&clone_hits),
+                    },
+                ))
+                .expect("prepare");
+
+            let resolved = service.resolve(receipt.token()).expect("resolve without deadlock");
+            assert_eq!(resolved.bytes, b"owned");
+            assert_eq!(clone_hits.load(Ordering::SeqCst), 1);
+            assert_eq!(service.stats().expect("complete state").charged_bytes, 5);
+            assert_eq!(broker.ledger_snapshot().expect("unchanged charge").total_owner_bytes(), 5);
+            service.close().expect("close");
+            assert_eq!(broker.ledger_snapshot().expect("refunded").total_owner_bytes(), 0);
         }
 
         #[test]
@@ -941,6 +1297,242 @@ mod tests {
             broker.finish_rebuild().expect("finish rebuild");
             assert_eq!(service.gc_orphans(&[]).expect("retry GC"), 2);
             assert_eq!(broker.ledger_snapshot().expect("snapshot").total_owner_bytes(), 0);
+        }
+
+        #[test]
+        fn close_refunds_all_entries_and_is_terminal_and_idempotent() {
+            let broker = broker(1_000_000);
+            let service = charged(&broker);
+            let first = service.prepare(request("id-1", b"one")).expect("first");
+            service.prepare(request("id-2", b"two")).expect("second");
+            assert_eq!(broker.ledger_snapshot().expect("before").total_owner_bytes(), 6);
+
+            service.close().expect("close");
+            assert_eq!(broker.ledger_snapshot().expect("after").total_owner_bytes(), 0);
+            assert_eq!(
+                service.stats().expect("terminal stats"),
+                PreparedPublicationStatsV1::default()
+            );
+            assert!(matches!(
+                service.resolve(first.token()),
+                Err(PreparedPublicationErrorV1::UnknownToken { .. })
+            ));
+            assert!(matches!(
+                service.prepare(request("id-3", b"three")),
+                Err(PreparedPublicationErrorV1::Storage(MemoryError::Closed(_)))
+            ));
+            assert!(matches!(
+                service.abort(first.token()),
+                Err(PreparedPublicationErrorV1::Storage(MemoryError::Closed(_)))
+            ));
+            assert!(matches!(
+                service.gc_orphans(&[]),
+                Err(PreparedPublicationErrorV1::Storage(MemoryError::Closed(_)))
+            ));
+            service.close().expect("double close");
+            assert_eq!(
+                broker.ledger_snapshot().expect("double close ledger").total_owner_bytes(),
+                0
+            );
+        }
+
+        #[test]
+        fn failed_close_keeps_exact_payloads_tokens_and_charges_for_retry() {
+            let broker = broker(1_000_000);
+            let service = charged(&broker);
+            let first = service.prepare(request("id-1", b"one")).expect("first");
+            let second = service.prepare(request("id-2", b"two")).expect("second");
+            let before = service.stats().expect("before");
+            broker.begin_rebuild().expect("begin rebuild");
+
+            assert!(matches!(service.close(), Err(PreparedPublicationErrorV1::Accounting(_))));
+            assert_eq!(service.stats().expect("after failed close"), before);
+            assert_eq!(service.resolve(first.token()).expect("first intact"), b"one");
+            assert_eq!(service.resolve(second.token()).expect("second intact"), b"two");
+            assert_eq!(broker.ledger_snapshot().expect("still charged").total_owner_bytes(), 6);
+
+            broker.finish_rebuild().expect("finish rebuild");
+            service.close().expect("retry close");
+            assert_eq!(broker.ledger_snapshot().expect("refunded").total_owner_bytes(), 0);
+        }
+
+        #[test]
+        fn drop_refunds_live_entries_and_rebuild_drop_defers_exact_release() {
+            let broker = broker(1_000_000);
+            {
+                let service = charged(&broker);
+                service.prepare(request("id-1", b"one")).expect("first");
+                service.prepare(request("id-2", b"two")).expect("second");
+                assert_eq!(broker.ledger_snapshot().expect("live").total_owner_bytes(), 6);
+            }
+            assert_eq!(broker.ledger_snapshot().expect("healthy drop").total_owner_bytes(), 0);
+
+            {
+                let service = charged(&broker);
+                service.prepare(request("id-3", b"three")).expect("third");
+                broker.begin_rebuild().expect("begin rebuild");
+                assert_eq!(broker.ledger_snapshot().expect("before drop").total_owner_bytes(), 5);
+            }
+            assert_eq!(broker.ledger_snapshot().expect("deferred").total_owner_bytes(), 5);
+            broker.finish_rebuild().expect("drain deferred");
+            assert_eq!(broker.ledger_snapshot().expect("drained").total_owner_bytes(), 0);
+        }
+
+        #[test]
+        fn multiple_panicking_client_drops_during_outer_unwind_drain_exact_charges() {
+            for operation in ["drop", "close", "gc"] {
+                let broker = broker(1_000_000);
+                let drops = Arc::new(AtomicUsize::new(0));
+                let service =
+                    PreparedPublicationService::<PanicOnDropPayload, Budgeted>::new_budgeted(
+                        binding(),
+                        None,
+                        None,
+                        broker.clone(),
+                    );
+                for (identity, bytes) in
+                    [("one", b"a".as_slice()), ("two", b"bb"), ("three", b"ccc")]
+                {
+                    service
+                        .prepare(panic_payload_request(identity, bytes, &drops))
+                        .expect("prepare panicking payload");
+                }
+                assert_eq!(broker.ledger_snapshot().expect("before unwind").total_owner_bytes(), 6);
+
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    match operation {
+                        "drop" => {
+                            // The owned service itself must be destroyed while
+                            // the outer panic is already unwinding.
+                            let _owned = service;
+                            panic!("outer unwind");
+                        }
+                        "close" | "gc" => {
+                            let _retire =
+                                RetireDuringUnwind { service: &service, gc: operation == "gc" };
+                            panic!("outer unwind");
+                        }
+                        _ => unreachable!(),
+                    }
+                }));
+                assert!(result.is_err(), "the outer panic must remain observable");
+                assert_eq!(drops.load(Ordering::SeqCst), 3, "{operation} must retire all payloads");
+                assert_eq!(broker.ledger_snapshot().expect("after unwind").total_owner_bytes(), 0);
+            }
+        }
+
+        #[test]
+        fn mutation_gate_returns_typed_busy_and_exposes_no_partial_plan() {
+            let broker = broker(1_000_000);
+            let service = charged(&broker);
+            let receipt = service.prepare(request("id", b"payload")).expect("prepare");
+            let guard = service.lifecycle.begin_mutation().expect("own lane");
+            assert!(matches!(
+                service.prepare(request("other", b"x")),
+                Err(PreparedPublicationErrorV1::Storage(MemoryError::OperationInProgress(_)))
+            ));
+            assert!(matches!(
+                service.abort(receipt.token()),
+                Err(PreparedPublicationErrorV1::Storage(MemoryError::OperationInProgress(_)))
+            ));
+            assert!(matches!(
+                service.gc_orphans(&[]),
+                Err(PreparedPublicationErrorV1::Storage(MemoryError::OperationInProgress(_)))
+            ));
+            assert!(matches!(
+                service.close(),
+                Err(PreparedPublicationErrorV1::Storage(MemoryError::OperationInProgress(_)))
+            ));
+            assert!(matches!(
+                service.stats(),
+                Err(PreparedPublicationErrorV1::Storage(MemoryError::OperationInProgress(_)))
+            ));
+            drop(guard);
+            assert_eq!(service.stats().expect("reopened").charged_bytes, 7);
+        }
+
+        #[test]
+        fn poisoned_store_reports_error_but_drop_still_releases_every_charge() {
+            let broker = broker(1_000_000);
+            let service = charged(&broker);
+            service.prepare(request("id", b"payload")).expect("prepare");
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _guard = service.state.lock().expect("healthy lock");
+                panic!("poison prepared publication state");
+            }));
+            assert!(matches!(service.stats(), Err(PreparedPublicationErrorV1::Storage(_))));
+            assert!(matches!(service.close(), Err(PreparedPublicationErrorV1::Storage(_))));
+            assert_eq!(broker.ledger_snapshot().expect("still charged").total_owner_bytes(), 7);
+            drop(service);
+            assert_eq!(broker.ledger_snapshot().expect("drop refunds").total_owner_bytes(), 0);
+        }
+
+        #[test]
+        fn checked_overflow_and_underflow_reject_before_broker_or_index_mutation() {
+            let broker = broker(1_000_000);
+            let service = charged(&broker);
+            {
+                let mut state = service.state.lock().expect("state");
+                state.charged_bytes = u64::MAX;
+            }
+            assert!(matches!(
+                service.prepare(request("overflow", b"x")),
+                Err(PreparedPublicationErrorV1::Capacity { .. })
+            ));
+            assert_eq!(broker.ledger_snapshot().expect("no charge").total_owner_bytes(), 0);
+            {
+                let mut state = service.state.lock().expect("state");
+                state.charged_bytes = 0;
+            }
+            let receipt = service.prepare(request("id", b"payload")).expect("prepare");
+            {
+                let mut state = service.state.lock().expect("state");
+                state.charged_bytes = 0;
+            }
+            assert!(matches!(
+                service.abort(receipt.token()),
+                Err(PreparedPublicationErrorV1::Storage(MemoryError::InvalidState(_)))
+            ));
+            assert_eq!(service.resolve(receipt.token()).expect("index intact"), b"payload");
+            assert_eq!(broker.ledger_snapshot().expect("charge intact").total_owner_bytes(), 7);
+            {
+                let mut state = service.state.lock().expect("state");
+                state.charged_bytes = 7;
+            }
+            assert_eq!(service.abort(receipt.token()).expect("retry"), AbortDispositionV1::Aborted);
+            assert_eq!(broker.ledger_snapshot().expect("refunded").total_owner_bytes(), 0);
+        }
+
+        #[test]
+        fn orphan_gc_batch_sum_overflow_cannot_partially_refund_or_tombstone() {
+            let broker = broker(1_000_000);
+            let service = charged(&broker);
+            let first = service.prepare(request("id-1", b"a")).expect("first");
+            let second = service.prepare(request("id-2", b"b")).expect("second");
+            {
+                let mut state = service.state.lock().expect("state");
+                for entry in state.entries.values_mut() {
+                    entry.charged_bytes = u64::MAX;
+                }
+            }
+
+            assert!(matches!(
+                service.gc_orphans(&[]),
+                Err(PreparedPublicationErrorV1::Storage(MemoryError::InvalidState(_)))
+            ));
+            assert_eq!(service.resolve(first.token()).expect("first intact"), b"a");
+            assert_eq!(service.resolve(second.token()).expect("second intact"), b"b");
+            assert_eq!(service.stats().expect("stats").tombstone_count, 0);
+            assert_eq!(broker.ledger_snapshot().expect("charges intact").total_owner_bytes(), 2);
+
+            {
+                let mut state = service.state.lock().expect("state");
+                for entry in state.entries.values_mut() {
+                    entry.charged_bytes = 1;
+                }
+            }
+            assert_eq!(service.gc_orphans(&[]).expect("retry"), 2);
+            assert_eq!(broker.ledger_snapshot().expect("refunded").total_owner_bytes(), 0);
         }
     }
 }
