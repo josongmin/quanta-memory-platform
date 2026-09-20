@@ -16,6 +16,15 @@ scripts/extract-to-standalone-repo.sh /tmp/qmp-boundary-audit.h8nz5W
 exit 7
 ```
 
+Current-source recheck (product `e047215a5c98c2f57f4f53281da4d4c055e82f92`,
+clean detached worktree, 2026-09-21): actual extraction to fresh
+`/tmp/qmp-120-red-qgMeWA` exits 7 at `regression-guards` after creating
+bootstrap commit `1e6fc5a` **before verification**. Extracted tree contains
+untracked, newly resolved `Cargo.lock`, and lacks
+`tools/semgrep/qmp-regressions.yml`. This is a RED reproduction, not an
+extraction success receipt. QMP-000 is QUALIFIED, so this ticket is `READY`,
+not dependency-blocked.
+
 원인:
 
 - copy plan이 `tools/semgrep/qmp-regressions.yml`을 누락.
@@ -87,4 +96,3 @@ cargo metadata --locked --format-version 1 --manifest-path "${qmp_extract_dir}/C
 
 - Semantica rewire: QMP-130
 - crates.io publish decision: QMP-140
-
