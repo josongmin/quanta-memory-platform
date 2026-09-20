@@ -15,20 +15,11 @@
 //! invariants that the host adapter and downstream presets depend on.
 
 use quanta_memory_platform_core::{
-    // domain::ledger
-    AccountingLedger,
     // ports::telemetry
     AllocatorAdvisory,
     // domain::stats
     AllocatorSnapshot,
     AllocatorTelemetry,
-    // ports::pin
-    BasicPinRegistry,
-    // api
-    BasicProcessMemoryBroker,
-    BasicRuntimeMemoryView,
-    // ports::scratch
-    BasicScratchAllocator,
     // domain::config
     BudgetOverrideLayer,
     // domain::errors
@@ -38,7 +29,6 @@ use quanta_memory_platform_core::{
     EffectiveMemoryBudgetReport,
     // domain::policy
     ExecutionBudget,
-    InvalidationOutcome,
     LedgerSnapshot,
     MemoryBudgetManifest,
     MemoryClass,
@@ -53,9 +43,7 @@ use quanta_memory_platform_core::{
     OverrideSource,
     OwnerKey,
     OwnerQuota,
-    PayloadPinLease,
     PinError,
-    PinRegistry,
     PressureState,
     ProcessMemoryBroker,
     ProcessMemoryBrokerBuilder,
@@ -88,6 +76,11 @@ use quanta_memory_platform_core::{
     ValidatedResidencyPolicy,
 };
 
+#[cfg(feature = "unbudgeted_pin")]
+use quanta_memory_platform_core::{
+    InvalidationOutcome, PayloadPinLease, PinRegistry, UnbudgetedPinRegistry,
+};
+
 #[cfg(feature = "live_control")]
 use quanta_memory_platform_core::{
     ChargeRechargeError, ChargeRechargeRecovery, ChargeReleaseError, CommittedCharge,
@@ -104,9 +97,7 @@ use quanta_memory_platform_core::{
 fn names_every_public_reexport() {
     // Type/trait aliases referenced as types (resolution is the assertion).
     #[cfg(feature = "live_control")]
-    type _Brokers = (BasicProcessMemoryBroker, BasicRuntimeMemoryView, LiveProcessMemoryBroker);
-    #[cfg(not(feature = "live_control"))]
-    type _Brokers = (BasicProcessMemoryBroker, BasicRuntimeMemoryView);
+    type _Brokers = LiveProcessMemoryBroker;
     type _BrokerTraits =
         (Box<dyn ProcessMemoryBroker>, Box<dyn RuntimeMemoryView>, ProcessMemoryBrokerBuilder);
     #[cfg(feature = "live_control")]
@@ -136,8 +127,7 @@ fn names_every_public_reexport() {
         StoreDeleteError,
         StoreWriteError,
     );
-    type _Ledger =
-        (AccountingLedger, ChargeKind, LedgerSnapshot, ReservationTicket, UsageBreakdown);
+    type _Ledger = (ChargeKind, LedgerSnapshot, ReservationTicket, UsageBreakdown);
     type _Recharge = (RechargeError, RechargeRecoveryV1);
     #[cfg(feature = "live_control")]
     type _OwnedAuthority = (
@@ -159,14 +149,14 @@ fn names_every_public_reexport() {
         ResourceGroup,
     );
     type _Stats = (AllocatorSnapshot, EffectiveMemoryBudgetReport, PressureState);
-    type _Pin = (
-        BasicPinRegistry,
+    #[cfg(feature = "unbudgeted_pin")]
+    type _UnbudgetedPin = (
+        UnbudgetedPinRegistry,
         InvalidationOutcome<String>,
         PayloadPinLease<String, String>,
         Box<dyn PinRegistry<String, String>>,
     );
-    type _Scratch =
-        (BasicScratchAllocator, Box<dyn ScratchAllocator>, ScratchRequest, ScratchReservation);
+    type _Scratch = (Box<dyn ScratchAllocator>, ScratchRequest, ScratchReservation);
     type _Store = (
         PublishedPayload<String>,
         RetainedEnvelope<Vec<u8>>,
@@ -283,12 +273,13 @@ fn memory_preset_has_exactly_the_four_documented_variants() {
 /// advertises the preset it was built from — proving the public path is wired,
 /// not just present.
 #[test]
+#[cfg(feature = "live_control")]
 fn builder_first_surface_produces_a_broker_from_a_preset() {
     let broker = ProcessMemoryBrokerBuilder::new()
         .with_preset(MemoryPreset::Production)
         .build()
         .expect("a preset manifest is structurally valid and must build");
-    let report: EffectiveMemoryBudgetReport = broker.effective_report();
+    let report: EffectiveMemoryBudgetReport = broker.effective_report().expect("report lock");
     assert_eq!(
         report.preset,
         MemoryPreset::Production,
@@ -308,9 +299,18 @@ fn builder_first_surface_produces_a_broker_from_a_preset() {
 /// typed `MemoryError`, part of the public surface.
 #[test]
 fn builder_without_manifest_fails_closed_with_build_variant() {
-    let result: MemoryResult<BasicProcessMemoryBroker> = ProcessMemoryBrokerBuilder::new().build();
+    let result = ProcessMemoryBrokerBuilder::new().build_report_only();
     assert!(
         matches!(result, Err(MemoryError::Build(_))),
         "a missing manifest must fail closed with MemoryError::Build, got {result:?}"
     );
+}
+
+#[test]
+fn report_only_builder_returns_data_without_runtime_authority() {
+    let report = ProcessMemoryBrokerBuilder::new()
+        .with_preset(MemoryPreset::Production)
+        .build_report_only()
+        .expect("preset resolves");
+    assert_eq!(report.preset, MemoryPreset::Production);
 }

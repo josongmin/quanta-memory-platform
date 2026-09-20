@@ -1,3 +1,24 @@
+//! Builder-first portable memory platform.
+//!
+//! Report-only resolution returns data, not runtime authority:
+//!
+//! ```compile_fail
+//! # use quanta_memory_platform_facade::{MemoryPlatformBuilder, PortableMemoryPresets};
+//! # use quanta_memory_platform_core::RuntimeKind;
+//! # fn demo() -> Result<(), Box<dyn std::error::Error>> {
+//! let report = MemoryPlatformBuilder::new()
+//!     .with_manifest(PortableMemoryPresets::development())
+//!     .build_report_only()?;
+//! report.attach_runtime("runtime".to_string(), RuntimeKind::Runtime)?;
+//! # Ok(()) }
+//! ```
+//!
+//! The former unrestricted bumpalo scratch surface is not public:
+//!
+//! ```compile_fail
+//! use quanta_memory_platform_facade::scratch::bumpalo::BumpaloScratchArena;
+//! ```
+
 // Slice-agnostic glue is always available: the broker builder, presets, the
 // accounting seam, and byte-measurement. Each store/pipeline slice is gated
 // behind its feature so `--no-default-features` carries no slice surface and a
@@ -14,8 +35,6 @@ pub mod publish_pipeline;
 pub mod retained_map;
 #[cfg(feature = "revocable_store")]
 pub mod revocable_store;
-#[cfg(feature = "payload_store")]
-pub mod scratch;
 #[cfg(feature = "spill")]
 pub mod spill;
 #[cfg(feature = "transcript")]

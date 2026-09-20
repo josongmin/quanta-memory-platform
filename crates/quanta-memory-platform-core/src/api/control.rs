@@ -8,17 +8,22 @@
 //! observed only through the advisory lane and never mutates the ledger.
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 
+use crate::adapters::scratch::BrokerBoundScratchAllocator;
 use crate::application::controller::LadderPressureController;
 use crate::application::scheduler::WeightedResourceGroupScheduler;
 use crate::domain::config::ValidatedResidencyPolicy;
-use crate::domain::context::{MemoryContextKind, OwnerKey};
+use crate::domain::context::{
+    MemoryContextHandle, MemoryContextKind, OwnerKey, RuntimeId, RuntimeKind,
+};
 use crate::domain::errors::{MemoryError, MemoryResult};
 use crate::domain::ledger::{AccountingLedger, ChargeKind, LedgerSnapshot, ReservationTicket};
 use crate::domain::policy::{MemoryClass, ResidencyPolicy};
 use crate::domain::recharge::{RechargeError, RechargeRecoveryV1};
 use crate::domain::stats::{AllocatorSnapshot, EffectiveMemoryBudgetReport, PressureState};
+use crate::ports::scratch::ScratchAllocator;
+use crate::ports::store::StoreBindingHandle;
 use crate::ports::telemetry::AllocatorAdvisory;
 
 /// A live, accounting-backed process memory broker.
@@ -74,13 +79,63 @@ impl PendingReservation {
             }
         }
     }
+
+    pub(crate) fn rollback(&mut self) -> MemoryResult<()> {
+        if let Some(ticket) = self.ticket.as_ref() {
+            self.broker.rollback_pending_ticket(ticket)?;
+            self.ticket = None;
+        }
+        Ok(())
+    }
 }
 
 impl Drop for PendingReservation {
     fn drop(&mut self) {
         if let Some(ticket) = self.ticket.take() {
-            let _ = self.broker.rollback_pending_ticket(&ticket);
+            self.broker.rollback_pending_ticket_on_drop(&ticket);
         }
+    }
+}
+
+struct LiveRuntimeMemoryView {
+    runtime_id: RuntimeId,
+    runtime_kind: RuntimeKind,
+    scratch: BrokerBoundScratchAllocator,
+}
+
+impl LiveRuntimeMemoryView {
+    fn new(
+        broker: LiveProcessMemoryBroker,
+        runtime_id: RuntimeId,
+        runtime_kind: RuntimeKind,
+    ) -> Self {
+        Self {
+            scratch: BrokerBoundScratchAllocator::new(broker, runtime_id.clone()),
+            runtime_id,
+            runtime_kind,
+        }
+    }
+}
+
+impl crate::api::broker::RuntimeMemoryView for LiveRuntimeMemoryView {
+    fn runtime_id(&self) -> &RuntimeId {
+        &self.runtime_id
+    }
+
+    fn runtime_kind(&self) -> RuntimeKind {
+        self.runtime_kind
+    }
+
+    fn context(&self, kind: MemoryContextKind, owner: OwnerKey) -> MemoryContextHandle {
+        MemoryContextHandle::new(self.runtime_id.clone(), kind, owner)
+    }
+
+    fn bind_store(&self, class: MemoryClass, owner: OwnerKey) -> StoreBindingHandle {
+        StoreBindingHandle::new(class, owner, Some(self.runtime_id.clone()))
+    }
+
+    fn scratch(&self) -> &dyn ScratchAllocator {
+        &self.scratch
     }
 }
 
@@ -142,7 +197,7 @@ impl LiveProcessMemoryBroker {
     /// Build a live broker from a validated effective report. The residency
     /// policy is re-validated here so a broker can never come up on an invalid
     /// policy.
-    pub fn from_report(report: EffectiveMemoryBudgetReport) -> MemoryResult<Self> {
+    pub(crate) fn from_report(report: EffectiveMemoryBudgetReport) -> MemoryResult<Self> {
         let validated = ValidatedResidencyPolicy::try_from(report.residency.clone())?;
         let residency = validated.as_policy();
         let scheduler = WeightedResourceGroupScheduler::new(
@@ -418,6 +473,19 @@ impl LiveProcessMemoryBroker {
         Self::rollback_pending_on(&mut core, ticket)
     }
 
+    /// Emergency RAII cleanup for an abandoned pending permit.
+    ///
+    /// Public mutations remain fail-closed on a poisoned broker lock. Drop is
+    /// different: losing the only pending-ticket authority would permanently
+    /// strand class/owner/context/group capacity. Recover the poisoned guard and
+    /// perform only the exact pending rollback. The rollback validates the
+    /// ledger instance, ticket contents, and Pending state before subtraction;
+    /// it cannot release a committed charge.
+    fn rollback_pending_ticket_on_drop(&self, ticket: &ReservationTicket) {
+        let mut core = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        let _ = Self::rollback_pending_on(&mut core, ticket);
+    }
+
     fn release_many_on(core: &mut BrokerCore, tickets: &[ReservationTicket]) -> MemoryResult<()> {
         core.ledger.release_batch(tickets)?;
         for ticket in tickets {
@@ -513,12 +581,6 @@ impl LiveProcessMemoryBroker {
         use crate::application::scheduler::ResourceGroupScheduler;
         let core = self.lock()?;
         Ok(core.scheduler.admits(group_name, bytes))
-    }
-
-    /// Record committed resource-group usage (drives fairness/starvation).
-    pub fn record_group_usage(&self, group_name: &str, bytes: u64) -> MemoryResult<u64> {
-        let mut core = self.lock()?;
-        Ok(core.scheduler.record_usage(group_name, bytes))
     }
 
     /// Enter rebuild mode: subsequent live writes are rejected until
@@ -748,7 +810,7 @@ impl crate::api::broker::ProcessMemoryBroker for LiveProcessMemoryBroker {
         runtime_id: crate::domain::context::RuntimeId,
         runtime_kind: crate::domain::context::RuntimeKind,
     ) -> MemoryResult<Arc<dyn crate::api::broker::RuntimeMemoryView>> {
-        Ok(Arc::new(crate::api::broker::BasicRuntimeMemoryView::new(runtime_id, runtime_kind)))
+        Ok(Arc::new(LiveRuntimeMemoryView::new(self.clone(), runtime_id, runtime_kind)))
     }
 
     fn effective_report(&self) -> EffectiveMemoryBudgetReport {
@@ -770,10 +832,13 @@ impl crate::api::broker::ProcessMemoryBroker for LiveProcessMemoryBroker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::broker::ProcessMemoryBroker;
+    use crate::domain::context::RuntimeKind;
     use crate::domain::policy::{
         MemoryClassBudget, OwnerQuota, ReclaimPriority, ResidencyPolicy, ResourceGroup,
     };
     use crate::domain::stats::PressureState;
+    use crate::ports::scratch::ScratchRequest;
 
     fn report_with(mut residency: ResidencyPolicy) -> EffectiveMemoryBudgetReport {
         // Most control-plane tests isolate global/owner/group behavior. Expand
@@ -1980,6 +2045,175 @@ mod tests {
         );
     }
 
+    fn runtime_scratch_broker(cap: usize) -> LiveProcessMemoryBroker {
+        let report = EffectiveMemoryBudgetReport {
+            execution: crate::domain::policy::ExecutionBudget {
+                max_execution_scratch_bytes: Some(cap),
+                ..crate::domain::policy::ExecutionBudget::unlimited()
+            },
+            ..report_with(ResidencyPolicy::new(10_000_000))
+        };
+        LiveProcessMemoryBroker::from_report(report).expect("valid scratch broker")
+    }
+
+    #[test]
+    fn live_runtime_scratch_charge_appears_in_ledger_snapshot() {
+        let b = runtime_scratch_broker(100);
+        let runtime = b
+            .attach_runtime("runtime-a".to_string(), RuntimeKind::Runtime)
+            .expect("attach runtime");
+        let context = runtime.context(MemoryContextKind::Request, "owner:scratch".to_string());
+        let mut reservation = runtime
+            .scratch()
+            .reserve_scratch_scope(&context, ScratchRequest::new("working-set", 60))
+            .expect("scratch reserve");
+
+        let snapshot = b.ledger_snapshot().expect("snapshot");
+        assert_eq!(snapshot.total_live_scratch_bytes(), 60);
+        assert_eq!(snapshot.total_owner_bytes(), 60);
+        assert_eq!(
+            snapshot.class_usage.get(&MemoryClass::ExecutionScratch).map(|usage| usage.total()),
+            Some(60)
+        );
+        assert_eq!(snapshot.owner_usage.get("owner:scratch").map(|usage| usage.total()), Some(60));
+        assert_eq!(
+            snapshot.context_usage.get(&MemoryContextKind::Request).map(|usage| usage.total()),
+            Some(60)
+        );
+        assert!(reservation.is_enforced());
+
+        reservation.release().expect("explicit release");
+        assert_eq!(b.ledger_snapshot().expect("after release").total_owner_bytes(), 0);
+    }
+
+    #[test]
+    fn live_runtime_scratch_over_cap_is_denied_without_mutation() {
+        let b = runtime_scratch_broker(100);
+        let runtime = b
+            .attach_runtime("runtime-a".to_string(), RuntimeKind::Runtime)
+            .expect("attach runtime");
+        let context = runtime.context(MemoryContextKind::Request, "owner:scratch".to_string());
+        let held = runtime
+            .scratch()
+            .reserve_scratch_scope(&context, ScratchRequest::new("held", 80))
+            .expect("initial reserve");
+        let before = b.ledger_snapshot().expect("before denial");
+
+        let denied =
+            runtime.scratch().reserve_scratch_scope(&context, ScratchRequest::new("denied", 21));
+        assert!(matches!(denied, Err(MemoryError::Capacity(_))));
+        assert_eq!(b.ledger_snapshot().expect("after denial"), before);
+
+        drop(held);
+        assert_eq!(b.ledger_snapshot().expect("after drop").total_owner_bytes(), 0);
+    }
+
+    #[test]
+    fn runtime_scratch_and_direct_broker_charge_share_one_limit() {
+        let b = runtime_scratch_broker(100);
+        let direct = b
+            .reserve_committed(
+                MemoryClass::ExecutionScratch,
+                "owner:direct".to_string(),
+                MemoryContextKind::Request,
+                ChargeKind::LiveScratch,
+                60,
+            )
+            .expect("direct scratch charge");
+        let runtime = b
+            .attach_runtime("runtime-a".to_string(), RuntimeKind::Runtime)
+            .expect("attach runtime");
+        let context = runtime.context(MemoryContextKind::Request, "owner:runtime".to_string());
+
+        let denied = runtime
+            .scratch()
+            .reserve_scratch_scope(&context, ScratchRequest::new("shared-limit", 41));
+        assert!(matches!(denied, Err(MemoryError::Capacity(_))));
+        assert_eq!(b.ledger_snapshot().expect("snapshot").total_live_scratch_bytes(), 60);
+        b.release(&direct).expect("release direct charge");
+    }
+
+    #[test]
+    fn dropping_runtime_scratch_during_rebuild_returns_capacity() {
+        let b = runtime_scratch_broker(100);
+        let runtime = b
+            .attach_runtime("runtime-a".to_string(), RuntimeKind::Runtime)
+            .expect("attach runtime");
+        let context = runtime.context(MemoryContextKind::Request, "owner:scratch".to_string());
+        let reservation = runtime
+            .scratch()
+            .reserve_scratch_scope(&context, ScratchRequest::new("temporary", 100))
+            .expect("fill capacity");
+        b.begin_rebuild().expect("begin rebuild");
+
+        drop(reservation);
+
+        let snapshot = b.ledger_snapshot().expect("snapshot");
+        assert!(snapshot.rebuild_in_progress);
+        assert_eq!(snapshot.total_owner_bytes(), 0);
+        b.finish_rebuild().expect("finish rebuild");
+    }
+
+    #[test]
+    fn runtime_scratch_rejects_foreign_runtime_context_without_mutation() {
+        let b = runtime_scratch_broker(100);
+        let runtime = b
+            .attach_runtime("runtime-a".to_string(), RuntimeKind::Runtime)
+            .expect("attach runtime");
+        let foreign = MemoryContextHandle::new(
+            "runtime-b".to_string(),
+            MemoryContextKind::Request,
+            "owner:scratch".to_string(),
+        );
+        let before = b.ledger_snapshot().expect("before");
+
+        let denied =
+            runtime.scratch().reserve_scratch_scope(&foreign, ScratchRequest::new("foreign", 1));
+        assert!(matches!(denied, Err(MemoryError::InvalidState(_))));
+        assert_eq!(b.ledger_snapshot().expect("after"), before);
+    }
+
+    #[test]
+    fn runtime_scratch_release_restores_resource_group_capacity() {
+        let group = ResourceGroup {
+            reserved_bytes: 0,
+            soft_cap_bytes: 100,
+            hard_cap_bytes: 100,
+            burst_percent: 0,
+            reclaim_priority: ReclaimPriority::Normal,
+            admission_weight: 1,
+        };
+        let residency = ResidencyPolicy::new(10_000)
+            .with_class_budget(
+                MemoryClass::ExecutionScratch,
+                class_budget(0, 10_000, 10_000, false),
+            )
+            .with_resource_group("runtime-group", group)
+            .with_owner_group("owner:scratch", "runtime-group");
+        let report = EffectiveMemoryBudgetReport {
+            execution: crate::domain::policy::ExecutionBudget {
+                max_execution_scratch_bytes: Some(10_000),
+                ..crate::domain::policy::ExecutionBudget::unlimited()
+            },
+            ..report_with(residency)
+        };
+        let b = LiveProcessMemoryBroker::from_report(report).expect("broker");
+        let runtime = b
+            .attach_runtime("runtime-a".to_string(), RuntimeKind::Runtime)
+            .expect("attach runtime");
+        let context = runtime.context(MemoryContextKind::Request, "owner:scratch".to_string());
+        let mut reservation = runtime
+            .scratch()
+            .reserve_scratch_scope(&context, ScratchRequest::new("fills-group", 100))
+            .expect("fill group capacity");
+        assert!(!b.admits_group("runtime-group", 1).expect("group is full"));
+
+        reservation.release().expect("explicit scratch release");
+
+        assert!(b.admits_group("runtime-group", 100).expect("group capacity restored"));
+        assert_eq!(b.ledger_snapshot().expect("after release").total_owner_bytes(), 0);
+    }
+
     // A recharge whose NEW live-scratch charge exceeds the execution scratch budget
     // (not a class/owner cap) must also be denied AND restore the old scratch charge
     // — proving the restore path is exercised for the scratch-budget denial source,
@@ -2564,6 +2798,31 @@ mod tests {
         })
         .join();
         assert!(panicked.is_err(), "poison helper must panic while holding the lock");
+    }
+
+    #[test]
+    fn poisoned_runtime_scratch_explicit_release_preserves_then_drop_recovers_authority() {
+        let b = runtime_scratch_broker(100);
+        let runtime = b
+            .attach_runtime("runtime-a".to_string(), RuntimeKind::Runtime)
+            .expect("attach runtime");
+        let context = runtime.context(MemoryContextKind::Request, "owner:scratch".to_string());
+        let mut reservation = runtime
+            .scratch()
+            .reserve_scratch_scope(&context, ScratchRequest::new("poison-cleanup", 100))
+            .expect("reserve scratch");
+        poison_broker_lock(&b);
+
+        let denied = reservation.release();
+        assert!(matches!(denied, Err(MemoryError::InvalidState(_))));
+        assert!(reservation.is_enforced(), "failed explicit release retains retry authority");
+
+        drop(reservation);
+
+        let core = b.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        let snapshot = core.ledger.snapshot();
+        assert_eq!(snapshot.total_owner_bytes(), 0);
+        assert!(snapshot.class_owner_balanced() && snapshot.owner_partition_balanced());
     }
 
     #[test]

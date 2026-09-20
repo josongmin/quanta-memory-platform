@@ -48,13 +48,19 @@ Config lives at the repo root: `clippy.toml` (`too-many-arguments-threshold = 8`
 `use_small_heuristics = "Max"`), `deny.toml` (license allow-list; private members
 exempt), `.cargo/config.toml`. Toolchain: cargo 1.95.0.
 
-Feature flags (always test `--all-features`, but features must also build alone):
+Feature flags (the matrix runs clippy `-D warnings` on default, bare, each leaf,
+`full`, and all-features; features must not leak through dependency defaults):
 
-- **core:** `pressure`, `scheduler`, `telemetry` (= `metrics` + `hdrhistogram`), `full`
-- **facade:** `payload_store` (bumpalo), `retained_map`, `revocable_store` (moka + scc),
+- **core:** `pressure`, `scheduler`, `live_control`, `unbudgeted_pin` (explicit experimental adapter),
+  `telemetry` (= `metrics` + `hdrhistogram`), `full`
+- **facade:** `core-live-accounting`, `payload_store`, `retained_map`, `revocable_store` (moka + scc),
   `transcript`, `publish_pipeline`, `spill` (redb), `full`
 - **testkit:** `fixtures`, `doctor`, `conformance`, `faults`,
   `alloc_tracking` (tracking-allocator), `full`
+
+Facade disables core dependency defaults; only `core-live-accounting` may
+activate core `live_control`. The feature matrix checks the resolved Cargo graph,
+not only whether the extra symbols happen to compile.
 
 Extraction into a standalone repo is mechanical and fail-closed:
 

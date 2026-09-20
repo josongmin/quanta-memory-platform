@@ -35,7 +35,7 @@ quanta-memory-host (Semantica) -> quanta-memory-platform-{core,facade}   # OUTSI
 | Semantica nouns (`Semantica*`, `quanta_runtime`, `codegraph`) in public API | Library must stay host-independent |
 | Raw broker constructor in public code | Use the builder-first surface (`MemoryPlatformBuilder`, `ProcessMemoryBrokerBuilder`) |
 | A path dependency escaping `crates/` | Breaks standalone extraction |
-| Storage backing (redb/moka/scc/bumpalo) leaking outside its feature gate | Backings stay confined + feature-gated |
+| Storage backing (redb/moka/scc) leaking outside its feature gate | Backings stay confined + feature-gated |
 
 ### Where new code goes
 
@@ -144,10 +144,10 @@ crates/
     src/application/ # use-case services: controller (pressure), scheduler
     src/domain/      # config, context, errors, ledger (accounting SSOT), policy, stats
     src/ports/       # trait definitions: pin, scratch, store, telemetry
-    src/adapters/    # port impls: hdrhistogram, metrics
+    src/adapters/    # port impls: broker-backed scratch, hdrhistogram, metrics; explicit unbudgeted pin
   quanta-memory-platform-facade/   # feature-sliced portable stores + pipelines
     src/{payload_store,retained_map,revocable_store,transcript_store,publish_pipeline,spill}/
-    src/{presets,shared,scratch}/
+    src/{presets,shared}/
   quanta-memory-platform-testkit/  # conformance / chaos / alloc tooling (never a prod dep)
     src/{conformance,faults,fixtures,doctor,fake,alloc_tracking}/
 ```
@@ -160,12 +160,13 @@ Boundary rules (hexagonal direction is inward-only):
 - **`ports/`** holds trait definitions only — no concrete adapters, no I/O.
 - **`adapters/`** implement port traits; infra types (hdrhistogram, metrics) live
   here. Allocator telemetry from adapters is **advisory**: it never mutates ledger
-  counters.
+  counters. The in-memory pin registry is explicitly named `UnbudgetedPinRegistry`
+  and exists only behind the non-default `unbudgeted_pin` feature.
 - **`application/`** orchestrates domain + ports; carries no host nouns.
 - **`api/`** is the public broker surface, builder-first. Low-level broker
   backdoors stay `pub(crate)` / unexported.
-- **`facade`** composes core behind builders; storage backings (redb, moka, scc,
-  bumpalo) are feature-gated and confined to their `*/backings/` modules.
+- **`facade`** composes core behind builders; storage backings (redb, moka, scc)
+  are feature-gated and confined to their `*/backings/` modules.
 - **`testkit`** is NEVER a mandatory production dependency. `alloc_tracking` (the
   only `tracking-allocator` integration) is feature-gated so it can never enter a
   production graph.
@@ -237,13 +238,19 @@ Config lives at the repo root: `clippy.toml` (`too-many-arguments-threshold = 8`
 `use_small_heuristics = "Max"`), `deny.toml` (license allow-list; private members
 exempt), `.cargo/config.toml`. Toolchain: cargo 1.95.0.
 
-Feature flags (always test `--all-features`, but features must also build alone):
+Feature flags (the matrix runs clippy `-D warnings` on default, bare, each leaf,
+`full`, and all-features; features must not leak through dependency defaults):
 
-- **core:** `pressure`, `scheduler`, `telemetry` (= `metrics` + `hdrhistogram`), `full`
-- **facade:** `payload_store` (bumpalo), `retained_map`, `revocable_store` (moka + scc),
+- **core:** `pressure`, `scheduler`, `live_control`, `unbudgeted_pin` (explicit experimental adapter),
+  `telemetry` (= `metrics` + `hdrhistogram`), `full`
+- **facade:** `core-live-accounting`, `payload_store`, `retained_map`, `revocable_store` (moka + scc),
   `transcript`, `publish_pipeline`, `spill` (redb), `full`
 - **testkit:** `fixtures`, `doctor`, `conformance`, `faults`,
   `alloc_tracking` (tracking-allocator), `full`
+
+Facade disables core dependency defaults; only `core-live-accounting` may
+activate core `live_control`. The feature matrix checks the resolved Cargo graph,
+not only whether the extra symbols happen to compile.
 
 Extraction into a standalone repo is mechanical and fail-closed:
 

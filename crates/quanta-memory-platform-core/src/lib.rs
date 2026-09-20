@@ -1,14 +1,52 @@
+//! Portable memory-budget authority.
+//!
+//! Raw ledger construction is intentionally not part of the public API:
+//!
+//! ```compile_fail
+//! use quanta_memory_platform_core::AccountingLedger;
+//! ```
+//!
+//! A live broker is materialized only through [`ProcessMemoryBrokerBuilder`]:
+//!
+//! ```compile_fail
+//! # use quanta_memory_platform_core::{EffectiveMemoryBudgetReport, LiveProcessMemoryBroker};
+//! # fn raw(report: EffectiveMemoryBudgetReport) {
+//! let broker = LiveProcessMemoryBroker::from_report(report);
+//! # }
+//! ```
+//!
+//! Removed basic/unbudgeted constructors and nested raw authority are also
+//! pinned out of the safe surface:
+//!
+//! ```compile_fail
+//! use quanta_memory_platform_core::domain::ledger::AccountingLedger;
+//! ```
+//!
+//! ```compile_fail
+//! use quanta_memory_platform_core::api::broker::BasicProcessMemoryBroker;
+//! ```
+//!
+//! ```compile_fail
+//! use quanta_memory_platform_core::api::broker::BasicRuntimeMemoryView;
+//! ```
+//!
+//! ```compile_fail
+//! use quanta_memory_platform_core::adapters::scratch::BasicScratchAllocator;
+//! ```
+//!
+//! ```compile_fail
+//! use quanta_memory_platform_core::BasicPinRegistry;
+//! ```
+
 pub mod adapters;
 pub mod api;
 pub mod application;
 pub mod domain;
 pub mod ports;
 
-pub use adapters::pin::BasicPinRegistry;
-pub use adapters::scratch::BasicScratchAllocator;
-pub use api::broker::{
-    BasicProcessMemoryBroker, BasicRuntimeMemoryView, ProcessMemoryBroker, RuntimeMemoryView,
-};
+#[cfg(feature = "unbudgeted_pin")]
+pub use adapters::pin::UnbudgetedPinRegistry;
+pub use api::broker::{ProcessMemoryBroker, RuntimeMemoryView};
 pub use api::builder::ProcessMemoryBrokerBuilder;
 #[cfg(feature = "live_control")]
 pub use api::control::{
@@ -32,15 +70,14 @@ pub use domain::errors::{
     CapacityError, MemoryError, MemoryResult, PinError, PublishError, StoreDeleteError,
     StoreWriteError,
 };
-pub use domain::ledger::{
-    AccountingLedger, ChargeKind, LedgerSnapshot, ReservationTicket, UsageBreakdown,
-};
+pub use domain::ledger::{ChargeKind, LedgerSnapshot, ReservationTicket, UsageBreakdown};
 pub use domain::policy::{
     ExecutionBudget, MemoryBudgetManifest, MemoryClass, MemoryClassBudget, MemoryPreset,
     OwnerQuota, ReclaimPriority, ResidencyPolicy, ResourceGroup,
 };
 pub use domain::recharge::{RechargeError, RechargeRecoveryV1};
 pub use domain::stats::{AllocatorSnapshot, EffectiveMemoryBudgetReport, PressureState};
+#[cfg(feature = "unbudgeted_pin")]
 pub use ports::pin::{InvalidationOutcome, PayloadPinLease, PinRegistry};
 pub use ports::scratch::{ScratchAllocator, ScratchRequest, ScratchReservation};
 pub use ports::store::{

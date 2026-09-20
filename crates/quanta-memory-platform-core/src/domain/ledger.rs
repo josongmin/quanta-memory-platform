@@ -7,7 +7,9 @@
 //! 2. `sum(owner usage) == retained payload bytes + retained metadata bytes
 //!     + live scratch reservations`
 //! 3. `reserved <= soft <= hard` (validated when the policy is installed)
-//! 4. live writes are forbidden while `rebuild_in_progress`
+//! 4. committed/live writes are forbidden while `rebuild_in_progress`; rollback
+//!    of an incomplete pending reservation remains allowed so abandoned
+//!    capacity permits cannot strand reserved bytes during a rebuild
 //! 5. `sum(owner usage) <= global_hard_limit_bytes`; non-`Headroom` charges are
 //!    additionally capped at `global_hard_limit_bytes - headroom_bytes`, so the
 //!    reserved headroom band is only reachable by the `Headroom` class.
@@ -24,19 +26,27 @@
 //! behind a lock. Every mutating operation either fully succeeds or leaves the
 //! ledger untouched (fail-closed before mutation).
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
+#[cfg(feature = "live_control")]
+use std::collections::BTreeSet;
+#[cfg(feature = "live_control")]
 use std::sync::atomic::{AtomicU64, Ordering};
 
+#[cfg(feature = "live_control")]
 use crate::domain::config::ValidatedResidencyPolicy;
 use crate::domain::context::{MemoryContextKind, OwnerKey};
+#[cfg(feature = "live_control")]
 use crate::domain::errors::{MemoryError, MemoryResult};
-use crate::domain::policy::{MemoryClass, ResidencyPolicy};
+use crate::domain::policy::MemoryClass;
+#[cfg(feature = "live_control")]
+use crate::domain::policy::ResidencyPolicy;
 
 /// Process-global source of per-ledger instance tags. Ticket ids are only unique
 /// *within* a ledger (each ledger's counter starts at 1), so every issued ticket
 /// also carries its ledger's instance tag; commit/release reject a ticket whose
 /// tag does not match this ledger, defeating cross-ledger id-space collisions
 /// (invariant 7).
+#[cfg(feature = "live_control")]
 static LEDGER_INSTANCE: AtomicU64 = AtomicU64::new(1);
 
 /// Why a charge is held: a payload byte, a metadata byte, or a live scratch
@@ -71,6 +81,7 @@ pub struct ReservationTicket {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(feature = "live_control")]
 enum TicketState {
     Pending,
     Committed,
@@ -124,6 +135,7 @@ impl UsageBreakdown {
             .saturating_add(self.live_scratch_bytes)
     }
 
+    #[cfg(feature = "live_control")]
     fn slot_mut(&mut self, kind: ChargeKind) -> &mut u64 {
         match kind {
             ChargeKind::RetainedPayload => &mut self.retained_payload_bytes,
@@ -140,6 +152,7 @@ impl UsageBreakdown {
     /// counters and breaking invariant 1). The reserve path's cap checks already
     /// reject anything that would overflow the (much smaller) global limit, so
     /// saturation here is a defence-in-depth guard, never the normal path.
+    #[cfg(feature = "live_control")]
     fn add(&mut self, kind: ChargeKind, bytes: u64) {
         let slot = self.slot_mut(kind);
         *slot = slot.saturating_add(bytes);
@@ -148,6 +161,7 @@ impl UsageBreakdown {
     /// Subtract `bytes` from the given kind's slot, saturating at `0`. A live
     /// ticket can never over-subtract (its bytes were added when reserved), so
     /// the saturation floor is defence-in-depth and never the normal path.
+    #[cfg(feature = "live_control")]
     fn sub(&mut self, kind: ChargeKind, bytes: u64) {
         let slot = self.slot_mut(kind);
         *slot = slot.saturating_sub(bytes);
@@ -230,7 +244,8 @@ impl LedgerSnapshot {
 /// ledger epoch, so duplicating the ledger state would re-open cross-ledger
 /// replay hazards.
 #[derive(Debug)]
-pub struct AccountingLedger {
+#[cfg(feature = "live_control")]
+pub(crate) struct AccountingLedger {
     policy: ValidatedResidencyPolicy,
     class_usage: BTreeMap<MemoryClass, UsageBreakdown>,
     owner_usage: BTreeMap<OwnerKey, UsageBreakdown>,
@@ -245,6 +260,7 @@ pub struct AccountingLedger {
     rebuild_in_progress: bool,
 }
 
+#[cfg(feature = "live_control")]
 impl AccountingLedger {
     #[must_use]
     pub(crate) fn new(policy: ValidatedResidencyPolicy) -> Self {
@@ -275,13 +291,9 @@ impl AccountingLedger {
         self.policy = new_policy;
     }
 
-    #[must_use]
-    pub fn rebuild_in_progress(&self) -> bool {
-        self.rebuild_in_progress
-    }
-
-    /// Enter rebuild mode: live writes (reserve/commit/release) are rejected
-    /// until [`Self::finish_rebuild`] is called.
+    /// Enter rebuild mode: committed/live writes (reserve/commit/release) are
+    /// rejected until [`Self::finish_rebuild`] is called. Rollback of an
+    /// incomplete pending reservation is the sole cleanup exception.
     pub fn begin_rebuild(&mut self) {
         self.rebuild_in_progress = true;
     }
@@ -648,7 +660,7 @@ impl AccountingLedger {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "live_control"))]
 mod tests {
     use super::*;
     use crate::domain::config::ValidatedResidencyPolicy;

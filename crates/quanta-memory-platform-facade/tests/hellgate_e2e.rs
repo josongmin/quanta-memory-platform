@@ -15,10 +15,9 @@
 use std::sync::Arc;
 
 use quanta_memory_platform_core::{
-    ChargeKind, EffectiveMemoryBudgetReport, ExecutionBudget, LedgerSnapshot,
-    LiveProcessMemoryBroker, MemoryBudgetManifest, MemoryClass, MemoryClassBudget,
-    MemoryContextKind, MemoryError, MemoryPreset, ReclaimPriority, ResidencyPolicy,
-    StoreBindingHandle,
+    ChargeKind, ExecutionBudget, LedgerSnapshot, LiveProcessMemoryBroker, MemoryBudgetManifest,
+    MemoryClass, MemoryClassBudget, MemoryContextKind, MemoryError, MemoryPreset, ReclaimPriority,
+    ResidencyPolicy, StoreBindingHandle,
 };
 use quanta_memory_platform_facade::{
     RetainedMapStore, RetainedMapStoreBuilder, SharedAccountingSink, SimpleRetainedMapStore,
@@ -39,11 +38,14 @@ fn broker(global: u64, class_hard: u64) -> LiveProcessMemoryBroker {
             reclaim_priority: ReclaimPriority::Normal,
         },
     );
-    let report = EffectiveMemoryBudgetReport::from_manifest(
-        MemoryBudgetManifest::new(MemoryPreset::Production, ExecutionBudget::default(), residency),
-        vec!["hellgate-e2e".to_string()],
-    );
-    LiveProcessMemoryBroker::from_report(report).expect("valid broker")
+    quanta_memory_platform_core::ProcessMemoryBrokerBuilder::new()
+        .with_manifest(MemoryBudgetManifest::new(
+            MemoryPreset::Production,
+            ExecutionBudget::default(),
+            residency,
+        ))
+        .build()
+        .expect("valid broker")
 }
 
 fn charged_map(broker: &LiveProcessMemoryBroker) -> SimpleRetainedMapStore<String, Vec<u8>> {

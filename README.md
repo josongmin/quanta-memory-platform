@@ -37,9 +37,14 @@ the direction. The portable library carries no Semantica nouns
 
 ## Builder-first usage (recommended public surface)
 
-Consumers use the builder-first API, never low-level broker backdoors:
+Consumers use the builder-first API; raw ledger/broker constructors are not
+public:
 
-- `MemoryPlatformBuilder` (facade) to build a broker from a preset/manifest.
+- `MemoryPlatformBuilder::build()` creates the enforced `LiveMemoryPlatform`
+  from a preset/manifest. Live accounting is a default feature.
+- `MemoryPlatformBuilder::build_report_only()` resolves and validates the same
+  override chain but returns only `EffectiveMemoryBudgetReport`; it cannot
+  attach a runtime, allocate scratch, or construct charged stores.
 - `PortableMemoryPresets` for named budget manifests.
 - Store/pipeline builders (`PayloadStoreBuilder`, `RetainedMapStoreBuilder`,
   `RevocableStoreBuilder`, `PreparedPublicationServiceBuilder`,
@@ -57,14 +62,17 @@ Consumers use the builder-first API, never low-level broker backdoors:
   `build()` is infallible; `charged_against(...)` is available on either builder
   state. `SimpleRetainedMapStore` deliberately exposes no late sink attachment,
   so uncharged entries can never be reclassified as ledger-backed.
+- Runtime scratch obtained through `LiveMemoryPlatform::attach_runtime` is
+  charged against the same broker ledger, execution-scratch cap, class cap,
+  owner/group admission, and release lifecycle as direct broker charges.
 
 Examples (compile against the real public APIs):
 
 ```bash
-# library-only hello world
+# enforced runtime scratch: success, cap denial, release, final ledger zero
 cargo run -p quanta-memory-platform-facade --example hello_world
 
-# effective budget report
+# report-only resolution; no runtime authority
 cargo run -p quanta-memory-platform-facade --example effective_budget_report
 ```
 

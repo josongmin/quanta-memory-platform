@@ -1,5 +1,7 @@
 //! The pin-registry PORT: a pure trait surface plus its contract types. The
-//! concrete in-memory adapter lives in `crate::adapters::pin::BasicPinRegistry`
+//! explicitly unbudgeted in-memory adapter lives in
+//! `crate::adapters::pin::UnbudgetedPinRegistry` behind the non-default
+//! `unbudgeted_pin` feature.
 //! so the port layer carries no `std::sync`/storage machinery (hexagonal rule).
 
 use crate::PinError;

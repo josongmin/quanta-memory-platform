@@ -6,7 +6,7 @@
 //! the consumer reaching into `conformance/*` or `fake/*` directly.
 
 use quanta_memory_platform_core::{
-    EffectiveMemoryBudgetReport, LiveProcessMemoryBroker, MemoryBudgetManifest, MemoryPreset,
+    LiveProcessMemoryBroker, MemoryBudgetManifest, MemoryPreset, ProcessMemoryBrokerBuilder,
 };
 
 use crate::conformance::{ConformanceSuite, ConformanceVerdict};
@@ -50,11 +50,7 @@ impl MemoryTestKit {
     pub fn live_broker(
         &self,
     ) -> quanta_memory_platform_core::MemoryResult<LiveProcessMemoryBroker> {
-        let report = EffectiveMemoryBudgetReport::from_manifest(
-            self.fixture.manifest.clone(),
-            vec!["memory-testkit".to_string()],
-        );
-        LiveProcessMemoryBroker::from_report(report)
+        ProcessMemoryBrokerBuilder::new().with_manifest(self.fixture.manifest.clone()).build()
     }
 
     /// Run the reusable broker accounting conformance suite against this kit's

@@ -9,6 +9,7 @@
 # such a break is caught BEFORE extraction.
 #
 # Axes checked, per member crate:
+#   - default features                      (the consumer-default surface)
 #   - --no-default-features                 (the bare, slice-free surface)
 #   - --no-default-features --features <f>  (each individual feature, ALONE)
 #   - --all-features                        (everything on together)
@@ -28,7 +29,7 @@ CORE_CRATE="quanta-memory-platform-core"
 FACADE_CRATE="quanta-memory-platform-facade"
 TESTKIT_CRATE="quanta-memory-platform-testkit"
 
-CORE_FEATURES=(pressure scheduler telemetry)
+CORE_FEATURES=(pressure scheduler live_control unbudgeted_pin telemetry)
 # Facade leaf slices PLUS the durable/concurrent BACKING features. Building a
 # backing alone (`--no-default-features --features spill-redb`) is the only way to
 # catch a backing module that fails to compile, leaks a symbol, or silently
@@ -37,6 +38,7 @@ CORE_FEATURES=(pressure scheduler telemetry)
 # every backing at once (a cross-backing feature-unification break shows up there).
 # Names are taken verbatim from facade/Cargo.toml — no invented variants.
 FACADE_FEATURES=(
+  core-live-accounting
   payload_store
   retained_map
   revocable_store
@@ -56,7 +58,7 @@ check_combo() {
   local label="$2"
   shift 2
   echo "==> [${crate}] checking: ${label}"
-  cargo check -p "${crate}" --all-targets "$@"
+  cargo clippy -p "${crate}" --all-targets "$@" -- -D warnings
 }
 
 # check_crate <crate> <feature...>
@@ -66,21 +68,24 @@ check_crate() {
   shift
   local features=("$@")
 
-  # 1. bare surface: no default, no features.
+  # 1. consumer-default surface.
+  check_combo "${crate}" "default features"
+
+  # 2. bare surface: no default, no features.
   check_combo "${crate}" "--no-default-features" --no-default-features
 
-  # 2. each individual feature, enabled ALONE on top of no-default-features.
+  # 3. each individual feature, enabled ALONE on top of no-default-features.
   local feature
   for feature in "${features[@]}"; do
     check_combo "${crate}" "feature '${feature}' alone" \
       --no-default-features --features "${feature}"
   done
 
-  # 3. the documented full aggregate, alone.
+  # 4. the documented full aggregate, alone.
   check_combo "${crate}" "--no-default-features --features full" \
     --no-default-features --features full
 
-  # 4. everything on together (mirrors check-workspace.sh's surface).
+  # 5. everything on together (mirrors check-workspace.sh's surface).
   check_combo "${crate}" "--all-features" --all-features
 }
 
@@ -90,11 +95,21 @@ check_crate "${CORE_CRATE}" "${CORE_FEATURES[@]}"
 check_crate "${FACADE_CRATE}" "${FACADE_FEATURES[@]}"
 check_crate "${TESTKIT_CRATE}" "${TESTKIT_FEATURES[@]}"
 
+# Facade's no-default graph must not activate core's default/live-control
+# surface through dependency defaults. Compilation alone cannot detect this
+# feature leak because the extra symbols still compile successfully.
+facade_bare_tree="$(cargo tree -p "${FACADE_CRATE}" --no-default-features -e features)"
+if rg -q 'quanta-memory-platform-core feature "(default|live_control)"' <<<"${facade_bare_tree}"; then
+  echo "feature-matrix: facade --no-default-features leaked core default/live_control" >&2
+  printf '%s\n' "${facade_bare_tree}" >&2
+  exit 1
+fi
+
 # Whole-workspace bookends: the two extremes must also resolve together, since a
 # cross-crate feature unification bug only shows up at the workspace level.
 echo "==> [workspace] checking: --workspace --no-default-features"
-cargo check --workspace --all-targets --no-default-features
+cargo clippy --workspace --all-targets --no-default-features -- -D warnings
 echo "==> [workspace] checking: --workspace --all-features"
-cargo check --workspace --all-targets --all-features
+cargo clippy --workspace --all-targets --all-features -- -D warnings
 
-echo "feature-matrix: OK (all feature combinations compiled)"
+echo "feature-matrix: OK (all feature combinations compiled warning-free)"

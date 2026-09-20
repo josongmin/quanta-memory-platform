@@ -1,9 +1,7 @@
-use crate::api::broker::BasicProcessMemoryBroker;
 #[cfg(feature = "live_control")]
 use crate::api::control::LiveProcessMemoryBroker;
-#[cfg(feature = "live_control")]
 use crate::domain::config::EffectiveBudgetResolver;
-use crate::domain::config::{validate_residency, BudgetOverrideLayer, OverrideSource};
+use crate::domain::config::{BudgetOverrideLayer, OverrideSource};
 use crate::domain::policy::MemoryBudgetManifest;
 use crate::domain::stats::EffectiveMemoryBudgetReport;
 use crate::{MemoryError, MemoryPreset, MemoryResult};
@@ -36,25 +34,7 @@ impl ProcessMemoryBrokerBuilder {
         self
     }
 
-    pub fn build(self) -> MemoryResult<BasicProcessMemoryBroker> {
-        let manifest = self
-            .manifest
-            .clone()
-            .ok_or_else(|| MemoryError::build("memory budget manifest is required"))?;
-        // Mirror `build_live`/`from_report`: a non-live broker must never be able
-        // to come up advertising a structurally impossible policy (e.g. a class
-        // hard cap above the global limit, or soft > hard). Validate the
-        // residency BEFORE we emit any report so the build fails closed with a
-        // typed `Config` error instead of handing out a misleading report.
-        validate_residency(&manifest.residency)?;
-        let report = EffectiveMemoryBudgetReport::from_manifest(
-            manifest,
-            vec!["builder.with_manifest".to_string()],
-        );
-        Ok(BasicProcessMemoryBroker::new(report))
-    }
-
-    /// Resolve config precedence and build a live accounting-backed broker.
+    /// Resolve config precedence and build the enforced accounting-backed broker.
     ///
     /// This runs the full effective-budget resolution (manifest + override
     /// layers), validates the residency policy, emits an
@@ -62,7 +42,25 @@ impl ProcessMemoryBrokerBuilder {
     /// constructs the broker. Fails closed with a typed error if the resolved
     /// policy is invalid.
     #[cfg(feature = "live_control")]
+    pub fn build(self) -> MemoryResult<LiveProcessMemoryBroker> {
+        let report = self.resolve_report()?;
+        LiveProcessMemoryBroker::from_report(report)
+    }
+
+    /// Compatibility alias for callers migrating to the enforced default.
+    #[cfg(feature = "live_control")]
     pub fn build_live(self) -> MemoryResult<LiveProcessMemoryBroker> {
+        self.build()
+    }
+
+    /// Resolve the same manifest and override chain as [`Self::build`] but return
+    /// only the effective report. The report carries no runtime, scratch, store,
+    /// or accounting authority.
+    pub fn build_report_only(self) -> MemoryResult<EffectiveMemoryBudgetReport> {
+        self.resolve_report()
+    }
+
+    fn resolve_report(self) -> MemoryResult<EffectiveMemoryBudgetReport> {
         let manifest = self
             .manifest
             .ok_or_else(|| MemoryError::build("memory budget manifest is required"))?;
@@ -73,8 +71,7 @@ impl ProcessMemoryBrokerBuilder {
             resolver = resolver.with_layer(source, layer);
         }
         let resolved = resolver.resolve()?;
-        let report = EffectiveMemoryBudgetReport::from_resolved(execution, resolved);
-        LiveProcessMemoryBroker::from_report(report)
+        Ok(EffectiveMemoryBudgetReport::from_resolved(execution, resolved))
     }
 
     pub fn with_preset(self, preset: MemoryPreset) -> Self {
@@ -86,7 +83,6 @@ impl ProcessMemoryBrokerBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::broker::ProcessMemoryBroker;
     use crate::domain::policy::{
         ExecutionBudget, MemoryClass, MemoryClassBudget, ReclaimPriority, ResidencyPolicy,
     };
@@ -101,16 +97,18 @@ mod tests {
         }
     }
 
-    // scenario C-builder: build() with NO manifest fails closed (typed Build).
+    // scenario C-builder: both products fail closed without a manifest.
     #[test]
     fn build_without_manifest_returns_build_error() {
-        let err = ProcessMemoryBrokerBuilder::new().build();
-        assert!(matches!(err, Err(MemoryError::Build(_))), "missing manifest is a Build error");
+        let report = ProcessMemoryBrokerBuilder::new().build_report_only();
+        assert!(matches!(report, Err(MemoryError::Build(_))));
+        #[cfg(feature = "live_control")]
+        assert!(matches!(ProcessMemoryBrokerBuilder::new().build(), Err(MemoryError::Build(_))));
     }
 
     // scenario C-builder: a structurally INVALID residency (class hard cap above
     // the global hard limit) must be rejected by build() with a typed Config
-    // error, mirroring build_live/from_report — the non-live broker can never
+    // error, mirroring build/from_report — report resolution can never
     // come up advertising an impossible policy.
     #[test]
     fn build_with_invalid_residency_returns_config_error() {
@@ -123,7 +121,7 @@ mod tests {
             ExecutionBudget::default(),
             bad_residency,
         );
-        let result = ProcessMemoryBrokerBuilder::new().with_manifest(manifest).build();
+        let result = ProcessMemoryBrokerBuilder::new().with_manifest(manifest).build_report_only();
         assert!(
             matches!(result, Err(MemoryError::Config(_))),
             "invalid residency must fail build() with a typed Config error, got {result:?}"
@@ -144,7 +142,7 @@ mod tests {
         );
         assert!(
             matches!(
-                ProcessMemoryBrokerBuilder::new().with_manifest(manifest).build(),
+                ProcessMemoryBrokerBuilder::new().with_manifest(manifest).build_report_only(),
                 Err(MemoryError::Config(_))
             ),
             "soft>hard must fail build() with a typed Config error"
@@ -163,11 +161,10 @@ mod tests {
             ExecutionBudget::default(),
             residency.clone(),
         );
-        let broker = ProcessMemoryBrokerBuilder::new()
+        let report = ProcessMemoryBrokerBuilder::new()
             .with_manifest(manifest)
-            .build()
+            .build_report_only()
             .expect("a structurally valid manifest must build");
-        let report = broker.effective_report();
         assert_eq!(
             report.residency.global_hard_limit_bytes, 1_000_000,
             "broker must advertise the residency it was built from"
@@ -190,8 +187,26 @@ mod tests {
         );
 
         assert!(matches!(
-            ProcessMemoryBrokerBuilder::new().with_manifest(manifest).build(),
+            ProcessMemoryBrokerBuilder::new().with_manifest(manifest).build_report_only(),
             Err(MemoryError::Config(_))
         ));
+    }
+
+    #[test]
+    fn report_only_builder_applies_override_layers() {
+        let report = ProcessMemoryBrokerBuilder::new()
+            .with_preset(MemoryPreset::Development)
+            .with_override_layer(
+                OverrideSource::TestFixture,
+                BudgetOverrideLayer::empty().with_global_hard_limit_bytes(5_000_000_000),
+            )
+            .build_report_only()
+            .expect("override remains structurally valid");
+
+        assert_eq!(report.residency.global_hard_limit_bytes, 5_000_000_000);
+        assert_eq!(
+            report.override_provenance.last().map(|record| record.source),
+            Some(OverrideSource::TestFixture)
+        );
     }
 }

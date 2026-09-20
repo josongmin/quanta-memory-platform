@@ -1,51 +1,67 @@
-//! Concrete adapter for the [`ScratchAllocator`] port.
+//! Broker-backed implementation of the scratch-allocation port.
 //!
-//! Lives in `adapters/` so the port layer is a pure trait + value-type surface;
-//! the allocator implementation belongs here (hexagonal rule).
+//! A scratch scope is a capacity permit: it reserves the execution-scratch
+//! budget before the caller allocates memory and owns that pending authority
+//! until explicit release or drop. It deliberately does not create a second
+//! counter beside the broker ledger.
 
-use crate::ports::scratch::{ScratchAllocator, ScratchRequest, ScratchReservation};
-use crate::{CapacityError, MemoryContextHandle};
+use crate::api::control::{LiveProcessMemoryBroker, PendingReservation};
+use crate::domain::context::{MemoryContextHandle, RuntimeId};
+use crate::domain::errors::MemoryError;
+use crate::domain::ledger::ChargeKind;
+use crate::domain::policy::MemoryClass;
+use crate::ports::scratch::{
+    ScratchAllocator, ScratchRequest, ScratchReservation, ScratchReservationAuthority,
+};
+use crate::{CapacityError, MemoryResult};
 
-/// The default scratch allocator: hands out a reservation sized exactly to the
-/// request. Accounting/enforcement is the broker's responsibility; this adapter
-/// only materializes the [`ScratchReservation`] value.
-#[derive(Clone, Debug, Default)]
-pub struct BasicScratchAllocator;
+struct BrokerScratchAuthority {
+    pending: PendingReservation,
+}
 
-impl ScratchAllocator for BasicScratchAllocator {
+impl ScratchReservationAuthority for BrokerScratchAuthority {
+    fn release(&mut self) -> MemoryResult<()> {
+        self.pending.rollback()
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct BrokerBoundScratchAllocator {
+    broker: LiveProcessMemoryBroker,
+    runtime_id: RuntimeId,
+}
+
+impl BrokerBoundScratchAllocator {
+    pub(crate) fn new(broker: LiveProcessMemoryBroker, runtime_id: RuntimeId) -> Self {
+        Self { broker, runtime_id }
+    }
+}
+
+impl ScratchAllocator for BrokerBoundScratchAllocator {
     fn reserve_scratch_scope(
         &self,
         ctx: &MemoryContextHandle,
         request: ScratchRequest,
     ) -> Result<ScratchReservation, CapacityError> {
-        Ok(ScratchReservation {
-            context: ctx.clone(),
-            label: request.label,
-            reserved_bytes: request.requested_bytes,
-            observed_bytes: 0,
-            released: false,
-        })
-    }
-}
+        if ctx.runtime_id != self.runtime_id {
+            return Err(MemoryError::InvalidState(format!(
+                "scratch context runtime {} does not match attached runtime {}",
+                ctx.runtime_id, self.runtime_id
+            )));
+        }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{ChargeKind, MemoryContextKind, OwnerKey, RuntimeId};
-
-    #[test]
-    fn basic_allocator_reserves_a_live_scratch_scope_sized_to_the_request() {
-        let ctx = MemoryContextHandle::new(
-            RuntimeId::from("rt"),
-            MemoryContextKind::Request,
-            OwnerKey::from("owner"),
-        );
-        let res = BasicScratchAllocator
-            .reserve_scratch_scope(&ctx, ScratchRequest::new("buf", 4096))
-            .expect("basic allocator reserves");
-        assert_eq!(res.reserved_bytes, 4096, "reservation mirrors the requested bytes");
-        assert_eq!(res.observed_bytes, 0, "fresh reservation observes nothing yet");
-        assert!(!res.released, "fresh reservation is live");
-        assert_eq!(res.charge_kind(), ChargeKind::LiveScratch, "scratch is LiveScratch");
+        let pending = self.broker.reserve_owned(
+            MemoryClass::ExecutionScratch,
+            ctx.owner.clone(),
+            ctx.kind,
+            ChargeKind::LiveScratch,
+            request.requested_bytes,
+        )?;
+        Ok(ScratchReservation::enforced(
+            ctx.clone(),
+            request.label,
+            request.requested_bytes,
+            Box::new(BrokerScratchAuthority { pending }),
+        ))
     }
 }

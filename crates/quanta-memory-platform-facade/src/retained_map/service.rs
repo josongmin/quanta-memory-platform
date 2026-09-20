@@ -1106,19 +1106,17 @@ mod tests {
         // This is the intentional non-budgeted path, kept distinct from the charged
         // path below.
         use quanta_memory_platform_core::{
-            EffectiveMemoryBudgetReport, ExecutionBudget, LiveProcessMemoryBroker,
-            MemoryBudgetManifest, MemoryPreset, ResidencyPolicy,
+            ExecutionBudget, MemoryBudgetManifest, MemoryPreset, ResidencyPolicy,
         };
 
-        let report = EffectiveMemoryBudgetReport::from_manifest(
-            MemoryBudgetManifest::new(
+        let broker = quanta_memory_platform_core::ProcessMemoryBrokerBuilder::new()
+            .with_manifest(MemoryBudgetManifest::new(
                 MemoryPreset::Production,
                 ExecutionBudget::default(),
                 ResidencyPolicy::new(1_000_000),
-            ),
-            vec!["test".to_string()],
-        );
-        let broker = LiveProcessMemoryBroker::from_report(report).expect("valid broker");
+            ))
+            .build()
+            .expect("valid broker");
 
         // No `charged_against`: explicit non-budgeted mode.
         let store = store();
@@ -1197,9 +1195,9 @@ mod tests {
         use super::*;
         use crate::shared::accounting::{AccountingSink, SharedAccountingSink};
         use quanta_memory_platform_core::{
-            EffectiveMemoryBudgetReport, ExecutionBudget, LiveProcessMemoryBroker,
-            MemoryBudgetManifest, MemoryClassBudget, MemoryPreset, MemoryResult, RechargeError,
-            RechargeRecoveryV1, ReclaimPriority, ResidencyPolicy,
+            ExecutionBudget, LiveProcessMemoryBroker, MemoryBudgetManifest, MemoryClassBudget,
+            MemoryPreset, MemoryResult, RechargeError, RechargeRecoveryV1, ReclaimPriority,
+            ResidencyPolicy,
         };
         use std::sync::Arc;
 
@@ -1214,15 +1212,14 @@ mod tests {
                     reclaim_priority: ReclaimPriority::Normal,
                 },
             );
-            let report = EffectiveMemoryBudgetReport::from_manifest(
-                MemoryBudgetManifest::new(
+            quanta_memory_platform_core::ProcessMemoryBrokerBuilder::new()
+                .with_manifest(MemoryBudgetManifest::new(
                     MemoryPreset::Production,
                     ExecutionBudget::default(),
                     residency,
-                ),
-                vec!["test".to_string()],
-            );
-            LiveProcessMemoryBroker::from_report(report).expect("valid broker")
+                ))
+                .build()
+                .expect("valid broker")
         }
 
         fn charged(broker: &LiveProcessMemoryBroker) -> SimpleRetainedMapStore<String, Vec<u8>> {

@@ -26,7 +26,7 @@ quanta-memory-host (Semantica) -> quanta-memory-platform-{core,facade}   # OUTSI
 | Semantica nouns (`Semantica*`, `quanta_runtime`, `codegraph`) in public API | Library must stay host-independent |
 | Raw broker constructor in public code | Use the builder-first surface (`MemoryPlatformBuilder`, `ProcessMemoryBrokerBuilder`) |
 | A path dependency escaping `crates/` | Breaks standalone extraction |
-| Storage backing (redb/moka/scc/bumpalo) leaking outside its feature gate | Backings stay confined + feature-gated |
+| Storage backing (redb/moka/scc) leaking outside its feature gate | Backings stay confined + feature-gated |
 
 ### Where new code goes
 

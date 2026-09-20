@@ -1,6 +1,6 @@
 use quanta_memory_platform_core::{
-    BasicProcessMemoryBroker, MemoryBudgetManifest, MemoryPreset, MemoryResult,
-    ProcessMemoryBrokerBuilder,
+    BudgetOverrideLayer, EffectiveMemoryBudgetReport, MemoryBudgetManifest, MemoryPreset,
+    MemoryResult, OverrideSource, ProcessMemoryBrokerBuilder,
 };
 
 // Imports shared by the store/pipeline builders; present only when at least one
@@ -72,21 +72,35 @@ impl MemoryPlatformBuilder {
         self
     }
 
-    pub fn build(self) -> MemoryResult<BasicProcessMemoryBroker> {
-        self.inner.build()
+    #[must_use]
+    pub fn with_override_layer(
+        mut self,
+        source: OverrideSource,
+        layer: BudgetOverrideLayer,
+    ) -> Self {
+        self.inner = self.inner.with_override_layer(source, layer);
+        self
     }
 
-    /// Build a live, accounting-backed platform — the builder-first surface for a
-    /// CHARGED deployment. Consumers never name the concrete `LiveProcessMemoryBroker`
-    /// nor hand-roll `Arc::new(broker.clone())`: the returned [`LiveMemoryPlatform`]
-    /// encapsulates the accounting sink and hands out pre-charged store builders.
+    /// Build the enforced, accounting-backed default platform.
+    #[cfg(feature = "core-live-accounting")]
+    pub fn build(self) -> MemoryResult<LiveMemoryPlatform> {
+        Ok(LiveMemoryPlatform::new(self.inner.build()?))
+    }
+
+    /// Compatibility alias for consumers migrating to the enforced default.
     #[cfg(feature = "core-live-accounting")]
     pub fn build_live(self) -> MemoryResult<LiveMemoryPlatform> {
-        Ok(LiveMemoryPlatform::new(self.inner.build_live()?))
+        self.build()
+    }
+
+    /// Resolve configuration without creating runtime or accounting authority.
+    pub fn build_report_only(self) -> MemoryResult<EffectiveMemoryBudgetReport> {
+        self.inner.build_report_only()
     }
 }
 
-/// A live, accounting-backed memory platform built via [`MemoryPlatformBuilder::build_live`].
+/// A live, accounting-backed memory platform built via [`MemoryPlatformBuilder::build`].
 ///
 /// It owns the live broker (the accounting SSOT) and the single shared accounting
 /// sink derived from it, and exposes pre-charged store builders so every store is
@@ -167,6 +181,25 @@ impl LiveMemoryPlatform {
         &self,
     ) -> PreparedPublicationServiceBuilder<Payload> {
         PreparedPublicationServiceBuilder::new().charged_against(self.sink())
+    }
+}
+
+#[cfg(feature = "core-live-accounting")]
+impl quanta_memory_platform_core::ProcessMemoryBroker for LiveMemoryPlatform {
+    fn attach_runtime(
+        &self,
+        runtime_id: quanta_memory_platform_core::RuntimeId,
+        runtime_kind: quanta_memory_platform_core::RuntimeKind,
+    ) -> MemoryResult<std::sync::Arc<dyn quanta_memory_platform_core::RuntimeMemoryView>> {
+        quanta_memory_platform_core::ProcessMemoryBroker::attach_runtime(
+            &self.broker,
+            runtime_id,
+            runtime_kind,
+        )
+    }
+
+    fn effective_report(&self) -> EffectiveMemoryBudgetReport {
+        quanta_memory_platform_core::ProcessMemoryBroker::effective_report(&self.broker)
     }
 }
 
@@ -506,20 +539,17 @@ impl<SessionId, MessageId, Message> SessionTranscriptStoreBuilder<SessionId, Mes
 #[cfg(all(test, feature = "full"))]
 mod tests {
     use super::*;
-    use quanta_memory_platform_core::{
-        EffectiveMemoryBudgetReport, LiveProcessMemoryBroker, MemoryBudgetManifest, MemoryClass,
-    };
+    use quanta_memory_platform_core::{LiveProcessMemoryBroker, MemoryClass};
 
     fn binding() -> StoreBindingHandle {
         StoreBindingHandle::new(MemoryClass::ArtifactCache, "owner".to_string(), None)
     }
 
     fn live_broker() -> LiveProcessMemoryBroker {
-        let report = EffectiveMemoryBudgetReport::from_manifest(
-            MemoryBudgetManifest::for_preset(MemoryPreset::Development),
-            vec!["builder-tests".to_string()],
-        );
-        LiveProcessMemoryBroker::from_report(report).expect("valid broker")
+        quanta_memory_platform_core::ProcessMemoryBrokerBuilder::new()
+            .with_preset(MemoryPreset::Development)
+            .build()
+            .expect("valid broker")
     }
 
     #[test]
@@ -625,13 +655,13 @@ mod tests {
     }
 
     #[test]
-    fn build_live_platform_composes_charged_stores_without_manual_glue() {
+    fn default_build_composes_charged_stores_without_manual_glue() {
         use crate::retained_map::RetainedMapStore;
         // Builder-first CHARGED path: no LiveProcessMemoryBroker named, no
         // Arc::new(broker.clone()) written — the platform encapsulates both.
         let platform = MemoryPlatformBuilder::new()
             .with_preset(MemoryPreset::Development)
-            .build_live()
+            .build()
             .expect("live platform builds from preset");
         let store =
             platform.retained_map_store_builder::<String, Vec<u8>>().bind(binding()).build();
@@ -647,10 +677,10 @@ mod tests {
     }
 
     #[test]
-    fn build_live_platform_sink_is_the_same_ledger_as_the_broker() {
+    fn default_build_platform_sink_is_the_same_ledger_as_the_broker() {
         let platform = MemoryPlatformBuilder::new()
             .with_preset(MemoryPreset::Development)
-            .build_live()
+            .build()
             .expect("live platform");
         // TWO distinct stores from the SAME platform must share ONE ledger via
         // platform.sink(): the broker sees the SUM of both. A regression where

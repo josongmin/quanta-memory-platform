@@ -6,10 +6,11 @@ version.workspace = true
 publish.workspace = true
 
 [features]
-default = []
+default = ["live_control"]
 pressure = []
 scheduler = []
 live_control = ["pressure", "scheduler"]
+unbudgeted_pin = []
 telemetry = ["dep:metrics", "dep:hdrhistogram"]
 full = ["live_control", "telemetry"]
 

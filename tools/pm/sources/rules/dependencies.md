@@ -6,7 +6,6 @@ against `deny.toml`.
 
 **Shared versions** (pin in root `[workspace.dependencies]`, opt in per crate):
 
-- `bumpalo` — facade `payload_store` scratch arena
 - `moka`, `scc` — facade `revocable_store` backings
 - `redb` — facade `spill` backing
 - `hdrhistogram`, `metrics` — core `telemetry` adapters

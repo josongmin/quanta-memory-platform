@@ -1,7 +1,7 @@
 use quanta_memory_platform_core::{
     ExecutionBudget, MemoryBudgetManifest, MemoryClass, MemoryClassBudget, MemoryError,
-    MemoryPreset, OwnerQuota, PressureState, ProcessMemoryBroker, ProcessMemoryBrokerBuilder,
-    ReclaimPriority, ResidencyPolicy, ResourceGroup, ValidatedResidencyPolicy,
+    MemoryPreset, OwnerQuota, PressureState, ProcessMemoryBrokerBuilder, ReclaimPriority,
+    ResidencyPolicy, ResourceGroup, ValidatedResidencyPolicy,
 };
 
 #[test]
@@ -96,16 +96,14 @@ fn residency_policy_tracks_class_quota_and_resource_group_vocabulary() {
 
 #[test]
 fn builder_emits_effective_budget_report_with_override_provenance() {
-    let broker = ProcessMemoryBrokerBuilder::new()
+    let report = ProcessMemoryBrokerBuilder::new()
         .with_preset(MemoryPreset::Ci)
-        .build()
+        .build_report_only()
         .expect("builder with preset should succeed");
-
-    let report = broker.effective_report();
 
     assert_eq!(report.preset, MemoryPreset::Ci);
     assert_eq!(report.execution.max_trace_edges, Some(10_000));
-    assert_eq!(report.override_sources, vec!["builder.with_manifest".to_string()]);
+    assert_eq!(report.override_sources, vec!["preset".to_string()]);
     assert_eq!(report.residency.global_hard_limit_bytes, 512 * 1024 * 1024);
 }
 
@@ -149,20 +147,21 @@ mod live_control_contracts {
     }
 
     fn broker_from_residency(residency: ResidencyPolicy) -> LiveProcessMemoryBroker {
-        let report = EffectiveMemoryBudgetReport::from_manifest(
-            MemoryBudgetManifest::new(MemoryPreset::Ci, ExecutionBudget::default(), residency),
-            vec!["wave1.contract".to_string()],
-        );
-        LiveProcessMemoryBroker::from_report(report)
+        ProcessMemoryBrokerBuilder::new()
+            .with_manifest(MemoryBudgetManifest::new(
+                MemoryPreset::Ci,
+                ExecutionBudget::default(),
+                residency,
+            ))
+            .build()
             .expect("residency policy is structurally valid")
     }
 
     fn broker_for_preset(preset: MemoryPreset) -> LiveProcessMemoryBroker {
-        let report = EffectiveMemoryBudgetReport::from_manifest(
-            MemoryBudgetManifest::for_preset(preset),
-            vec!["builder.with_manifest".to_string()],
-        );
-        LiveProcessMemoryBroker::from_report(report).expect("preset residency must be valid")
+        ProcessMemoryBrokerBuilder::new()
+            .with_preset(preset)
+            .build()
+            .expect("preset residency must be valid")
     }
 
     #[test]
@@ -385,7 +384,10 @@ mod live_control_contracts {
             );
             let cap = report.residency.classes[&MemoryClass::ManifestResidency].hard_cap_bytes;
             assert!(cap > 0, "{preset:?} must grant ManifestResidency a positive cap");
-            let b = LiveProcessMemoryBroker::from_report(report).expect("preset broker builds");
+            let b = ProcessMemoryBrokerBuilder::new()
+                .with_preset(preset.clone())
+                .build()
+                .expect("preset broker builds");
 
             let denied = b.reserve(
                 MemoryClass::ManifestResidency,

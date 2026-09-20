@@ -90,6 +90,23 @@ check helpers that the control plane enforces (see group C/D).
 - ✅ reconfig deny rules + pressure-from-semantic + advisory-non-mutating — existing `live_reconfig_*`, `pressure_classifies_from_semantic_usage`, `allocator_advisory_mismatch_does_not_mutate_accounting`.
 - ✅ **scheduler → reserve admission (fail-closed)** — `reserve_gated_by_resource_group_admission_fail_closed`, `owner_without_group_mapping_is_not_gated_by_admission` (`core/src/api/control.rs`). Owner→group mapping now gates a `reserve`: a group-admission denial blocks the reserve and leaves accounting untouched; an unmapped owner is not gated.
 - ✅ **ExecutionBudget scratch enforcement** — `execution_scratch_budget_caps_live_scratch_and_spares_other_kinds` (`core/src/api/control.rs`); the live-scratch cap admits within budget and denies over it without disturbing other charge kinds.
+- ✅ **Enforced default + explicit report-only product** — core/facade `build()`
+  materialize live accounting authority; `build_report_only()` returns only the
+  effective report. `default_builder_over_cap_store_mutation_is_denied` and
+  `default_builder_and_report_only_share_override_resolution`
+  (`facade/tests/public_api_surface.rs`) pin typed cap denial and canonical
+  override parity.
+- ✅ **Broker-bound runtime scratch** —
+  `live_runtime_scratch_charge_appears_in_ledger_snapshot`,
+  `live_runtime_scratch_over_cap_is_denied_without_mutation`,
+  `runtime_scratch_and_direct_broker_charge_share_one_limit`,
+  `runtime_scratch_release_restores_resource_group_capacity`,
+  `dropping_runtime_scratch_during_rebuild_returns_capacity`,
+  `runtime_scratch_rejects_foreign_runtime_context_without_mutation`, and
+  `poisoned_runtime_scratch_explicit_release_preserves_then_drop_recovers_authority`
+  (`core/src/api/control.rs`). Scratch is a pending capacity permit: rebuild
+  fences committed/live writes but permits exact rollback of incomplete pending
+  authority so drop cannot strand ledger or group capacity.
 
 ## D. Scheduler — ✅ (`core/src/application/scheduler.rs`)
 
@@ -141,7 +158,10 @@ choice documented in `facade/src/publish_pipeline/service.rs`, not a gap.
 ## H. Extraction / portability rails — ✅ (`scripts/`, root manifests)
 
 - ✅ existing: direction, no host nouns, dry-run pre-flight, standalone build.
-- ✅ **Per-feature build matrix** — `tools/ci/feature-matrix.sh` exercises `--no-default-features` + single-feature builds, and `scripts/check-workspace.sh` now runs it as the one-shot rail.
+- ✅ **Per-feature build matrix** — `tools/ci/feature-matrix.sh` runs clippy
+  `-D warnings` across default, bare, every leaf feature, `full`, and
+  all-features, and rejects facade no-default graphs that activate core
+  `default`/`live_control` through dependency defaults.
 - ✅ **Public API surface snapshot** — re-export regression guard: `crates/quanta-memory-platform-core/tests/public_api_surface.rs`.
 - ✅ **Self-hosting extracted set** — `scripts/lib/self-hosting-manifest.sh`, `scripts/scaffold-external-repo.sh`, and `scripts/extract-to-standalone-repo.sh` assert the canonical extracted file set and reject copied `tools/ci/gates`.
 
@@ -166,8 +186,10 @@ choice documented in `facade/src/publish_pipeline/service.rs`, not a gap.
 - ✅ observation-only invariant — `allocator_telemetry_trait_surface_is_observation_only`, `trait_path_absent_allocator_data_never_contradicts_ssot`, `emitter_holds_no_accounting_state`.
 - ✅ hdrhistogram adapter — `records_deterministic_set_and_reads_back_count_and_percentiles`, `invalid_bounds_return_error_not_panic`, `out_of_range_record_is_rejected_and_does_not_mutate_count`.
 
-## M. Pin registry — ✅ (`core/src/ports/pin.rs`)
+## M. Experimental unbudgeted pin registry — ✅ (`core/src/{ports,adapters}/pin.rs`)
 
+- ✅ It is absent from default builds and available only as the explicitly named
+  `UnbudgetedPinRegistry` behind the non-default `unbudgeted_pin` feature.
 - ✅ poison fail-closed (no panic) — `poisoned_lock_is_fail_closed_not_panicking`.
 - ✅ no over-count + round-trip — `duplicate_pin_does_not_over_count_dependent`, `distinct_dependents_each_increment_count`, `pin_invalidate_round_trip_tracks_dependent_count`, `invalidation_outcome_reports_exact_dependents`.
 
@@ -175,6 +197,9 @@ choice documented in `facade/src/publish_pipeline/service.rs`, not a gap.
 
 - ✅ misuse resistance — `grow_after_release_is_rejected_and_fail_closed`, `double_release_is_rejected_not_silent`, `grow_beyond_reserved_is_fail_closed_capacity_error`.
 - ✅ charge-kind + lifecycle — `reservation_maps_to_live_scratch_charge_kind`, `lifecycle_reserve_grow_release_succeeds_in_order`.
+- ✅ broker-backed authority — live runtime coverage is listed in group C; the
+  concrete port implementation lives in `core/src/adapters/scratch.rs`, not in
+  the port or API module.
 
 ## R. Cross-cutting contracts — ✅ (`core/tests/wave1_policy_contracts.rs`)
 
@@ -190,10 +215,14 @@ New invariants promoted to the public API boundary:
 
 ---
 
-## Closeout status — ✅
+## Current campaign status — 🚧
 
-- No open remaining tranche is tracked at the standalone-library scope.
-- No known limitation is tracked at the standalone-library scope.
+- QMP-030 implementation is locally covered by default/bare/leaf/full/all
+  warning-free feature slices, runtime scratch owner tests, public surface
+  compile-fail tests, examples, and extraction dry-run.
+- Terminal standalone extraction, host-adapter adoption, facade authority
+  migration, and SemVer/feature policy remain separately owned by QMP-120,
+  QMP-130, QMP-040, and QMP-140. Do not infer those closures from this file.
 - Charged facade mutations are now uniformly fail-closed: charge via `reserve_committed`,
   overwrite via `recharge`, and refund-bearing delete/reclaim/truncate paths via
   fallible refund-before-mutate APIs.
@@ -209,7 +238,7 @@ cargo test --workspace --all-features
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo fmt --all --check
 cargo deny --all-features check
-scripts/check-workspace.sh            # includes the per-feature build matrix
+scripts/check-workspace.sh            # includes warning-free feature matrix + feature-leak guard
 scripts/memory-platform-doctor        # repo-local fmt/clippy/feature-matrix/check/test/examples/deny rail
 # list the evidence test names per file:
 grep -rA1 '#\[test\]' crates --include='*.rs' | grep -oE 'fn [a-z0-9_]+'

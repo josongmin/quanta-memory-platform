@@ -320,9 +320,8 @@ mod tests {
         use super::*;
         use crate::shared::accounting::SharedAccountingSink;
         use quanta_memory_platform_core::{
-            EffectiveMemoryBudgetReport, ExecutionBudget, LiveProcessMemoryBroker,
-            MemoryBudgetManifest, MemoryClassBudget, MemoryPreset, ReclaimPriority,
-            ResidencyPolicy,
+            ExecutionBudget, LiveProcessMemoryBroker, MemoryBudgetManifest, MemoryClassBudget,
+            MemoryPreset, ReclaimPriority, ResidencyPolicy,
         };
         use std::sync::Arc;
 
@@ -337,15 +336,14 @@ mod tests {
                     reclaim_priority: ReclaimPriority::First,
                 },
             );
-            let report = EffectiveMemoryBudgetReport::from_manifest(
-                MemoryBudgetManifest::new(
+            quanta_memory_platform_core::ProcessMemoryBrokerBuilder::new()
+                .with_manifest(MemoryBudgetManifest::new(
                     MemoryPreset::Production,
                     ExecutionBudget::default(),
                     residency,
-                ),
-                vec!["test".to_string()],
-            );
-            LiveProcessMemoryBroker::from_report(report).expect("valid broker")
+                ))
+                .build()
+                .expect("valid broker")
         }
 
         fn charged(broker: &LiveProcessMemoryBroker) -> SimpleRevocableStore<String, Vec<u8>> {

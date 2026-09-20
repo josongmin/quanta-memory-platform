@@ -404,9 +404,8 @@ mod tests {
 
         use crate::shared::accounting::SharedAccountingSink;
         use quanta_memory_platform_core::{
-            EffectiveMemoryBudgetReport, ExecutionBudget, LiveProcessMemoryBroker,
-            MemoryBudgetManifest, MemoryClassBudget, MemoryPreset, ReclaimPriority,
-            ResidencyPolicy,
+            ExecutionBudget, LiveProcessMemoryBroker, MemoryBudgetManifest, MemoryClassBudget,
+            MemoryPreset, ReclaimPriority, ResidencyPolicy,
         };
 
         fn live_broker(global: u64, class_hard: u64) -> LiveProcessMemoryBroker {
@@ -420,15 +419,14 @@ mod tests {
                     reclaim_priority: ReclaimPriority::Normal,
                 },
             );
-            let report = EffectiveMemoryBudgetReport::from_manifest(
-                MemoryBudgetManifest::new(
+            quanta_memory_platform_core::ProcessMemoryBrokerBuilder::new()
+                .with_manifest(MemoryBudgetManifest::new(
                     MemoryPreset::Production,
                     ExecutionBudget::default(),
                     residency,
-                ),
-                vec!["test".to_string()],
-            );
-            LiveProcessMemoryBroker::from_report(report).expect("valid broker")
+                ))
+                .build()
+                .expect("valid broker")
         }
 
         fn charged_store(broker: &LiveProcessMemoryBroker) -> SimplePayloadStore<String, Vec<u8>> {

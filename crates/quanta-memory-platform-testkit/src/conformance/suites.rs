@@ -956,8 +956,8 @@ mod tests {
     use crate::conformance::target::{AccountingView, AllocatorAdvisoryView};
     use crate::fake::{AccountingFidelity, FakeProcessBroker};
     use quanta_memory_platform_core::{
-        EffectiveMemoryBudgetReport, LiveProcessMemoryBroker, MemoryBudgetManifest, MemoryClass,
-        MemoryClassBudget, MemoryPreset, ReclaimPriority, ResidencyPolicy, StoreBindingHandle,
+        LiveProcessMemoryBroker, MemoryBudgetManifest, MemoryClass, MemoryClassBudget,
+        MemoryPreset, ReclaimPriority, ResidencyPolicy, StoreBindingHandle,
     };
     #[cfg(feature = "fixtures")]
     use quanta_memory_platform_core::{RechargeError, RechargeRecoveryV1};
@@ -1641,15 +1641,14 @@ mod tests {
                     reclaim_priority: ReclaimPriority::Normal,
                 },
             );
-        let report = EffectiveMemoryBudgetReport::from_manifest(
-            MemoryBudgetManifest::new(
+        quanta_memory_platform_core::ProcessMemoryBrokerBuilder::new()
+            .with_manifest(MemoryBudgetManifest::new(
                 MemoryPreset::Ci,
                 quanta_memory_platform_core::ExecutionBudget::default(),
                 residency,
-            ),
-            vec!["conformance-cap-test".to_string()],
-        );
-        LiveProcessMemoryBroker::from_report(report).expect("valid residency")
+            ))
+            .build()
+            .expect("valid residency")
     }
 
     #[test]

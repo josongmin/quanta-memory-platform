@@ -1,4 +1,4 @@
-//! Concrete in-memory adapter for the [`PinRegistry`] port.
+//! Explicitly unbudgeted in-memory adapter for the [`PinRegistry`] port.
 //!
 //! Lives in `adapters/` (not `ports/`) so the port layer stays a pure trait
 //! surface: the `Arc<Mutex<HashMap>>` machinery and `std::sync` dependency belong
@@ -11,17 +11,17 @@ use crate::ports::pin::{InvalidationOutcome, PayloadPinLease, PinRegistry};
 use crate::{MemoryError, MemoryResult, PinError};
 
 #[derive(Clone, Default)]
-pub struct BasicPinRegistry {
+pub struct UnbudgetedPinRegistry {
     state: Arc<Mutex<HashMap<String, Vec<String>>>>,
 }
 
-impl std::fmt::Debug for BasicPinRegistry {
+impl std::fmt::Debug for UnbudgetedPinRegistry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("BasicPinRegistry").finish_non_exhaustive()
+        f.debug_struct("UnbudgetedPinRegistry").finish_non_exhaustive()
     }
 }
 
-impl BasicPinRegistry {
+impl UnbudgetedPinRegistry {
     /// Acquire the state lock fail-closed: a poisoned lock surfaces as a typed
     /// `MemoryError::InvalidState` instead of panicking, so a mutating op can
     /// abort cleanly without taking the process down. Mirrors the broker
@@ -43,7 +43,7 @@ impl BasicPinRegistry {
     }
 }
 
-impl PinRegistry<String, String> for BasicPinRegistry {
+impl PinRegistry<String, String> for UnbudgetedPinRegistry {
     fn pin(
         &self,
         payload: String,
@@ -78,8 +78,8 @@ impl PinRegistry<String, String> for BasicPinRegistry {
 mod tests {
     use super::*;
 
-    fn registry() -> BasicPinRegistry {
-        BasicPinRegistry::default()
+    fn registry() -> UnbudgetedPinRegistry {
+        UnbudgetedPinRegistry::default()
     }
 
     // scenario M: pin -> invalidate -> unpin (re-pin) round-trip leaves the

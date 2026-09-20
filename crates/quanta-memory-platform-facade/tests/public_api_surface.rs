@@ -30,7 +30,7 @@ use quanta_memory_platform_facade::{
 // assertions below). These are core re-exports consumed through the facade's
 // public dependency, not facade internals.
 #[cfg(feature = "core-live-accounting")]
-use quanta_memory_platform_core::{EffectiveMemoryBudgetReport, LiveProcessMemoryBroker};
+use quanta_memory_platform_core::{LiveProcessMemoryBroker, ProcessMemoryBrokerBuilder};
 use quanta_memory_platform_core::{MemoryBudgetManifest, MemoryClass, MemoryPreset};
 
 /// Names EVERY always-on facade re-export in type position. Never called; its only
@@ -52,21 +52,20 @@ fn names_always_on_reexports() {
 #[cfg(feature = "core-live-accounting")]
 #[test]
 fn live_broker_bridge_is_present_only_with_core_live_accounting() {
-    let report = EffectiveMemoryBudgetReport::from_manifest(
-        MemoryBudgetManifest::for_preset(MemoryPreset::Production),
-        vec!["public-api-surface".to_string()],
-    );
-    let broker = LiveProcessMemoryBroker::from_report(report).expect("valid broker");
-    let _sink: SharedAccountingSink = std::sync::Arc::new(broker);
+    let platform = MemoryPlatformBuilder::new()
+        .with_preset(MemoryPreset::Production)
+        .build()
+        .expect("valid platform");
+    let _sink: SharedAccountingSink = platform.sink();
 }
 
 #[cfg(feature = "core-live-accounting")]
+#[allow(dead_code)] // some isolated feature slices enable the bridge without a store test consumer.
 fn public_test_broker() -> LiveProcessMemoryBroker {
-    let report = EffectiveMemoryBudgetReport::from_manifest(
-        MemoryBudgetManifest::for_preset(MemoryPreset::Production),
-        vec!["public-api-surface".to_string()],
-    );
-    LiveProcessMemoryBroker::from_report(report).expect("valid broker")
+    ProcessMemoryBrokerBuilder::new()
+        .with_preset(MemoryPreset::Production)
+        .build()
+        .expect("valid broker")
 }
 
 #[cfg(feature = "payload_store")]
@@ -258,6 +257,7 @@ fn portable_presets_cover_every_preset_with_full_class_taxonomy() {
 /// portable facade entry point (no raw broker constructor). Pins that
 /// `MemoryPlatformBuilder` is wired to the core builder, not merely re-exported.
 #[test]
+#[cfg(feature = "core-live-accounting")]
 fn memory_platform_builder_builds_a_broker_from_a_preset() {
     let result = MemoryPlatformBuilder::new().with_preset(MemoryPreset::Production).build();
     assert!(result.is_ok(), "a preset manifest is structurally valid and must build: {result:?}");
@@ -267,9 +267,104 @@ fn memory_platform_builder_builds_a_broker_from_a_preset() {
 /// typed error (never panics, never a default broker) — pinning the builder's
 /// fail-closed error contract.
 #[test]
+#[cfg(feature = "core-live-accounting")]
 fn memory_platform_builder_without_config_fails_closed() {
     let result = MemoryPlatformBuilder::new().build();
     assert!(result.is_err(), "an unconfigured builder must fail closed, got Ok");
+}
+
+#[test]
+fn report_only_builder_resolves_without_runtime_authority() {
+    let report = MemoryPlatformBuilder::new()
+        .with_preset(MemoryPreset::Production)
+        .build_report_only()
+        .expect("preset resolves");
+    assert_eq!(report.preset, MemoryPreset::Production);
+}
+
+#[test]
+fn report_only_builder_without_config_fails_closed() {
+    let result = MemoryPlatformBuilder::new().build_report_only();
+    assert!(result.is_err(), "an unconfigured report builder must fail closed");
+}
+
+#[cfg(all(feature = "core-live-accounting", feature = "retained_map"))]
+#[test]
+fn default_builder_over_cap_store_mutation_is_denied() {
+    use quanta_memory_platform_core::{
+        ExecutionBudget, MemoryClassBudget, ReclaimPriority, ResidencyPolicy, StoreBindingHandle,
+    };
+
+    let residency = ResidencyPolicy::new(100).with_class_budget(
+        MemoryClass::ArtifactCache,
+        MemoryClassBudget {
+            reserved_bytes: 0,
+            soft_cap_bytes: 64,
+            hard_cap_bytes: 64,
+            borrow_from_shared_pool: false,
+            reclaim_priority: ReclaimPriority::Normal,
+        },
+    );
+    let manifest =
+        MemoryBudgetManifest::new(MemoryPreset::Ci, ExecutionBudget::default(), residency);
+    let platform =
+        MemoryPlatformBuilder::new().with_manifest(manifest).build().expect("enforced platform");
+    let binding = StoreBindingHandle::new(
+        MemoryClass::ArtifactCache,
+        "default-builder-owner".to_string(),
+        None,
+    );
+    let store = platform.retained_map_store_builder::<String, Vec<u8>>().bind(binding).build();
+    store.insert_checked("fits".to_string(), vec![0; 64]).expect("at cap");
+    let before = platform.broker().ledger_snapshot().expect("before denial");
+
+    let denied = store.insert_checked("over".to_string(), vec![1]);
+    assert!(
+        matches!(denied, Err(quanta_memory_platform_core::MemoryError::Capacity(_))),
+        "cap+1 store mutation must return typed Capacity denial"
+    );
+    assert_eq!(platform.broker().ledger_snapshot().expect("after denial"), before);
+    assert!(store.get(&"over".to_string()).is_none(), "denied value was not retained");
+}
+
+#[cfg(feature = "core-live-accounting")]
+#[test]
+fn default_builder_and_report_only_share_override_resolution() {
+    use quanta_memory_platform_core::{
+        BudgetOverrideLayer, ExecutionBudget, MemoryClassBudget, OverrideSource, ReclaimPriority,
+        ResidencyPolicy,
+    };
+
+    let residency = ResidencyPolicy::new(100).with_class_budget(
+        MemoryClass::ArtifactCache,
+        MemoryClassBudget {
+            reserved_bytes: 0,
+            soft_cap_bytes: 80,
+            hard_cap_bytes: 80,
+            borrow_from_shared_pool: false,
+            reclaim_priority: ReclaimPriority::Normal,
+        },
+    );
+    let builder = MemoryPlatformBuilder::new()
+        .with_manifest(MemoryBudgetManifest::new(
+            MemoryPreset::Ci,
+            ExecutionBudget::default(),
+            residency,
+        ))
+        .with_override_layer(
+            OverrideSource::TestFixture,
+            BudgetOverrideLayer::empty().with_global_hard_limit_bytes(80),
+        );
+    let expected = builder.clone().build_report_only().expect("report");
+    let platform = builder.build().expect("live platform");
+    let actual = platform.broker().effective_report().expect("live report");
+
+    assert_eq!(actual, expected);
+    assert_eq!(actual.residency.global_hard_limit_bytes, 80);
+    assert_eq!(
+        actual.override_provenance.last().map(|record| record.source),
+        Some(OverrideSource::TestFixture)
+    );
 }
 
 /// The `payload_store` builder yields a `SimplePayloadStore`, and a fresh store

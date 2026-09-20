@@ -6,12 +6,12 @@ version.workspace = true
 publish.workspace = true
 
 [features]
-default = []
+default = ["core-live-accounting"]
 # Facade-local gate for live-broker accounting paths. Forward core's
 # `live_control` feature so the live broker type and controller surfaces are
 # present whenever the facade wires the broker in as an accounting sink.
 core-live-accounting = ["quanta-memory-platform-core/live_control"]
-payload_store = ["dep:bumpalo"]
+payload_store = []
 retained_map = ["dep:hashlink"]
 # Base store/pipeline slices are pure-Rust in-memory and carry NO third-party
 # (copyleft) backing deps. Durable/concurrent backings are opt-in via the
@@ -42,11 +42,14 @@ full = [
 # `full-backings` = `full` plus every durable/concurrent backing (heavy deps).
 full-backings = ["full", "spill-redb", "revocable-moka", "revocable-scc"]
 
+[[example]]
+name = "hello_world"
+required-features = ["core-live-accounting"]
+
 [dependencies]
 blake3 = { workspace = true, optional = true }
-bumpalo = { workspace = true, optional = true }
 hashlink = { workspace = true, optional = true }
 moka = { workspace = true, optional = true }
-quanta-memory-platform-core = { path = "../quanta-memory-platform-core" }
+quanta-memory-platform-core = { path = "../quanta-memory-platform-core", default-features = false }
 redb = { workspace = true, optional = true }
 scc = { workspace = true, optional = true }

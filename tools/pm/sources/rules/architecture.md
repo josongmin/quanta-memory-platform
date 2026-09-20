@@ -28,10 +28,10 @@ crates/
     src/application/ # use-case services: controller (pressure), scheduler
     src/domain/      # config, context, errors, ledger (accounting SSOT), policy, stats
     src/ports/       # trait definitions: pin, scratch, store, telemetry
-    src/adapters/    # port impls: hdrhistogram, metrics
+    src/adapters/    # port impls: broker-backed scratch, hdrhistogram, metrics; explicit unbudgeted pin
   quanta-memory-platform-facade/   # feature-sliced portable stores + pipelines
     src/{payload_store,retained_map,revocable_store,transcript_store,publish_pipeline,spill}/
-    src/{presets,shared,scratch}/
+    src/{presets,shared}/
   quanta-memory-platform-testkit/  # conformance / chaos / alloc tooling (never a prod dep)
     src/{conformance,faults,fixtures,doctor,fake,alloc_tracking}/
 ```
@@ -44,12 +44,13 @@ Boundary rules (hexagonal direction is inward-only):
 - **`ports/`** holds trait definitions only — no concrete adapters, no I/O.
 - **`adapters/`** implement port traits; infra types (hdrhistogram, metrics) live
   here. Allocator telemetry from adapters is **advisory**: it never mutates ledger
-  counters.
+  counters. The in-memory pin registry is explicitly named `UnbudgetedPinRegistry`
+  and exists only behind the non-default `unbudgeted_pin` feature.
 - **`application/`** orchestrates domain + ports; carries no host nouns.
 - **`api/`** is the public broker surface, builder-first. Low-level broker
   backdoors stay `pub(crate)` / unexported.
-- **`facade`** composes core behind builders; storage backings (redb, moka, scc,
-  bumpalo) are feature-gated and confined to their `*/backings/` modules.
+- **`facade`** composes core behind builders; storage backings (redb, moka, scc)
+  are feature-gated and confined to their `*/backings/` modules.
 - **`testkit`** is NEVER a mandatory production dependency. `alloc_tracking` (the
   only `tracking-allocator` integration) is feature-gated so it can never enter a
   production graph.
