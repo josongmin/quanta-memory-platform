@@ -22,5 +22,6 @@ jobs:
           scripts/tests/extraction-contracts.sh
           qmp_extract_dir="$(mktemp -d /tmp/qmp-ci-extraction.XXXXXX)"
           scripts/extract-to-standalone-repo.sh "${qmp_extract_dir}"
+          "${qmp_extract_dir}/scripts/check-workspace-offline.sh"
           test -z "$(git -C "${qmp_extract_dir}" status --porcelain)"
           cargo metadata --locked --format-version 1 --manifest-path "${qmp_extract_dir}/Cargo.toml" > /dev/null
