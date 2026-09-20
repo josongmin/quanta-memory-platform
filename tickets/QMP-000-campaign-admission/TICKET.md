@@ -60,11 +60,11 @@ Blocks: every implementation ticket
 
 ## Acceptance
 
-- [ ] ticket tree를 한 명령으로 검증할 수 있다.
-- [ ] fixture에서 missing file, cycle, uncovered finding, stale receipt가 모두 RED다.
-- [ ] 실제 tree는 GREEN이다.
-- [ ] validator는 product code를 수정하지 않는다.
-- [ ] `README` 상태 변경과 receipt 생성 절차가 결정적이다.
+- [x] ticket tree를 한 명령으로 검증할 수 있다.
+- [x] fixture에서 missing file, cycle, uncovered finding, stale receipt가 모두 RED다.
+- [x] 실제 tree는 GREEN이다.
+- [x] validator는 product code를 수정하지 않는다.
+- [x] `README` 상태 변경과 receipt 생성 절차가 결정적이다.
 
 ## Verification
 
@@ -85,3 +85,7 @@ python3 tools/pm/pm.py lint
 
 `STATIC`, validator negative fixtures, current tree GREEN receipt가 필요하다. 문서가 존재하는 것만으로 QMP-000을 닫지 않는다.
 
+## Receipt
+
+- Validator implementation commits: `fd4fdf08c362131193856898a4d7aeb539f59d53`, `dc2e7d0373911ec4fa943a5c0129ebf680ca0817`
+- Receipt: [`receipts/2026-09-20T183609Z-dc2e7d0.md`](receipts/2026-09-20T183609Z-dc2e7d0.md)

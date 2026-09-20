@@ -41,7 +41,7 @@
 
 | ID | 우선순위 | 상태 | 목적 | depends_on | 주요 write set |
 | --- | --- | --- | --- | --- | --- |
-| [QMP-000](QMP-000-campaign-admission/TICKET.md) | P1 | READY | source freeze, claim, RED baseline, receipt discipline | — | `tickets/**` only |
+| [QMP-000](QMP-000-campaign-admission/TICKET.md) | P1 | QUALIFIED | source freeze, claim, RED baseline, receipt discipline | — | `tickets/**` only |
 | [QMP-010](QMP-010-policy-totality/TICKET.md) | P1 | IMPLEMENTED | mandatory class totality와 validated policy authority | QMP-000 | core `policy.rs`, `config.rs`, builder/policy tests |
 | [QMP-020](QMP-020-reservation-lifecycle/TICKET.md) | P1 | BLOCKED | reservation typestate, commit-once, abandoned rollback | QMP-010 | core `ledger.rs`, recharge/control seams |
 | [QMP-030](QMP-030-enforced-builder-runtime-view/TICKET.md) | P1 | BLOCKED | enforced default builder, raw authority 축소, broker-bound runtime scratch | QMP-010, QMP-020 | core/facade builders, broker/control/scratch API, examples |
@@ -151,6 +151,11 @@ QMP-140 SemVer/docs closeout waits for QMP-130
 6. focused tests → owning crate all-features → workspace rails 순서로 실행.
 7. Cargo/use path/public API 변경 시 actual extraction까지 실행.
 8. receipt를 `tickets/<id>/receipts/<timestamp>-<sha>.md`에 남기고 status 변경을 제안.
+
+Active claim은 [`CLAIM-TEMPLATE.md`](CLAIM-TEMPLATE.md)를 복사해
+`tickets/claims/<ticket-id>-<owner>.md`에 두며, claim 종료 시 제거한다.
+`scripts/verify-tickets.sh`는 inventory/dependency/finding/claim/receipt 체인을
+negative fixture와 실제 tree 양쪽에서 검증하는 canonical admission command다.
 
 ## 8. Receipt evidence levels
 
