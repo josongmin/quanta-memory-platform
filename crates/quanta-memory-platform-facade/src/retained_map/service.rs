@@ -518,7 +518,9 @@ where
         self.restore_state(state);
         // Dropping an arbitrary client key may unwind. Publish the exact
         // ledger-matching postimage before invoking that destructor.
-        drop(retired_key);
+        // A panicking client key destructor must not prevent returning the
+        // removed value or unwind into its destructor after the ledger refund.
+        retire_client_value(retired_key);
         Ok(Some(removed.value))
     }
 
@@ -1775,6 +1777,33 @@ mod tests {
             assert_eq!(broker.ledger_snapshot().expect("unchanged ledger").total_owner_bytes(), 0);
         }
 
+        #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+        struct PanicMeasuredKey(u8);
+
+        impl ByteSized for PanicMeasuredKey {
+            fn byte_size(&self) -> u64 {
+                panic!("injected key measurement panic")
+            }
+        }
+
+        #[test]
+        fn key_measurement_panic_precedes_accounting_and_preserves_state() {
+            let broker = live_broker(1_000);
+            let binding = StoreBindingHandle::new(
+                MemoryClass::MemoResidency,
+                "key-measure-panic-owner".into(),
+                None,
+            );
+            let store: SimpleRetainedMapStore<PanicMeasuredKey, Vec<u8>, Budgeted> =
+                SimpleRetainedMapStore::new_budgeted(binding, broker.clone());
+            let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = store.insert_checked(PanicMeasuredKey(1), vec![1]);
+            }));
+            assert!(caught.is_err());
+            assert_eq!(store.stats_checked().expect("state not poisoned"), StoreStats::default());
+            assert_eq!(broker.ledger_snapshot().expect("no charge").total_owner_bytes(), 0);
+        }
+
         #[derive(Clone, Debug)]
         struct AliasKey {
             id: u8,
@@ -2672,6 +2701,108 @@ mod tests {
                 SimpleRetainedMapStore::new_unbudgeted_fixture(binding);
             store.insert_checked("k".to_string(), vec![0u8; 7]).expect("insert");
             assert_eq!(store.committed_bytes().expect("committed"), retained_cost("k", 7));
+        }
+
+        #[test]
+        fn remove_contains_panicking_key_and_returns_value_after_exact_refund() {
+            use std::hash::{Hash, Hasher};
+            use std::sync::atomic::{AtomicUsize, Ordering};
+
+            static PANIC_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+            #[derive(Debug)]
+            struct Key {
+                text: String,
+                panic_on_drop: bool,
+            }
+
+            impl Clone for Key {
+                fn clone(&self) -> Self {
+                    Self { text: self.text.clone(), panic_on_drop: false }
+                }
+            }
+
+            impl PartialEq for Key {
+                fn eq(&self, other: &Self) -> bool {
+                    self.text == other.text
+                }
+            }
+
+            impl Eq for Key {}
+
+            impl Hash for Key {
+                fn hash<H: Hasher>(&self, state: &mut H) {
+                    self.text.hash(state);
+                }
+            }
+
+            impl ByteSized for Key {
+                fn byte_size(&self) -> u64 {
+                    self.text.len() as u64
+                }
+            }
+
+            impl Drop for Key {
+                fn drop(&mut self) {
+                    if self.panic_on_drop {
+                        PANIC_COUNT.fetch_add(1, Ordering::SeqCst);
+                        panic!("retired key drop trap");
+                    }
+                }
+            }
+
+            #[derive(Clone, Debug)]
+            struct Value;
+
+            impl ByteSized for Value {
+                fn byte_size(&self) -> u64 {
+                    1
+                }
+            }
+
+            impl Drop for Value {
+                fn drop(&mut self) {
+                    PANIC_COUNT.fetch_add(1, Ordering::SeqCst);
+                    panic!("returned value drop trap");
+                }
+            }
+
+            const CHILD: &str = "QMP_RETAINED_REMOVE_DROP_CHILD";
+            if std::env::var_os(CHILD).is_some() {
+                let broker = live_broker(1_000_000);
+                let binding = StoreBindingHandle::new(
+                    MemoryClass::MemoResidency,
+                    "remove-drop-test".into(),
+                    None,
+                );
+                let store = SimpleRetainedMapStore::<Key, Value, Budgeted>::new_budgeted(
+                    binding,
+                    broker.clone(),
+                );
+                store
+                    .insert_checked(Key { text: "key".into(), panic_on_drop: true }, Value)
+                    .expect("seed");
+                let query = Key { text: "key".into(), panic_on_drop: false };
+                let returned = store.remove(&query).expect("remove").expect("returned value");
+                assert_eq!(store.stats_checked().expect("postimage").item_count, 0);
+                assert_eq!(broker.ledger_snapshot().expect("ledger").total_owner_bytes(), 0);
+                retire_client_value(returned);
+                assert_eq!(PANIC_COUNT.load(Ordering::SeqCst), 2, "both fields retired");
+                return;
+            }
+
+            let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+                .arg("remove_contains_panicking_key_and_returns_value_after_exact_refund")
+                .arg("--nocapture")
+                .env(CHILD, "1")
+                .output()
+                .expect("spawn child");
+            assert!(
+                output.status.success(),
+                "child {:?}; stderr: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
         }
     }
 }

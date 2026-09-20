@@ -12,7 +12,7 @@ use quanta_memory_platform_core::{
 use crate::shared::accounting::Unbudgeted;
 use crate::shared::accounting::{Budgeted, StoreAccounting};
 use crate::shared::lifecycle::{retire_client_value, BeginClose, DropTransition, StoreLifecycle};
-use crate::shared::measure::{ByteSized, CanonicalKey};
+use crate::shared::measure::{semantic_cost_v1, ByteSized, CanonicalKey, RetainedCostV1};
 use crate::transcript_store::{
     SessionTranscriptStore, TranscriptAppendDispositionV1, TranscriptAppendErrorV1,
     TranscriptAppendRequestV1, TranscriptRecordV1, TranscriptRetainDispositionV1,
@@ -21,19 +21,58 @@ use crate::transcript_store::{
 
 const BODY_DIGEST_DOMAIN: &[u8] = b"qmp.transcript-body.v1\0";
 
+fn active_row_cost(body_bytes: u64, message_id_bytes: u64) -> MemoryResult<u64> {
+    RetainedCostV1 {
+        payload_bytes: body_bytes,
+        key_identity_bytes: message_id_bytes,
+        index_bytes: semantic_cost_v1::ORDERED_INDEX_BYTES,
+        fixed_overhead_bytes: semantic_cost_v1::ENTRY_STATE_BYTES,
+        ..RetainedCostV1::default()
+    }
+    .total()
+}
+
+fn identity_evidence_cost(message_id_bytes: u64) -> MemoryResult<u64> {
+    let two = |value: u64| {
+        value
+            .checked_mul(2)
+            .ok_or_else(|| MemoryError::capacity("transcript evidence cost overflow"))
+    };
+    RetainedCostV1 {
+        key_identity_bytes: two(message_id_bytes)?,
+        index_bytes: two(semantic_cost_v1::ORDERED_INDEX_BYTES)?,
+        tombstone_bytes: two(semantic_cost_v1::DIGEST_BYTES)?,
+        fixed_overhead_bytes: two(semantic_cost_v1::ENTRY_STATE_BYTES)?,
+        ..RetainedCostV1::default()
+    }
+    .total()
+}
+
+fn session_key_cost(session_id_bytes: u64) -> MemoryResult<u64> {
+    RetainedCostV1 {
+        key_identity_bytes: session_id_bytes,
+        index_bytes: semantic_cost_v1::ORDERED_INDEX_BYTES,
+        fixed_overhead_bytes: semantic_cost_v1::ENTRY_STATE_BYTES,
+        ..RetainedCostV1::default()
+    }
+    .total()
+}
+
 #[derive(Debug)]
 struct TranscriptEntry<MessageId, Message> {
     sequence: u64,
     message_id: MessageId,
     body: Message,
-    charged_bytes: u64,
-    charge: Option<ManagedCharge>,
+    active_bytes: u64,
+    active_charge: Option<ManagedCharge>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct SequenceEvidence<MessageId> {
     message_id: MessageId,
     body_digest: [u8; 32],
+    evidence_bytes: u64,
+    evidence_charge: Option<ManagedCharge>,
 }
 
 #[derive(Clone, Debug)]
@@ -45,6 +84,9 @@ struct MessageEvidence {
 #[derive(Debug)]
 struct SessionState<MessageId, Message> {
     version: u64,
+    key_bytes: u64,
+    key_charge: Option<ManagedCharge>,
+    retained_bytes: u64,
     rows: BTreeMap<u64, TranscriptEntry<MessageId, Message>>,
     sequence_evidence: BTreeMap<u64, SequenceEvidence<MessageId>>,
     message_evidence: BTreeMap<MessageId, MessageEvidence>,
@@ -54,6 +96,9 @@ impl<MessageId, Message> Default for SessionState<MessageId, Message> {
     fn default() -> Self {
         Self {
             version: 0,
+            key_bytes: 0,
+            key_charge: None,
+            retained_bytes: 0,
             rows: BTreeMap::new(),
             sequence_evidence: BTreeMap::new(),
             message_evidence: BTreeMap::new(),
@@ -67,12 +112,28 @@ struct TranscriptState<SessionId, MessageId, Message> {
     retained_bytes: u64,
 }
 
+fn semantic_session_bytes<MessageId, Message>(
+    session: &SessionState<MessageId, Message>,
+) -> MemoryResult<u64> {
+    let with_rows = session.rows.values().try_fold(session.key_bytes, |total, row| {
+        total
+            .checked_add(row.active_bytes)
+            .ok_or_else(|| MemoryError::capacity("transcript active-row sum overflow"))
+    })?;
+    session.sequence_evidence.values().try_fold(with_rows, |total, evidence| {
+        total
+            .checked_add(evidence.evidence_bytes)
+            .ok_or_else(|| MemoryError::capacity("transcript evidence sum overflow"))
+    })
+}
+
 /// Portable process-lifetime transcript store with caller-owned append identity.
 ///
 /// One mutex owns rows, both identity indexes, body evidence, retained-byte
 /// accounting, and non-clone charge leases. Every append either commits all of
-/// them or none. Truncation evicts active bodies and refunds their charges while
-/// retaining process-lifetime tombstones; this in-memory implementation makes no
+/// them or none. Truncation evicts active rows and refunds only their leases;
+/// identity evidence and the session key remain charged until close/Drop.
+/// This in-memory implementation makes no
 /// restart-durability claim.
 ///
 /// The accounting mode is fixed before construction and has no default. Raw
@@ -179,15 +240,15 @@ impl<SessionId, MessageId, Message, Mode>
 
     fn require_charge_shape(
         &self,
-        entry: &TranscriptEntry<MessageId, Message>,
+        charge: &Option<ManagedCharge>,
         operation: &str,
     ) -> MemoryResult<()> {
-        match (self.accounting.broker().is_some(), entry.charge.is_some()) {
+        match (self.accounting.broker().is_some(), charge.is_some()) {
             (true, false) => Err(MemoryError::InvalidState(format!(
-                "budgeted transcript row has no managed charge during {operation}"
+                "budgeted transcript retention component has no managed charge during {operation}"
             ))),
             (false, true) => Err(MemoryError::InvalidState(format!(
-                "unbudgeted transcript row owns a managed charge during {operation}"
+                "unbudgeted transcript retention component owns a managed charge during {operation}"
             ))),
             _ => Ok(()),
         }
@@ -203,10 +264,32 @@ impl<SessionId, MessageId, Message, Mode>
 
         let mut sessions = {
             let mut state = self.lock_state()?;
+            let mut checked_total = 0u64;
             for session in state.sessions.values() {
-                for entry in session.rows.values() {
-                    self.require_charge_shape(entry, "close")?;
+                let checked_session = semantic_session_bytes(session)?;
+                if checked_session != session.retained_bytes {
+                    return Err(MemoryError::InvalidState(
+                        "transcript session cost counter disagrees with owned leases".to_string(),
+                    ));
                 }
+                checked_total = checked_total
+                    .checked_add(checked_session)
+                    .ok_or_else(|| MemoryError::capacity("transcript close total overflow"))?;
+                self.require_charge_shape(&session.key_charge, "close session key")?;
+                for entry in session.rows.values() {
+                    self.require_charge_shape(&entry.active_charge, "close active row")?;
+                }
+                for evidence in session.sequence_evidence.values() {
+                    self.require_charge_shape(
+                        &evidence.evidence_charge,
+                        "close identity evidence",
+                    )?;
+                }
+            }
+            if checked_total != state.retained_bytes {
+                return Err(MemoryError::InvalidState(
+                    "transcript total cost counter disagrees with sessions".to_string(),
+                ));
             }
             std::mem::take(&mut state.sessions)
         };
@@ -245,15 +328,17 @@ impl<SessionId, MessageId, Message>
 impl<SessionId, MessageId, Message, Mode>
     SimpleSessionTranscriptStore<SessionId, MessageId, Message, Mode>
 where
-    SessionId: Clone + Ord,
+    SessionId: Clone + Ord + ByteSized,
 {
     pub fn session_bytes(&self, session_id: &SessionId) -> MemoryResult<u64> {
         self.lock_read()?.sessions.get(session_id).map_or(Ok(0), |session| {
-            session.rows.values().try_fold(0u64, |total, entry| {
-                total.checked_add(entry.charged_bytes).ok_or_else(|| {
-                    MemoryError::capacity("transcript session byte counter overflow")
-                })
-            })
+            let checked = semantic_session_bytes(session)?;
+            if checked != session.retained_bytes {
+                return Err(MemoryError::InvalidState(
+                    "transcript session cost counter disagrees with owned leases".to_string(),
+                ));
+            }
+            Ok(checked)
         })
     }
 
@@ -279,80 +364,84 @@ where
             ));
         }
 
-        let (mut dropped, session_ordinal, next_version, next_retained_bytes) =
-            {
-                let mut state = self.lock_state()?;
-                // Find the canonical session before detaching any row or charge.
-                // Later recovery/publication must not compare a client-supplied
-                // SessionId: Ord may panic and strand detached accounting authority.
-                let Some(session_ordinal) =
-                    state.sessions.keys().position(|candidate| candidate.cmp(session_id).is_eq())
-                else {
-                    return if retained.is_empty() {
-                        Ok(())
-                    } else {
-                        Err(MemoryError::InvalidState(
-                            "transcript retain selector references a missing session".to_string(),
-                        ))
-                    };
+        let (mut dropped, session_ordinal, next_version, next_retained_bytes, next_session_bytes) = {
+            let mut state = self.lock_state()?;
+            // Find the canonical session before detaching any row or charge.
+            // Later recovery/publication must not compare a client-supplied
+            // SessionId: Ord may panic and strand detached accounting authority.
+            let Some(session_ordinal) =
+                state.sessions.keys().position(|candidate| candidate.cmp(session_id).is_eq())
+            else {
+                return if retained.is_empty() {
+                    Ok(())
+                } else {
+                    Err(MemoryError::InvalidState(
+                        "transcript retain selector references a missing session".to_string(),
+                    ))
                 };
-                let session =
-                    state.sessions.values().nth(session_ordinal).expect(
-                        "validated transcript session ordinal is present under state mutex",
-                    );
-                if let Some(sequence) =
-                    retained.iter().find(|sequence| !session.rows.contains_key(sequence))
-                {
-                    return Err(MemoryError::InvalidState(format!(
-                        "transcript retain selector references inactive sequence {sequence}"
-                    )));
-                }
+            };
+            let session = state
+                .sessions
+                .values()
+                .nth(session_ordinal)
+                .expect("validated transcript session ordinal is present under state mutex");
+            if let Some(sequence) =
+                retained.iter().find(|sequence| !session.rows.contains_key(sequence))
+            {
+                return Err(MemoryError::InvalidState(format!(
+                    "transcript retain selector references inactive sequence {sequence}"
+                )));
+            }
 
-                let drop_sequences: Vec<_> = session
-                    .rows
-                    .keys()
-                    .copied()
-                    .filter(|sequence| !retained.contains(sequence))
-                    .collect();
-                if drop_sequences.is_empty() {
-                    return Ok(());
-                }
-                let next_version = session
-                    .version
-                    .checked_add(1)
-                    .ok_or_else(|| MemoryError::capacity("transcript session version overflow"))?;
-                let mut dropped_bytes = 0u64;
-                for sequence in &drop_sequences {
-                    let entry = session.rows.get(sequence).ok_or_else(|| {
-                        MemoryError::InvalidState(
-                            "transcript row disappeared during retain planning".to_string(),
-                        )
-                    })?;
-                    self.require_charge_shape(entry, "retain")?;
-                    dropped_bytes =
-                        dropped_bytes.checked_add(entry.charged_bytes).ok_or_else(|| {
-                            MemoryError::capacity("transcript dropped-byte counter overflow")
-                        })?;
-                }
-                let next_retained_bytes =
-                    state.retained_bytes.checked_sub(dropped_bytes).ok_or_else(|| {
-                        MemoryError::InvalidState("transcript retained-byte underflow".to_string())
-                    })?;
-                let session = state.sessions.values_mut().nth(session_ordinal).expect(
+            let drop_sequences: Vec<_> = session
+                .rows
+                .keys()
+                .copied()
+                .filter(|sequence| !retained.contains(sequence))
+                .collect();
+            if drop_sequences.is_empty() {
+                return Ok(());
+            }
+            let next_version = session
+                .version
+                .checked_add(1)
+                .ok_or_else(|| MemoryError::capacity("transcript session version overflow"))?;
+            let mut dropped_bytes = 0u64;
+            for sequence in &drop_sequences {
+                let entry = session.rows.get(sequence).ok_or_else(|| {
+                    MemoryError::InvalidState(
+                        "transcript row disappeared during retain planning".to_string(),
+                    )
+                })?;
+                self.require_charge_shape(&entry.active_charge, "retain")?;
+                dropped_bytes = dropped_bytes.checked_add(entry.active_bytes).ok_or_else(|| {
+                    MemoryError::capacity("transcript dropped-byte counter overflow")
+                })?;
+            }
+            let next_retained_bytes =
+                state.retained_bytes.checked_sub(dropped_bytes).ok_or_else(|| {
+                    MemoryError::InvalidState("transcript retained-byte underflow".to_string())
+                })?;
+            let next_session_bytes =
+                session.retained_bytes.checked_sub(dropped_bytes).ok_or_else(|| {
+                    MemoryError::InvalidState("transcript session-byte underflow".to_string())
+                })?;
+            let session =
+                state.sessions.values_mut().nth(session_ordinal).expect(
                     "validated transcript session ordinal remains present under state mutex",
                 );
-                let dropped = drop_sequences
-                    .into_iter()
-                    .map(|sequence| {
-                        let entry = session
-                            .rows
-                            .remove(&sequence)
-                            .expect("validated transcript row remains present under state mutex");
-                        (sequence, entry)
-                    })
-                    .collect::<Vec<_>>();
-                (dropped, session_ordinal, next_version, next_retained_bytes)
-            };
+            let dropped = drop_sequences
+                .into_iter()
+                .map(|sequence| {
+                    let entry = session
+                        .rows
+                        .remove(&sequence)
+                        .expect("validated transcript row remains present under state mutex");
+                    (sequence, entry)
+                })
+                .collect::<Vec<_>>();
+            (dropped, session_ordinal, next_version, next_retained_bytes, next_session_bytes)
+        };
 
         let (charge_slots, mut charges) = take_entry_charges(&mut dropped);
         if let Err(error) = self.accounting.release_many(&mut charges) {
@@ -370,6 +459,7 @@ where
             "mutation lane preserves transcript session while retain accounting is in flight",
         );
         session.version = next_version;
+        session.retained_bytes = next_session_bytes;
         // sequence_evidence and message_evidence intentionally survive as
         // process-lifetime tombstones. They are the late-retry safety owner.
         state.retained_bytes = next_retained_bytes;
@@ -382,8 +472,8 @@ where
 impl<SessionId, MessageId, Message, Mode>
     SimpleSessionTranscriptStore<SessionId, MessageId, Message, Mode>
 where
-    SessionId: Clone + Ord,
-    MessageId: Clone + Ord,
+    SessionId: Clone + Ord + ByteSized,
+    MessageId: Clone + Ord + ByteSized,
     Message: Clone + ByteSized + CanonicalKey,
 {
     /// Copy active rows and their mutation version under the store mutex.
@@ -435,8 +525,8 @@ where
 impl<SessionId, MessageId, Message, Mode> SessionTranscriptStore<SessionId, MessageId, Message>
     for SimpleSessionTranscriptStore<SessionId, MessageId, Message, Mode>
 where
-    SessionId: Clone + Ord,
-    MessageId: Clone + Ord,
+    SessionId: Clone + Ord + ByteSized,
+    MessageId: Clone + Ord + ByteSized,
     Message: Clone + ByteSized + CanonicalKey,
 {
     fn binding(&self) -> &StoreBindingHandle {
@@ -454,11 +544,17 @@ where
         let session_id = request.identity.session_id;
         let sequence = request.identity.sequence;
         let message_id = request.identity.message_id;
-        let charged_bytes = request.body.byte_size();
-        let (next_total, next_version) = {
+        let message_id_bytes = message_id.byte_size();
+        let active_bytes = active_row_cost(request.body.byte_size(), message_id_bytes)
+            .map_err(TranscriptAppendErrorV1::Accounting)?;
+        let evidence_bytes = identity_evidence_cost(message_id_bytes)
+            .map_err(TranscriptAppendErrorV1::Accounting)?;
+        let key_bytes = session_key_cost(session_id.byte_size())
+            .map_err(TranscriptAppendErrorV1::Accounting)?;
+        let (next_total, next_session_bytes, next_version, new_session) = {
             let state = self.lock_state().map_err(TranscriptAppendErrorV1::Storage)?;
-
-            if let Some(session) = state.sessions.get(&session_id) {
+            let existing = state.sessions.get(&session_id);
+            if let Some(session) = existing {
                 if let Some(evidence) = session.sequence_evidence.get(&sequence) {
                     if evidence.message_id != message_id {
                         return Err(TranscriptAppendErrorV1::SequenceConflict { sequence });
@@ -485,19 +581,36 @@ where
                 }
             }
 
-            let next_total = state.retained_bytes.checked_add(charged_bytes).ok_or_else(|| {
+            let new_session = existing.is_none();
+            let increment = active_bytes
+                .checked_add(evidence_bytes)
+                .and_then(|sum| sum.checked_add(if new_session { key_bytes } else { 0 }))
+                .ok_or_else(|| {
+                    TranscriptAppendErrorV1::Accounting(MemoryError::capacity(
+                        "transcript append cost overflow",
+                    ))
+                })?;
+            let next_total = state.retained_bytes.checked_add(increment).ok_or_else(|| {
                 TranscriptAppendErrorV1::Accounting(MemoryError::capacity(
                     "transcript retained-byte counter overflow",
                 ))
             })?;
-            let next_version = state.sessions.get(&session_id).map_or(Ok(1), |session| {
+            let next_session_bytes = existing
+                .map_or(0, |session| session.retained_bytes)
+                .checked_add(increment)
+                .ok_or_else(|| {
+                    TranscriptAppendErrorV1::Accounting(MemoryError::capacity(
+                        "transcript session-byte counter overflow",
+                    ))
+                })?;
+            let next_version = existing.map_or(Ok(1), |session| {
                 session.version.checked_add(1).ok_or_else(|| {
                     TranscriptAppendErrorV1::Storage(MemoryError::capacity(
                         "transcript session version overflow",
                     ))
                 })
             })?;
-            (next_total, next_version)
+            (next_total, next_session_bytes, next_version, new_session)
         };
 
         // Client Clone may panic or reenter. Complete both copies before
@@ -505,21 +618,46 @@ where
         let row_message_id = message_id.clone();
         let evidence_message_id = message_id.clone();
 
-        let charge = self
+        let active_charge = self
             .accounting
             .charge(
                 self.binding.class.clone(),
                 self.binding.owner.clone(),
                 MemoryContextKind::Session,
                 ChargeKind::RetainedPayload,
-                charged_bytes,
+                active_bytes,
             )
             .map_err(TranscriptAppendErrorV1::Accounting)?;
+        let evidence_charge = self
+            .accounting
+            .charge(
+                self.binding.class.clone(),
+                self.binding.owner.clone(),
+                MemoryContextKind::Session,
+                ChargeKind::RetainedMetadata,
+                evidence_bytes,
+            )
+            .map_err(TranscriptAppendErrorV1::Accounting)?;
+        let key_charge = if new_session {
+            self.accounting
+                .charge(
+                    self.binding.class.clone(),
+                    self.binding.owner.clone(),
+                    MemoryContextKind::Session,
+                    ChargeKind::RetainedMetadata,
+                    key_bytes,
+                )
+                .map_err(TranscriptAppendErrorV1::Accounting)?
+        } else {
+            None
+        };
 
         let mut state = match self.lock_state() {
             Ok(state) => state,
             Err(error) => {
-                drop(charge);
+                drop(active_charge);
+                drop(evidence_charge);
+                drop(key_charge);
                 return Err(TranscriptAppendErrorV1::Storage(error));
             }
         };
@@ -527,11 +665,16 @@ where
             sequence,
             message_id: row_message_id,
             body: request.body,
-            charged_bytes,
-            charge,
+            active_bytes,
+            active_charge,
         });
-        let mut sequence_evidence =
-            Some(SequenceEvidence { message_id: evidence_message_id, body_digest });
+        let mut sequence_evidence = Some(SequenceEvidence {
+            message_id: evidence_message_id,
+            body_digest,
+            evidence_bytes,
+            evidence_charge,
+        });
+        let mut key_charge = key_charge;
 
         // Both BTreeMap::entry lookups may invoke client Ord. Resolve their
         // insertion positions before publishing a row, evidence, version, or
@@ -564,11 +707,17 @@ where
                     );
                     message_slot.insert(MessageEvidence { sequence, body_digest });
                     session.version = next_version;
+                    session.retained_bytes = next_session_bytes;
                 }
                 Entry::Vacant(session_slot) => {
                     // A new session is assembled off-map; only the final
                     // VacantEntry insertion makes it visible.
-                    let mut session = SessionState::default();
+                    let mut session = SessionState {
+                        key_bytes,
+                        key_charge: key_charge.take(),
+                        retained_bytes: next_session_bytes,
+                        ..SessionState::default()
+                    };
                     session.rows.insert(sequence, row.take().expect("planned row"));
                     session.sequence_evidence.insert(
                         sequence,
@@ -592,8 +741,10 @@ where
             retire_rows([unpublished]);
         }
         if let Some(unpublished) = sequence_evidence.take() {
+            drop(unpublished.evidence_charge);
             retire_client_value(unpublished.message_id);
         }
+        drop(key_charge);
         match publication {
             Ok(result) => result,
             Err(payload) => std::panic::resume_unwind(payload),
@@ -659,7 +810,7 @@ fn take_entry_charges<MessageId, Message>(
     let mut slots = Vec::new();
     let mut charges = Vec::new();
     for (index, (_, entry)) in entries.iter_mut().enumerate() {
-        if let Some(charge) = entry.charge.take() {
+        if let Some(charge) = entry.active_charge.take() {
             slots.push(index);
             charges.push(charge);
         }
@@ -673,19 +824,36 @@ fn restore_entry_charges<MessageId, Message>(
     charges: Vec<ManagedCharge>,
 ) {
     for (slot, charge) in slots.iter().copied().zip(charges) {
-        entries[slot].1.charge = Some(charge);
+        entries[slot].1.active_charge = Some(charge);
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum SessionLeaseSlot {
+    Key(usize),
+    ActiveRow(usize, usize),
+    Evidence(usize, usize),
 }
 
 fn take_session_charges<SessionId, MessageId, Message>(
     sessions: &mut BTreeMap<SessionId, SessionState<MessageId, Message>>,
-) -> (Vec<(usize, usize)>, Vec<ManagedCharge>) {
+) -> (Vec<SessionLeaseSlot>, Vec<ManagedCharge>) {
     let mut slots = Vec::new();
     let mut charges = Vec::new();
     for (session_index, session) in sessions.values_mut().enumerate() {
+        if let Some(charge) = session.key_charge.take() {
+            slots.push(SessionLeaseSlot::Key(session_index));
+            charges.push(charge);
+        }
         for (row_index, row) in session.rows.values_mut().enumerate() {
-            if let Some(charge) = row.charge.take() {
-                slots.push((session_index, row_index));
+            if let Some(charge) = row.active_charge.take() {
+                slots.push(SessionLeaseSlot::ActiveRow(session_index, row_index));
+                charges.push(charge);
+            }
+        }
+        for (evidence_index, evidence) in session.sequence_evidence.values_mut().enumerate() {
+            if let Some(charge) = evidence.evidence_charge.take() {
+                slots.push(SessionLeaseSlot::Evidence(session_index, evidence_index));
                 charges.push(charge);
             }
         }
@@ -695,21 +863,42 @@ fn take_session_charges<SessionId, MessageId, Message>(
 
 fn restore_session_charges<SessionId, MessageId, Message>(
     sessions: &mut BTreeMap<SessionId, SessionState<MessageId, Message>>,
-    slots: &[(usize, usize)],
+    slots: &[SessionLeaseSlot],
     charges: Vec<ManagedCharge>,
 ) {
-    let mut slots_and_charges = slots.iter().copied().zip(charges).peekable();
-    for (session_index, session) in sessions.values_mut().enumerate() {
-        for (row_index, row) in session.rows.values_mut().enumerate() {
-            if slots_and_charges
-                .peek()
-                .is_some_and(|((s, r), _)| (*s, *r) == (session_index, row_index))
-            {
-                row.charge = Some(slots_and_charges.next().expect("peeked charge").1);
+    for (slot, charge) in slots.iter().copied().zip(charges) {
+        match slot {
+            SessionLeaseSlot::Key(session_index) => {
+                sessions
+                    .values_mut()
+                    .nth(session_index)
+                    .expect("validated session slot")
+                    .key_charge = Some(charge);
+            }
+            SessionLeaseSlot::ActiveRow(session_index, row_index) => {
+                sessions
+                    .values_mut()
+                    .nth(session_index)
+                    .expect("validated session slot")
+                    .rows
+                    .values_mut()
+                    .nth(row_index)
+                    .expect("validated row slot")
+                    .active_charge = Some(charge);
+            }
+            SessionLeaseSlot::Evidence(session_index, evidence_index) => {
+                sessions
+                    .values_mut()
+                    .nth(session_index)
+                    .expect("validated session slot")
+                    .sequence_evidence
+                    .values_mut()
+                    .nth(evidence_index)
+                    .expect("validated evidence slot")
+                    .evidence_charge = Some(charge);
             }
         }
     }
-    debug_assert!(slots_and_charges.next().is_none());
 }
 
 /// Release every charge before invoking any client-owned destructor. Retire
@@ -719,8 +908,8 @@ fn retire_rows<MessageId, Message>(
     rows: impl IntoIterator<Item = TranscriptEntry<MessageId, Message>>,
 ) {
     for row in rows {
-        let TranscriptEntry { message_id, body, charge, .. } = row;
-        drop(charge);
+        let TranscriptEntry { message_id, body, active_charge, .. } = row;
+        drop(active_charge);
         retire_client_value(message_id);
         retire_client_value(body);
     }
@@ -730,13 +919,18 @@ fn retire_sessions<SessionId, MessageId, Message>(
     mut sessions: BTreeMap<SessionId, SessionState<MessageId, Message>>,
 ) {
     for session in sessions.values_mut() {
+        drop(session.key_charge.take());
         for row in session.rows.values_mut() {
-            drop(row.charge.take());
+            drop(row.active_charge.take());
+        }
+        for evidence in session.sequence_evidence.values_mut() {
+            drop(evidence.evidence_charge.take());
         }
     }
     for (session_id, session) in sessions {
         retire_rows(session.rows.into_values());
         for (_, evidence) in session.sequence_evidence {
+            drop(evidence.evidence_charge);
             retire_client_value(evidence.message_id);
         }
         for (message_id, _) in session.message_evidence {
@@ -781,6 +975,22 @@ mod tests {
     use std::thread;
 
     type Store = SimpleSessionTranscriptStore<String, String, String, TestUnbudgeted>;
+
+    fn cost(session_id: &str, rows: &[(&str, &str, bool)]) -> u64 {
+        // Independent oracle: do not call the production cost calculators.
+        (session_id.len() as u64 + 24 + 16)
+            + rows
+                .iter()
+                .map(|(message_id, body, active)| {
+                    (2 * message_id.len() as u64 + 2 * 24 + 2 * 32 + 2 * 16)
+                        + if *active {
+                            body.len() as u64 + message_id.len() as u64 + 24 + 16
+                        } else {
+                            0
+                        }
+                })
+                .sum::<u64>()
+    }
 
     #[test]
     fn reentrant_load_stats_and_close_under_read_lock_are_typed_busy() {
@@ -867,8 +1077,14 @@ mod tests {
         assert_eq!(store.load(&"s".into()).expect("outer load").len(), 1);
         armed.store(false, Ordering::SeqCst);
         assert_eq!(busy_callbacks.load(Ordering::SeqCst), 1);
-        assert_eq!(store.stats().expect("postimage").estimated_bytes, 3);
-        assert_eq!(broker.ledger_snapshot().expect("ledger").total_owner_bytes(), 3);
+        assert_eq!(
+            store.stats().expect("postimage").estimated_bytes,
+            cost("s", &[("m", "one", true)])
+        );
+        assert_eq!(
+            broker.ledger_snapshot().expect("ledger").total_owner_bytes(),
+            cost("s", &[("m", "one", true)])
+        );
         store.close().expect("close after callback");
         assert_eq!(broker.ledger_snapshot().expect("drained").total_owner_bytes(), 0);
     }
@@ -914,7 +1130,7 @@ mod tests {
             7
         );
         assert_eq!(store.load(&"s".to_string()).expect("load").len(), 1);
-        assert_eq!(store.retained_bytes().expect("bytes"), 4);
+        assert_eq!(store.retained_bytes().expect("bytes"), cost("s", &[("m0", "body", true)]));
     }
 
     #[test]
@@ -986,7 +1202,7 @@ mod tests {
             1
         );
         assert_eq!(store.load(&"s".to_string()).expect("load").len(), 1);
-        assert_eq!(store.retained_bytes().expect("bytes"), 4);
+        assert_eq!(store.retained_bytes().expect("bytes"), cost("s", &[("m0", "body", true)]));
     }
 
     #[test]
@@ -1059,7 +1275,10 @@ mod tests {
         store.truncate_to(&"s".to_string(), 0).expect("truncate all");
 
         assert!(store.load(&"s".to_string()).expect("load").is_empty());
-        assert_eq!(store.retained_bytes().expect("bytes"), 0);
+        assert_eq!(
+            store.retained_bytes().expect("bytes"),
+            cost("s", &[("m0", "zero", false), ("m2", "two", false)])
+        );
         assert_eq!(
             store.append(request("s", 0, "m0", "zero")).expect("zero replay"),
             TranscriptAppendDispositionV1::Replayed
@@ -1069,6 +1288,27 @@ mod tests {
             TranscriptAppendDispositionV1::Replayed
         );
         assert!(store.load(&"s".to_string()).expect("load after retries").is_empty());
+    }
+
+    #[test]
+    fn zero_body_with_large_ids_and_session_retains_semantic_evidence_cost() {
+        let store = store();
+        let session = "s".repeat(512);
+        let message_id = "m".repeat(1024);
+        store.append(request(&session, 0, &message_id, "")).expect("zero-body append");
+        let before = cost(&session, &[(&message_id, "", true)]);
+        assert_eq!(store.session_bytes(&session).expect("session bytes"), before);
+        assert_eq!(store.retained_bytes().expect("total"), before);
+        store.truncate_to(&session, 0).expect("truncate body");
+        let evidence_only = cost(&session, &[(&message_id, "", false)]);
+        assert_eq!(store.session_bytes(&session).expect("persistent evidence"), evidence_only);
+        assert_eq!(store.retained_bytes().expect("total evidence"), evidence_only);
+        assert_eq!(
+            store.append(request(&session, 0, &message_id, "")).expect("late replay"),
+            TranscriptAppendDispositionV1::Replayed
+        );
+        store.close().expect("close evidence");
+        assert_eq!(store.retained_bytes().expect("terminal"), 0);
     }
 
     #[test]
@@ -1082,7 +1322,10 @@ mod tests {
 
         let rows = store.load(&"s".to_string()).expect("load");
         assert_eq!(rows.iter().map(TranscriptRecordV1::sequence).collect::<Vec<_>>(), vec![0, 2]);
-        assert_eq!(store.retained_bytes().expect("bytes"), 7);
+        assert_eq!(
+            store.retained_bytes().expect("bytes"),
+            cost("s", &[("m0", "zero", true), ("m1", "one", false), ("m2", "two", true)])
+        );
         assert_eq!(
             store.append(request("s", 1, "m1", "one")).expect("evicted replay"),
             TranscriptAppendDispositionV1::Replayed
@@ -1215,6 +1458,12 @@ mod tests {
             trap: Arc<ComparisonTrap>,
         }
 
+        impl ByteSized for OrderedSessionId {
+            fn byte_size(&self) -> u64 {
+                self.name.len() as u64
+            }
+        }
+
         impl PartialEq for OrderedSessionId {
             fn eq(&self, other: &Self) -> bool {
                 self.name == other.name
@@ -1283,6 +1532,12 @@ mod tests {
             comparisons: Arc<CallbackTrap>,
         }
 
+        impl ByteSized for CallbackMessageId {
+            fn byte_size(&self) -> u64 {
+                self.name.len() as u64
+            }
+        }
+
         impl Clone for CallbackMessageId {
             fn clone(&self) -> Self {
                 self.clones.hit();
@@ -1349,6 +1604,12 @@ mod tests {
             name: &'static str,
             owner: Arc<OnceLock<Weak<ReentrantIdStore>>>,
             busy_callbacks: Arc<AtomicUsize>,
+        }
+
+        impl ByteSized for ReentrantMessageId {
+            fn byte_size(&self) -> u64 {
+                self.name.len() as u64
+            }
         }
 
         impl ReentrantMessageId {
@@ -1425,7 +1686,10 @@ mod tests {
             }
             assert!(busy_callbacks.load(AtomicOrdering::SeqCst) >= 4);
             assert_eq!(store.stats().expect("committed postimage").item_count, 2);
-            assert_eq!(broker.ledger_snapshot().expect("ledger").total_owner_bytes(), 7);
+            assert_eq!(
+                broker.ledger_snapshot().expect("ledger").total_owner_bytes(),
+                cost("s", &[("m0", "one", true), ("m1", "four", true)])
+            );
             store.close().expect("close after callbacks");
             assert_eq!(broker.ledger_snapshot().expect("drained").total_owner_bytes(), 0);
         }
@@ -1452,12 +1716,19 @@ mod tests {
                 .rows
                 .get(&0)
                 .expect("seed row")
-                .charge
+                .active_charge
                 .as_ref()
                 .is_some_and(ManagedCharge::is_active));
-            assert_eq!(state.retained_bytes, 3, "failed append changed retained-byte counter");
+            assert_eq!(
+                state.retained_bytes,
+                cost("s", &[("m0", "one", true)]),
+                "failed append changed retained-byte counter"
+            );
             drop(state);
-            assert_eq!(broker.ledger_snapshot().expect("ledger").total_owner_bytes(), 3);
+            assert_eq!(
+                broker.ledger_snapshot().expect("ledger").total_owner_bytes(),
+                cost("s", &[("m0", "one", true)])
+            );
         }
 
         #[test]
@@ -1573,10 +1844,10 @@ mod tests {
                 ))
                 .expect("seed session");
             let new_id = OrderedSessionId { name: "new", trap: Arc::clone(&trap) };
-            // The preflight performs two lookups; the third comparison is the
+            // The preflight performs one lookup; the second comparison is the
             // charged publication entry lookup, still before insertion.
             let before = trap.calls.load(AtomicOrdering::SeqCst);
-            trap.panic_at.store(before + 3, AtomicOrdering::SeqCst);
+            trap.panic_at.store(before + 2, AtomicOrdering::SeqCst);
             let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let _ = store.append(TranscriptAppendRequestV1::new(
                     TranscriptAppendIdentityV1::new(new_id.clone(), 0, "m1".to_string()),
@@ -1586,10 +1857,13 @@ mod tests {
             assert!(panicked.is_err(), "new-session Ord trap must fire during publication");
             trap.disarm();
             assert_eq!(store.stats().expect("readable after callback panic").item_count, 1);
-            assert_eq!(store.retained_bytes().expect("bytes"), 3);
+            assert_eq!(store.retained_bytes().expect("bytes"), cost("old", &[("m0", "one", true)]));
             assert_eq!(store.load(&old_id).expect("old session").len(), 1);
             assert!(store.load(&new_id).expect("no new session").is_empty());
-            assert_eq!(broker.ledger_snapshot().expect("ledger").total_owner_bytes(), 3);
+            assert_eq!(
+                broker.ledger_snapshot().expect("ledger").total_owner_bytes(),
+                cost("old", &[("m0", "one", true)])
+            );
             store.close().expect("close after callback panic");
             assert_eq!(broker.ledger_snapshot().expect("drained").total_owner_bytes(), 0);
         }
@@ -1650,8 +1924,12 @@ mod tests {
                 "append compared MessageId after its vacant slot was resolved"
             );
             comparisons.disarm();
-            assert_eq!(store.retained_bytes().expect("committed bytes"), 7);
-            assert_eq!(broker.ledger_snapshot().expect("committed ledger").total_owner_bytes(), 7);
+            let expected = cost("s", &[("m0", "one", true), ("m1", "four", true)]);
+            assert_eq!(store.retained_bytes().expect("committed bytes"), expected);
+            assert_eq!(
+                broker.ledger_snapshot().expect("committed ledger").total_owner_bytes(),
+                expected
+            );
             store.close().expect("close after callback panic");
             assert_eq!(broker.ledger_snapshot().expect("drained").total_owner_bytes(), 0);
         }
@@ -1712,6 +1990,79 @@ mod tests {
             )
         }
 
+        #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+        struct SizedId {
+            name: &'static str,
+            bytes: u64,
+        }
+
+        impl ByteSized for SizedId {
+            fn byte_size(&self) -> u64 {
+                self.bytes
+            }
+        }
+
+        #[test]
+        fn semantic_identity_component_overflow_denies_before_ledger_or_index_mutation() {
+            let broker = broker(1_000_000);
+            let store =
+                SimpleSessionTranscriptStore::<SizedId, SizedId, Vec<u8>, Budgeted>::new_budgeted(
+                    StoreBindingHandle::new(
+                        MemoryClass::SessionTranscript,
+                        "overflow".into(),
+                        None,
+                    ),
+                    TranscriptRetentionPolicyV1::process_lifetime(),
+                    broker.clone(),
+                );
+            for (session_bytes, message_bytes) in [(u64::MAX, 1), (1, u64::MAX)] {
+                let err = store
+                    .append(TranscriptAppendRequestV1::new(
+                        TranscriptAppendIdentityV1::new(
+                            SizedId { name: "session", bytes: session_bytes },
+                            0,
+                            SizedId { name: "message", bytes: message_bytes },
+                        ),
+                        Vec::new(),
+                    ))
+                    .expect_err("cost overflow");
+                assert!(matches!(
+                    err,
+                    TranscriptAppendErrorV1::Accounting(MemoryError::Capacity(_))
+                ));
+                assert!(store.lock_state().expect("state").sessions.is_empty());
+                assert_eq!(store.retained_bytes().expect("inert bytes"), 0);
+                assert_eq!(broker.ledger_snapshot().expect("inert ledger").total_owner_bytes(), 0);
+            }
+        }
+
+        #[test]
+        fn zero_body_large_identity_and_session_are_charged_until_evidence_retirement() {
+            let broker = broker(10_000);
+            let store = charged(&broker);
+            let session = "s".repeat(512);
+            let message_id = "m".repeat(1024);
+            store.append(request(&session, 0, &message_id, "")).expect("zero-body append");
+            let before = cost(&session, &[(&message_id, "", true)]);
+            assert_eq!(store.session_bytes(&session).expect("session bytes"), before);
+            assert_eq!(store.stats().expect("stats").estimated_bytes, before);
+            assert_eq!(broker.ledger_snapshot().expect("ledger").total_owner_bytes(), before);
+            store.truncate_to(&session, 0).expect("truncate active row");
+            let after = cost(&session, &[(&message_id, "", false)]);
+            assert_eq!(store.session_bytes(&session).expect("evidence bytes"), after);
+            assert_eq!(store.retained_bytes().expect("total evidence"), after);
+            assert_eq!(
+                broker.ledger_snapshot().expect("evidence ledger").total_owner_bytes(),
+                after
+            );
+            assert_eq!(
+                store.append(request(&session, 0, &message_id, "")).expect("late replay"),
+                TranscriptAppendDispositionV1::Replayed
+            );
+            store.close().expect("close evidence");
+            assert_eq!(broker.ledger_snapshot().expect("drained").total_owner_bytes(), 0);
+        }
+
         #[test]
         fn retain_rollback_and_commit_do_not_compare_client_session_id_after_detach() {
             let broker = broker(1_000_000);
@@ -1738,7 +2089,11 @@ mod tests {
                     ))
                     .expect("seed row");
             }
-            assert_eq!(broker.ledger_snapshot().expect("seed ledger").total_owner_bytes(), 7);
+            let before_cost = cost("session", &[("m0", "one", true), ("m1", "four", true)]);
+            assert_eq!(
+                broker.ledger_snapshot().expect("seed ledger").total_owner_bytes(),
+                before_cost
+            );
 
             broker.begin_rebuild().expect("fence release");
             let before = trap.arm_after_one_more_comparison();
@@ -1746,8 +2101,11 @@ mod tests {
             assert_eq!(trap.calls.load(AtomicOrdering::SeqCst), before + 1);
             trap.disarm();
             assert_eq!(store.load(&id).expect("rollback rows").len(), 2);
-            assert_eq!(store.retained_bytes().expect("rollback bytes"), 7);
-            assert_eq!(broker.ledger_snapshot().expect("rollback ledger").total_owner_bytes(), 7);
+            assert_eq!(store.retained_bytes().expect("rollback bytes"), before_cost);
+            assert_eq!(
+                broker.ledger_snapshot().expect("rollback ledger").total_owner_bytes(),
+                before_cost
+            );
 
             broker.finish_rebuild().expect("open fence");
             let before = trap.arm_after_one_more_comparison();
@@ -1755,8 +2113,12 @@ mod tests {
             assert_eq!(trap.calls.load(AtomicOrdering::SeqCst), before + 1);
             trap.disarm();
             assert_eq!(store.load(&id).expect("retained row").len(), 1);
-            assert_eq!(store.retained_bytes().expect("retained bytes"), 3);
-            assert_eq!(broker.ledger_snapshot().expect("retained ledger").total_owner_bytes(), 3);
+            let after_cost = cost("session", &[("m0", "one", true), ("m1", "four", false)]);
+            assert_eq!(store.retained_bytes().expect("retained bytes"), after_cost);
+            assert_eq!(
+                broker.ledger_snapshot().expect("retained ledger").total_owner_bytes(),
+                after_cost
+            );
         }
 
         #[test]
@@ -1798,10 +2160,16 @@ mod tests {
             assert!(session
                 .rows
                 .values()
-                .all(|row| row.charge.as_ref().is_some_and(ManagedCharge::is_active)));
-            assert_eq!(state.retained_bytes, 7);
+                .all(|row| row.active_charge.as_ref().is_some_and(ManagedCharge::is_active)));
+            assert_eq!(
+                state.retained_bytes,
+                cost("session", &[("m0", "one", true), ("m1", "four", true)])
+            );
             drop(state);
-            assert_eq!(broker.ledger_snapshot().expect("ledger unchanged").total_owner_bytes(), 7);
+            assert_eq!(
+                broker.ledger_snapshot().expect("ledger unchanged").total_owner_bytes(),
+                cost("session", &[("m0", "one", true), ("m1", "four", true)])
+            );
             drop(store);
             assert_eq!(broker.ledger_snapshot().expect("drop cleanup").total_owner_bytes(), 0);
         }
@@ -1837,7 +2205,10 @@ mod tests {
                         ))
                         .expect("seed charged row");
                 }
-                assert_eq!(broker.ledger_snapshot().expect("live ledger").total_owner_bytes(), 6);
+                assert_eq!(
+                    broker.ledger_snapshot().expect("live ledger").total_owner_bytes(),
+                    cost("session", &[("message-0", "one", true), ("message-1", "two", true)])
+                );
                 let outer = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     let _store = store;
                     panic!("outer unwind");
@@ -1889,18 +2260,39 @@ mod tests {
                     ))
                     .expect("seed row");
             }
-            assert_eq!(broker.ledger_snapshot().expect("live ledger").total_owner_bytes(), 9);
+            assert_eq!(
+                broker.ledger_snapshot().expect("live ledger").total_owner_bytes(),
+                cost(
+                    "session",
+                    &[
+                        ("message-0", "one", true),
+                        ("message-1", "two", true),
+                        ("message-2", "tri", true)
+                    ]
+                )
+            );
             store.retain_sequences(&"session".to_string(), &[0]).expect("retain");
             assert_eq!(store.stats().expect("postimage").item_count, 1);
-            assert_eq!(store.retained_bytes().expect("retained bytes"), 3);
-            assert_eq!(broker.ledger_snapshot().expect("retained ledger").total_owner_bytes(), 3);
+            let expected = cost(
+                "session",
+                &[
+                    ("message-0", "one", true),
+                    ("message-1", "two", false),
+                    ("message-2", "tri", false),
+                ],
+            );
+            assert_eq!(store.retained_bytes().expect("retained bytes"), expected);
+            assert_eq!(
+                broker.ledger_snapshot().expect("retained ledger").total_owner_bytes(),
+                expected
+            );
             store.close().expect("close survivor without client panic");
             assert_eq!(broker.ledger_snapshot().expect("closed ledger").total_owner_bytes(), 0);
         }
 
         #[test]
         fn quota_denial_leaves_row_indexes_and_charge_unchanged() {
-            let broker = broker(3);
+            let broker = broker(cost("s", &[("m0", "ok", true)]));
             let store = charged(&broker);
             let denied = store.append(request("s", 0, "m0", "four"));
             assert!(matches!(
@@ -1937,8 +2329,9 @@ mod tests {
             ));
             assert!(matches!(conflicts[2], Err(TranscriptAppendErrorV1::MessageIdConflict)));
             assert_eq!(store.load(&"s".to_string()).expect("load").len(), 1);
-            assert_eq!(store.retained_bytes().expect("bytes"), 4);
-            assert_eq!(broker.ledger_snapshot().expect("snapshot").total_owner_bytes(), 4);
+            let expected = cost("s", &[("m0", "body", true)]);
+            assert_eq!(store.retained_bytes().expect("bytes"), expected);
+            assert_eq!(broker.ledger_snapshot().expect("snapshot").total_owner_bytes(), expected);
         }
 
         #[test]
@@ -1948,14 +2341,18 @@ mod tests {
             store.append(request("s", 0, "m0", "one")).expect("first");
             store.append(request("s", 0, "m0", "one")).expect("replay");
             store.append(request("s", 1, "m1", "four")).expect("second");
-            assert_eq!(broker.ledger_snapshot().expect("snapshot").total_owner_bytes(), 7);
+            assert_eq!(
+                broker.ledger_snapshot().expect("snapshot").total_owner_bytes(),
+                cost("s", &[("m0", "one", true), ("m1", "four", true)])
+            );
             store.truncate_to(&"s".to_string(), 1).expect("truncate");
-            assert_eq!(broker.ledger_snapshot().expect("snapshot").total_owner_bytes(), 3);
+            let after = cost("s", &[("m0", "one", true), ("m1", "four", false)]);
+            assert_eq!(broker.ledger_snapshot().expect("snapshot").total_owner_bytes(), after);
             assert_eq!(
                 store.append(request("s", 1, "m1", "four")).expect("late replay"),
                 TranscriptAppendDispositionV1::Replayed
             );
-            assert_eq!(broker.ledger_snapshot().expect("snapshot").total_owner_bytes(), 3);
+            assert_eq!(broker.ledger_snapshot().expect("snapshot").total_owner_bytes(), after);
         }
 
         #[test]
@@ -1968,8 +2365,9 @@ mod tests {
             let denied = store.truncate_to(&"s".to_string(), 1);
             assert!(matches!(denied, Err(MemoryError::InvalidState(_))));
             assert_eq!(store.load(&"s".to_string()).expect("load").len(), 2);
-            assert_eq!(store.retained_bytes().expect("bytes"), 7);
-            assert_eq!(broker.ledger_snapshot().expect("snapshot").total_owner_bytes(), 7);
+            let expected = cost("s", &[("m0", "one", true), ("m1", "four", true)]);
+            assert_eq!(store.retained_bytes().expect("bytes"), expected);
+            assert_eq!(broker.ledger_snapshot().expect("snapshot").total_owner_bytes(), expected);
             broker.finish_rebuild().expect("finish rebuild");
         }
 
@@ -1980,7 +2378,11 @@ mod tests {
             store.append(request("a", 0, "m0", "one")).expect("first");
             store.append(request("a", 2, "m2", "four")).expect("second");
             store.append(request("b", 9, "m9", "xx")).expect("third");
-            assert_eq!(broker.ledger_snapshot().expect("before").total_owner_bytes(), 9);
+            assert_eq!(
+                broker.ledger_snapshot().expect("before").total_owner_bytes(),
+                cost("a", &[("m0", "one", true), ("m2", "four", true)])
+                    + cost("b", &[("m9", "xx", true)])
+            );
 
             SessionTranscriptStore::close(&store).expect("close");
             assert_eq!(broker.ledger_snapshot().expect("after").total_owner_bytes(), 0);
@@ -2014,7 +2416,10 @@ mod tests {
                 store.load_versioned_snapshot(&"a".to_string()).expect("before").version();
             broker.begin_rebuild().expect("fence");
             assert!(matches!(store.close(), Err(MemoryError::InvalidState(_))));
-            assert_eq!(broker.ledger_snapshot().expect("fenced ledger").total_owner_bytes(), 7);
+            assert_eq!(
+                broker.ledger_snapshot().expect("fenced ledger").total_owner_bytes(),
+                cost("a", &[("m0", "one", true)]) + cost("b", &[("m1", "four", true)])
+            );
             assert_eq!(store.stats().expect("restored stats").item_count, 2);
             assert_eq!(store.load(&"b".to_string()).expect("restored row")[0].body(), "four");
             assert_eq!(
@@ -2044,7 +2449,10 @@ mod tests {
             .join();
             assert!(matches!(store.close(), Err(MemoryError::InvalidState(_))));
             assert!(matches!(store.stats(), Err(MemoryError::InvalidState(_))));
-            assert_eq!(broker.ledger_snapshot().expect("charged").total_owner_bytes(), 7);
+            assert_eq!(
+                broker.ledger_snapshot().expect("charged").total_owner_bytes(),
+                cost("a", &[("m0", "one", true)]) + cost("b", &[("m1", "four", true)])
+            );
             drop(store);
             assert_eq!(broker.ledger_snapshot().expect("drop refund").total_owner_bytes(), 0);
         }
@@ -2057,7 +2465,10 @@ mod tests {
             store.append(request("b", 1, "m1", "four")).expect("second");
             broker.begin_rebuild().expect("fence");
             drop(store);
-            assert_eq!(broker.ledger_snapshot().expect("fenced").total_owner_bytes(), 7);
+            assert_eq!(
+                broker.ledger_snapshot().expect("fenced").total_owner_bytes(),
+                cost("a", &[("m0", "one", true)]) + cost("b", &[("m1", "four", true)])
+            );
             broker.finish_rebuild().expect("drain deferred charges");
             assert_eq!(broker.ledger_snapshot().expect("drained").total_owner_bytes(), 0);
         }
@@ -2080,7 +2491,10 @@ mod tests {
             assert!(matches!(store.stats(), Err(MemoryError::OperationInProgress(_))));
             drop(permit);
             assert_eq!(store.load(&"s".to_string()).expect("stable image").len(), 1);
-            assert_eq!(broker.ledger_snapshot().expect("inert reentry").total_owner_bytes(), 3);
+            assert_eq!(
+                broker.ledger_snapshot().expect("inert reentry").total_owner_bytes(),
+                cost("s", &[("m0", "one", true)])
+            );
         }
 
         #[test]
@@ -2144,10 +2558,19 @@ mod tests {
                 store.append(request("s", 0, "m0", "one")).expect("evicted retry"),
                 TranscriptAppendDispositionV1::Replayed
             );
-            assert_eq!(store.retained_bytes().expect("after retain"), 7);
+            let after_cost = cost(
+                "s",
+                &[
+                    ("m0", "one", false),
+                    ("m2", "two", true),
+                    ("m4", "four", false),
+                    ("m9", "nine", true),
+                ],
+            );
+            assert_eq!(store.retained_bytes().expect("after retain"), after_cost);
             assert_eq!(
                 broker.ledger_snapshot().expect("after retain ledger").total_owner_bytes(),
-                7
+                after_cost
             );
         }
 

@@ -58,6 +58,13 @@ use crate::shared::accounting::Unbudgeted;
     feature = "transcript"
 ))]
 use crate::shared::accounting::{AccountingUnset, Budgeted};
+#[cfg(any(
+    feature = "payload_store",
+    feature = "retained_map",
+    feature = "revocable_store",
+    feature = "transcript"
+))]
+use crate::shared::measure::ByteSized;
 #[cfg(feature = "transcript")]
 use crate::transcript_store::{service::SimpleSessionTranscriptStore, TranscriptRetentionPolicyV1};
 #[cfg(feature = "payload_store")]
@@ -264,7 +271,10 @@ impl<PayloadRef, Bytes> PayloadStoreBuilder<PayloadRef, Bytes, Budgeted> {
         }
     }
 
-    pub fn build(self) -> MemoryResult<SimplePayloadStore<PayloadRef, Bytes, Budgeted>> {
+    pub fn build(self) -> MemoryResult<SimplePayloadStore<PayloadRef, Bytes, Budgeted>>
+    where
+        PayloadRef: ByteSized,
+    {
         let binding = self.binding.ok_or_else(missing_binding)?;
         Ok(SimplePayloadStore::new_budgeted(binding, self.context, self.accounting.into_broker()))
     }
@@ -272,7 +282,10 @@ impl<PayloadRef, Bytes> PayloadStoreBuilder<PayloadRef, Bytes, Budgeted> {
 
 #[cfg(all(feature = "payload_store", feature = "unbudgeted-stores"))]
 impl<PayloadRef, Bytes> PayloadStoreBuilder<PayloadRef, Bytes, Unbudgeted> {
-    pub fn build(self) -> MemoryResult<SimplePayloadStore<PayloadRef, Bytes, Unbudgeted>> {
+    pub fn build(self) -> MemoryResult<SimplePayloadStore<PayloadRef, Bytes, Unbudgeted>>
+    where
+        PayloadRef: ByteSized,
+    {
         let binding = self.binding.ok_or_else(missing_binding)?;
         Ok(SimplePayloadStore::new_unbudgeted(binding, self.context))
     }
@@ -368,14 +381,20 @@ impl<Key, Value, Mode> RetainedMapStoreBuilder<Key, Value, Mode> {
 
 #[cfg(feature = "retained_map")]
 impl<Key, Value> BoundRetainedMapStoreBuilder<Key, Value, Budgeted> {
-    pub fn build(self) -> SimpleRetainedMapStore<Key, Value, Budgeted> {
+    pub fn build(self) -> SimpleRetainedMapStore<Key, Value, Budgeted>
+    where
+        Key: ByteSized,
+    {
         SimpleRetainedMapStore::new_budgeted(self.binding, self.accounting.into_broker())
     }
 }
 
 #[cfg(all(feature = "retained_map", feature = "unbudgeted-stores"))]
 impl<Key, Value> BoundRetainedMapStoreBuilder<Key, Value, Unbudgeted> {
-    pub fn build(self) -> SimpleRetainedMapStore<Key, Value, Unbudgeted> {
+    pub fn build(self) -> SimpleRetainedMapStore<Key, Value, Unbudgeted>
+    where
+        Key: ByteSized,
+    {
         SimpleRetainedMapStore::new_unbudgeted(self.binding)
     }
 }
@@ -417,7 +436,10 @@ impl<Key, Value> RevocableStoreBuilder<Key, Value, Budgeted> {
         Self { binding: None, accounting: Budgeted::new(broker), _marker: PhantomData }
     }
 
-    pub fn build(self) -> MemoryResult<SimpleRevocableStore<Key, Value, Budgeted>> {
+    pub fn build(self) -> MemoryResult<SimpleRevocableStore<Key, Value, Budgeted>>
+    where
+        Key: ByteSized,
+    {
         let binding = self.binding.ok_or_else(missing_binding)?;
         Ok(SimpleRevocableStore::new_budgeted(binding, self.accounting.into_broker()))
     }
@@ -425,7 +447,10 @@ impl<Key, Value> RevocableStoreBuilder<Key, Value, Budgeted> {
 
 #[cfg(all(feature = "revocable_store", feature = "unbudgeted-stores"))]
 impl<Key, Value> RevocableStoreBuilder<Key, Value, Unbudgeted> {
-    pub fn build(self) -> MemoryResult<SimpleRevocableStore<Key, Value, Unbudgeted>> {
+    pub fn build(self) -> MemoryResult<SimpleRevocableStore<Key, Value, Unbudgeted>>
+    where
+        Key: ByteSized,
+    {
         let binding = self.binding.ok_or_else(missing_binding)?;
         Ok(SimpleRevocableStore::new_unbudgeted(binding))
     }
@@ -634,7 +659,11 @@ impl<SessionId, MessageId, Message>
 
     pub fn build(
         self,
-    ) -> MemoryResult<SimpleSessionTranscriptStore<SessionId, MessageId, Message, Budgeted>> {
+    ) -> MemoryResult<SimpleSessionTranscriptStore<SessionId, MessageId, Message, Budgeted>>
+    where
+        SessionId: ByteSized,
+        MessageId: ByteSized,
+    {
         let binding = self.binding.ok_or_else(missing_binding)?;
         Ok(SimpleSessionTranscriptStore::new_budgeted(
             binding,
@@ -650,7 +679,11 @@ impl<SessionId, MessageId, Message>
 {
     pub fn build(
         self,
-    ) -> MemoryResult<SimpleSessionTranscriptStore<SessionId, MessageId, Message, Unbudgeted>> {
+    ) -> MemoryResult<SimpleSessionTranscriptStore<SessionId, MessageId, Message, Unbudgeted>>
+    where
+        SessionId: ByteSized,
+        MessageId: ByteSized,
+    {
         let binding = self.binding.ok_or_else(missing_binding)?;
         Ok(SimpleSessionTranscriptStore::new_unbudgeted(binding, self.retention))
     }
@@ -725,7 +758,8 @@ mod tests {
             platform.retained_map_store_builder::<String, Vec<u8>>().bind(binding()).build();
 
         store.insert_checked("k".to_string(), vec![0u8; 64]).expect("insert");
-        assert_eq!(platform.broker().ledger_snapshot().expect("snap").total_owner_bytes(), 64);
+        // value 64 + retained key 1 + hash slot 24 + entry state 16.
+        assert_eq!(platform.broker().ledger_snapshot().expect("snap").total_owner_bytes(), 105);
     }
 
     #[test]
@@ -764,7 +798,9 @@ mod tests {
                 "hello".to_string(),
             ))
             .expect("append");
-        assert_eq!(platform.broker().ledger_snapshot().expect("snap").total_owner_bytes(), 5);
+        // session 1+24+16, active row 5+2+24+16, persistent
+        // evidence 2*2+2*24+2*32+2*16.
+        assert_eq!(platform.broker().ledger_snapshot().expect("snap").total_owner_bytes(), 236);
     }
 
     #[test]
@@ -788,7 +824,8 @@ mod tests {
             .expect("builder charged revocable store");
 
         store.insert_checked("k".to_string(), vec![0u8; 16]).expect("insert");
-        assert_eq!(platform.broker().ledger_snapshot().expect("snap").total_owner_bytes(), 16);
+        // value 16 + key 1 + FIFO slot 16 + entry state 16.
+        assert_eq!(platform.broker().ledger_snapshot().expect("snap").total_owner_bytes(), 49);
     }
 
     #[test]
@@ -806,7 +843,7 @@ mod tests {
         store.insert_checked("k".to_string(), vec![0u8; 48]).expect("insert");
         assert_eq!(
             platform.broker().ledger_snapshot().expect("snap").total_owner_bytes(),
-            48,
+            89,
             "a store built from the platform routes its bytes through the platform ledger"
         );
         store.remove(&"k".to_string()).expect("remove");
@@ -834,8 +871,8 @@ mod tests {
         b.insert_checked("y".to_string(), vec![0u8; 25]).expect("insert b");
         assert_eq!(
             platform.broker().ledger_snapshot().expect("snap").total_owner_bytes(),
-            35,
-            "both stores' bytes land in the one shared ledger (10 + 25)"
+            117,
+            "both stores' full semantic costs land in one ledger ((10 + 41) + (25 + 41))"
         );
     }
 

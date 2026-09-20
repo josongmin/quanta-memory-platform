@@ -2,6 +2,7 @@ pub mod service;
 
 use std::fmt::{Display, Formatter};
 
+use crate::shared::measure::ByteSized;
 use quanta_memory_platform_core::{MemoryError, MemoryResult, StoreBindingHandle, StoreStats};
 
 pub use crate::shared::builder::SessionTranscriptStoreBuilder;
@@ -193,7 +194,15 @@ impl Default for TranscriptRetentionPolicyV1 {
     }
 }
 
-pub trait SessionTranscriptStore<SessionId, MessageId, Message> {
+/// Transcript admission charges active rows, persistent idempotency evidence,
+/// and the first retained session key. Both identity types must report their
+/// semantic retained byte length; truncating active rows does not erase or
+/// refund process-lifetime identity evidence.
+pub trait SessionTranscriptStore<SessionId, MessageId, Message>
+where
+    SessionId: ByteSized,
+    MessageId: ByteSized,
+{
     fn binding(&self) -> &StoreBindingHandle;
     fn append(
         &self,

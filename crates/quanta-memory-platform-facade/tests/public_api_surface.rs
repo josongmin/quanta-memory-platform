@@ -387,7 +387,8 @@ fn default_builder_over_cap_store_mutation_is_denied() {
         None,
     );
     let store = platform.retained_map_store_builder::<String, Vec<u8>>().bind(binding).build();
-    store.insert_checked("fits".to_string(), vec![0; 64]).expect("at cap");
+    // 20 payload + 4 key + 24 hash slot + 16 state = class cap 64.
+    store.insert_checked("fits".to_string(), vec![0; 20]).expect("at cap");
     let before = platform.broker().ledger_snapshot().expect("before denial");
 
     let denied = store.insert_checked("over".to_string(), vec![1]);
@@ -477,7 +478,7 @@ fn retained_map_builder_exposes_public_charged_path() {
         platform.retained_map_store_builder::<String, Vec<u8>>().bind(binding).build();
 
     store.insert_checked("k".to_string(), vec![0u8; 32]).expect("insert");
-    assert_eq!(platform.broker().ledger_snapshot().expect("snap").total_owner_bytes(), 32);
+    assert_eq!(platform.broker().ledger_snapshot().expect("snap").total_owner_bytes(), 73);
 }
 
 #[cfg(all(feature = "retained_map", feature = "unbudgeted-stores"))]
@@ -502,10 +503,10 @@ fn explicit_unbudgeted_store_is_a_distinct_product_and_does_not_charge_the_platf
     only_unbudgeted(&unbudgeted);
 
     unbudgeted.insert_checked("fixture".to_string(), vec![0; 7]).expect("explicit fixture write");
-    assert_eq!(unbudgeted.stats_checked().expect("fixture stats").estimated_bytes, 7);
+    assert_eq!(unbudgeted.stats_checked().expect("fixture stats").estimated_bytes, 54);
     assert_eq!(platform.broker().ledger_snapshot().expect("ledger").total_owner_bytes(), 0);
     budgeted.insert_checked("production".to_string(), vec![0; 11]).expect("charged write");
-    assert_eq!(platform.broker().ledger_snapshot().expect("ledger").total_owner_bytes(), 11);
+    assert_eq!(platform.broker().ledger_snapshot().expect("ledger").total_owner_bytes(), 61);
 }
 
 #[cfg(feature = "retained_map")]
@@ -542,7 +543,7 @@ fn retained_map_atomic_insert_returns_occupied_value_without_overwrite() {
         Arc::ptr_eq(&stored, &retained),
         "occupied insert must preserve the original allocation"
     );
-    assert_eq!(store.stats_checked().expect("stats").estimated_bytes, 3);
+    assert_eq!(store.stats_checked().expect("stats").estimated_bytes, 44);
 }
 
 #[cfg(all(feature = "core-live-accounting", feature = "revocable_store"))]
@@ -560,8 +561,8 @@ fn revocable_builder_exposes_public_charged_path() {
         .expect("budgeted revocable builder must build");
 
     store.insert_checked("k".to_string(), vec![0u8; 24]).expect("insert");
-    assert_eq!(store.stats().expect("checked revocable stats").estimated_bytes, 24);
-    assert_eq!(platform.broker().ledger_snapshot().expect("snap").total_owner_bytes(), 24);
+    assert_eq!(store.stats().expect("checked revocable stats").estimated_bytes, 57);
+    assert_eq!(platform.broker().ledger_snapshot().expect("snap").total_owner_bytes(), 57);
 }
 
 #[cfg(all(feature = "core-live-accounting", feature = "transcript"))]
@@ -587,8 +588,8 @@ fn transcript_builder_exposes_public_charged_path() {
         .expect("append");
     assert_eq!(disposition, TranscriptAppendDispositionV1::Applied);
     assert_eq!(store.load(&"s".to_string()).expect("load").len(), 1);
-    assert_eq!(store.stats().expect("checked transcript stats").estimated_bytes, 5);
-    assert_eq!(platform.broker().ledger_snapshot().expect("snap").total_owner_bytes(), 5);
+    assert_eq!(store.stats().expect("checked transcript stats").estimated_bytes, 236);
+    assert_eq!(platform.broker().ledger_snapshot().expect("snap").total_owner_bytes(), 236);
 }
 
 /// The `spill` slice is a genuine two-way tier: a routed controller over a

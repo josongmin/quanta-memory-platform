@@ -25,6 +25,12 @@ use quanta_memory_platform_facade::{
 
 const OWNER: &str = "e2e-owner";
 
+// Independent semantic-cost oracle for String-keyed retained-map entries:
+// payload + retained key bytes + one hash linkage (24) + entry state (16).
+fn map_cost(key: &str, payload_bytes: u64) -> u64 {
+    payload_bytes + key.len() as u64 + 24 + 16
+}
+
 /// A live platform whose `MemoResidency` class is capped at `class_hard` and whose global
 /// limit is `global`. Roomy elsewhere so the test controls exactly which cap bites.
 fn broker(global: u64, class_hard: u64) -> LiveMemoryPlatform {
@@ -71,17 +77,21 @@ fn charged_store_bytes_flow_through_the_ledger_and_drain_to_zero() {
     store.insert_checked("a".to_string(), vec![0u8; 100]).expect("insert a");
     store.insert_checked("b".to_string(), vec![0u8; 250]).expect("insert b");
     let snap = b.broker().ledger_snapshot().expect("snap");
-    assert_eq!(snap.total_owner_bytes(), 350, "store bytes are visible in the broker ledger");
+    let expected = map_cost("a", 100) + map_cost("b", 250);
+    assert_eq!(snap.total_owner_bytes(), expected, "store bytes are visible in the broker ledger");
     assert_eq!(
         store.committed_bytes().expect("committed"),
-        350,
+        expected,
         "store counter agrees with ledger"
     );
     assert_balanced(&snap);
 
     // Overwrite 'a' smaller: the ledger re-charges to the new size, never doubles.
     store.insert_checked("a".to_string(), vec![0u8; 40]).expect("overwrite a");
-    assert_eq!(b.broker().ledger_snapshot().expect("snap").total_owner_bytes(), 290);
+    assert_eq!(
+        b.broker().ledger_snapshot().expect("snap").total_owner_bytes(),
+        map_cost("a", 40) + map_cost("b", 250)
+    );
 
     store.remove(&"a".to_string()).expect("remove a");
     store.remove(&"b".to_string()).expect("remove b");
@@ -96,7 +106,10 @@ fn close_drains_all_charges_once_and_rejects_later_mutation() {
     let store = charged_map(&platform);
     store.insert_checked("a".to_string(), vec![0; 100]).expect("a");
     store.insert_checked("b".to_string(), vec![0; 250]).expect("b");
-    assert_eq!(platform.broker().ledger_snapshot().expect("before").total_owner_bytes(), 350);
+    assert_eq!(
+        platform.broker().ledger_snapshot().expect("before").total_owner_bytes(),
+        map_cost("a", 100) + map_cost("b", 250)
+    );
 
     store.close().expect("terminal close");
     store.close().expect("idempotent close");
@@ -125,7 +138,7 @@ fn failed_close_during_rebuild_preserves_store_and_retries_after_fence() {
     );
     assert_eq!(platform.broker().ledger_snapshot().expect("after denial"), before);
     assert_eq!(store.get_checked(&"kept".to_string()).expect("checked read"), Some(vec![0; 200]));
-    assert_eq!(store.committed_bytes().expect("counter"), 200);
+    assert_eq!(store.committed_bytes().expect("counter"), map_cost("kept", 200));
 
     platform.broker().finish_rebuild().expect("end fence");
     store.close().expect("retry close");
@@ -141,7 +154,11 @@ fn store_drop_during_rebuild_defers_refund_until_finish() {
     drop(store);
 
     let fenced = platform.broker().ledger_snapshot().expect("fenced snapshot");
-    assert_eq!(fenced.total_owner_bytes(), 321, "rebuild must not silently zero the ledger");
+    assert_eq!(
+        fenced.total_owner_bytes(),
+        map_cost("dropped", 321),
+        "rebuild must not silently zero the ledger"
+    );
     assert_balanced(&fenced);
     platform.broker().finish_rebuild().expect("drain deferred cleanup");
     let drained = platform.broker().ledger_snapshot().expect("drained snapshot");
@@ -164,7 +181,7 @@ fn e2e_spill_tier_round_trips_fifo_and_never_touches_the_ledger() {
     let store = charged_map(&b);
     store.insert_checked("resident".to_string(), vec![0u8; 500]).expect("insert");
     let ledger_before = b.broker().ledger_snapshot().expect("snap").total_owner_bytes();
-    assert_eq!(ledger_before, 500);
+    assert_eq!(ledger_before, map_cost("resident", 500));
 
     let controller = RoutedSpillController::new(RetainingSpillTarget::available());
     controller.spill("h1".to_string()).expect("spill 1");
@@ -226,16 +243,20 @@ fn class_cap_gates_store_bytes_fail_closed() {
 //    the cap succeeds even when (old + new) would transiently exceed it.
 #[test]
 fn overwrite_recharge_admits_net_fitting_replacement() {
-    let b = broker(10_000_000, 1_000); // class cap 1_000
+    let b = broker(10_000_000, 1_050); // new full retained cost is 1_041
     let store = charged_map(&b);
     store.insert_checked("k".to_string(), vec![0u8; 900]).expect("900 of 1000");
-    // Replace with 1_000: net is +100 (fits), but old+new = 1_900 > cap. A
+    // Replace with 1_000: old=941, new=1_041 fits cap 1_050, but
+    // transient old+new=1_982 does not. A
     // naive charge-then-refund would deny; the atomic recharge admits it.
     store
         .insert_checked("k".to_string(), vec![0u8; 1_000])
         .expect("net-fitting overwrite via recharge");
-    assert_eq!(b.broker().ledger_snapshot().expect("snap").total_owner_bytes(), 1_000);
-    assert_eq!(store.committed_bytes().expect("c"), 1_000);
+    assert_eq!(
+        b.broker().ledger_snapshot().expect("snap").total_owner_bytes(),
+        map_cost("k", 1_000)
+    );
+    assert_eq!(store.committed_bytes().expect("c"), map_cost("k", 1_000));
 }
 
 // 4) A broker rebuild fences charged-store writes (fail-closed), then resumes.
@@ -252,11 +273,17 @@ fn rebuild_fences_charged_store_writes_then_resumes() {
         "charged insert during rebuild must be rejected, got {during:?}"
     );
     // Fail-closed: nothing stranded, the pre-rebuild charge is intact.
-    assert_eq!(b.broker().ledger_snapshot().expect("snap").total_owner_bytes(), 500);
+    assert_eq!(
+        b.broker().ledger_snapshot().expect("snap").total_owner_bytes(),
+        map_cost("pre", 500)
+    );
 
     b.broker().finish_rebuild().expect("finish rebuild");
     store.insert_checked("post".to_string(), vec![0u8; 300]).expect("writes resume after rebuild");
-    assert_eq!(b.broker().ledger_snapshot().expect("snap").total_owner_bytes(), 800);
+    assert_eq!(
+        b.broker().ledger_snapshot().expect("snap").total_owner_bytes(),
+        map_cost("pre", 500) + map_cost("post", 300)
+    );
     assert_balanced(&b.broker().ledger_snapshot().expect("snap"));
 }
 
@@ -280,13 +307,20 @@ fn reconfigure_raise_preserves_charged_usage() {
     );
     b.broker().try_live_reconfigure(raised).expect("raising caps is legal");
     let snap = b.broker().ledger_snapshot().expect("snap");
-    assert_eq!(snap.total_owner_bytes(), 600_000, "charged usage survives a legal reconfigure");
+    assert_eq!(
+        snap.total_owner_bytes(),
+        map_cost("x", 600_000),
+        "charged usage survives a legal reconfigure"
+    );
     assert_balanced(&snap);
     // The larger cap now admits what the old one would have denied.
     store
         .insert_checked("y".to_string(), vec![0u8; 3_000_000])
         .expect("admitted under the raised cap");
-    assert_eq!(b.broker().ledger_snapshot().expect("snap").total_owner_bytes(), 3_600_000);
+    assert_eq!(
+        b.broker().ledger_snapshot().expect("snap").total_owner_bytes(),
+        map_cost("x", 600_000) + map_cost("y", 3_000_000)
+    );
 }
 
 // 6) Concurrency: many threads hammering one charged store (shared broker) never
@@ -303,7 +337,8 @@ fn concurrent_charged_inserts_never_exceed_global_and_stay_consistent() {
         let store = Arc::clone(&store);
         handles.push(std::thread::spawn(move || {
             for i in 0..50 {
-                // Distinct keys so every attempt is a fresh 1_000-byte insert.
+                // Distinct keys: every attempt is 1_000 payload bytes plus
+                // its retained key and semantic node cost.
                 // A competing store operation now returns typed busy instead of
                 // waiting; retry only that transient state. Capacity is terminal.
                 let mut busy_retries = 0usize;
@@ -336,8 +371,9 @@ fn concurrent_charged_inserts_never_exceed_global_and_stay_consistent() {
         store.committed_bytes().expect("committed"),
         "store counter and ledger must agree exactly after concurrent inserts (no torn updates)"
     );
-    // 8*50*1000 = 400k attempts against a 100k ceiling -> saturates exactly.
-    assert_eq!(snap.total_owner_bytes(), global, "the ceiling is saturated, not under/over-shot");
+    // There are far more attempted entries than capacity. The remaining
+    // headroom must be smaller than the cheapest possible entry (key "k0-0").
+    assert!(global - snap.total_owner_bytes() < map_cost("k0-0", 1_000));
     assert_balanced(&snap);
 }
 
@@ -348,7 +384,10 @@ fn double_remove_does_not_double_refund_the_ledger() {
     let b = broker(10_000_000, 1_000_000);
     let store = charged_map(&b);
     store.insert_checked("k".to_string(), vec![0u8; 1_000]).expect("insert");
-    assert_eq!(b.broker().ledger_snapshot().expect("snap").total_owner_bytes(), 1_000);
+    assert_eq!(
+        b.broker().ledger_snapshot().expect("snap").total_owner_bytes(),
+        map_cost("k", 1_000)
+    );
 
     assert_eq!(
         store.remove(&"k".to_string()).expect("first remove"),
@@ -533,12 +572,13 @@ mod payload_e2e {
         let first = store
             .put_canonical(RetainedEnvelope::new(vec![7u8; 32]))
             .expect("first put charges the ledger");
-        assert_eq!(ledger(&b), 32, "payload bytes flow through the broker ledger");
+        // 32 body + retained reference "payload-0" (9) + digest 32 + state 16.
+        assert_eq!(ledger(&b), 89, "full payload retention flows through the broker ledger");
 
         // Canonical dedup: the identical payload re-uses the entry, one live charge.
         let second = store.put_canonical(RetainedEnvelope::new(vec![7u8; 32])).expect("dedup put");
         assert_eq!(second.payload_ref(), first.payload_ref(), "dedup returns the same ref");
-        assert_eq!(ledger(&b), 32, "dedup does not double-charge the ledger");
+        assert_eq!(ledger(&b), 89, "dedup does not double-charge the ledger");
 
         // Pin discipline: a pinned payload cannot be deleted; the ledger is intact.
         store.pin(first.payload_ref()).expect("pin");
@@ -547,7 +587,7 @@ mod payload_e2e {
             matches!(pinned_delete, Err(MemoryError::InvalidState(_))),
             "deleting a pinned payload must be rejected, got {pinned_delete:?}"
         );
-        assert_eq!(ledger(&b), 32, "a refused pinned delete leaves the ledger charged");
+        assert_eq!(ledger(&b), 89, "a refused pinned delete leaves the ledger charged");
 
         // Unpin, then delete refunds the ledger to zero.
         store.unpin(first.payload_ref()).expect("unpin");

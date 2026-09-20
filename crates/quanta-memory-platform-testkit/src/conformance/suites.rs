@@ -110,6 +110,16 @@ pub fn run_prepared_publication_suite<T>(target: &T) -> Vec<AssertionVerdict>
 where
     T: PreparedPublicationConformanceTarget,
 {
+    // Independently specified V1 semantic cost; never ask the target to
+    // calculate its own expected bytes. Vec<u8>::canonical_key retains a
+    // second copy of the payload bytes while prepared.
+    let evidence_cost = |identity_len: u64| identity_len + 128;
+    let prepared_cost = |identity_len: u64, payload_len: u64| {
+        evidence_cost(identity_len) + payload_len + payload_len + identity_len + 16
+    };
+    let initial_prepared = prepared_cost(8, 7);
+    let first_evidence = evidence_cost(8);
+    let final_evidence = first_evidence + evidence_cost(15) + evidence_cost(19);
     let replay = InvariantAssertion::new(
         ContractFamily::ReserveFailClosed,
         "prepared_publication_replay_is_inert",
@@ -173,9 +183,10 @@ where
                         stats_after_cleanup,
                         Ok(PreparedPublicationStatsV1 {
                             prepared_count: 0,
-                            charged_bytes: 0,
-                            ..
-                        })
+                            charged_bytes,
+                            tombstone_count: 3,
+                            tombstone_bytes,
+                        }) if charged_bytes == final_evidence && tombstone_bytes == final_evidence
                     ),
                 format!(
                     "orphan={orphan:?} referenced={referenced:?} enumerated={enumerated:?} collected={collected:?} orphan_after={orphan_after:?} referenced_after={referenced_after:?} cleanup={cleanup:?} final={stats_after_cleanup:?}"
@@ -192,8 +203,8 @@ where
             matches!((&first, &replayed, &before_conflict),
                 (Ok((first_token, PrepareDispositionV1::Applied)),
                  Ok((replay_token, PrepareDispositionV1::Replayed)),
-                 Ok(PreparedPublicationStatsV1 { prepared_count: 1, charged_bytes: 7, .. }))
-                 if first_token == replay_token),
+                 Ok(PreparedPublicationStatsV1 { prepared_count: 1, charged_bytes, tombstone_count: 0, tombstone_bytes: 0 }))
+                 if first_token == replay_token && *charged_bytes == initial_prepared),
             format!("first={first:?} replay={replayed:?} stats={before_conflict:?}"),
         ),
         conflict.assert_that(
@@ -209,7 +220,12 @@ where
                 && matches!(abort_replay, Ok(AbortDispositionV1::Replayed))
                 && matches!(
                     final_stats,
-                    Ok(PreparedPublicationStatsV1 { prepared_count: 0, charged_bytes: 0, .. })
+                    Ok(PreparedPublicationStatsV1 {
+                        prepared_count: 0,
+                        charged_bytes,
+                        tombstone_count: 1,
+                        tombstone_bytes,
+                    }) if charged_bytes == first_evidence && tombstone_bytes == first_evidence
                 ),
             format!(
                 "resolution={resolution:?} abort={abort_first:?} replay={abort_replay:?} final={final_stats:?}"
@@ -275,6 +291,13 @@ pub fn run_transcript_append_suite<T>(target: &T) -> Vec<AssertionVerdict>
 where
     T: TranscriptAppendConformanceTarget,
 {
+    // An independent, literal V1 semantic-cost oracle. The target may not
+    // supply its own formula as the expected value.
+    let session = 1 + 24 + 16;
+    let evidence = 2 * 2 + 2 * 24 + 2 * 32 + 2 * 16;
+    let first_active = 3 + 2 + 24 + 16;
+    let first_expected = session + evidence + first_active;
+    let after_truncate_expected = first_expected + evidence;
     let replay = InvariantAssertion::new(
         ContractFamily::ReserveFailClosed,
         "transcript_exact_replay_is_inert",
@@ -307,7 +330,7 @@ where
             matches!(first, Ok(TranscriptAppendDispositionV1::Applied))
                 && matches!(replayed, Ok(TranscriptAppendDispositionV1::Replayed))
                 && matches!(&rows_after_replay, Ok(rows) if rows.len() == 1)
-                && matches!(bytes_after_replay, Ok(3)),
+                && matches!(bytes_after_replay, Ok(bytes) if bytes == first_expected),
             format!(
                 "first={first:?} replay={replayed:?} rows={rows_after_replay:?} bytes={bytes_after_replay:?}"
             ),
@@ -332,7 +355,7 @@ where
                 && truncate.is_ok()
                 && matches!(late_retry, Ok(TranscriptAppendDispositionV1::Replayed))
                 && matches!(&rows_after_late_retry, Ok(rows) if rows.len() == 1)
-                && matches!(bytes_after_late_retry, Ok(3)),
+                && matches!(bytes_after_late_retry, Ok(bytes) if bytes == after_truncate_expected),
             format!(
                 "second={second:?} truncate={truncate:?} late={late_retry:?} rows={rows_after_late_retry:?} bytes={bytes_after_late_retry:?}"
             ),
@@ -882,6 +905,9 @@ fn run_all_store_lifecycle_suites(kit: &MemoryTestKit) -> Vec<AssertionVerdict> 
 
 #[cfg(feature = "fixtures")]
 fn run_payload_store_slice(kit: &MemoryTestKit) -> Vec<AssertionVerdict> {
+    // 32 body + the retained "payload-0" reference (9) + digest (32) +
+    // entry state (16). This is independent of the store's calculator.
+    let expected_entry_bytes = 32 + 9 + 32 + 16;
     let accounting =
         InvariantAssertion::new(ContractFamily::ReclaimAccounting, "payload_dedup_refund");
     let pin_discipline = InvariantAssertion::new(ContractFamily::PinDiscipline, "pin_safe_delete");
@@ -931,9 +957,9 @@ fn run_payload_store_slice(kit: &MemoryTestKit) -> Vec<AssertionVerdict> {
     vec![
         accounting.assert_that(
             matches!(&second, Ok(published) if published.payload_ref() == first.payload_ref())
-                && matches!(&ledger_after_first, Ok(bytes) if *bytes == 32)
-                && matches!(&ledger_after_dedup, Ok(bytes) if *bytes == 32)
-                && matches!(&charged_after_dedup, Ok(bytes) if *bytes == 32)
+                && matches!(&ledger_after_first, Ok(bytes) if *bytes == expected_entry_bytes)
+                && matches!(&ledger_after_dedup, Ok(bytes) if *bytes == expected_entry_bytes)
+                && matches!(&charged_after_dedup, Ok(bytes) if *bytes == expected_entry_bytes)
                 && final_delete.is_ok()
                 && matches!(&final_ledger, Ok(bytes) if *bytes == 0)
                 && matches!(&final_charged, Ok(bytes) if *bytes == 0),
@@ -1017,21 +1043,22 @@ fn run_retained_map_slice_with_platform(
         "retained_atomic_recharge_overwrite",
     );
     let recharge_verdict =
-        match make_platform(&class_capped_kit(kit, MemoryClass::MemoResidency, 30)) {
+        match make_platform(&class_capped_kit(kit, MemoryClass::MemoResidency, 70)) {
             Ok(tight_platform) => {
                 let tight_broker = tight_platform.broker();
                 let tight_store = tight_platform
                     .retained_map_store_builder::<String, Vec<u8>>()
                     .bind(binding(MemoryClass::MemoResidency, "conformance:map-tight"))
                     .build();
-                let seed = tight_store.insert_checked("k".to_string(), vec![0u8; 24]); // 24 of 30
-                                                                                       // old(24) + new(20) = 44 > 30 cap, but net 20 <= 30: atomic recharge only.
+                // key 1 + hash slot 24 + state 16: old=65, new=61.
+                // Combined transient 126 exceeds cap 70; net new 61 fits.
+                let seed = tight_store.insert_checked("k".to_string(), vec![0u8; 24]);
                 let net_fit = tight_store.insert_checked("k".to_string(), vec![0u8; 20]);
                 let tight_ledger = broker_bytes(tight_broker);
                 recharge.assert_that(
                     seed.is_ok()
                         && net_fit.is_ok()
-                        && matches!(&tight_ledger, Ok(bytes) if *bytes == 20),
+                        && matches!(&tight_ledger, Ok(bytes) if *bytes == 61),
                     format!("seed={seed:?} net_fit={net_fit:?} tight_ledger={tight_ledger:?}"),
                 )
             }
@@ -1043,12 +1070,14 @@ fn run_retained_map_slice_with_platform(
     vec![
         accounting.assert_that(
             overwrite.is_ok()
-                && matches!(&after_overwrite, Ok(bytes) if *bytes == 10)
-                && matches!(&committed_after_overwrite, Ok(bytes) if *bytes == 10)
+                && matches!(&after_overwrite, Ok(bytes) if *bytes == 51)
+                && matches!(&committed_after_overwrite, Ok(bytes) if *bytes == 51)
                 && seed_sweep.is_ok()
-                && matches!(&sweep_stats, Ok(stats) if stats.reclaimed_items == 2 && stats.reclaimed_bytes == 12)
-                && matches!(&after_sweep, Ok(bytes) if *bytes == 10)
-                && matches!(&committed_after_sweep, Ok(bytes) if *bytes == 10)
+                && matches!(&sweep_stats, Ok(stats) if stats.reclaimed_items == 1 && stats.reclaimed_bytes == 46)
+                && matches!(&after_sweep, Ok(bytes) if *bytes == 99)
+                && matches!(&committed_after_sweep, Ok(bytes) if *bytes == 99)
+                && matches!(store.get_checked(&"b".to_string()), Ok(Some(value)) if value == vec![2u8; 7])
+                && matches!(store.get_checked(&"c".to_string()), Ok(None))
                 && matches!(store.get_checked(&"k".to_string()), Ok(Some(value)) if value == vec![1u8; 10]),
             format!(
                 "overwrite={overwrite:?} after_overwrite={after_overwrite:?} committed_after_overwrite={committed_after_overwrite:?} seed_sweep={seed_sweep:?} sweep_stats={sweep_stats:?} after_sweep={after_sweep:?} committed_after_sweep={committed_after_sweep:?} remaining_keys={:?}",
@@ -1061,6 +1090,12 @@ fn run_retained_map_slice_with_platform(
 
 #[cfg(feature = "fixtures")]
 fn run_transcript_slice(kit: &MemoryTestKit) -> Vec<AssertionVerdict> {
+    let session = 1 + 24 + 16;
+    let evidence = 2 * 2 + 2 * 24 + 2 * 32 + 2 * 16;
+    let first_active = 2 + 2 + 24 + 16;
+    let second_active = 8 + 2 + 24 + 16;
+    let before_expected = session + evidence + first_active + evidence + second_active;
+    let after_expected = before_expected - second_active;
     let accounting =
         InvariantAssertion::new(ContractFamily::ReclaimAccounting, "transcript_truncate_refund");
     let fail_closed = InvariantAssertion::new(
@@ -1107,10 +1142,10 @@ fn run_transcript_slice(kit: &MemoryTestKit) -> Vec<AssertionVerdict> {
             return vec![
                 accounting.assert_that(
                     truncate.is_ok()
-                        && matches!(&before_truncate, Ok(bytes) if *bytes == 10)
+                        && matches!(&before_truncate, Ok(bytes) if *bytes == before_expected)
                         && truncate_result.is_ok()
-                        && matches!(&after_truncate, Ok(bytes) if *bytes == 2)
-                        && matches!(&retained_after_truncate, Ok(bytes) if *bytes == 2),
+                        && matches!(&after_truncate, Ok(bytes) if *bytes == after_expected)
+                        && matches!(&retained_after_truncate, Ok(bytes) if *bytes == after_expected),
                     format!(
                         "truncate={truncate:?} before_truncate={before_truncate:?} truncate_result={truncate_result:?} after_truncate={after_truncate:?} retained_after_truncate={retained_after_truncate:?}",
                     ),
@@ -1135,10 +1170,10 @@ fn run_transcript_slice(kit: &MemoryTestKit) -> Vec<AssertionVerdict> {
     vec![
         accounting.assert_that(
             truncate.is_ok()
-                && matches!(&before_truncate, Ok(bytes) if *bytes == 10)
+                && matches!(&before_truncate, Ok(bytes) if *bytes == before_expected)
                 && truncate_result.is_ok()
-                && matches!(&after_truncate, Ok(bytes) if *bytes == 2)
-                && matches!(&retained_after_truncate, Ok(bytes) if *bytes == 2),
+                && matches!(&after_truncate, Ok(bytes) if *bytes == after_expected)
+                && matches!(&retained_after_truncate, Ok(bytes) if *bytes == after_expected),
             format!(
                 "truncate={truncate:?} before_truncate={before_truncate:?} truncate_result={truncate_result:?} after_truncate={after_truncate:?} retained_after_truncate={retained_after_truncate:?}",
             ),
@@ -1253,6 +1288,80 @@ mod tests {
             .expect("bound prepared builder");
         let verdicts = run_prepared_publication_suite(&service);
         assert!(all_held(&verdicts), "honest prepared service failed: {verdicts:?}");
+    }
+
+    struct UnderbillingPreparedTarget<'a, T>(&'a T);
+
+    impl<T: PreparedPublicationConformanceTarget> PreparedPublicationConformanceTarget
+        for UnderbillingPreparedTarget<'_, T>
+    {
+        type Token = T::Token;
+
+        fn prepare(
+            &self,
+            identity: &[u8],
+            payload: &[u8],
+        ) -> Result<(Self::Token, PrepareDispositionV1), PreparedPublicationErrorV1> {
+            self.0.prepare(identity, payload)
+        }
+
+        fn resolve(&self, token: &Self::Token) -> Result<Vec<u8>, PreparedPublicationErrorV1> {
+            self.0.resolve(token)
+        }
+
+        fn abort(
+            &self,
+            token: &Self::Token,
+        ) -> Result<AbortDispositionV1, PreparedPublicationErrorV1> {
+            self.0.abort(token)
+        }
+
+        fn orphan_tokens(
+            &self,
+            referenced_tokens: &[Self::Token],
+        ) -> Result<Vec<Self::Token>, PreparedPublicationErrorV1> {
+            self.0.orphan_tokens(referenced_tokens)
+        }
+
+        fn gc_orphans(
+            &self,
+            referenced_tokens: &[Self::Token],
+        ) -> Result<usize, PreparedPublicationErrorV1> {
+            self.0.gc_orphans(referenced_tokens)
+        }
+
+        fn stats(&self) -> Result<PreparedPublicationStatsV1, PreparedPublicationErrorV1> {
+            self.0.stats().map(|mut stats| {
+                stats.charged_bytes = 0;
+                stats.tombstone_bytes = 0;
+                stats
+            })
+        }
+    }
+
+    #[test]
+    fn prepared_suite_rejects_correct_replay_with_unbilled_identity() {
+        let platform = MemoryPlatformBuilder::new()
+            .with_preset(MemoryPreset::Development)
+            .build()
+            .expect("platform");
+        let service = platform
+            .prepared_publication_builder::<Vec<u8>>()
+            .bind(StoreBindingHandle::new(
+                MemoryClass::ManifestResidency,
+                "underbilling-prepared".to_string(),
+                None,
+            ))
+            .build()
+            .expect("service");
+        let verdicts = run_prepared_publication_suite(&UnderbillingPreparedTarget(&service));
+        assert!(!all_held(&verdicts), "zero-byte accounting fake must fail: {verdicts:?}");
+        assert!(verdicts.iter().any(|verdict| {
+            verdict.name == "prepared_publication_replay_is_inert" && !verdict.held()
+        }));
+        assert!(verdicts.iter().any(|verdict| {
+            verdict.name == "prepared_publication_payload_drift_conflicts" && verdict.held()
+        }));
     }
 
     #[derive(Debug, Default)]
@@ -1478,6 +1587,59 @@ mod tests {
             violated(&verdicts).contains(&ContractFamily::ReserveFailClosed),
             "duplicate mutation must localize to fail-closed: {verdicts:?}"
         );
+    }
+
+    struct UnderbillingTranscriptTarget<'a, T>(&'a T);
+
+    impl<T: TranscriptAppendConformanceTarget> TranscriptAppendConformanceTarget
+        for UnderbillingTranscriptTarget<'_, T>
+    {
+        fn append(
+            &self,
+            session_id: &[u8],
+            sequence: u64,
+            message_id: &[u8],
+            body: &[u8],
+        ) -> Result<TranscriptAppendDispositionV1, TranscriptAppendErrorV1> {
+            self.0.append(session_id, sequence, message_id, body)
+        }
+
+        fn load(&self, session_id: &[u8]) -> Result<Vec<(u64, Vec<u8>, Vec<u8>)>, MemoryError> {
+            self.0.load(session_id)
+        }
+
+        fn truncate_to(&self, session_id: &[u8], max_messages: usize) -> Result<(), MemoryError> {
+            self.0.truncate_to(session_id, max_messages)
+        }
+
+        fn retained_bytes(&self) -> Result<u64, MemoryError> {
+            Ok(0)
+        }
+    }
+
+    #[test]
+    fn transcript_suite_rejects_correct_replay_with_unbilled_identity() {
+        let platform = MemoryPlatformBuilder::new()
+            .with_preset(MemoryPreset::Development)
+            .build()
+            .expect("platform");
+        let store = platform
+            .transcript_store_builder::<Vec<u8>, Vec<u8>, Vec<u8>>()
+            .bind(StoreBindingHandle::new(
+                MemoryClass::SessionTranscript,
+                "underbilling-transcript".to_string(),
+                None,
+            ))
+            .build()
+            .expect("store");
+        let verdicts = run_transcript_append_suite(&UnderbillingTranscriptTarget(&store));
+        assert!(!all_held(&verdicts), "zero-byte accounting fake must fail: {verdicts:?}");
+        assert!(verdicts.iter().any(|verdict| {
+            verdict.name == "transcript_exact_replay_is_inert" && !verdict.held()
+        }));
+        assert!(verdicts.iter().any(|verdict| {
+            verdict.name == "transcript_collision_axes_are_typed" && verdict.held()
+        }));
     }
 
     #[test]

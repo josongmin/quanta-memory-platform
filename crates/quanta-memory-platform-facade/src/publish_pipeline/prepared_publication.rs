@@ -12,12 +12,18 @@ use quanta_memory_platform_core::{
 use crate::shared::accounting::Unbudgeted;
 use crate::shared::accounting::{Budgeted, StoreAccounting};
 use crate::shared::lifecycle::{retire_client_value, BeginClose, DropTransition, StoreLifecycle};
-use crate::shared::measure::{ByteSized, CanonicalKey};
+use crate::shared::measure::{semantic_cost_v1, ByteSized, CanonicalKey, RetainedCostV1};
 
 const TOKEN_DOMAIN: &[u8] = b"qmp.prepared-publication.v1\0";
 const DEFAULT_TOMBSTONE_COUNT_CAPACITY: usize = 4_096;
 const DEFAULT_TOMBSTONE_BYTES_CAPACITY: u64 = 4 * 1024 * 1024;
-const TOKEN_BYTES: u64 = 32;
+// The persistent lease covers the identity-index key and state token, plus
+// the token key/index that moves from the prepared map to the aborted set.
+// The active lease covers only fields destroyed by abort/GC.
+const TOKEN_BYTES: u64 = semantic_cost_v1::DIGEST_BYTES;
+const PERSISTENT_INDEX_BYTES: u64 = 2 * semantic_cost_v1::ORDERED_INDEX_BYTES;
+const PERSISTENT_FIXED_BYTES: u64 = 2 * TOKEN_BYTES + semantic_cost_v1::ENTRY_STATE_BYTES;
+const ACTIVE_FIXED_BYTES: u64 = semantic_cost_v1::ENTRY_STATE_BYTES;
 
 /// Caller-owned stable identity for one logical publication attempt.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -198,14 +204,14 @@ struct PreparedEntry<Payload> {
     identity: PreparedPublicationIdentityV1,
     canonical_key: Vec<u8>,
     payload: Payload,
-    charged_bytes: u64,
-    /// Single-owner accounting authority for this exact retained payload.
-    charge: Option<ManagedCharge>,
+    active_bytes: u64,
+    /// Only payload, canonical key, and the entry's second identity copy.
+    active_charge: Option<ManagedCharge>,
 }
 
 fn retire_entry<Payload>(entry: PreparedEntry<Payload>) {
-    let PreparedEntry { payload, charge, .. } = entry;
-    drop(charge);
+    let PreparedEntry { payload, active_charge, .. } = entry;
+    drop(active_charge);
     retire_client_value(payload);
 }
 
@@ -215,16 +221,24 @@ fn retire_entries<Payload>(entries: BTreeMap<PreparedPublicationTokenV1, Prepare
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 enum IdentityState {
     Prepared(PreparedPublicationTokenV1),
     Aborted(PreparedPublicationTokenV1),
 }
 
 #[derive(Debug)]
+struct IdentityEvidence {
+    state: IdentityState,
+    retained_bytes: u64,
+    /// Survives abort/GC along with the identity index and token tombstone.
+    charge: Option<ManagedCharge>,
+}
+
+#[derive(Debug)]
 struct PreparedState<Payload> {
     entries: BTreeMap<PreparedPublicationTokenV1, PreparedEntry<Payload>>,
-    identity_index: BTreeMap<PreparedPublicationIdentityV1, IdentityState>,
+    identity_index: BTreeMap<PreparedPublicationIdentityV1, IdentityEvidence>,
     aborted_tokens: BTreeSet<PreparedPublicationTokenV1>,
     charged_bytes: u64,
     tombstone_bytes: u64,
@@ -240,6 +254,47 @@ impl<Payload> PreparedState<Payload> {
             tombstone_bytes: 0,
         }
     }
+}
+
+fn measured_len(len: usize) -> Result<u64, PreparedPublicationErrorV1> {
+    u64::try_from(len).map_err(|_| {
+        PreparedPublicationErrorV1::Accounting(MemoryError::capacity(
+            "prepared publication retained length does not fit u64",
+        ))
+    })
+}
+
+fn persistent_cost(identity_len: usize) -> Result<u64, PreparedPublicationErrorV1> {
+    RetainedCostV1 {
+        key_identity_bytes: measured_len(identity_len)?,
+        index_bytes: PERSISTENT_INDEX_BYTES,
+        fixed_overhead_bytes: PERSISTENT_FIXED_BYTES,
+        ..RetainedCostV1::default()
+    }
+    .total()
+    .map_err(PreparedPublicationErrorV1::Accounting)
+}
+
+fn active_cost(
+    payload_bytes: u64,
+    identity_len: usize,
+    canonical_key_len: usize,
+) -> Result<u64, PreparedPublicationErrorV1> {
+    let identity_bytes = measured_len(identity_len)?;
+    let key_bytes = measured_len(canonical_key_len)?;
+    let key_identity_bytes = identity_bytes.checked_add(key_bytes).ok_or_else(|| {
+        PreparedPublicationErrorV1::Accounting(MemoryError::capacity(
+            "prepared publication active identity/key cost overflow",
+        ))
+    })?;
+    RetainedCostV1 {
+        payload_bytes,
+        key_identity_bytes,
+        fixed_overhead_bytes: ACTIVE_FIXED_BYTES,
+        ..RetainedCostV1::default()
+    }
+    .total()
+    .map_err(PreparedPublicationErrorV1::Accounting)
 }
 
 /// In-memory prepared-publication owner. It proves process-lifetime atomicity
@@ -348,10 +403,13 @@ impl<Payload, Mode> PreparedPublicationService<Payload, Mode> {
 
     fn require_charge_shape(
         &self,
-        entry: &PreparedEntry<Payload>,
+        charge: Option<&ManagedCharge>,
+        bytes: u64,
         operation: &str,
     ) -> Result<(), PreparedPublicationErrorV1> {
-        if self.accounting.broker().is_some() == entry.charge.is_some() {
+        if self.accounting.broker().is_some() == charge.is_some()
+            && charge.is_none_or(|charge| charge.bytes() == Some(bytes))
+        {
             Ok(())
         } else {
             Err(PreparedPublicationErrorV1::Storage(MemoryError::InvalidState(format!(
@@ -360,7 +418,7 @@ impl<Payload, Mode> PreparedPublicationService<Payload, Mode> {
         }
     }
 
-    /// Release every live payload charge and enter the terminal closed state.
+    /// Release active payload and persistent identity/tombstone leases atomically.
     /// A failed release restores the exact preimage and reopens the service.
     pub fn close(&self) -> Result<(), PreparedPublicationErrorV1> {
         let close =
@@ -369,7 +427,12 @@ impl<Payload, Mode> PreparedPublicationService<Payload, Mode> {
                 BeginClose::Acquired(close) => close,
             };
 
-        let (tokens, mut charges) = {
+        enum LeaseOwner {
+            Active(PreparedPublicationTokenV1),
+            Evidence(PreparedPublicationIdentityV1),
+        }
+
+        let (owners, mut charges) = {
             let mut state = match self.lock_state() {
                 Ok(state) => state,
                 Err(error) => {
@@ -378,27 +441,60 @@ impl<Payload, Mode> PreparedPublicationService<Payload, Mode> {
                 }
             };
             for entry in state.entries.values() {
-                if let Err(error) = self.require_charge_shape(entry, "close") {
+                if let Err(error) = self.require_charge_shape(
+                    entry.active_charge.as_ref(),
+                    entry.active_bytes,
+                    "close active",
+                ) {
                     close.rollback();
                     return Err(error);
                 }
             }
-            let mut tokens = Vec::new();
+            for evidence in state.identity_index.values() {
+                if let Err(error) = self.require_charge_shape(
+                    evidence.charge.as_ref(),
+                    evidence.retained_bytes,
+                    "close identity evidence",
+                ) {
+                    close.rollback();
+                    return Err(error);
+                }
+            }
+            let mut owners = Vec::new();
             let mut charges = Vec::new();
             for (token, entry) in &mut state.entries {
-                if let Some(charge) = entry.charge.take() {
-                    tokens.push(token.clone());
+                if let Some(charge) = entry.active_charge.take() {
+                    owners.push(LeaseOwner::Active(token.clone()));
                     charges.push(charge);
                 }
             }
-            (tokens, charges)
+            for (identity, evidence) in &mut state.identity_index {
+                if let Some(charge) = evidence.charge.take() {
+                    owners.push(LeaseOwner::Evidence(identity.clone()));
+                    charges.push(charge);
+                }
+            }
+            (owners, charges)
         };
 
         if let Err(error) = self.accounting.release_many(&mut charges) {
             let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-            for (token, charge) in tokens.into_iter().zip(charges) {
-                if let Some(entry) = state.entries.get_mut(&token) {
-                    entry.charge = Some(charge);
+            for (owner, charge) in owners.into_iter().zip(charges) {
+                match owner {
+                    LeaseOwner::Active(token) => {
+                        state
+                            .entries
+                            .get_mut(&token)
+                            .expect("closing lane owns entry")
+                            .active_charge = Some(charge);
+                    }
+                    LeaseOwner::Evidence(identity) => {
+                        state
+                            .identity_index
+                            .get_mut(&identity)
+                            .expect("closing lane owns evidence")
+                            .charge = Some(charge);
+                    }
                 }
             }
             close.rollback();
@@ -410,6 +506,7 @@ impl<Payload, Mode> PreparedPublicationService<Payload, Mode> {
             std::mem::replace(&mut *state, PreparedState::empty())
         };
         close.commit();
+        drop(old_state.identity_index);
         retire_entries(old_state.entries);
         Ok(())
     }
@@ -422,7 +519,10 @@ impl<Payload, Mode> Drop for PreparedPublicationService<Payload, Mode> {
         }
         let state = self.state.get_mut().unwrap_or_else(PoisonError::into_inner);
         let entries = std::mem::take(&mut state.entries);
+        let evidence = std::mem::take(&mut state.identity_index);
         state.charged_bytes = 0;
+        state.tombstone_bytes = 0;
+        drop(evidence);
         retire_entries(entries);
     }
 }
@@ -438,12 +538,11 @@ where
         let _permit =
             self.lifecycle.begin_mutation().map_err(PreparedPublicationErrorV1::Storage)?;
         let payload_key = request.payload.canonical_key();
-        let token = derive_token(&request.identity, &payload_key);
-        let charged_bytes = request.payload.byte_size();
+        let token = derive_token(&request.identity, &payload_key)?;
         let state = self.lock_state()?;
 
-        if let Some(identity_state) = state.identity_index.get(&request.identity) {
-            return match identity_state {
+        if let Some(identity_evidence) = state.identity_index.get(&request.identity) {
+            return match &identity_evidence.state {
                 IdentityState::Prepared(existing_token) => {
                     let existing = state.entries.get(existing_token).ok_or_else(|| {
                         PreparedPublicationErrorV1::Storage(MemoryError::InvalidState(
@@ -474,37 +573,60 @@ where
             return Err(PreparedPublicationErrorV1::TokenCollision { token });
         }
 
-        let next_total = state.charged_bytes.checked_add(charged_bytes).ok_or(
-            PreparedPublicationErrorV1::Capacity {
-                requested_bytes: charged_bytes,
-                available_bytes: 0,
-            },
+        let persistent_bytes = persistent_cost(request.identity.as_bytes().len())?;
+        let active_bytes = active_cost(
+            request.payload.byte_size(),
+            request.identity.as_bytes().len(),
+            payload_key.len(),
         )?;
+        let requested_bytes = persistent_bytes.checked_add(active_bytes).ok_or_else(|| {
+            PreparedPublicationErrorV1::Accounting(MemoryError::capacity(
+                "prepared publication combined retained cost overflow",
+            ))
+        })?;
+        let next_total = state
+            .charged_bytes
+            .checked_add(requested_bytes)
+            .ok_or(PreparedPublicationErrorV1::Capacity { requested_bytes, available_bytes: 0 })?;
         if let Some(capacity_bytes) = self.capacity_bytes {
             if next_total > capacity_bytes {
                 return Err(PreparedPublicationErrorV1::Capacity {
-                    requested_bytes: charged_bytes,
+                    requested_bytes,
                     available_bytes: capacity_bytes.saturating_sub(state.charged_bytes),
                 });
             }
         }
 
         drop(state);
-        let charge = self
+        let persistent_charge = self
             .accounting
             .charge(
                 self.binding.class.clone(),
                 self.binding.owner.clone(),
                 MemoryContextKind::Request,
                 ChargeKind::RetainedPayload,
-                charged_bytes,
+                persistent_bytes,
             )
             .map_err(PreparedPublicationErrorV1::Accounting)?;
+        let active_charge = match self.accounting.charge(
+            self.binding.class.clone(),
+            self.binding.owner.clone(),
+            MemoryContextKind::Request,
+            ChargeKind::RetainedPayload,
+            active_bytes,
+        ) {
+            Ok(charge) => charge,
+            Err(error) => {
+                drop(persistent_charge);
+                return Err(PreparedPublicationErrorV1::Accounting(error));
+            }
+        };
 
         let mut state = match self.lock_state() {
             Ok(state) => state,
             Err(error) => {
-                drop(charge);
+                drop(active_charge);
+                drop(persistent_charge);
                 return Err(error);
             }
         };
@@ -515,11 +637,18 @@ where
                 identity: identity.clone(),
                 canonical_key: payload_key,
                 payload: request.payload,
-                charged_bytes,
-                charge,
+                active_bytes,
+                active_charge,
             },
         );
-        state.identity_index.insert(identity, IdentityState::Prepared(token.clone()));
+        state.identity_index.insert(
+            identity,
+            IdentityEvidence {
+                state: IdentityState::Prepared(token.clone()),
+                retained_bytes: persistent_bytes,
+                charge: persistent_charge,
+            },
+        );
         state.charged_bytes = next_total;
         Ok(PreparedPublicationReceiptV1::new(token, PrepareDispositionV1::Applied))
     }
@@ -553,10 +682,29 @@ where
                 .entries
                 .get(token)
                 .ok_or_else(|| PreparedPublicationErrorV1::UnknownToken { token: token.clone() })?;
-            self.require_charge_shape(entry, "abort")?;
+            self.require_charge_shape(
+                entry.active_charge.as_ref(),
+                entry.active_bytes,
+                "abort active",
+            )?;
+            let evidence = state.identity_index.get(&entry.identity).ok_or_else(|| {
+                PreparedPublicationErrorV1::Storage(MemoryError::InvalidState(
+                    "prepared entry has no identity evidence".to_string(),
+                ))
+            })?;
+            if !matches!(&evidence.state, IdentityState::Prepared(indexed) if indexed == token) {
+                return Err(PreparedPublicationErrorV1::Storage(MemoryError::InvalidState(
+                    "prepared identity evidence does not point to entry".to_string(),
+                )));
+            }
+            self.require_charge_shape(
+                evidence.charge.as_ref(),
+                evidence.retained_bytes,
+                "abort identity evidence",
+            )?;
             let tombstone_bytes = self.ensure_tombstone_capacity(&state, [entry])?;
             let next_total =
-                state.charged_bytes.checked_sub(entry.charged_bytes).ok_or_else(|| {
+                state.charged_bytes.checked_sub(entry.active_bytes).ok_or_else(|| {
                     PreparedPublicationErrorV1::Storage(MemoryError::InvalidState(
                         "prepared publication retained-byte counter underflow".to_string(),
                     ))
@@ -567,24 +715,28 @@ where
                         "prepared publication tombstone-byte counter overflow".to_string(),
                     ))
                 })?;
-            let charge = state.entries.get_mut(token).and_then(|entry| entry.charge.take());
+            let charge = state.entries.get_mut(token).and_then(|entry| entry.active_charge.take());
             (next_total, next_tombstone_bytes, charge)
         };
         if let Some(active) = charge.as_mut() {
             if let Err(error) = self.accounting.release_many(std::slice::from_mut(active)) {
                 let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-                state.entries.get_mut(token).expect("mutation lane owns entry").charge = charge;
+                state.entries.get_mut(token).expect("mutation lane owns entry").active_charge =
+                    charge;
                 return Err(PreparedPublicationErrorV1::Accounting(error));
             }
         }
         let entry = {
             let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-            let entry = state.entries.remove(token).expect("mutation lane owns entry");
+            let (owned_token, entry) =
+                state.entries.remove_entry(token).expect("mutation lane owns entry");
             state.charged_bytes = next_total;
             state
                 .identity_index
-                .insert(entry.identity.clone(), IdentityState::Aborted(token.clone()));
-            state.aborted_tokens.insert(token.clone());
+                .get_mut(&entry.identity)
+                .expect("mutation lane owns evidence")
+                .state = IdentityState::Aborted(token.clone());
+            state.aborted_tokens.insert(owned_token);
             state.tombstone_bytes = next_tombstone_bytes;
             entry
         };
@@ -627,13 +779,33 @@ where
                 .iter()
                 .map(|token| state.entries.get(token).expect("classified token is live"))
                 .collect::<Vec<_>>();
-            for entry in &tombstone_entries {
-                self.require_charge_shape(entry, "orphan GC")?;
+            for (token, entry) in prepared_tokens.iter().zip(&tombstone_entries) {
+                self.require_charge_shape(
+                    entry.active_charge.as_ref(),
+                    entry.active_bytes,
+                    "orphan GC active",
+                )?;
+                let evidence = state.identity_index.get(&entry.identity).ok_or_else(|| {
+                    PreparedPublicationErrorV1::Storage(MemoryError::InvalidState(
+                        "orphan GC entry has no identity evidence".to_string(),
+                    ))
+                })?;
+                if !matches!(&evidence.state, IdentityState::Prepared(indexed) if indexed == token)
+                {
+                    return Err(PreparedPublicationErrorV1::Storage(MemoryError::InvalidState(
+                        "orphan GC identity evidence does not point to entry".to_string(),
+                    )));
+                }
+                self.require_charge_shape(
+                    evidence.charge.as_ref(),
+                    evidence.retained_bytes,
+                    "orphan GC identity evidence",
+                )?;
             }
             let tombstone_bytes =
                 self.ensure_tombstone_capacity(&state, tombstone_entries.iter().copied())?;
             let reclaimed_bytes = tombstone_entries.iter().try_fold(0u64, |total, entry| {
-                total.checked_add(entry.charged_bytes).ok_or_else(|| {
+                total.checked_add(entry.active_bytes).ok_or_else(|| {
                     PreparedPublicationErrorV1::Storage(MemoryError::InvalidState(
                         "prepared publication reclaimed-byte counter overflow".to_string(),
                     ))
@@ -653,8 +825,12 @@ where
             let mut charged_tokens = Vec::new();
             let mut charges = Vec::new();
             for token in &prepared_tokens {
-                if let Some(charge) =
-                    state.entries.get_mut(token).expect("classified token is live").charge.take()
+                if let Some(charge) = state
+                    .entries
+                    .get_mut(token)
+                    .expect("classified token is live")
+                    .active_charge
+                    .take()
                 {
                     charged_tokens.push(token.clone());
                     charges.push(charge);
@@ -665,7 +841,7 @@ where
         if let Err(error) = self.accounting.release_many(&mut charges) {
             let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
             for (token, charge) in charged_tokens.into_iter().zip(charges) {
-                state.entries.get_mut(&token).expect("mutation lane owns entry").charge =
+                state.entries.get_mut(&token).expect("mutation lane owns entry").active_charge =
                     Some(charge);
             }
             return Err(PreparedPublicationErrorV1::Accounting(error));
@@ -674,11 +850,14 @@ where
             let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
             let mut removed = Vec::with_capacity(prepared_tokens.len());
             for token in &prepared_tokens {
-                let entry = state.entries.remove(token).expect("mutation lane owns entry");
+                let (owned_token, entry) =
+                    state.entries.remove_entry(token).expect("mutation lane owns entry");
                 state
                     .identity_index
-                    .insert(entry.identity.clone(), IdentityState::Aborted(token.clone()));
-                state.aborted_tokens.insert(token.clone());
+                    .get_mut(&entry.identity)
+                    .expect("mutation lane owns evidence")
+                    .state = IdentityState::Aborted(token.clone());
+                state.aborted_tokens.insert(owned_token);
                 removed.push(entry);
             }
             state.charged_bytes = next_total;
@@ -717,15 +896,13 @@ where
                     "prepared publication tombstone-count overflow".to_string(),
                 ))
             })?;
-            let identity_bytes = u64::try_from(entry.identity.as_bytes().len()).map_err(|_| {
+            let evidence = state.identity_index.get(&entry.identity).ok_or_else(|| {
                 PreparedPublicationErrorV1::Storage(MemoryError::InvalidState(
-                    "prepared publication identity length does not fit u64".to_string(),
+                    "prepared entry has no identity evidence".to_string(),
                 ))
             })?;
-            requested_bytes = requested_bytes
-                .checked_add(identity_bytes)
-                .and_then(|bytes| bytes.checked_add(TOKEN_BYTES))
-                .ok_or_else(|| {
+            requested_bytes =
+                requested_bytes.checked_add(evidence.retained_bytes).ok_or_else(|| {
                     PreparedPublicationErrorV1::Storage(MemoryError::InvalidState(
                         "prepared publication tombstone-byte counter overflow".to_string(),
                     ))
@@ -766,14 +943,16 @@ fn classify_orphan_tokens<Payload>(
 fn derive_token(
     identity: &PreparedPublicationIdentityV1,
     payload_key: &[u8],
-) -> PreparedPublicationTokenV1 {
+) -> Result<PreparedPublicationTokenV1, PreparedPublicationErrorV1> {
+    let identity_len = measured_len(identity.0.len())?;
+    let key_len = measured_len(payload_key.len())?;
     let mut hasher = blake3::Hasher::new();
     hasher.update(TOKEN_DOMAIN);
-    hasher.update(&(identity.0.len() as u64).to_le_bytes());
+    hasher.update(&identity_len.to_le_bytes());
     hasher.update(&identity.0);
-    hasher.update(&(payload_key.len() as u64).to_le_bytes());
+    hasher.update(&key_len.to_le_bytes());
     hasher.update(payload_key);
-    PreparedPublicationTokenV1(*hasher.finalize().as_bytes())
+    Ok(PreparedPublicationTokenV1(*hasher.finalize().as_bytes()))
 }
 
 #[cfg(test)]
@@ -817,6 +996,21 @@ mod tests {
             PreparedPublicationIdentityV1::new(identity.as_bytes().to_vec()).expect("identity"),
             payload.to_vec(),
         )
+    }
+
+    // Independent V1 oracle: identity-index key + two token copies + two
+    // ordered-index slots + evidence state; active has a second identity copy,
+    // canonical key, payload, and one entry state. Do not call production cost
+    // helpers here: a shared formula bug must fail these assertions.
+    fn evidence_cost(identity: &str) -> u64 {
+        u64::try_from(identity.len()).expect("test identity fits u64") + 128
+    }
+
+    fn live_cost(identity: &str, payload: &[u8]) -> u64 {
+        evidence_cost(identity)
+            + u64::try_from(identity.len()).expect("test identity fits u64")
+            + 2 * u64::try_from(payload.len()).expect("test payload fits u64")
+            + 16
     }
 
     fn prepare_after_busy(
@@ -865,7 +1059,7 @@ mod tests {
         assert_eq!(first.token(), replay.token());
         assert_eq!(first.disposition(), PrepareDispositionV1::Applied);
         assert_eq!(replay.disposition(), PrepareDispositionV1::Replayed);
-        assert_eq!(service.stats().expect("stats").charged_bytes, 7);
+        assert_eq!(service.stats().expect("stats").charged_bytes, live_cost("id-1", b"payload"));
     }
 
     #[test]
@@ -875,7 +1069,7 @@ mod tests {
         let err = service.prepare(request("id-1", b"new")).expect_err("payload drift");
         assert!(matches!(err, PreparedPublicationErrorV1::IdentityConflict { .. }));
         assert_eq!(service.resolve(original.token()).expect("original intact"), b"old".to_vec());
-        assert_eq!(service.stats().expect("stats").charged_bytes, 3);
+        assert_eq!(service.stats().expect("stats").charged_bytes, live_cost("id-1", b"old"));
     }
 
     #[test]
@@ -895,9 +1089,9 @@ mod tests {
             service.stats().expect("stats"),
             PreparedPublicationStatsV1 {
                 prepared_count: 0,
-                charged_bytes: 0,
+                charged_bytes: evidence_cost("id-1"),
                 tombstone_count: 1,
-                tombstone_bytes: 36,
+                tombstone_bytes: evidence_cost("id-1"),
             }
         );
     }
@@ -927,7 +1121,7 @@ mod tests {
             N - 1
         );
         assert!(receipts.iter().all(|r| r.token() == receipts[0].token()));
-        assert_eq!(service.stats().expect("stats").charged_bytes, 7);
+        assert_eq!(service.stats().expect("stats").charged_bytes, live_cost("same", b"payload"));
     }
 
     #[test]
@@ -993,7 +1187,7 @@ mod tests {
             service.stats().expect("stats"),
             PreparedPublicationStatsV1 {
                 prepared_count: 2,
-                charged_bytes: 6,
+                charged_bytes: live_cost("id-1", b"one") + live_cost("id-2", b"two"),
                 ..PreparedPublicationStatsV1::default()
             }
         );
@@ -1015,9 +1209,9 @@ mod tests {
             service.stats().expect("stats"),
             PreparedPublicationStatsV1 {
                 prepared_count: 1,
-                charged_bytes: 3,
+                charged_bytes: evidence_cost("id-1") + live_cost("id-2", b"two"),
                 tombstone_count: 1,
-                tombstone_bytes: 36,
+                tombstone_bytes: evidence_cost("id-1"),
             }
         );
     }
@@ -1025,7 +1219,7 @@ mod tests {
     #[test]
     fn tombstone_limits_bound_n_cycle_churn_and_fail_closed_at_saturation() {
         const MAX_TOMBSTONES: usize = 4;
-        const TOMBSTONE_BYTES_PER_CYCLE: u64 = 36;
+        const TOMBSTONE_BYTES_PER_CYCLE: u64 = 132;
         let service = service_with_limits(
             None,
             Some((MAX_TOMBSTONES, MAX_TOMBSTONES as u64 * TOMBSTONE_BYTES_PER_CYCLE)),
@@ -1040,7 +1234,7 @@ mod tests {
             service.stats().expect("bounded stats"),
             PreparedPublicationStatsV1 {
                 prepared_count: 0,
-                charged_bytes: 0,
+                charged_bytes: MAX_TOMBSTONES as u64 * TOMBSTONE_BYTES_PER_CYCLE,
                 tombstone_count: MAX_TOMBSTONES,
                 tombstone_bytes: MAX_TOMBSTONES as u64 * TOMBSTONE_BYTES_PER_CYCLE,
             }
@@ -1062,7 +1256,8 @@ mod tests {
             service.stats().expect("saturated stats"),
             PreparedPublicationStatsV1 {
                 prepared_count: 1,
-                charged_bytes: 1,
+                charged_bytes: MAX_TOMBSTONES as u64 * TOMBSTONE_BYTES_PER_CYCLE
+                    + live_cost("id-4", b"x"),
                 tombstone_count: MAX_TOMBSTONES,
                 tombstone_bytes: MAX_TOMBSTONES as u64 * TOMBSTONE_BYTES_PER_CYCLE,
             }
@@ -1194,6 +1389,84 @@ mod tests {
         }
 
         #[test]
+        fn large_identity_with_zero_payload_is_denied_before_retention() {
+            let broker = broker(100);
+            let service = charged(&broker);
+            let identity = PreparedPublicationIdentityV1::new(vec![7; 101]).expect("identity");
+            let request = PreparedPublicationRequestV1::new(identity, Vec::new());
+            assert!(matches!(
+                service.prepare(request),
+                Err(PreparedPublicationErrorV1::Accounting(MemoryError::Capacity(_)))
+            ));
+            assert_eq!(service.stats().expect("unchanged stats").prepared_count, 0);
+            assert_eq!(broker.ledger_snapshot().expect("unchanged ledger").total_owner_bytes(), 0);
+        }
+
+        #[test]
+        fn prepared_identity_index_and_tombstone_keep_exact_independent_cost() {
+            let broker = broker(1_000_000);
+            let service = charged(&broker);
+            let identity = "identity-with-no-payload";
+            let receipt = service.prepare(request(identity, b"")).expect("prepare identity");
+            let live = live_cost(identity, b"");
+            assert_eq!(service.stats().expect("live stats").charged_bytes, live);
+            assert_eq!(broker.ledger_snapshot().expect("live ledger").total_owner_bytes(), live);
+
+            service.abort(receipt.token()).expect("abort");
+            let persistent = evidence_cost(identity);
+            let stats = service.stats().expect("tombstone stats");
+            assert_eq!(stats.prepared_count, 0);
+            assert_eq!(stats.tombstone_count, 1);
+            assert_eq!(stats.tombstone_bytes, persistent);
+            assert_eq!(stats.charged_bytes, persistent);
+            assert_eq!(
+                broker.ledger_snapshot().expect("tombstone ledger").total_owner_bytes(),
+                persistent
+            );
+            service.close().expect("close evidence");
+            assert_eq!(broker.ledger_snapshot().expect("closed ledger").total_owner_bytes(), 0);
+        }
+
+        #[derive(Clone)]
+        struct OverflowPayload;
+
+        impl ByteSized for OverflowPayload {
+            fn byte_size(&self) -> u64 {
+                u64::MAX
+            }
+        }
+
+        impl CanonicalKey for OverflowPayload {
+            fn canonical_key(&self) -> Vec<u8> {
+                Vec::new()
+            }
+        }
+
+        #[test]
+        fn prepared_component_sum_overflow_is_fail_closed_before_reservation() {
+            let broker = broker(1_000_000);
+            let service = PreparedPublicationService::<OverflowPayload, Budgeted>::new_budgeted(
+                binding(),
+                None,
+                None,
+                broker.clone(),
+            );
+            let request = PreparedPublicationRequestV1::new(
+                PreparedPublicationIdentityV1::new(b"overflow".to_vec()).expect("identity"),
+                OverflowPayload,
+            );
+            assert!(matches!(
+                service.prepare(request),
+                Err(PreparedPublicationErrorV1::Accounting(MemoryError::Capacity(_)))
+            ));
+            assert_eq!(
+                service.stats().expect("unchanged stats"),
+                PreparedPublicationStatsV1::default()
+            );
+            assert_eq!(broker.ledger_snapshot().expect("unchanged ledger").total_owner_bytes(), 0);
+        }
+
+        #[test]
         fn resolve_clone_reentry_under_read_lock_is_typed_busy_and_preserves_charge() {
             let broker = broker(1_000_000);
             let service = Arc::new(
@@ -1222,24 +1495,41 @@ mod tests {
             let resolved = service.resolve(receipt.token()).expect("resolve without deadlock");
             assert_eq!(resolved.bytes, b"owned");
             assert_eq!(clone_hits.load(Ordering::SeqCst), 1);
-            assert_eq!(service.stats().expect("complete state").charged_bytes, 5);
-            assert_eq!(broker.ledger_snapshot().expect("unchanged charge").total_owner_bytes(), 5);
+            assert_eq!(
+                service.stats().expect("complete state").charged_bytes,
+                live_cost("clone-reentry", b"owned")
+            );
+            assert_eq!(
+                broker.ledger_snapshot().expect("unchanged charge").total_owner_bytes(),
+                live_cost("clone-reentry", b"owned")
+            );
             service.close().expect("close");
             assert_eq!(broker.ledger_snapshot().expect("refunded").total_owner_bytes(), 0);
         }
 
         #[test]
-        fn replay_charges_once_and_abort_refunds_exactly_once() {
+        fn replay_charges_once_and_abort_preserves_identity_evidence_once() {
             let broker = broker(1_000_000);
             let service = charged(&broker);
             let first = service.prepare(request("id", b"payload")).expect("first");
             let replay = service.prepare(request("id", b"payload")).expect("replay");
             assert_eq!(first.token(), replay.token());
-            assert_eq!(broker.ledger_snapshot().expect("snapshot").total_owner_bytes(), 7);
+            assert_eq!(
+                broker.ledger_snapshot().expect("snapshot").total_owner_bytes(),
+                live_cost("id", b"payload")
+            );
             assert_eq!(service.abort(first.token()).expect("abort"), AbortDispositionV1::Aborted);
-            assert_eq!(broker.ledger_snapshot().expect("snapshot").total_owner_bytes(), 0);
+            assert_eq!(
+                broker.ledger_snapshot().expect("snapshot").total_owner_bytes(),
+                evidence_cost("id")
+            );
             assert_eq!(service.abort(first.token()).expect("replay"), AbortDispositionV1::Replayed);
-            assert_eq!(broker.ledger_snapshot().expect("snapshot").total_owner_bytes(), 0);
+            assert_eq!(
+                broker.ledger_snapshot().expect("snapshot").total_owner_bytes(),
+                evidence_cost("id")
+            );
+            service.close().expect("close evidence");
+            assert_eq!(broker.ledger_snapshot().expect("close").total_owner_bytes(), 0);
         }
 
         #[test]
@@ -1252,8 +1542,11 @@ mod tests {
             let denied = service.abort(receipt.token());
             assert!(matches!(denied, Err(PreparedPublicationErrorV1::Accounting(_))));
             assert_eq!(service.resolve(receipt.token()).expect("still prepared"), b"payload");
-            assert_eq!(service.stats().expect("stats").charged_bytes, 7);
-            assert_eq!(broker.ledger_snapshot().expect("snapshot").total_owner_bytes(), 7);
+            assert_eq!(service.stats().expect("stats").charged_bytes, live_cost("id", b"payload"));
+            assert_eq!(
+                broker.ledger_snapshot().expect("snapshot").total_owner_bytes(),
+                live_cost("id", b"payload")
+            );
 
             broker.finish_rebuild().expect("finish rebuild");
             assert_eq!(service.abort(receipt.token()).expect("abort"), AbortDispositionV1::Aborted);
@@ -1288,15 +1581,23 @@ mod tests {
                 service.stats().expect("stats"),
                 PreparedPublicationStatsV1 {
                     prepared_count: 2,
-                    charged_bytes: 6,
+                    charged_bytes: live_cost("id-1", b"one") + live_cost("id-2", b"two"),
                     ..PreparedPublicationStatsV1::default()
                 }
             );
-            assert_eq!(broker.ledger_snapshot().expect("snapshot").total_owner_bytes(), 6);
+            assert_eq!(
+                broker.ledger_snapshot().expect("snapshot").total_owner_bytes(),
+                live_cost("id-1", b"one") + live_cost("id-2", b"two")
+            );
 
             broker.finish_rebuild().expect("finish rebuild");
             assert_eq!(service.gc_orphans(&[]).expect("retry GC"), 2);
-            assert_eq!(broker.ledger_snapshot().expect("snapshot").total_owner_bytes(), 0);
+            assert_eq!(
+                broker.ledger_snapshot().expect("snapshot").total_owner_bytes(),
+                evidence_cost("id-1") + evidence_cost("id-2")
+            );
+            service.close().expect("close evidence");
+            assert_eq!(broker.ledger_snapshot().expect("close").total_owner_bytes(), 0);
         }
 
         #[test]
@@ -1305,7 +1606,10 @@ mod tests {
             let service = charged(&broker);
             let first = service.prepare(request("id-1", b"one")).expect("first");
             service.prepare(request("id-2", b"two")).expect("second");
-            assert_eq!(broker.ledger_snapshot().expect("before").total_owner_bytes(), 6);
+            assert_eq!(
+                broker.ledger_snapshot().expect("before").total_owner_bytes(),
+                live_cost("id-1", b"one") + live_cost("id-2", b"two")
+            );
 
             service.close().expect("close");
             assert_eq!(broker.ledger_snapshot().expect("after").total_owner_bytes(), 0);
@@ -1349,7 +1653,10 @@ mod tests {
             assert_eq!(service.stats().expect("after failed close"), before);
             assert_eq!(service.resolve(first.token()).expect("first intact"), b"one");
             assert_eq!(service.resolve(second.token()).expect("second intact"), b"two");
-            assert_eq!(broker.ledger_snapshot().expect("still charged").total_owner_bytes(), 6);
+            assert_eq!(
+                broker.ledger_snapshot().expect("still charged").total_owner_bytes(),
+                live_cost("id-1", b"one") + live_cost("id-2", b"two")
+            );
 
             broker.finish_rebuild().expect("finish rebuild");
             service.close().expect("retry close");
@@ -1363,7 +1670,10 @@ mod tests {
                 let service = charged(&broker);
                 service.prepare(request("id-1", b"one")).expect("first");
                 service.prepare(request("id-2", b"two")).expect("second");
-                assert_eq!(broker.ledger_snapshot().expect("live").total_owner_bytes(), 6);
+                assert_eq!(
+                    broker.ledger_snapshot().expect("live").total_owner_bytes(),
+                    live_cost("id-1", b"one") + live_cost("id-2", b"two")
+                );
             }
             assert_eq!(broker.ledger_snapshot().expect("healthy drop").total_owner_bytes(), 0);
 
@@ -1371,9 +1681,15 @@ mod tests {
                 let service = charged(&broker);
                 service.prepare(request("id-3", b"three")).expect("third");
                 broker.begin_rebuild().expect("begin rebuild");
-                assert_eq!(broker.ledger_snapshot().expect("before drop").total_owner_bytes(), 5);
+                assert_eq!(
+                    broker.ledger_snapshot().expect("before drop").total_owner_bytes(),
+                    live_cost("id-3", b"three")
+                );
             }
-            assert_eq!(broker.ledger_snapshot().expect("deferred").total_owner_bytes(), 5);
+            assert_eq!(
+                broker.ledger_snapshot().expect("deferred").total_owner_bytes(),
+                live_cost("id-3", b"three")
+            );
             broker.finish_rebuild().expect("drain deferred");
             assert_eq!(broker.ledger_snapshot().expect("drained").total_owner_bytes(), 0);
         }
@@ -1397,7 +1713,10 @@ mod tests {
                         .prepare(panic_payload_request(identity, bytes, &drops))
                         .expect("prepare panicking payload");
                 }
-                assert_eq!(broker.ledger_snapshot().expect("before unwind").total_owner_bytes(), 6);
+                assert_eq!(
+                    broker.ledger_snapshot().expect("before unwind").total_owner_bytes(),
+                    live_cost("one", b"a") + live_cost("two", b"bb") + live_cost("three", b"ccc")
+                );
 
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     match operation {
@@ -1448,7 +1767,10 @@ mod tests {
                 Err(PreparedPublicationErrorV1::Storage(MemoryError::OperationInProgress(_)))
             ));
             drop(guard);
-            assert_eq!(service.stats().expect("reopened").charged_bytes, 7);
+            assert_eq!(
+                service.stats().expect("reopened").charged_bytes,
+                live_cost("id", b"payload")
+            );
         }
 
         #[test]
@@ -1462,7 +1784,10 @@ mod tests {
             }));
             assert!(matches!(service.stats(), Err(PreparedPublicationErrorV1::Storage(_))));
             assert!(matches!(service.close(), Err(PreparedPublicationErrorV1::Storage(_))));
-            assert_eq!(broker.ledger_snapshot().expect("still charged").total_owner_bytes(), 7);
+            assert_eq!(
+                broker.ledger_snapshot().expect("still charged").total_owner_bytes(),
+                live_cost("id", b"payload")
+            );
             drop(service);
             assert_eq!(broker.ledger_snapshot().expect("drop refunds").total_owner_bytes(), 0);
         }
@@ -1485,6 +1810,7 @@ mod tests {
                 state.charged_bytes = 0;
             }
             let receipt = service.prepare(request("id", b"payload")).expect("prepare");
+            let expected_live = live_cost("id", b"payload");
             {
                 let mut state = service.state.lock().expect("state");
                 state.charged_bytes = 0;
@@ -1494,25 +1820,37 @@ mod tests {
                 Err(PreparedPublicationErrorV1::Storage(MemoryError::InvalidState(_)))
             ));
             assert_eq!(service.resolve(receipt.token()).expect("index intact"), b"payload");
-            assert_eq!(broker.ledger_snapshot().expect("charge intact").total_owner_bytes(), 7);
+            assert_eq!(
+                broker.ledger_snapshot().expect("charge intact").total_owner_bytes(),
+                expected_live
+            );
             {
                 let mut state = service.state.lock().expect("state");
-                state.charged_bytes = 7;
+                state.charged_bytes = expected_live;
             }
             assert_eq!(service.abort(receipt.token()).expect("retry"), AbortDispositionV1::Aborted);
+            assert_eq!(
+                broker.ledger_snapshot().expect("persistent evidence").total_owner_bytes(),
+                evidence_cost("id")
+            );
+            service.close().expect("close evidence");
             assert_eq!(broker.ledger_snapshot().expect("refunded").total_owner_bytes(), 0);
         }
 
         #[test]
-        fn orphan_gc_batch_sum_overflow_cannot_partially_refund_or_tombstone() {
+        fn orphan_gc_rejects_corrupt_active_lease_cost_without_partial_refund() {
             let broker = broker(1_000_000);
             let service = charged(&broker);
             let first = service.prepare(request("id-1", b"a")).expect("first");
             let second = service.prepare(request("id-2", b"b")).expect("second");
+            let original_active = {
+                let state = service.state.lock().expect("state");
+                state.entries.values().map(|entry| entry.active_bytes).collect::<Vec<_>>()
+            };
             {
                 let mut state = service.state.lock().expect("state");
                 for entry in state.entries.values_mut() {
-                    entry.charged_bytes = u64::MAX;
+                    entry.active_bytes = u64::MAX;
                 }
             }
 
@@ -1523,15 +1861,23 @@ mod tests {
             assert_eq!(service.resolve(first.token()).expect("first intact"), b"a");
             assert_eq!(service.resolve(second.token()).expect("second intact"), b"b");
             assert_eq!(service.stats().expect("stats").tombstone_count, 0);
-            assert_eq!(broker.ledger_snapshot().expect("charges intact").total_owner_bytes(), 2);
+            assert_eq!(
+                broker.ledger_snapshot().expect("charges intact").total_owner_bytes(),
+                live_cost("id-1", b"a") + live_cost("id-2", b"b")
+            );
 
             {
                 let mut state = service.state.lock().expect("state");
-                for entry in state.entries.values_mut() {
-                    entry.charged_bytes = 1;
+                for (entry, bytes) in state.entries.values_mut().zip(original_active) {
+                    entry.active_bytes = bytes;
                 }
             }
             assert_eq!(service.gc_orphans(&[]).expect("retry"), 2);
+            assert_eq!(
+                broker.ledger_snapshot().expect("persistent evidence").total_owner_bytes(),
+                evidence_cost("id-1") + evidence_cost("id-2")
+            );
+            service.close().expect("close evidence");
             assert_eq!(broker.ledger_snapshot().expect("refunded").total_owner_bytes(), 0);
         }
     }

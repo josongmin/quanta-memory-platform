@@ -31,12 +31,16 @@ struct PayloadEntry<PayloadRef, Bytes> {
     bytes: Bytes,
 }
 
+fn retire_entry<PayloadRef, Bytes>(entry: PayloadEntry<PayloadRef, Bytes>) {
+    let PayloadEntry { payload_ref, bytes, charge, .. } = entry;
+    drop(charge);
+    retire_client_value(payload_ref);
+    retire_client_value(bytes);
+}
+
 fn retire_entries<PayloadRef, Bytes>(entries: Vec<PayloadEntry<PayloadRef, Bytes>>) {
     for entry in entries {
-        let PayloadEntry { payload_ref, bytes, charge, .. } = entry;
-        drop(charge);
-        retire_client_value(payload_ref);
-        retire_client_value(bytes);
+        retire_entry(entry);
     }
 }
 
@@ -244,7 +248,7 @@ where
         let canonical_key = value.bytes.canonical_key();
         let digest = canonical_digest(&canonical_key);
 
-        let (payload_ref, next_ref) = {
+        let (payload_ref_text, next_ref) = {
             let state = self.lock()?;
             if let Some(existing) = state.entries.iter().find(|entry| {
                 entry.canonical_digest == digest && entry.bytes.canonical_key() == canonical_key
@@ -255,12 +259,12 @@ where
                 .next_ref
                 .checked_add(1)
                 .ok_or_else(|| MemoryError::capacity("payload reference counter overflow"))?;
-            let payload_ref = PayloadRef::from(format!("payload-{}", state.next_ref));
-            (payload_ref, next_ref)
+            (format!("payload-{}", state.next_ref), next_ref)
         };
         // Client measurement callbacks run with no store state lock held. A
         // panic or reentry cannot poison the authoritative state or charge the
         // broker before the complete semantic cost is known.
+        let payload_ref = PayloadRef::from(payload_ref_text);
         let charged_bytes = RetainedCostV1 {
             payload_bytes: value.bytes.byte_size(),
             key_identity_bytes: payload_ref.byte_size(),
@@ -343,7 +347,10 @@ where
             state.charged_total = next_total;
             removed
         };
-        drop(removed);
+        // The terminal delete postimage is already published. Retire generic
+        // fields separately so one client destructor cannot abort the process
+        // while another field is being dropped during unwind.
+        retire_entry(removed);
         Ok(())
     }
 
@@ -472,6 +479,21 @@ mod tests {
     impl CanonicalKey for MaxMeasuredPayload {
         fn canonical_key(&self) -> Vec<u8> {
             vec![9]
+        }
+    }
+
+    #[derive(Clone)]
+    struct PanicMeasuredPayload;
+
+    impl ByteSized for PanicMeasuredPayload {
+        fn byte_size(&self) -> u64 {
+            panic!("injected ByteSized panic")
+        }
+    }
+
+    impl CanonicalKey for PanicMeasuredPayload {
+        fn canonical_key(&self) -> Vec<u8> {
+            vec![10]
         }
     }
 
@@ -605,6 +627,22 @@ mod tests {
         ));
         assert_eq!(store.stats().expect("unchanged stats").item_count, 0);
         assert_eq!(broker.ledger_snapshot().expect("unchanged ledger").total_owner_bytes(), 0);
+    }
+
+    #[test]
+    fn measurement_panic_precedes_accounting_and_does_not_poison_state() {
+        let broker = live_broker(1_000, 1_000);
+        let store = SimplePayloadStore::<String, PanicMeasuredPayload, Budgeted>::new_budgeted(
+            binding(),
+            None,
+            broker.clone(),
+        );
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = store.put_canonical(RetainedEnvelope::new(PanicMeasuredPayload));
+        }));
+        assert!(caught.is_err());
+        assert_eq!(store.stats().expect("state not poisoned"), StoreStats::default());
+        assert_eq!(broker.ledger_snapshot().expect("no charge").total_owner_bytes(), 0);
     }
 
     #[test]
@@ -992,5 +1030,110 @@ mod tests {
             line.starts_with("pub struct SimplePayloadStore<") && line.contains("Mode = Budgeted")
         }));
         assert!(source.contains("pub(crate) fn new_budgeted"));
+    }
+
+    #[test]
+    fn delete_contains_two_panicking_client_destructors_after_exact_refund() {
+        use std::sync::atomic::AtomicBool;
+
+        static PANIC_REF: AtomicBool = AtomicBool::new(false);
+        static PANIC_BODY: AtomicBool = AtomicBool::new(false);
+        static PANIC_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+        #[derive(Debug)]
+        struct Ref(String);
+
+        impl Clone for Ref {
+            fn clone(&self) -> Self {
+                Self(self.0.clone())
+            }
+        }
+
+        impl From<String> for Ref {
+            fn from(value: String) -> Self {
+                Self(value)
+            }
+        }
+
+        impl PartialEq for Ref {
+            fn eq(&self, other: &Self) -> bool {
+                self.0 == other.0
+            }
+        }
+
+        impl Eq for Ref {}
+
+        impl ByteSized for Ref {
+            fn byte_size(&self) -> u64 {
+                self.0.len() as u64
+            }
+        }
+
+        impl Drop for Ref {
+            fn drop(&mut self) {
+                if PANIC_REF.load(Ordering::SeqCst) {
+                    PANIC_COUNT.fetch_add(1, Ordering::SeqCst);
+                    panic!("reference drop trap");
+                }
+            }
+        }
+
+        #[derive(Clone, Debug)]
+        struct Body(Vec<u8>);
+
+        impl ByteSized for Body {
+            fn byte_size(&self) -> u64 {
+                self.0.len() as u64
+            }
+        }
+
+        impl CanonicalKey for Body {
+            fn canonical_key(&self) -> Vec<u8> {
+                self.0.clone()
+            }
+        }
+
+        impl Drop for Body {
+            fn drop(&mut self) {
+                if PANIC_BODY.load(Ordering::SeqCst) {
+                    PANIC_COUNT.fetch_add(1, Ordering::SeqCst);
+                    panic!("body drop trap");
+                }
+            }
+        }
+
+        const CHILD: &str = "QMP_PAYLOAD_DELETE_DROP_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let broker = live_broker(1_000_000, 600_000);
+            let store = SimplePayloadStore::<Ref, Body, Budgeted>::new_budgeted(
+                binding(),
+                None,
+                broker.clone(),
+            );
+            let published =
+                store.put_canonical(RetainedEnvelope::new(Body(vec![1, 2, 3]))).expect("seed");
+            PANIC_REF.store(true, Ordering::SeqCst);
+            PANIC_BODY.store(true, Ordering::SeqCst);
+            store.delete_if_unpinned(&published.payload_ref).expect("delete");
+            PANIC_REF.store(false, Ordering::SeqCst);
+            PANIC_BODY.store(false, Ordering::SeqCst);
+            assert_eq!(PANIC_COUNT.load(Ordering::SeqCst), 2, "both fields retired");
+            assert_eq!(store.stats().expect("postimage").item_count, 0);
+            assert_eq!(broker.ledger_snapshot().expect("ledger").total_owner_bytes(), 0);
+            return;
+        }
+
+        let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .arg("delete_contains_two_panicking_client_destructors_after_exact_refund")
+            .arg("--nocapture")
+            .env(CHILD, "1")
+            .output()
+            .expect("spawn child");
+        assert!(
+            output.status.success(),
+            "child {:?}; stderr: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 }
