@@ -14,7 +14,7 @@ echo "[doctor] fmt --check"
 cargo fmt --all --check
 
 echo "[doctor] clippy -D warnings"
-cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 
 echo "[doctor] regression-guards"
 scripts/regression-guards.sh
@@ -23,19 +23,19 @@ echo "[doctor] feature-matrix"
 tools/ci/feature-matrix.sh
 
 echo "[doctor] cargo check --workspace --all-features"
-cargo check --workspace --all-features
+cargo check --locked --workspace --all-features
 
 echo "[doctor] cargo test --workspace --all-features"
-cargo test --workspace --all-features
+cargo test --locked --workspace --all-features
 
 echo "[doctor] cargo build --examples --all-features"
-cargo build --examples --all-features
+cargo build --locked --examples --all-features
 
 echo "[doctor] cargo deny"
-if command -v cargo-deny >/dev/null 2>&1; then
-  cargo deny --all-features check
-else
-  echo "memory-platform-doctor: cargo-deny unavailable; skipped"
+if ! command -v cargo-deny >/dev/null 2>&1; then
+  echo "memory-platform-doctor: cargo-deny unavailable" >&2
+  exit 1
 fi
+cargo deny --locked --all-features check
 
 echo "memory-platform-doctor: clean (repo-local lint/build/test rails only)"

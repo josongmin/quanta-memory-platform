@@ -15,7 +15,8 @@ dependency direction. Not prose: every step is a command or a verifiable gate.
 
 ## Inputs / Outputs
 
-- Input: this repo (`quanta-memory-platform/`) with green crates 05/06/07.
+- Input: this repo (`quanta-memory-platform/`) with committed `Cargo.lock`,
+  pinned `rust-toolchain.toml`, and installed `cargo-deny` and `semgrep`.
 - Output: a standalone git repo at `<dest>` that builds in isolation with its
   own repo-local rails, plus a one-line manual rewire on the Semantica host
   adapter manifest.
@@ -33,7 +34,7 @@ dependency direction. Not prose: every step is a command or a verifiable gate.
    - `core` has no upward dep on facade/testkit,
    - `facade` has no upward dep on testkit,
    - no member has a path dep escaping the workspace,
-   - `cargo metadata` resolves cleanly,
+   - `cargo metadata --locked` resolves without changing the lockfile,
    - the self-hosting extracted file set is present in-source,
    - the copy plan excludes `tools/ci/gates`.
 
@@ -46,13 +47,21 @@ dependency direction. Not prose: every step is a command or a verifiable gate.
    scripts/extract-to-standalone-repo.sh /path/to/new/quanta-memory-platform
    ```
 
-   This copies the canonical file set, `git init` + initial commit, then
-   verifies the extracted workspace with:
+   This copies only tracked canonical files and compares source/extracted
+   SHA-256 digests. It verifies the extracted workspace before `git init` or
+   any bootstrap commit, using:
 
    ```bash
    scripts/check-workspace.sh
    scripts/memory-platform-doctor
+   scripts/verify-tickets.sh
+   python3 tools/pm/pm.py lint
    ```
+
+   Both build rails require the lockfile, `semgrep`, and `cargo-deny`; missing
+   tooling fails the extraction. After verification, the script commits the
+   extracted tree and requires `git status --porcelain` to be empty. A failed
+   verification leaves no success commit.
 
 3. Validate repo-local rails in the extracted repo:
 
@@ -61,6 +70,9 @@ dependency direction. Not prose: every step is a command or a verifiable gate.
    scripts/scaffold-external-repo.sh   # required self-hosting file set present, no copied gates
    scripts/check-workspace.sh          # fmt + clippy -D warnings + check + examples + feature matrix + deny
    scripts/memory-platform-doctor      # repo-local doctor rail, includes workspace tests, no tools/ci/gates dependency
+   scripts/tests/extraction-contracts.sh # negative release-rail contracts
+   python3 -m unittest -v scripts/tests/test_extraction_metadata.py # dependency-graph negative fixtures
+   cargo metadata --locked --format-version 1 # no re-resolution
    ```
 
 4. Rewire the Semantica host adapter (manual, one edit):
@@ -93,10 +105,13 @@ dependency direction. Not prose: every step is a command or a verifiable gate.
    cargo test -p quanta-memory-host --features full --test host_boundary_static_guard
    ```
 
-## Done criteria
+## Standalone extraction gate (QMP-120)
 
 - Extracted repo: `scripts/check-workspace.sh`, `scripts/memory-platform-doctor`,
-  and `scripts/scaffold-external-repo.sh` all pass standalone.
-- Host adapter compiles against the extracted repo.
-- Both Semantica static guards pass.
-- `memory-platform-doctor` reports clean using repo-local lint/build/test rails only.
+  `scripts/scaffold-external-repo.sh`, ticket validation, and PM lint all pass.
+- Source/extracted canonical digests match and the extracted git worktree is clean.
+- All Cargo resolution is locked; missing Semgrep or cargo-deny fails closed.
+- The fresh extraction test in `.github/workflows/standalone-extraction.yml` passes.
+
+Host adapter compilation and Semantica static guards are QMP-130 adoption
+proof, not evidence that this repo-local extraction rail passed.

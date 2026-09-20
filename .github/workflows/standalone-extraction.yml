@@ -1,0 +1,26 @@
+name: standalone-extraction
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  actual-extraction:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Install pinned release tools
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal -c clippy -c rustfmt
+          python3 -m venv "$RUNNER_TEMP/qmp-semgrep"
+          "$RUNNER_TEMP/qmp-semgrep/bin/pip" install semgrep==1.157.0
+          cargo install cargo-deny --version 0.19.7 --locked
+          echo "$RUNNER_TEMP/qmp-semgrep/bin" >> "$GITHUB_PATH"
+      - name: Negative extraction contracts and actual extraction
+        run: |
+          python3 -m unittest -v scripts/tests/test_extraction_metadata.py
+          scripts/tests/extraction-contracts.sh
+          qmp_extract_dir="$(mktemp -d /tmp/qmp-ci-extraction.XXXXXX)"
+          scripts/extract-to-standalone-repo.sh "${qmp_extract_dir}"
+          test -z "$(git -C "${qmp_extract_dir}" status --porcelain)"
+          cargo metadata --locked --format-version 1 --manifest-path "${qmp_extract_dir}/Cargo.toml" > /dev/null

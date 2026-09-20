@@ -59,7 +59,7 @@ check_combo() {
   local label="$2"
   shift 2
   echo "==> [${crate}] checking: ${label}"
-  cargo clippy -p "${crate}" --all-targets "$@" -- -D warnings
+  cargo clippy --locked -p "${crate}" --all-targets "$@" -- -D warnings
 }
 
 # check_crate <crate> <feature...>
@@ -99,7 +99,7 @@ check_crate "${TESTKIT_CRATE}" "${TESTKIT_FEATURES[@]}"
 # Facade's no-default graph must not activate core's default/live-control
 # surface through dependency defaults. Compilation alone cannot detect this
 # feature leak because the extra symbols still compile successfully.
-facade_bare_tree="$(cargo tree -p "${FACADE_CRATE}" --no-default-features -e features)"
+facade_bare_tree="$(cargo tree --locked -p "${FACADE_CRATE}" --no-default-features -e features)"
 if rg -q 'quanta-memory-platform-core feature "(default|live_control)"' <<<"${facade_bare_tree}"; then
   echo "feature-matrix: facade --no-default-features leaked core default/live_control" >&2
   printf '%s\n' "${facade_bare_tree}" >&2
@@ -108,7 +108,7 @@ fi
 
 # The documented production aggregate must not expose the explicit unbudgeted
 # escape hatch. `--all-features` covers its compilation separately.
-facade_full_tree="$(cargo tree -p "${FACADE_CRATE}" --no-default-features --features full \
+facade_full_tree="$(cargo tree --locked -p "${FACADE_CRATE}" --no-default-features --features full \
   -e features -i "${FACADE_CRATE}")"
 if rg -q 'quanta-memory-platform-facade feature "unbudgeted-stores"' <<<"${facade_full_tree}"; then
   echo "feature-matrix: facade feature 'full' must not enable unbudgeted-stores" >&2
@@ -118,8 +118,8 @@ fi
 # Whole-workspace bookends: the two extremes must also resolve together, since a
 # cross-crate feature unification bug only shows up at the workspace level.
 echo "==> [workspace] checking: --workspace --no-default-features"
-cargo clippy --workspace --all-targets --no-default-features -- -D warnings
+cargo clippy --locked --workspace --all-targets --no-default-features -- -D warnings
 echo "==> [workspace] checking: --workspace --all-features"
-cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 
 echo "feature-matrix: OK (all feature combinations compiled warning-free)"
