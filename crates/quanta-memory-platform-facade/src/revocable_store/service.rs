@@ -11,7 +11,7 @@ use crate::revocable_store::RevocableStore;
 use crate::shared::accounting::Unbudgeted;
 use crate::shared::accounting::{Budgeted, StoreAccounting};
 use crate::shared::lifecycle::{retire_client_value, BeginClose, StoreLifecycle};
-use crate::shared::measure::ByteSized;
+use crate::shared::measure::{semantic_cost_v1, ByteSized, RetainedCostV1};
 
 #[derive(Debug)]
 struct RevocableEntry<Key, Value> {
@@ -219,6 +219,7 @@ impl<Key, Value> SimpleRevocableStore<Key, Value, Unbudgeted> {
 
 impl<Key, Value, Mode> RevocableStore<Key, Value> for SimpleRevocableStore<Key, Value, Mode>
 where
+    Key: ByteSized,
     Value: ByteSized,
 {
     fn binding(&self) -> &StoreBindingHandle {
@@ -227,7 +228,14 @@ where
 
     fn insert_checked(&self, key: Key, value: Value) -> Result<(), StoreWriteError> {
         let _mutation = self.lifecycle.begin_mutation()?;
-        let charged_bytes = value.byte_size();
+        let charged_bytes = RetainedCostV1 {
+            payload_bytes: value.byte_size(),
+            key_identity_bytes: key.byte_size(),
+            index_bytes: semantic_cost_v1::FIFO_INDEX_BYTES,
+            fixed_overhead_bytes: semantic_cost_v1::ENTRY_STATE_BYTES,
+            ..RetainedCostV1::default()
+        }
+        .total()?;
         let next_committed =
             self.lock_state()?.committed_bytes.checked_add(charged_bytes).ok_or_else(|| {
                 MemoryError::capacity("revocable committed byte accounting overflow")
@@ -351,6 +359,10 @@ mod tests {
 
     type Store = SimpleRevocableStore<String, Vec<u8>, Budgeted>;
 
+    fn expected_entry_cost(key: &str, payload_bytes: u64) -> u64 {
+        u64::try_from(key.len()).expect("test key fits") + payload_bytes + 16 + 16
+    }
+
     fn binding() -> StoreBindingHandle {
         StoreBindingHandle::new(
             MemoryClass::ExecutionScratchRevocable,
@@ -411,10 +423,11 @@ mod tests {
         let store = store();
         store.insert_checked("a".into(), vec![0; 4]).expect("a");
         store.insert_checked("b".into(), vec![0; 6]).expect("b");
-        assert_eq!(store.committed_bytes().expect("bytes"), 10);
+        let expected = expected_entry_cost("a", 4) + expected_entry_cost("b", 6);
+        assert_eq!(store.committed_bytes().expect("bytes"), expected);
         assert_eq!(
             store.stats().expect("stats"),
-            StoreStats { item_count: 2, estimated_bytes: 10 }
+            StoreStats { item_count: 2, estimated_bytes: expected }
         );
     }
 
@@ -424,13 +437,17 @@ mod tests {
         let store = store_with_broker(&broker);
         store.insert_checked("first".to_string(), vec![0; 4]).expect("first");
         store.insert_checked("second".to_string(), vec![0; 6]).expect("second");
-        assert_eq!(store.stats().expect("stats").estimated_bytes, 10);
-        assert_eq!(broker.ledger_snapshot().expect("ledger").total_owner_bytes(), 10);
+        let expected = expected_entry_cost("first", 4) + expected_entry_cost("second", 6);
+        assert_eq!(store.stats().expect("stats").estimated_bytes, expected);
+        assert_eq!(broker.ledger_snapshot().expect("ledger").total_owner_bytes(), expected);
 
         let (key, value) = store.reclaim_one().expect("reclaim").expect("entry");
         assert_eq!((key.as_str(), value.len()), ("first", 4));
-        assert_eq!(store.committed_bytes().expect("bytes"), 6);
-        assert_eq!(broker.ledger_snapshot().expect("ledger").total_owner_bytes(), 6);
+        assert_eq!(store.committed_bytes().expect("bytes"), expected_entry_cost("second", 6));
+        assert_eq!(
+            broker.ledger_snapshot().expect("ledger").total_owner_bytes(),
+            expected_entry_cost("second", 6)
+        );
     }
 
     #[test]
@@ -446,9 +463,12 @@ mod tests {
         for key in ["a", "b", "c"] {
             store.insert_checked(key.into(), vec![0; 4]).expect("insert");
         }
-        let outcome = store.reclaim_until(5).expect("reclaim");
-        assert_eq!(outcome, SweepStats { reclaimed_items: 2, reclaimed_bytes: 8 });
-        assert_eq!(store.committed_bytes().expect("bytes"), 4);
+        let outcome = store.reclaim_until(expected_entry_cost("a", 4) + 1).expect("reclaim");
+        assert_eq!(
+            outcome,
+            SweepStats { reclaimed_items: 2, reclaimed_bytes: 2 * expected_entry_cost("a", 4) }
+        );
+        assert_eq!(store.committed_bytes().expect("bytes"), expected_entry_cost("c", 4));
     }
 
     #[test]
@@ -460,28 +480,34 @@ mod tests {
     }
 
     #[test]
-    fn reclaim_until_does_not_over_evict_zero_byte_entries() {
+    fn reclaim_until_charges_and_evicts_zero_payload_keys() {
         let store = store();
         store.insert_checked("zero".into(), vec![]).expect("zero");
         store.insert_checked("a".into(), vec![0; 4]).expect("a");
         store.insert_checked("b".into(), vec![0; 4]).expect("b");
-        let outcome = store.reclaim_until(5).expect("reclaim");
-        assert_eq!(outcome, SweepStats { reclaimed_items: 2, reclaimed_bytes: 8 });
+        let outcome = store.reclaim_until(expected_entry_cost("zero", 0) + 1).expect("reclaim");
+        assert_eq!(
+            outcome,
+            SweepStats {
+                reclaimed_items: 2,
+                reclaimed_bytes: expected_entry_cost("zero", 0) + expected_entry_cost("a", 4)
+            }
+        );
         assert_eq!(store.stats().expect("stats").item_count, 1);
-        assert_eq!(store.reclaim_one().expect("zero remains").expect("entry").0, "zero");
+        assert_eq!(store.reclaim_one().expect("last remains").expect("entry").0, "b");
     }
 
     #[test]
-    fn reclaim_until_of_all_zero_byte_entries_reclaims_nothing() {
+    fn reclaim_until_of_zero_payload_entries_reclaims_their_key_and_index_cost() {
         let store = store();
         for key in ["a", "b", "c"] {
             store.insert_checked(key.into(), vec![]).expect("insert");
         }
         assert_eq!(
             store.reclaim_until(5).expect("reclaim"),
-            SweepStats { reclaimed_items: 0, reclaimed_bytes: 0 }
+            SweepStats { reclaimed_items: 1, reclaimed_bytes: expected_entry_cost("a", 0) }
         );
-        assert_eq!(store.stats().expect("stats").item_count, 3);
+        assert_eq!(store.stats().expect("stats").item_count, 2);
     }
 
     #[test]
@@ -513,14 +539,51 @@ mod tests {
     }
 
     #[test]
+    fn large_key_with_zero_value_is_charged_and_denied_without_state_change() {
+        let broker = live_broker(100);
+        let store = store_with_broker(&broker);
+        let denied = store.insert_checked("k".repeat(101), Vec::new());
+        assert!(matches!(denied, Err(MemoryError::Capacity(_))));
+        assert_eq!(store.stats().expect("unchanged state"), StoreStats::default());
+        assert_eq!(broker.ledger_snapshot().expect("unchanged ledger").total_owner_bytes(), 0);
+    }
+
+    #[test]
+    fn cost_component_sum_overflow_is_fail_closed_before_charge() {
+        struct OversizedKey;
+        impl ByteSized for OversizedKey {
+            fn byte_size(&self) -> u64 {
+                u64::MAX
+            }
+        }
+        let broker = live_broker(1_000);
+        let store = SimpleRevocableStore::<OversizedKey, Vec<u8>, Budgeted>::new_budgeted(
+            binding(),
+            broker.clone(),
+        );
+        assert!(matches!(
+            store.insert_checked(OversizedKey, vec![1]),
+            Err(MemoryError::Capacity(_))
+        ));
+        assert_eq!(store.stats().expect("unchanged state"), StoreStats::default());
+        assert_eq!(broker.ledger_snapshot().expect("unchanged ledger").total_owner_bytes(), 0);
+    }
+
+    #[test]
     fn insert_charges_and_reclaim_refunds_the_ledger() {
         let broker = live_broker(1_000_000);
         let store = store_with_broker(&broker);
         store.insert_checked("a".into(), vec![0; 4]).expect("a");
         store.insert_checked("b".into(), vec![0; 6]).expect("b");
-        assert_eq!(broker.ledger_snapshot().expect("ledger").total_owner_bytes(), 10);
+        assert_eq!(
+            broker.ledger_snapshot().expect("ledger").total_owner_bytes(),
+            expected_entry_cost("a", 4) + expected_entry_cost("b", 6)
+        );
         store.reclaim_one().expect("one").expect("entry");
-        assert_eq!(broker.ledger_snapshot().expect("ledger").total_owner_bytes(), 6);
+        assert_eq!(
+            broker.ledger_snapshot().expect("ledger").total_owner_bytes(),
+            expected_entry_cost("b", 6)
+        );
         store.reclaim_until(100).expect("rest");
         assert_eq!(broker.ledger_snapshot().expect("ledger").total_owner_bytes(), 0);
     }
@@ -553,8 +616,9 @@ mod tests {
 
         assert!(matches!(store.close(), Err(MemoryError::InvalidState(_))));
         assert_eq!(store.stats().expect("restored stats").item_count, 2);
-        assert_eq!(store.committed_bytes().expect("restored bytes"), 10);
-        assert_eq!(broker.ledger_snapshot().expect("ledger").total_owner_bytes(), 10);
+        let expected = expected_entry_cost("a", 4) + expected_entry_cost("b", 6);
+        assert_eq!(store.committed_bytes().expect("restored bytes"), expected);
+        assert_eq!(broker.ledger_snapshot().expect("ledger").total_owner_bytes(), expected);
 
         broker.finish_rebuild().expect("finish rebuild");
         assert_eq!(store.reclaim_one().expect("fifo").expect("entry").0, "a");
@@ -572,8 +636,9 @@ mod tests {
         broker.begin_rebuild().expect("begin rebuild");
         assert!(matches!(store.reclaim_until(5), Err(MemoryError::InvalidState(_))));
         assert_eq!(store.stats().expect("stats").item_count, 3);
-        assert_eq!(store.committed_bytes().expect("bytes"), 12);
-        assert_eq!(broker.ledger_snapshot().expect("ledger").total_owner_bytes(), 12);
+        let expected = 3 * expected_entry_cost("a", 4);
+        assert_eq!(store.committed_bytes().expect("bytes"), expected);
+        assert_eq!(broker.ledger_snapshot().expect("ledger").total_owner_bytes(), expected);
         broker.finish_rebuild().expect("finish rebuild");
         assert_eq!(store.reclaim_one().expect("fifo").expect("entry").0, "a");
     }
@@ -587,8 +652,9 @@ mod tests {
         broker.begin_rebuild().expect("begin rebuild");
         assert!(matches!(store.reclaim_one(), Err(MemoryError::InvalidState(_))));
         assert_eq!(store.stats().expect("stats").item_count, 2);
-        assert_eq!(store.committed_bytes().expect("bytes"), 10);
-        assert_eq!(broker.ledger_snapshot().expect("ledger").total_owner_bytes(), 10);
+        let expected = expected_entry_cost("a", 4) + expected_entry_cost("b", 6);
+        assert_eq!(store.committed_bytes().expect("bytes"), expected);
+        assert_eq!(broker.ledger_snapshot().expect("ledger").total_owner_bytes(), expected);
         broker.finish_rebuild().expect("finish rebuild");
     }
 
@@ -602,8 +668,9 @@ mod tests {
         broker.begin_rebuild().expect("begin rebuild");
         assert!(matches!(store.reclaim_until(5), Err(MemoryError::InvalidState(_))));
         assert_eq!(store.stats().expect("stats").item_count, 3);
-        assert_eq!(store.committed_bytes().expect("bytes"), 12);
-        assert_eq!(broker.ledger_snapshot().expect("ledger").total_owner_bytes(), 12);
+        let expected = 3 * expected_entry_cost("a", 4);
+        assert_eq!(store.committed_bytes().expect("bytes"), expected);
+        assert_eq!(broker.ledger_snapshot().expect("ledger").total_owner_bytes(), expected);
         broker.finish_rebuild().expect("finish rebuild");
     }
 
@@ -613,7 +680,10 @@ mod tests {
         {
             let store = store_with_broker(&broker);
             store.insert_checked("live".into(), vec![0; 9]).expect("insert");
-            assert_eq!(broker.ledger_snapshot().expect("ledger").total_owner_bytes(), 9);
+            assert_eq!(
+                broker.ledger_snapshot().expect("ledger").total_owner_bytes(),
+                expected_entry_cost("live", 9)
+            );
         }
         assert_eq!(broker.ledger_snapshot().expect("ledger").total_owner_bytes(), 0);
     }
@@ -625,7 +695,10 @@ mod tests {
         store.insert_checked("live".into(), vec![0; 9]).expect("insert");
         broker.begin_rebuild().expect("begin rebuild");
         drop(store);
-        assert_eq!(broker.ledger_snapshot().expect("conservative ledger").total_owner_bytes(), 9);
+        assert_eq!(
+            broker.ledger_snapshot().expect("conservative ledger").total_owner_bytes(),
+            expected_entry_cost("live", 9)
+        );
         broker.finish_rebuild().expect("finish and drain");
         assert_eq!(broker.ledger_snapshot().expect("ledger").total_owner_bytes(), 0);
     }
@@ -646,7 +719,10 @@ mod tests {
                 )
                 .expect("insert before unwind");
         }
-        assert_eq!(broker.ledger_snapshot().expect("before").total_owner_bytes(), 10);
+        assert_eq!(
+            broker.ledger_snapshot().expect("before").total_owner_bytes(),
+            expected_entry_cost("first", 4) + expected_entry_cost("second", 6)
+        );
 
         let outer = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
             let _store = store;
@@ -680,7 +756,14 @@ mod tests {
             }
         }
         let insert = worker.join().expect("worker");
-        assert!(insert.is_ok() || matches!(insert, Err(MemoryError::Closed(_))));
+        assert!(
+            insert.is_ok()
+                || matches!(
+                    insert,
+                    Err(MemoryError::Closed(_) | MemoryError::OperationInProgress(_))
+                ),
+            "a contending mutation may be rejected as Busy before it acquires the lifecycle lane"
+        );
         assert_eq!(broker.ledger_snapshot().expect("ledger").total_owner_bytes(), 0);
         assert_eq!(store.stats().expect("terminal stats"), StoreStats::default());
     }
@@ -724,7 +807,10 @@ mod tests {
         assert!(matches!(store.stats(), Err(MemoryError::OperationInProgress(_))));
         assert!(matches!(store.close(), Err(MemoryError::OperationInProgress(_))));
         drop(held);
-        assert_eq!(store.stats().expect("open postimage").estimated_bytes, 4);
+        assert_eq!(
+            store.stats().expect("open postimage").estimated_bytes,
+            expected_entry_cost("live", 4)
+        );
         store.close().expect("retry after callback");
         assert_eq!(broker.ledger_snapshot().expect("drained").total_owner_bytes(), 0);
     }
@@ -744,7 +830,7 @@ mod tests {
         store.insert_checked("newest".into(), vec![0; 4]).expect("newest");
         assert_eq!(
             store.reclaim_until(1).expect("reclaim"),
-            SweepStats { reclaimed_items: 1, reclaimed_bytes: 4 }
+            SweepStats { reclaimed_items: 1, reclaimed_bytes: expected_entry_cost("oldest", 4) }
         );
         assert_eq!(store.reclaim_one().expect("next").expect("entry").0, "middle");
     }
@@ -754,7 +840,10 @@ mod tests {
     fn unbudgeted_store_is_a_distinct_explicit_product_type() {
         let store = SimpleRevocableStore::<String, Vec<u8>, Unbudgeted>::new_unbudgeted(binding());
         store.insert_checked("fixture".into(), vec![0; 3]).expect("insert");
-        assert_eq!(store.stats().expect("stats").estimated_bytes, 3);
+        assert_eq!(
+            store.stats().expect("stats").estimated_bytes,
+            expected_entry_cost("fixture", 3)
+        );
         store.close().expect("close");
     }
 }
