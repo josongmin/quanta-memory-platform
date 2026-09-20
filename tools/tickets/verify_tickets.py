@@ -252,8 +252,15 @@ def validate_tree(root: Path) -> None:
 
     try:
         current_sha = _git(root, "rev-parse", "HEAD")
+        dirty_output = _git(root, "status", "--porcelain")
+        dirty_paths = tuple(
+            line[3:].split(" -> ")[-1]
+            for line in dirty_output.splitlines()
+            if len(line) > 3
+        )
     except (subprocess.CalledProcessError, FileNotFoundError):
         current_sha = None
+        dirty_paths = ()
 
     for ticket in tickets.values():
         receipts = sorted((ticket_root / ticket.path).parent.glob("receipts/*.md"))
@@ -269,7 +276,8 @@ def validate_tree(root: Path) -> None:
                 try:
                     _git(root, "cat-file", "-e", f"{receipt_head}^{{commit}}")
                     changed = _git(root, "diff", "--name-only", f"{receipt_head}..{current_sha}")
-                    changed_paths = tuple(changed.splitlines()) if changed else ()
+                    committed_paths = tuple(changed.splitlines()) if changed else ()
+                    changed_paths = tuple(dict.fromkeys((*committed_paths, *dirty_paths)))
                 except subprocess.CalledProcessError as exc:
                     raise ValidationError(
                         f"receipt references unknown commit: {receipt_head}"
