@@ -12,7 +12,7 @@ echo "[fix] rustfmt"
 cargo fmt --all
 
 echo "[fix] clippy --fix (machine-applicable lints)"
-cargo clippy --workspace --all-targets --all-features --fix --allow-dirty --allow-staged \
+cargo clippy --locked --workspace --all-targets --all-features --fix --allow-dirty --allow-staged \
   -- -D warnings || true
 
 echo "memory-platform-fix: applied fmt + clippy --fix (re-run memory-platform-doctor to verify)"

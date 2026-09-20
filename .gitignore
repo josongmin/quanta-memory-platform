@@ -1,5 +1,7 @@
 # --- Rust / Cargo ---
 /target/
+__pycache__/
+*.pyc
 **/*.rs.bk
 *.pdb
 
