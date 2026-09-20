@@ -1,3 +1,4 @@
+use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet};
 use std::marker::PhantomData;
 use std::sync::{Mutex, MutexGuard, PoisonError};
@@ -499,6 +500,11 @@ where
             (next_total, next_version)
         };
 
+        // Client Clone may panic or reenter. Complete both copies before
+        // acquiring a charge or mutating any store-owned state.
+        let row_message_id = message_id.clone();
+        let evidence_message_id = message_id.clone();
+
         let charge = self
             .accounting
             .charge(
@@ -517,24 +523,81 @@ where
                 return Err(TranscriptAppendErrorV1::Storage(error));
             }
         };
-        let session = state.sessions.entry(session_id).or_default();
-        session.version = next_version;
-        session.rows.insert(
+        let mut row = Some(TranscriptEntry {
             sequence,
-            TranscriptEntry {
-                sequence,
-                message_id: message_id.clone(),
-                body: request.body,
-                charged_bytes,
-                charge,
-            },
-        );
-        session
-            .sequence_evidence
-            .insert(sequence, SequenceEvidence { message_id: message_id.clone(), body_digest });
-        session.message_evidence.insert(message_id, MessageEvidence { sequence, body_digest });
-        state.retained_bytes = next_total;
-        Ok(TranscriptAppendDispositionV1::Applied)
+            message_id: row_message_id,
+            body: request.body,
+            charged_bytes,
+            charge,
+        });
+        let mut sequence_evidence =
+            Some(SequenceEvidence { message_id: evidence_message_id, body_digest });
+
+        // Both BTreeMap::entry lookups may invoke client Ord. Resolve their
+        // insertion positions before publishing a row, evidence, version, or
+        // retained bytes. VacantEntry::insert and the u64-keyed maps need no
+        // client callbacks. Catch an Ord panic while the guard is held, then
+        // resume it only after releasing the guard so the state stays readable.
+        let publication = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            match state.sessions.entry(session_id) {
+                Entry::Occupied(mut occupied) => {
+                    let session = occupied.get_mut();
+                    if session.rows.contains_key(&sequence)
+                        || session.sequence_evidence.contains_key(&sequence)
+                    {
+                        return Err(TranscriptAppendErrorV1::Storage(MemoryError::InvalidState(
+                            "transcript sequence index changed during append publication"
+                                .to_string(),
+                        )));
+                    }
+                    let Entry::Vacant(message_slot) = session.message_evidence.entry(message_id)
+                    else {
+                        return Err(TranscriptAppendErrorV1::Storage(MemoryError::InvalidState(
+                            "transcript message-id index changed during append publication"
+                                .to_string(),
+                        )));
+                    };
+                    session.rows.insert(sequence, row.take().expect("planned row"));
+                    session.sequence_evidence.insert(
+                        sequence,
+                        sequence_evidence.take().expect("planned sequence evidence"),
+                    );
+                    message_slot.insert(MessageEvidence { sequence, body_digest });
+                    session.version = next_version;
+                }
+                Entry::Vacant(session_slot) => {
+                    // A new session is assembled off-map; only the final
+                    // VacantEntry insertion makes it visible.
+                    let mut session = SessionState::default();
+                    session.rows.insert(sequence, row.take().expect("planned row"));
+                    session.sequence_evidence.insert(
+                        sequence,
+                        sequence_evidence.take().expect("planned sequence evidence"),
+                    );
+                    session
+                        .message_evidence
+                        .insert(message_id, MessageEvidence { sequence, body_digest });
+                    session.version = next_version;
+                    session_slot.insert(session);
+                }
+            }
+            state.retained_bytes = next_total;
+            Ok(TranscriptAppendDispositionV1::Applied)
+        }));
+        drop(state);
+        // On any prepublication error, release the lease and retire client
+        // values only after the store mutex is gone. Keep this cleanup outside
+        // the catch boundary so a client Drop panic cannot unwind through it.
+        if let Some(unpublished) = row.take() {
+            retire_rows([unpublished]);
+        }
+        if let Some(unpublished) = sequence_evidence.take() {
+            retire_client_value(unpublished.message_id);
+        }
+        match publication {
+            Ok(result) => result,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
     }
 
     fn load(
@@ -1119,6 +1182,7 @@ mod tests {
         };
         use std::cmp::Ordering;
         use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+        use std::sync::{OnceLock, Weak};
 
         #[derive(Debug)]
         struct ComparisonTrap {
@@ -1175,6 +1239,421 @@ mod tests {
                 );
                 self.name.cmp(other.name)
             }
+        }
+
+        #[derive(Debug)]
+        struct CallbackTrap {
+            calls: AtomicUsize,
+            panic_at: AtomicUsize,
+        }
+
+        impl CallbackTrap {
+            fn new() -> Arc<Self> {
+                Arc::new(Self {
+                    calls: AtomicUsize::new(0),
+                    panic_at: AtomicUsize::new(usize::MAX),
+                })
+            }
+
+            fn arm_after(&self, additional_calls: usize) {
+                self.panic_at.store(
+                    self.calls.load(AtomicOrdering::SeqCst) + additional_calls,
+                    AtomicOrdering::SeqCst,
+                );
+            }
+
+            fn disarm(&self) {
+                self.panic_at.store(usize::MAX, AtomicOrdering::SeqCst);
+            }
+
+            fn hit(&self) {
+                let call = self.calls.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+                assert_ne!(
+                    call,
+                    self.panic_at.load(AtomicOrdering::SeqCst),
+                    "client callback panic"
+                );
+            }
+        }
+
+        #[derive(Debug)]
+        struct CallbackMessageId {
+            name: &'static str,
+            clones: Arc<CallbackTrap>,
+            comparisons: Arc<CallbackTrap>,
+        }
+
+        impl Clone for CallbackMessageId {
+            fn clone(&self) -> Self {
+                self.clones.hit();
+                Self {
+                    name: self.name,
+                    clones: Arc::clone(&self.clones),
+                    comparisons: Arc::clone(&self.comparisons),
+                }
+            }
+        }
+
+        impl PartialEq for CallbackMessageId {
+            fn eq(&self, other: &Self) -> bool {
+                self.name == other.name
+            }
+        }
+
+        impl Eq for CallbackMessageId {}
+
+        impl PartialOrd for CallbackMessageId {
+            fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+                Some(self.cmp(other))
+            }
+        }
+
+        impl Ord for CallbackMessageId {
+            fn cmp(&self, other: &Self) -> Ordering {
+                self.comparisons.hit();
+                self.name.cmp(other.name)
+            }
+        }
+
+        fn callback_id(
+            name: &'static str,
+            clones: &Arc<CallbackTrap>,
+            comparisons: &Arc<CallbackTrap>,
+        ) -> CallbackMessageId {
+            CallbackMessageId {
+                name,
+                clones: Arc::clone(clones),
+                comparisons: Arc::clone(comparisons),
+            }
+        }
+
+        fn callback_store(
+            broker: &LiveProcessMemoryBroker,
+        ) -> SimpleSessionTranscriptStore<String, CallbackMessageId, String, Budgeted> {
+            SimpleSessionTranscriptStore::new_budgeted(
+                StoreBindingHandle::new(
+                    MemoryClass::SessionTranscript,
+                    "transcript-append-callback-test".to_string(),
+                    None,
+                ),
+                TranscriptRetentionPolicyV1::process_lifetime(),
+                broker.clone(),
+            )
+        }
+
+        type ReentrantIdStore =
+            SimpleSessionTranscriptStore<String, ReentrantMessageId, String, Budgeted>;
+
+        #[derive(Debug)]
+        struct ReentrantMessageId {
+            name: &'static str,
+            owner: Arc<OnceLock<Weak<ReentrantIdStore>>>,
+            busy_callbacks: Arc<AtomicUsize>,
+        }
+
+        impl ReentrantMessageId {
+            fn callback(&self) {
+                let store = self.owner.get().expect("owner installed").upgrade().expect("live");
+                assert!(matches!(store.stats(), Err(MemoryError::OperationInProgress(_))));
+                assert!(matches!(store.close(), Err(MemoryError::OperationInProgress(_))));
+                self.busy_callbacks.fetch_add(1, AtomicOrdering::SeqCst);
+            }
+        }
+
+        impl Clone for ReentrantMessageId {
+            fn clone(&self) -> Self {
+                self.callback();
+                Self {
+                    name: self.name,
+                    owner: Arc::clone(&self.owner),
+                    busy_callbacks: Arc::clone(&self.busy_callbacks),
+                }
+            }
+        }
+
+        impl PartialEq for ReentrantMessageId {
+            fn eq(&self, other: &Self) -> bool {
+                self.name == other.name
+            }
+        }
+
+        impl Eq for ReentrantMessageId {}
+
+        impl PartialOrd for ReentrantMessageId {
+            fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+                Some(self.cmp(other))
+            }
+        }
+
+        impl Ord for ReentrantMessageId {
+            fn cmp(&self, other: &Self) -> Ordering {
+                self.callback();
+                self.name.cmp(other.name)
+            }
+        }
+
+        #[test]
+        fn append_message_id_clone_and_order_reentry_is_typed_busy() {
+            let broker = broker(1_000_000);
+            let store = Arc::new(ReentrantIdStore::new_budgeted(
+                StoreBindingHandle::new(
+                    MemoryClass::SessionTranscript,
+                    "transcript-append-reentry-test".to_string(),
+                    None,
+                ),
+                TranscriptRetentionPolicyV1::process_lifetime(),
+                broker.clone(),
+            ));
+            let owner = Arc::new(OnceLock::new());
+            owner.set(Arc::downgrade(&store)).expect("one owner");
+            let busy_callbacks = Arc::new(AtomicUsize::new(0));
+            for (sequence, name, body) in [(0, "m0", "one"), (1, "m1", "four")] {
+                store
+                    .append(TranscriptAppendRequestV1::new(
+                        TranscriptAppendIdentityV1::new(
+                            "s".to_string(),
+                            sequence,
+                            ReentrantMessageId {
+                                name,
+                                owner: Arc::clone(&owner),
+                                busy_callbacks: Arc::clone(&busy_callbacks),
+                            },
+                        ),
+                        body.to_string(),
+                    ))
+                    .expect("append after typed busy callbacks");
+            }
+            assert!(busy_callbacks.load(AtomicOrdering::SeqCst) >= 4);
+            assert_eq!(store.stats().expect("committed postimage").item_count, 2);
+            assert_eq!(broker.ledger_snapshot().expect("ledger").total_owner_bytes(), 7);
+            store.close().expect("close after callbacks");
+            assert_eq!(broker.ledger_snapshot().expect("drained").total_owner_bytes(), 0);
+        }
+
+        fn assert_seed_only_after_append_panic(
+            store: &SimpleSessionTranscriptStore<String, CallbackMessageId, String, Budgeted>,
+            broker: &LiveProcessMemoryBroker,
+        ) {
+            let state = store.state.lock().unwrap_or_else(PoisonError::into_inner);
+            let session = state.sessions.get("s").expect("seed session remains");
+            assert_eq!(session.version, 1, "failed append advanced version");
+            assert_eq!(session.rows.len(), 1, "failed append published a row");
+            assert_eq!(
+                session.sequence_evidence.len(),
+                1,
+                "failed append published sequence evidence"
+            );
+            assert_eq!(
+                session.message_evidence.len(),
+                1,
+                "failed append published message evidence"
+            );
+            assert!(session
+                .rows
+                .get(&0)
+                .expect("seed row")
+                .charge
+                .as_ref()
+                .is_some_and(ManagedCharge::is_active));
+            assert_eq!(state.retained_bytes, 3, "failed append changed retained-byte counter");
+            drop(state);
+            assert_eq!(broker.ledger_snapshot().expect("ledger").total_owner_bytes(), 3);
+        }
+
+        #[test]
+        fn panicking_message_id_clone_at_each_publication_point_leaves_append_atomic() {
+            for panic_after in [1, 2] {
+                let broker = broker(1_000_000);
+                let store = callback_store(&broker);
+                let clones = CallbackTrap::new();
+                let comparisons = CallbackTrap::new();
+                store
+                    .append(TranscriptAppendRequestV1::new(
+                        TranscriptAppendIdentityV1::new(
+                            "s".to_string(),
+                            0,
+                            callback_id("m0", &clones, &comparisons),
+                        ),
+                        "one".to_string(),
+                    ))
+                    .expect("seed row");
+                clones.arm_after(panic_after);
+                let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let _ = store.append(TranscriptAppendRequestV1::new(
+                        TranscriptAppendIdentityV1::new(
+                            "s".to_string(),
+                            1,
+                            callback_id("m1", &clones, &comparisons),
+                        ),
+                        "four".to_string(),
+                    ));
+                }));
+                assert!(panicked.is_err(), "clone trap must fire at point {panic_after}");
+                clones.disarm();
+                assert_seed_only_after_append_panic(&store, &broker);
+                assert_eq!(
+                    store.load(&"s".to_string()).expect("readable after callback panic").len(),
+                    1
+                );
+                store.close().expect("close after callback panic");
+                assert_eq!(broker.ledger_snapshot().expect("drained").total_owner_bytes(), 0);
+            }
+        }
+
+        #[test]
+        fn panicking_message_id_clone_cannot_publish_an_empty_new_session() {
+            for panic_after in [1, 2] {
+                let broker = broker(1_000_000);
+                let store = callback_store(&broker);
+                let clones = CallbackTrap::new();
+                let comparisons = CallbackTrap::new();
+                clones.arm_after(panic_after);
+                let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let _ = store.append(TranscriptAppendRequestV1::new(
+                        TranscriptAppendIdentityV1::new(
+                            "new".to_string(),
+                            0,
+                            callback_id("m0", &clones, &comparisons),
+                        ),
+                        "body".to_string(),
+                    ));
+                }));
+                assert!(panicked.is_err(), "clone trap must fire at point {panic_after}");
+                clones.disarm();
+                assert!(store
+                    .state
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .sessions
+                    .is_empty());
+                assert_eq!(store.stats().expect("readable after callback panic").item_count, 0);
+                assert_eq!(store.retained_bytes().expect("bytes"), 0);
+                assert_eq!(broker.ledger_snapshot().expect("ledger").total_owner_bytes(), 0);
+                assert_eq!(
+                    store
+                        .append(TranscriptAppendRequestV1::new(
+                            TranscriptAppendIdentityV1::new(
+                                "new".to_string(),
+                                0,
+                                callback_id("m0", &clones, &comparisons),
+                            ),
+                            "body".to_string(),
+                        ))
+                        .expect("fresh retry"),
+                    TranscriptAppendDispositionV1::Applied
+                );
+                store.close().expect("close after retry");
+                assert_eq!(broker.ledger_snapshot().expect("drained").total_owner_bytes(), 0);
+            }
+        }
+
+        #[test]
+        fn panicking_new_session_order_after_charge_preserves_old_session_and_ledger() {
+            let broker = broker(1_000_000);
+            let trap = ComparisonTrap::new();
+            let store = SimpleSessionTranscriptStore::<
+                OrderedSessionId,
+                String,
+                String,
+                Budgeted,
+            >::new_budgeted(
+                StoreBindingHandle::new(
+                    MemoryClass::SessionTranscript,
+                    "transcript-new-session-order-panic".to_string(),
+                    None,
+                ),
+                TranscriptRetentionPolicyV1::process_lifetime(),
+                broker.clone(),
+            );
+            let old_id = OrderedSessionId { name: "old", trap: Arc::clone(&trap) };
+            store
+                .append(TranscriptAppendRequestV1::new(
+                    TranscriptAppendIdentityV1::new(old_id.clone(), 0, "m0".to_string()),
+                    "one".to_string(),
+                ))
+                .expect("seed session");
+            let new_id = OrderedSessionId { name: "new", trap: Arc::clone(&trap) };
+            // The preflight performs two lookups; the third comparison is the
+            // charged publication entry lookup, still before insertion.
+            let before = trap.calls.load(AtomicOrdering::SeqCst);
+            trap.panic_at.store(before + 3, AtomicOrdering::SeqCst);
+            let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = store.append(TranscriptAppendRequestV1::new(
+                    TranscriptAppendIdentityV1::new(new_id.clone(), 0, "m1".to_string()),
+                    "four".to_string(),
+                ));
+            }));
+            assert!(panicked.is_err(), "new-session Ord trap must fire during publication");
+            trap.disarm();
+            assert_eq!(store.stats().expect("readable after callback panic").item_count, 1);
+            assert_eq!(store.retained_bytes().expect("bytes"), 3);
+            assert_eq!(store.load(&old_id).expect("old session").len(), 1);
+            assert!(store.load(&new_id).expect("no new session").is_empty());
+            assert_eq!(broker.ledger_snapshot().expect("ledger").total_owner_bytes(), 3);
+            store.close().expect("close after callback panic");
+            assert_eq!(broker.ledger_snapshot().expect("drained").total_owner_bytes(), 0);
+        }
+
+        #[test]
+        fn panicking_message_id_order_at_publication_leaves_append_atomic() {
+            let broker = broker(1_000_000);
+            let store = callback_store(&broker);
+            let clones = CallbackTrap::new();
+            let comparisons = CallbackTrap::new();
+            store
+                .append(TranscriptAppendRequestV1::new(
+                    TranscriptAppendIdentityV1::new(
+                        "s".to_string(),
+                        0,
+                        callback_id("m0", &clones, &comparisons),
+                    ),
+                    "one".to_string(),
+                ))
+                .expect("seed row");
+            // One comparison is the preflight lookup; the next is publication.
+            comparisons.arm_after(2);
+            let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = store.append(TranscriptAppendRequestV1::new(
+                    TranscriptAppendIdentityV1::new(
+                        "s".to_string(),
+                        1,
+                        callback_id("m1", &clones, &comparisons),
+                    ),
+                    "four".to_string(),
+                ));
+            }));
+            assert!(panicked.is_err(), "order trap must fire at publication");
+            comparisons.disarm();
+            assert_seed_only_after_append_panic(&store, &broker);
+            assert_eq!(
+                store.load(&"s".to_string()).expect("readable after callback panic").len(),
+                1
+            );
+            let before_retry = comparisons.calls.load(AtomicOrdering::SeqCst);
+            comparisons.arm_after(3);
+            assert_eq!(
+                store
+                    .append(TranscriptAppendRequestV1::new(
+                        TranscriptAppendIdentityV1::new(
+                            "s".to_string(),
+                            1,
+                            callback_id("m1", &clones, &comparisons),
+                        ),
+                        "four".to_string(),
+                    ))
+                    .expect("retry after callback panic"),
+                TranscriptAppendDispositionV1::Applied
+            );
+            assert_eq!(
+                comparisons.calls.load(AtomicOrdering::SeqCst),
+                before_retry + 2,
+                "append compared MessageId after its vacant slot was resolved"
+            );
+            comparisons.disarm();
+            assert_eq!(store.retained_bytes().expect("committed bytes"), 7);
+            assert_eq!(broker.ledger_snapshot().expect("committed ledger").total_owner_bytes(), 7);
+            store.close().expect("close after callback panic");
+            assert_eq!(broker.ledger_snapshot().expect("drained").total_owner_bytes(), 0);
         }
 
         #[derive(Clone, Debug)]

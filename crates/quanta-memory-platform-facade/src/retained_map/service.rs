@@ -1,10 +1,10 @@
 use std::collections::hash_map::RandomState;
-use std::hash::Hash;
+use std::hash::{BuildHasher, Hash};
 use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
-use hashlink::linked_hash_map::Entry;
+use hashlink::linked_hash_map::{Entry, RawEntryMut};
 use hashlink::LinkedHashMap;
 
 use quanta_memory_platform_core::{
@@ -42,7 +42,7 @@ struct MapState<Key, Value> {
     committed_bytes: u64,
 }
 
-fn retire_map_entries<Key, Value>(entries: LinkedHashMap<Key, MapEntry<Value>, RandomState>) {
+fn retire_map_entries<Key, Value>(entries: impl IntoIterator<Item = (Key, MapEntry<Value>)>) {
     for (key, entry) in entries {
         let MapEntry { value, charge, .. } = entry;
         drop(charge);
@@ -493,9 +493,10 @@ where
         let mut state = self.take_state()?;
         let mut reclaimed_items = 0usize;
         let mut reclaimed_bytes = 0u64;
-        // Select newest-first without cloning or rehashing client keys. All
-        // later charge extraction/rollback is positional and callback-free.
-        for (_, entry) in state.entries.iter().rev() {
+        let mut selected = Vec::new();
+        // Select newest-first without cloning client keys. All later charge
+        // extraction/rollback is positional and callback-free.
+        for (key, entry) in state.entries.iter().rev() {
             if reclaimed_bytes >= hint.target_bytes {
                 break;
             }
@@ -516,6 +517,9 @@ where
                     ));
                 }
             };
+            // Hash only while the original charge still belongs to the entry.
+            // A client panic here leaves the entire map and ledger untouched.
+            selected.push((state.entries.hasher().hash_one(key), key as *const Key));
         }
         let next_committed_bytes =
             match Self::committed_bytes_after_replace_v1(state.committed_bytes, reclaimed_bytes, 0)
@@ -541,6 +545,27 @@ where
             entry.sweep_selected = true;
             remaining -= 1;
         }
+        // Validate exact hash-table identities before moving any charge. A
+        // hash changed through interior mutability is a denied operation;
+        // node addresses remain stable under subsequent removals.
+        for &(hash, key_addr) in &selected {
+            if state
+                .entries
+                .raw_entry()
+                .from_hash(hash, |candidate| std::ptr::eq(candidate, key_addr))
+                .is_none()
+            {
+                for entry in state.entries.values_mut() {
+                    entry.sweep_selected = false;
+                }
+                self.restore_state(state);
+                return Err(MemoryError::InvalidState(
+                    "retained-map sweep key hash changed after insertion".to_string(),
+                ));
+            }
+        }
+        // Reserve before the refund; transfer into this vector is infallible.
+        let mut retired_entries = Vec::with_capacity(selected.len());
         // Validate the entire plan before moving any non-clone charge out of an
         // entry. Otherwise a later corrupt candidate can drop an earlier lease
         // on the error path and partially refund the broker.
@@ -563,11 +588,22 @@ where
             return Err(error);
         }
         state.committed_bytes = next_committed_bytes;
-        // hashlink retain removes every selected key from its hash table before
-        // running any client Key/Value destructor; unlike remove(key), it does
-        // not call client Hash/Eq after the broker has committed the refund.
-        state.entries.retain(|_, entry| !entry.sweep_selected);
+        // The validated raw identities remove owned entries without invoking
+        // client Hash/Eq/Drop after the refund. hashlink::retain is unsuitable:
+        // its batch destructor can stop at the first client panic, leaking the
+        // rest of the removed payloads and preventing a complete postimage.
+        for (hash, key_addr) in selected {
+            let RawEntryMut::Occupied(entry) = state
+                .entries
+                .raw_entry_mut()
+                .from_hash(hash, |candidate| std::ptr::eq(candidate, key_addr))
+            else {
+                unreachable!("validated retained-map sweep identity disappeared")
+            };
+            retired_entries.push(entry.remove_entry());
+        }
         self.restore_state(state);
+        retire_map_entries(retired_entries);
         Ok(SweepStats { reclaimed_items, reclaimed_bytes })
     }
 
@@ -982,6 +1018,41 @@ mod tests {
         assert_eq!(broker.ledger_snapshot().expect("unchanged ledger").total_owner_bytes(), 3);
         store.close().expect("closing phase restored after reentry");
         assert_eq!(broker.ledger_snapshot().expect("released ledger").total_owner_bytes(), 0);
+    }
+
+    #[test]
+    fn sweep_hash_callback_reentry_is_typed_busy_before_refund() {
+        use quanta_memory_platform_core::{MemoryPreset, ProcessMemoryBrokerBuilder};
+
+        let broker = ProcessMemoryBrokerBuilder::new()
+            .with_preset(MemoryPreset::Development)
+            .build()
+            .expect("broker");
+        let binding = StoreBindingHandle::new(
+            MemoryClass::MemoResidency,
+            "owner-sweep-reentry".to_string(),
+            None,
+        );
+        let store = Arc::new(ReentrantReadStore::new_budgeted(binding, broker.clone()));
+        let armed = Arc::new(AtomicBool::new(false));
+        let callbacks = Arc::new(AtomicUsize::new(0));
+        let owner = Arc::new(OnceLock::new());
+        owner.set(Arc::downgrade(&store)).expect("install weak store once");
+        let key = ReentrantReadKey {
+            id: 8,
+            armed: Arc::clone(&armed),
+            store: owner,
+            callbacks: Arc::clone(&callbacks),
+        };
+        store.insert_checked(key, vec![1, 2, 3]).expect("charged preimage");
+        assert_eq!(broker.ledger_snapshot().expect("preimage ledger").total_owner_bytes(), 3);
+
+        armed.store(true, Ordering::SeqCst);
+        let swept = store.sweep(SweepHint { target_bytes: 3 }).expect("sweep succeeds");
+        assert_eq!(swept.reclaimed_bytes, 3);
+        assert_eq!(callbacks.load(Ordering::SeqCst), 1, "planning invokes client Hash once");
+        assert_eq!(store.stats_checked().expect("complete postimage").item_count, 0);
+        assert_eq!(broker.ledger_snapshot().expect("refunded ledger").total_owner_bytes(), 0);
     }
 
     #[test]
@@ -1723,8 +1794,100 @@ mod tests {
             }
         }
 
+        #[derive(Clone, Debug)]
+        struct AssertChargedDuringHashKey {
+            id: u64,
+            broker: LiveProcessMemoryBroker,
+            armed: Arc<AtomicBool>,
+            callbacks: Arc<AtomicUsize>,
+        }
+
+        impl PartialEq for AssertChargedDuringHashKey {
+            fn eq(&self, other: &Self) -> bool {
+                self.id == other.id
+            }
+        }
+
+        impl Eq for AssertChargedDuringHashKey {}
+
+        impl Hash for AssertChargedDuringHashKey {
+            fn hash<H: Hasher>(&self, state: &mut H) {
+                if self.armed.load(Ordering::SeqCst) {
+                    assert_eq!(
+                        self.broker
+                            .ledger_snapshot()
+                            .expect("ledger in client Hash")
+                            .total_owner_bytes(),
+                        5,
+                        "sweep must never call client Hash after refund"
+                    );
+                    self.callbacks.fetch_add(1, Ordering::SeqCst);
+                }
+                self.id.hash(state);
+            }
+        }
+
         #[test]
-        fn sweep_after_planning_never_rehashes_client_keys_or_loses_charge() {
+        fn sweep_never_hashes_client_key_after_refund() {
+            let broker = live_broker(1_000);
+            let binding = StoreBindingHandle::new(
+                MemoryClass::MemoResidency,
+                "sweep-hash-after-refund-owner".into(),
+                None,
+            );
+            let store: SimpleRetainedMapStore<AssertChargedDuringHashKey, Vec<u8>, Budgeted> =
+                SimpleRetainedMapStore::new_budgeted(binding, broker.clone());
+            let armed = Arc::new(AtomicBool::new(false));
+            let callbacks = Arc::new(AtomicUsize::new(0));
+            store
+                .insert_checked(
+                    AssertChargedDuringHashKey {
+                        id: 1,
+                        broker: broker.clone(),
+                        armed: Arc::clone(&armed),
+                        callbacks: Arc::clone(&callbacks),
+                    },
+                    vec![7; 5],
+                )
+                .expect("charged insert");
+            armed.store(true, Ordering::SeqCst);
+            let swept = store.sweep(SweepHint { target_bytes: 5 }).expect("sweep succeeds");
+            assert_eq!(swept.reclaimed_bytes, 5);
+            assert_eq!(callbacks.load(Ordering::SeqCst), 1);
+            assert_eq!(store.stats_checked().expect("postimage").item_count, 0);
+            assert_eq!(broker.ledger_snapshot().expect("refunded ledger").total_owner_bytes(), 0);
+        }
+
+        #[derive(Clone, Debug)]
+        struct PanicAfterSweepDropKey {
+            id: &'static str,
+            panic_once: Arc<AtomicBool>,
+        }
+
+        impl PartialEq for PanicAfterSweepDropKey {
+            fn eq(&self, other: &Self) -> bool {
+                self.id == other.id
+            }
+        }
+
+        impl Eq for PanicAfterSweepDropKey {}
+
+        impl Hash for PanicAfterSweepDropKey {
+            fn hash<H: Hasher>(&self, state: &mut H) {
+                self.id.hash(state);
+            }
+        }
+
+        impl Drop for PanicAfterSweepDropKey {
+            fn drop(&mut self) {
+                if self.panic_once.swap(false, Ordering::SeqCst) {
+                    panic!("client key destructor");
+                }
+            }
+        }
+
+        #[test]
+        fn sweep_hash_panic_before_refund_preserves_charged_preimage() {
             let broker = live_broker(1_000);
             let binding = StoreBindingHandle::new(
                 MemoryClass::MemoResidency,
@@ -1744,14 +1907,18 @@ mod tests {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 store.sweep(SweepHint { target_bytes: 5 })
             }));
-            let stats = result.expect("no post-plan Hash callback").expect("sweep succeeds");
+            assert!(result.is_err(), "client Hash panic occurs before refund");
+            assert_eq!(store.stats_checked().expect("charged preimage").estimated_bytes, 5);
+            assert_eq!(broker.ledger_snapshot().expect("charged ledger").total_owner_bytes(), 5);
+            hash_must_panic.store(false, Ordering::SeqCst);
+            let stats = store.sweep(SweepHint { target_bytes: 5 }).expect("retry succeeds");
             assert_eq!(stats.reclaimed_bytes, 5);
             assert_eq!(store.stats_checked().expect("postimage").estimated_bytes, 0);
             assert_eq!(broker.ledger_snapshot().expect("postimage ledger").total_owner_bytes(), 0);
         }
 
         #[test]
-        fn panic_in_sweep_value_drop_keeps_exact_refund_and_empty_postimage() {
+        fn panic_in_sweep_value_drop_is_contained_after_exact_refund() {
             let broker = live_broker(1_000);
             let binding = StoreBindingHandle::new(
                 MemoryClass::MemoResidency,
@@ -1769,10 +1936,94 @@ mod tests {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 store.sweep(SweepHint { target_bytes: 5 })
             }));
-            assert!(result.is_err(), "client destructor did panic");
+            assert_eq!(
+                result.expect("client destructor panic is contained").expect("sweep"),
+                SweepStats { reclaimed_items: 1, reclaimed_bytes: 5 }
+            );
             assert_eq!(store.stats_checked().expect("postimage").item_count, 0);
             assert_eq!(store.committed_bytes().expect("postimage bytes"), 0);
             assert_eq!(broker.ledger_snapshot().expect("postimage ledger").total_owner_bytes(), 0);
+        }
+
+        #[test]
+        fn sweep_multiple_panicking_destructors_does_not_abort_process() {
+            const CHILD: &str = "QMP_RETAINED_SWEEP_MULTI_PANIC_CHILD";
+            if std::env::var_os(CHILD).is_some() {
+                let broker = live_broker(1_000);
+                let binding = StoreBindingHandle::new(
+                    MemoryClass::MemoResidency,
+                    "sweep-multi-panic-owner".into(),
+                    None,
+                );
+                let store: SimpleRetainedMapStore<PanicAfterSweepDropKey, PanicOnRetire, Budgeted> =
+                    SimpleRetainedMapStore::new_budgeted(binding, broker.clone());
+                let mut key_panics = Vec::new();
+                let mut value_panics = Vec::new();
+                for (key, bytes, panic) in [("survivor", 7, false), ("a", 5, true), ("b", 5, true)]
+                {
+                    let key_panic = Arc::new(AtomicBool::new(false));
+                    let value_panic = Arc::new(AtomicBool::new(panic));
+                    store
+                        .insert_checked(
+                            PanicAfterSweepDropKey { id: key, panic_once: Arc::clone(&key_panic) },
+                            PanicOnRetire { bytes, panic_once: Arc::clone(&value_panic) },
+                        )
+                        .expect("seed charged entry");
+                    key_panics.push(key_panic);
+                    value_panics.push(value_panic);
+                }
+                key_panics[1].store(true, Ordering::SeqCst);
+                key_panics[2].store(true, Ordering::SeqCst);
+                struct SweepOnOuterUnwind<'a> {
+                    store:
+                        &'a SimpleRetainedMapStore<PanicAfterSweepDropKey, PanicOnRetire, Budgeted>,
+                    result: &'a mut Option<Result<SweepStats, MemoryError>>,
+                }
+
+                impl Drop for SweepOnOuterUnwind<'_> {
+                    fn drop(&mut self) {
+                        *self.result = Some(self.store.sweep(SweepHint { target_bytes: 10 }));
+                    }
+                }
+
+                let mut result = None;
+                let outer = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let _sweep = SweepOnOuterUnwind { store: &store, result: &mut result };
+                    panic!("outer unwind before sweep destructor");
+                }));
+                assert!(outer.is_err(), "outer unwind reached sweep");
+                let swept =
+                    result.expect("sweep ran during outer unwind").expect("sweep completes");
+                assert_eq!(swept.reclaimed_items, 2);
+                assert_eq!(swept.reclaimed_bytes, 10);
+                assert_eq!(store.stats_checked().expect("complete postimage").item_count, 1);
+                assert_eq!(store.committed_bytes().expect("complete postimage"), 7);
+                assert_eq!(broker.ledger_snapshot().expect("exact ledger").total_owner_bytes(), 7);
+                assert!(key_panics[1..].iter().all(|flag| !flag.load(Ordering::SeqCst)));
+                assert!(value_panics[1..].iter().all(|flag| !flag.load(Ordering::SeqCst)));
+                store.close().expect("survivor remains closable");
+                assert_eq!(
+                    broker.ledger_snapshot().expect("drained ledger").total_owner_bytes(),
+                    0
+                );
+                return;
+            }
+
+            let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+                .arg("--exact")
+                .arg("retained_map::service::tests::charged::sweep_multiple_panicking_destructors_does_not_abort_process")
+                .arg("--nocapture")
+                .env(CHILD, "1")
+                .output()
+                .expect("run isolated destructor-panic scenario");
+            assert!(
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+                "sweep must not abort or unwind with two client Drop panics: status={:?}, stdout={}, stderr={}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
         }
 
         #[test]
