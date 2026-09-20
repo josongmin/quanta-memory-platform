@@ -45,6 +45,10 @@ struct BrokerCore {
     /// time so `release` returns capacity to the ISSUING group even after a live
     /// reconfigure remaps owners (reserve/release stay symmetric).
     ticket_groups: BTreeMap<u64, String>,
+    /// Committed charges whose last owning lease was dropped while the rebuild
+    /// fence was closed. They remain charged until `finish_rebuild` opens the
+    /// fence and releases the complete batch atomically.
+    deferred_committed_releases: Vec<ReservationTicket>,
 }
 
 /// An owned pending reservation. This type is intentionally not `Clone`.
@@ -193,6 +197,144 @@ pub struct ChargeRechargeError {
     pub recovery: ChargeRechargeRecovery,
 }
 
+/// Recovery disposition for a failed [`ManagedCharge::recharge`]. The lease
+/// itself retains a usable charge for `ChargePreserved`; callers never have to
+/// move accounting authority through an error value.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ManagedChargeRechargeRecovery {
+    ChargePreserved,
+    RecoveryRequired { rollback_error: MemoryError },
+}
+
+/// Failed managed recharge. Inspect `recovery` to distinguish a denied
+/// replacement whose old charge remains owned by the lease from an internal
+/// rollback failure.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ManagedChargeRechargeError {
+    pub error: MemoryError,
+    pub recovery: ManagedChargeRechargeRecovery,
+}
+
+/// Broker-bound, single-owner committed accounting lease.
+///
+/// The lease is intentionally not `Clone`; dropping the final authority releases
+/// its charge, or defers that exact release when a rebuild fence is active.
+///
+/// ```compile_fail
+/// # use quanta_memory_platform_core::ManagedCharge;
+/// # fn cannot_clone(charge: ManagedCharge) {
+/// let duplicate = charge.clone();
+/// # }
+/// ```
+#[derive(Debug)]
+pub struct ManagedCharge {
+    broker: LiveProcessMemoryBroker,
+    charge: Option<CommittedCharge>,
+}
+
+impl ManagedCharge {
+    #[must_use]
+    pub fn is_active(&self) -> bool {
+        self.charge.is_some()
+    }
+
+    #[must_use]
+    pub fn id(&self) -> Option<u64> {
+        self.charge.as_ref().map(CommittedCharge::id)
+    }
+
+    #[must_use]
+    pub fn bytes(&self) -> Option<u64> {
+        self.charge.as_ref().map(CommittedCharge::bytes)
+    }
+
+    #[must_use]
+    pub fn class(&self) -> Option<&MemoryClass> {
+        self.charge.as_ref().map(CommittedCharge::class)
+    }
+
+    #[must_use]
+    pub fn owner(&self) -> Option<&OwnerKey> {
+        self.charge.as_ref().map(|charge| charge.ticket.owner())
+    }
+
+    #[must_use]
+    pub fn context(&self) -> Option<MemoryContextKind> {
+        self.charge.as_ref().map(|charge| charge.ticket.context())
+    }
+
+    #[must_use]
+    pub fn kind(&self) -> Option<ChargeKind> {
+        self.charge.as_ref().map(|charge| charge.ticket.kind())
+    }
+
+    /// Release this charge explicitly. A failed release restores the unchanged
+    /// committed authority into this lease so the caller can retry or drop it.
+    pub fn release(&mut self) -> MemoryResult<()> {
+        let charge = self.charge.take().ok_or_else(|| {
+            MemoryError::InvalidState("managed charge is already released".to_string())
+        })?;
+        match self.broker.release_owned(charge) {
+            Ok(()) => Ok(()),
+            Err(ChargeReleaseError { error, charge }) => {
+                self.charge = Some(charge);
+                Err(error)
+            }
+        }
+    }
+
+    /// Replace this live charge atomically. A normal denial restores the old (or
+    /// ledger-restored) committed authority into this lease before returning.
+    pub fn recharge(
+        &mut self,
+        class: MemoryClass,
+        owner: OwnerKey,
+        context: MemoryContextKind,
+        kind: ChargeKind,
+        bytes: u64,
+    ) -> Result<(), ManagedChargeRechargeError> {
+        let old = self.charge.take().ok_or_else(|| ManagedChargeRechargeError {
+            error: MemoryError::InvalidState("managed charge is already released".to_string()),
+            recovery: ManagedChargeRechargeRecovery::RecoveryRequired {
+                rollback_error: MemoryError::InvalidState(
+                    "no committed authority remains to restore".to_string(),
+                ),
+            },
+        })?;
+        match self.broker.recharge_owned(old, class, owner, context, kind, bytes) {
+            Ok(replacement) => {
+                self.charge = Some(replacement);
+                Ok(())
+            }
+            Err(ChargeRechargeError {
+                error,
+                recovery: ChargeRechargeRecovery::ChargePreserved(charge),
+            }) => {
+                self.charge = Some(charge);
+                Err(ManagedChargeRechargeError {
+                    error,
+                    recovery: ManagedChargeRechargeRecovery::ChargePreserved,
+                })
+            }
+            Err(ChargeRechargeError {
+                error,
+                recovery: ChargeRechargeRecovery::RecoveryRequired { rollback_error },
+            }) => Err(ManagedChargeRechargeError {
+                error,
+                recovery: ManagedChargeRechargeRecovery::RecoveryRequired { rollback_error },
+            }),
+        }
+    }
+}
+
+impl Drop for ManagedCharge {
+    fn drop(&mut self) {
+        if let Some(charge) = self.charge.take() {
+            self.broker.release_managed_charge_on_drop(charge);
+        }
+    }
+}
+
 impl LiveProcessMemoryBroker {
     /// Build a live broker from a validated effective report. The residency
     /// policy is re-validated here so a broker can never come up on an invalid
@@ -217,6 +359,7 @@ impl LiveProcessMemoryBroker {
                 controller,
                 report,
                 ticket_groups: BTreeMap::new(),
+                deferred_committed_releases: Vec::new(),
             })),
         })
     }
@@ -283,6 +426,21 @@ impl LiveProcessMemoryBroker {
     ) -> MemoryResult<CommittedCharge> {
         self.reserve_committed(class, owner, context, kind, bytes)
             .map(|ticket| CommittedCharge { ticket })
+    }
+
+    /// Builder-first committed accounting path for long-lived facade objects.
+    /// The returned non-clone lease owns both the charge and its issuing broker,
+    /// so explicit failure and `Drop` cannot discard release authority.
+    pub fn reserve_managed_charge(
+        &self,
+        class: MemoryClass,
+        owner: OwnerKey,
+        context: MemoryContextKind,
+        kind: ChargeKind,
+        bytes: u64,
+    ) -> MemoryResult<ManagedCharge> {
+        let charge = self.reserve_committed_owned(class, owner, context, kind, bytes)?;
+        Ok(ManagedCharge { broker: self.clone(), charge: Some(charge) })
     }
 
     /// Consume a committed charge. On denial the same charge is returned.
@@ -486,6 +644,30 @@ impl LiveProcessMemoryBroker {
         let _ = Self::rollback_pending_on(&mut core, ticket);
     }
 
+    /// Emergency cleanup for the last owner of a committed charge.
+    ///
+    /// Recovering a poisoned mutex is intentionally confined to this exact
+    /// authority-preserving cleanup path. A healthy/open ledger validates and
+    /// releases the original ticket. During rebuild, the exact ticket is queued
+    /// under the same broker lock and remains conservatively charged until
+    /// `finish_rebuild` drains the batch.
+    fn release_managed_charge_on_drop(&self, charge: CommittedCharge) {
+        let ticket = charge.ticket;
+        let mut core = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        if core.ledger.snapshot().rebuild_in_progress {
+            core.deferred_committed_releases.push(ticket);
+            return;
+        }
+
+        // A live ManagedCharge is issued by this broker and cannot be cloned, so
+        // non-rebuild failure is unreachable without an internal invariant break.
+        // Retain the exact ticket in the deferred owner queue instead of silently
+        // discarding authority if that invariant is ever violated.
+        if Self::release_on(&mut core, &ticket).is_err() {
+            core.deferred_committed_releases.push(ticket);
+        }
+    }
+
     fn release_many_on(core: &mut BrokerCore, tickets: &[ReservationTicket]) -> MemoryResult<()> {
         core.ledger.release_batch(tickets)?;
         for ticket in tickets {
@@ -576,6 +758,34 @@ impl LiveProcessMemoryBroker {
         Self::release_many_on(&mut core, tickets)
     }
 
+    /// Atomically release active managed charges issued by this broker.
+    ///
+    /// Broker affinity and active authority are checked before the ledger is
+    /// touched. Any validation/rebuild failure leaves every lease unchanged.
+    pub fn release_managed_many(&self, charges: &mut [ManagedCharge]) -> MemoryResult<()> {
+        let mut tickets = Vec::with_capacity(charges.len());
+        for charge in charges.iter() {
+            if !Arc::ptr_eq(&self.inner, &charge.broker.inner) {
+                return Err(MemoryError::InvalidState(
+                    "managed charge batch contains a foreign broker lease".to_string(),
+                ));
+            }
+            let committed = charge.charge.as_ref().ok_or_else(|| {
+                MemoryError::InvalidState(
+                    "managed charge batch contains an already released lease".to_string(),
+                )
+            })?;
+            tickets.push(committed.ticket.clone());
+        }
+
+        let mut core = self.lock()?;
+        Self::release_many_on(&mut core, &tickets)?;
+        for charge in charges {
+            charge.charge = None;
+        }
+        Ok(())
+    }
+
     /// Ask resource-group admission whether `group_name` may grow by `bytes`.
     pub fn admits_group(&self, group_name: &str, bytes: u64) -> MemoryResult<bool> {
         use crate::application::scheduler::ResourceGroupScheduler;
@@ -594,6 +804,13 @@ impl LiveProcessMemoryBroker {
     pub fn finish_rebuild(&self) -> MemoryResult<()> {
         let mut core = self.lock()?;
         core.ledger.finish_rebuild();
+        let deferred = std::mem::take(&mut core.deferred_committed_releases);
+        if let Err(error) = Self::release_many_on(&mut core, &deferred) {
+            // Batch release pre-validates before mutation. Preserve every queued
+            // authority for a later retry if an internal inconsistency is found.
+            core.deferred_committed_releases = deferred;
+            return Err(error);
+        }
         Ok(())
     }
 
@@ -980,6 +1197,142 @@ mod tests {
 
         assert!(b.admits_group("g", 100).expect("capacity restored"));
         assert_eq!(b.ledger_snapshot().expect("snapshot").total_owner_bytes(), 0);
+    }
+
+    fn managed_charge(broker: &LiveProcessMemoryBroker, bytes: u64) -> ManagedCharge {
+        broker
+            .reserve_managed_charge(
+                MemoryClass::ArtifactCache,
+                "owner:a".to_string(),
+                MemoryContextKind::Request,
+                ChargeKind::RetainedPayload,
+                bytes,
+            )
+            .expect("reserve managed charge")
+    }
+
+    #[test]
+    fn managed_charge_drop_on_healthy_broker_releases_exact_capacity() {
+        let b = broker();
+        let charge = managed_charge(&b, 100_000);
+        assert_eq!(charge.bytes(), Some(100_000));
+        assert_eq!(charge.owner().map(String::as_str), Some("owner:a"));
+        assert_eq!(charge.context(), Some(MemoryContextKind::Request));
+        assert_eq!(charge.kind(), Some(ChargeKind::RetainedPayload));
+        assert_eq!(b.ledger_snapshot().expect("charged").total_owner_bytes(), 100_000);
+
+        drop(charge);
+
+        assert_eq!(b.ledger_snapshot().expect("released").total_owner_bytes(), 0);
+    }
+
+    #[test]
+    fn managed_charge_drop_during_rebuild_defers_until_finish() {
+        let b = broker();
+        let charge = managed_charge(&b, 100_000);
+        b.begin_rebuild().expect("begin rebuild");
+
+        drop(charge);
+
+        let fenced = b.ledger_snapshot().expect("fenced snapshot");
+        assert!(fenced.rebuild_in_progress);
+        assert_eq!(fenced.total_owner_bytes(), 100_000, "deferred release stays conservative");
+
+        b.finish_rebuild().expect("finish drains deferred charge");
+        let drained = b.ledger_snapshot().expect("drained snapshot");
+        assert!(!drained.rebuild_in_progress);
+        assert_eq!(drained.total_owner_bytes(), 0);
+    }
+
+    #[test]
+    fn managed_charge_explicit_release_failure_retains_authority() {
+        let b = broker();
+        let mut charge = managed_charge(&b, 100_000);
+        let id = charge.id();
+        b.begin_rebuild().expect("begin rebuild");
+
+        let error = charge.release().expect_err("release is fenced during rebuild");
+        assert!(matches!(error, MemoryError::InvalidState(_)));
+        assert!(charge.is_active());
+        assert_eq!(charge.id(), id);
+        assert_eq!(b.ledger_snapshot().expect("still charged").total_owner_bytes(), 100_000);
+
+        b.finish_rebuild().expect("finish rebuild");
+        charge.release().expect("retry exact release");
+        assert!(!charge.is_active());
+        assert_eq!(b.ledger_snapshot().expect("released").total_owner_bytes(), 0);
+    }
+
+    #[test]
+    fn managed_charge_batch_failure_retains_every_lease() {
+        let b = broker();
+        let mut charges = [managed_charge(&b, 100_000), managed_charge(&b, 120_000)];
+        let ids = [charges[0].id(), charges[1].id()];
+        b.begin_rebuild().expect("begin rebuild");
+
+        b.release_managed_many(&mut charges).expect_err("batch release is fenced");
+        assert!(charges.iter().all(ManagedCharge::is_active));
+        assert_eq!([charges[0].id(), charges[1].id()], ids);
+        assert_eq!(b.ledger_snapshot().expect("unchanged").total_owner_bytes(), 220_000);
+
+        b.finish_rebuild().expect("finish rebuild");
+        b.release_managed_many(&mut charges).expect("atomic retry");
+        assert!(charges.iter().all(|charge| !charge.is_active()));
+        assert_eq!(b.ledger_snapshot().expect("released").total_owner_bytes(), 0);
+    }
+
+    #[test]
+    fn managed_charge_batch_rejects_foreign_broker_before_mutation() {
+        let a = broker();
+        let b = broker();
+        let mut charges = [managed_charge(&a, 100_000), managed_charge(&b, 120_000)];
+
+        let error = a
+            .release_managed_many(&mut charges)
+            .expect_err("foreign broker lease must reject the complete batch");
+        assert!(matches!(error, MemoryError::InvalidState(_)));
+        assert!(charges.iter().all(ManagedCharge::is_active));
+        assert_eq!(a.ledger_snapshot().expect("a unchanged").total_owner_bytes(), 100_000);
+        assert_eq!(b.ledger_snapshot().expect("b unchanged").total_owner_bytes(), 120_000);
+
+        drop(charges);
+        assert_eq!(a.ledger_snapshot().expect("a drop cleanup").total_owner_bytes(), 0);
+        assert_eq!(b.ledger_snapshot().expect("b drop cleanup").total_owner_bytes(), 0);
+    }
+
+    #[test]
+    fn managed_charge_recharge_denial_restores_old_authority() {
+        let b = broker();
+        let mut charge = managed_charge(&b, 100_000);
+        let original_id = charge.id();
+
+        let denied = charge
+            .recharge(
+                MemoryClass::ArtifactCache,
+                "owner:a".to_string(),
+                MemoryContextKind::Request,
+                ChargeKind::RetainedPayload,
+                700_000,
+            )
+            .expect_err("replacement over class cap is denied");
+        assert_eq!(denied.recovery, ManagedChargeRechargeRecovery::ChargePreserved);
+        assert_eq!(charge.id(), original_id);
+        assert_eq!(charge.bytes(), Some(100_000));
+        assert_eq!(b.ledger_snapshot().expect("old preserved").total_owner_bytes(), 100_000);
+
+        charge
+            .recharge(
+                MemoryClass::ArtifactCache,
+                "owner:a".to_string(),
+                MemoryContextKind::Request,
+                ChargeKind::RetainedPayload,
+                200_000,
+            )
+            .expect("legal replacement");
+        assert_ne!(charge.id(), original_id);
+        assert_eq!(charge.bytes(), Some(200_000));
+        drop(charge);
+        assert_eq!(b.ledger_snapshot().expect("drop replacement").total_owner_bytes(), 0);
     }
 
     #[test]
@@ -2798,6 +3151,21 @@ mod tests {
         })
         .join();
         assert!(panicked.is_err(), "poison helper must panic while holding the lock");
+    }
+
+    #[test]
+    fn managed_charge_drop_recovers_poisoned_lock_for_exact_release() {
+        let b = broker();
+        let charge = managed_charge(&b, 100_000);
+        poison_broker_lock(&b);
+
+        drop(charge);
+
+        let core = b.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        let snapshot = core.ledger.snapshot();
+        assert_eq!(snapshot.total_owner_bytes(), 0);
+        assert!(snapshot.class_owner_balanced() && snapshot.owner_partition_balanced());
+        assert!(core.deferred_committed_releases.is_empty());
     }
 
     #[test]

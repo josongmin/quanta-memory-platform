@@ -169,15 +169,18 @@ fn names_every_public_reexport() {
     type _Telemetry = (AllocatorAdvisory, Box<dyn AllocatorTelemetry>, StaticAllocatorTelemetry);
 }
 
-/// All six `MemoryError` variants remain constructible. The single error type is
-/// a public contract (Build|Config|Capacity|InvalidState|Report|Unsupported);
+/// All eight `MemoryError` variants remain constructible. The single error type is
+/// a public contract
+/// (Build|Config|Capacity|Closed|OperationInProgress|InvalidState|Report|Unsupported);
 /// removing or renaming a variant breaks this exhaustive match.
 #[test]
-fn memory_error_has_exactly_the_six_documented_variants() {
+fn memory_error_has_exactly_the_eight_documented_variants() {
     let variants = [
         MemoryError::Build("b".to_string()),
         MemoryError::Config("c".to_string()),
         MemoryError::Capacity("cap".to_string()),
+        MemoryError::Closed("closed-store".to_string()),
+        MemoryError::OperationInProgress("busy-store".to_string()),
         MemoryError::InvalidState("s".to_string()),
         MemoryError::Report("r".to_string()),
         MemoryError::Unsupported("u".to_string()),
@@ -189,6 +192,8 @@ fn memory_error_has_exactly_the_six_documented_variants() {
             MemoryError::Build(_) => "build",
             MemoryError::Config(_) => "config",
             MemoryError::Capacity(_) => "capacity",
+            MemoryError::Closed(_) => "closed",
+            MemoryError::OperationInProgress(_) => "operation_in_progress",
             MemoryError::InvalidState(_) => "invalid_state",
             MemoryError::Report(_) => "report",
             MemoryError::Unsupported(_) => "unsupported",
@@ -199,7 +204,15 @@ fn memory_error_has_exactly_the_six_documented_variants() {
     assert!(matches!(MemoryError::build("x"), MemoryError::Build(_)));
     assert!(matches!(MemoryError::config("x"), MemoryError::Config(_)));
     assert!(matches!(MemoryError::capacity("x"), MemoryError::Capacity(_)));
+    assert!(matches!(MemoryError::closed("x"), MemoryError::Closed(_)));
+    assert!(matches!(MemoryError::operation_in_progress("x"), MemoryError::OperationInProgress(_)));
     assert!(matches!(MemoryError::report("x"), MemoryError::Report(_)));
+
+    assert_eq!(MemoryError::closed("payload store").to_string(), "closed: payload store");
+    assert_eq!(
+        MemoryError::operation_in_progress("payload store").to_string(),
+        "operation in progress: payload store"
+    );
 }
 
 /// The mandatory memory-class taxonomy is a stable contract every preset must

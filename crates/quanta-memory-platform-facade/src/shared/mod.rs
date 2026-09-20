@@ -7,6 +7,7 @@
 
 pub mod accounting;
 pub mod builder;
+pub(crate) mod lifecycle;
 pub mod measure;
 
 pub use accounting::{AccountingSink, SharedAccountingSink};
