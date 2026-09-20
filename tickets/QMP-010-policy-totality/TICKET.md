@@ -95,13 +95,13 @@ Cross-cutting:
 
 ## Acceptance
 
-- [ ] unvalidated `ResidencyPolicy`로 ledger/live broker를 public construction할 수 없다.
-- [ ] mandatory class 하나씩 제거한 table test가 모두 typed error다.
-- [ ] absent class reserve가 global-only로 진행되지 않는다.
-- [ ] build와 reconfigure가 같은 validation owner를 사용한다.
-- [ ] denial 전후 ledger/report/scheduler snapshot이 동일하다.
-- [ ] preset output은 기존 semantics를 보존한다.
-- [ ] public docs가 future class behavior를 명시한다.
+- [x] unvalidated `ResidencyPolicy`로 ledger/live broker를 public construction할 수 없다.
+- [x] mandatory class 하나씩 제거한 table test가 모두 typed error다.
+- [x] absent class reserve가 global-only로 진행되지 않는다.
+- [x] build와 reconfigure가 같은 validation owner를 사용한다.
+- [x] denial 전후 ledger/report/scheduler snapshot이 동일하다.
+- [x] preset output은 기존 semantics를 보존한다.
+- [x] public docs가 future class behavior를 명시한다.
 
 ## Verification
 
@@ -120,3 +120,9 @@ Cargo/public use path가 바뀌면 QMP-120 actual extraction receipt도 요구�
 - soft/reserved/burst의 runtime semantics 구현: QMP-080
 - public builder default 변경: QMP-030
 - host manifest migration: QMP-130
+
+## Receipt
+
+- Product implementation commit: `10af630512aa809ca5fe8b69d9e15d6e636d7462`
+- Receipt: [`receipts/2026-09-20T183204Z-10af630.md`](receipts/2026-09-20T183204Z-10af630.md)
+- Lifecycle remains `IMPLEMENTED`, not `QUALIFIED`: actual standalone extraction exposed the existing QMP-120 missing-semgrep-rule defect.
