@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import re
 import subprocess
 import sys
@@ -189,6 +190,7 @@ def validate_receipt(
     head = _field(text, "HEAD")
     base = _field(text, "base SHA")
     source_changed = _field(text, "source changed during run")
+    source_paths = _csv_paths(_field(text, "source paths"))
     if not SHA.fullmatch(head) or not SHA.fullmatch(base):
         raise ValidationError("receipt HEAD/base SHA must be full 40-character git SHAs")
     if source_changed != "no":
@@ -197,11 +199,20 @@ def validate_receipt(
         if section not in text:
             raise ValidationError(f"receipt missing section: {section}")
     if status in TERMINAL and current_sha and head != current_sha:
-        product_drift = [path for path in changed_paths if not path.startswith("tickets/")]
-        if product_drift:
+        scoped_drift = [
+            path
+            for path in changed_paths
+            if any(
+                fnmatch.fnmatchcase(path, pattern)
+                if any(char in pattern for char in "*?[")
+                else _paths_overlap(path, pattern)
+                for pattern in source_paths
+            )
+        ]
+        if scoped_drift:
             raise ValidationError(
-                "terminal receipt is stale; product source changed after receipt HEAD: "
-                + ", ".join(product_drift)
+                "terminal receipt is stale; owned source changed after receipt HEAD: "
+                + ", ".join(scoped_drift)
             )
     return head
 

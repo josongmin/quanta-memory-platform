@@ -87,6 +87,7 @@ class TicketValidatorTests(unittest.TestCase):
                 "HEAD: " + "a" * 40,
                 "base SHA: " + "b" * 40,
                 "source changed during run: no",
+                "source paths: crates/core/**",
                 "## RED evidence",
                 "## Verification",
                 "## Acceptance checklist",

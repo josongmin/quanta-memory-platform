@@ -20,6 +20,7 @@ claimed by:
 write set:
 foreign dirty paths:
 source changed during run: yes/no
+source paths: comma-separated repository-relative paths or globs owned by this receipt
 ```
 
 ## Change summary
