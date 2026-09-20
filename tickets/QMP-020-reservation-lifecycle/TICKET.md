@@ -94,12 +94,12 @@ Owner symbols:
 
 ## Acceptance
 
-- [ ] state transition이 한 canonical owner에 구현된다.
-- [ ] duplicate commit 성공이 불가능하다.
-- [ ] abandoned pending reservation이 capacity를 남기지 않는다.
-- [ ] class/owner/context/kind/group axes가 모든 transition에서 균형을 유지한다.
-- [ ] public store가 raw clone ticket에 의존하지 않도록 migration path가 문서화된다.
-- [ ] existing recharge fail-closed semantics가 유지된다.
+- [x] state transition이 한 canonical owner에 구현된다.
+- [x] duplicate commit 성공이 불가능하다.
+- [x] abandoned pending reservation이 capacity를 남기지 않는다.
+- [x] class/owner/context/kind/group axes가 모든 transition에서 균형을 유지한다.
+- [x] public store가 raw clone ticket에 의존하지 않도록 migration path가 문서화된다.
+- [x] existing recharge fail-closed semantics가 유지된다.
 
 ## Verification
 
@@ -120,3 +120,9 @@ DataFusion reservation과 Tokio owned permit처럼 capacity authority를 owner l
 - facade store close policy: QMP-040
 - spill transfer choreography: QMP-070
 - runtime view integration: QMP-030
+
+## Receipt
+
+- Product implementation commit: `783d0bbfdf32efad97103b1dc6d8ac774abaa9ed`
+- Receipt: [`receipts/2026-09-20T184809Z-783d0bb.md`](receipts/2026-09-20T184809Z-783d0bb.md)
+- Lifecycle remains `IMPLEMENTED`: QMP-040 must migrate facade stores off the documented legacy clone-handle bridge before raw compatibility authority can be removed.
