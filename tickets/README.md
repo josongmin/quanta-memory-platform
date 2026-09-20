@@ -46,7 +46,7 @@
 | [QMP-020](QMP-020-reservation-lifecycle/TICKET.md) | P1 | IMPLEMENTED | reservation typestate, commit-once, abandoned rollback | QMP-010 | core `ledger.rs`, recharge/control seams |
 | [QMP-030](QMP-030-enforced-builder-runtime-view/TICKET.md) | P1 | IMPLEMENTED | enforced default builder, raw authority 축소, broker-bound runtime scratch | QMP-010, QMP-020 | core/facade builders, broker/control/scratch API, examples |
 | [QMP-040](QMP-040-store-lifecycle/TICKET.md) | P1 | IMPLEMENTED | store construction typestate, close/drain, callback lock discipline | QMP-020, QMP-030 | facade shared builder/accounting + all store services |
-| [QMP-050](QMP-050-total-retained-cost/TICKET.md) | P1 | READY | total retained-cost accounting | QMP-040 | measure/accounting + store entry cost paths |
+| [QMP-050](QMP-050-total-retained-cost/TICKET.md) | P1 | IN_PROGRESS | total retained-cost accounting | QMP-040 | measure/accounting + store entry cost paths |
 | [QMP-060](QMP-060-transcript-tombstones/TICKET.md) | P1 | BLOCKED | bounded transcript tombstone/idempotency lifecycle | QMP-050 | transcript types/service/builder |
 | [QMP-070](QMP-070-spill-transfer-backings/TICKET.md) | P1 | BLOCKED | reclaim→spill receipt transfer, safe spill semantics, real backings | QMP-020, QMP-040, QMP-050 | revocable/spill/backings/builders |
 | [QMP-080](QMP-080-policy-runtime-semantics/TICKET.md) | P2 | READY | reserved/soft/hard/burst/reclaim runtime semantics | QMP-010, QMP-020, QMP-030 | scheduler/controller/control/config |
