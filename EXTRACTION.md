@@ -63,6 +63,10 @@ dependency direction. Not prose: every step is a command or a verifiable gate.
    extracted tree and requires `git status --porcelain` to be empty. A failed
    verification leaves no success commit.
 
+   CI then runs `scripts/check-workspace-offline.sh` as a separate `--frozen`
+   lane against the warmed Cargo/advisory caches. It is not a substitute for
+   the online locked release rail.
+
 3. Validate repo-local rails in the extracted repo:
 
    ```bash
@@ -70,6 +74,7 @@ dependency direction. Not prose: every step is a command or a verifiable gate.
    scripts/scaffold-external-repo.sh   # required self-hosting file set present, no copied gates
    scripts/check-workspace.sh          # fmt + clippy -D warnings + check + examples + feature matrix + deny
    scripts/memory-platform-doctor      # repo-local doctor rail, includes workspace tests, no tools/ci/gates dependency
+   scripts/check-workspace-offline.sh  # separate frozen/cache-only recheck
    scripts/tests/extraction-contracts.sh # negative release-rail contracts
    python3 -m unittest -v scripts/tests/test_extraction_metadata.py # dependency-graph negative fixtures
    cargo metadata --locked --format-version 1 # no re-resolution
