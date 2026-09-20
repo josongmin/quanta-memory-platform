@@ -97,7 +97,7 @@ Owner symbols:
 - [x] state transition이 한 canonical owner에 구현된다.
 - [x] duplicate commit 성공이 불가능하다.
 - [x] abandoned pending reservation이 capacity를 남기지 않는다.
-- [x] class/owner/context/kind/group axes가 모든 transition에서 균형을 유지한다.
+- [ ] class/owner/context/kind/group axes가 모든 transition에서 정확한 byte 총합을 유지한다. P1-D01 overflow RED 미해결.
 - [x] public store가 raw clone ticket에 의존하지 않도록 migration path가 문서화된다.
 - [x] existing recharge fail-closed semantics가 유지된다.
 
@@ -125,4 +125,17 @@ DataFusion reservation과 Tokio owned permit처럼 capacity authority를 owner l
 
 - Product implementation commit: `783d0bbfdf32efad97103b1dc6d8ac774abaa9ed`
 - Receipt: [`receipts/2026-09-20T184809Z-783d0bb.md`](receipts/2026-09-20T184809Z-783d0bb.md)
-- Lifecycle remains `IMPLEMENTED`: QMP-040 must migrate facade stores off the documented legacy clone-handle bridge before raw compatibility authority can be removed.
+- Historical receipt는 당시 reservation typestate 및 focused tests에만 유효하다. 현재 P1-D01의 RED로 ticket을 `READY`로 재개방했다. QMP-040/050의 과거 receipt를 파기하지 않지만 QMP-020 및 의존 ticket의 terminal qualification은 이 문제 해결 전 금지한다.
+
+## Reopened P1-D01 — saturating admission loses a live ticket (2026-09-21)
+
+Current product source `47021d3271c3613c861ad4c06c4d3c2b4b1edb17`: `ledger.rs:344,359-371` uses saturating prospective totals, `:156-159` saturates the persisted kind counter, `:184-236` saturates public snapshot totals/balance checks, and `:997-1014` explicitly asserts the broken acceptance as GREEN. A validated policy with global/class hard `u64::MAX` admits `u64::MAX-10` followed by `100`. The latter creates a second live ticket but the counters cannot represent its cost; releasing the first leaves the second live while owner usage reads `10` rather than `100` (or may reach zero under same-slot selection). This is semantic accounting corruption, not physical allocation of `u64::MAX` bytes: public reservation magnitudes and caller-provided `ByteSized` permit the path.
+
+Detached RED owner tests on `35bdd8de8c505d70b6559edc6b39743a1a0e4052` (same core source as current HEAD) both failed as expected: `overflow_denial_preserves_exact_live_ticket_accounting_red` observed `Ok(ticket id=2)` where typed capacity denial was required; `accepted_overflow_ticket_is_lost_after_first_release_red` observed owner total `10` with a live `100`-byte ticket. The same isolated fixture's `scratch_reserve_cap_overflow_is_denied_red` and `scratch_recharge_cap_overflow_is_denied_red` also failed: `control.rs:714,561` returned successful authority for a postimage beyond the `u64::MAX` scratch ceiling. `control.rs:943` group reconfigure overflow was inspected but its RED is **not run**. Main tree was not modified by this experiment; the uncommitted RED fixture remains at `/tmp/qmp-overflow-red-X2pSkd/worktree` and is not a product receipt.
+
+Owner-level repair, in order:
+
+1. In ledger admission, compute global/owner/class/kind/context prospective totals with `checked_add` before ticket ID allocation, counter writes, or scheduler mutation; overflow is typed Capacity and leaves the entire preimage untouched. Burst aggregation must also be checked.
+2. Replace the saturating counter mutation with an exact, proven-in-range operation; release/rollback must never silently underflow. If public snapshot totals cannot be represented, expose typed checked observation rather than silently reporting saturated balance. Reconcile `control.rs:714,943` scratch/reconfigure and `application/scheduler.rs:47-56,80-96` group saturation with the same exact model; avoid a consumer-side cap shim.
+3. Replace `saturating_add_near_u64_max_keeps_class_owner_balanced` with a denial oracle, then assert first ticket still exact after denial, first release drains all axes, failed second release is inert, and a later small reservation works. Add same-kind/different-kind, same-owner/different-owner, grouped owner, pending rollback, recharge replacement and `u64::MAX` boundary cases.
+4. Require a fresh current-product RED→GREEN owner receipt plus core all-features tests, workspace and extraction delta proof before restoring `IMPLEMENTED`; no original receipt is an overflow qualification.

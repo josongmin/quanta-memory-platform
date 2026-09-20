@@ -112,3 +112,7 @@ cargo test -p quanta-memory-platform-facade --all-features
 - general broker pressure trigger: QMP-080
 - performance threshold: QMP-100
 - external host storage choice: QMP-130
+
+## Current-source delta: failure consumes the only handle (2026-09-21)
+
+At `47021d3`, `revocable_store/service.rs:258-284` removes the source and refunds its lease before returning `(Key, Value)`. `spill/service.rs:81-99` then consumes `Handle` by value: if no destination is available or `accept` fails, the handle drops on `Err`, so the caller cannot roll back the source or retry another destination. This is in addition to the uncharged in-process tier and `NoopSpillController` successful discard already recorded above. The QMP-070 protocol must return owned source recovery authority on every pre-commit error, or keep the source intact until destination receipt commits; an `Err` with no handle is not fail-closed. Add a fault-injected unavailable/accept-error test asserting source value+charge survive and destination has no receipt; then inverse restore and reopen tests. This is static reachability evidence, not an executed negative test.

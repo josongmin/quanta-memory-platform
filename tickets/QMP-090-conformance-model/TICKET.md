@@ -120,3 +120,9 @@ cargo test -p quanta-memory-platform-testkit --features loom loom_ticket_transit
 ```
 
 nightly/tool availability가 없으면 `NOT_RUN`으로 남으며 ticket terminal closure가 아니다.
+
+## Current-source oracle audit (2026-09-21)
+
+On `47021d3`, `testkit/src/conformance/target.rs:95-96,232-245` exposes infallible `view()` and translates a real ledger snapshot error into a zero `AccountingView`; `suites.rs:355-405` asserts self-reported class/owner/partition relationships rather than independently predicted bytes, while commit `:380-388` and finish/release `:434-440` results are discarded. The existing fake at `fake/broker.rs:303-327` has no-op commit and replay-tolerant release. This is static reachability; the specified black-hole and commit-swallowing RED fakes are still required before any qualification claim.
+
+Canonical change order: make observation fallible and a failed verdict; construct one independent model over ticket state and per-axis expected bytes; assert every operation result and exact postimage (including final zero) against that model; then show each negative fake is rejected at its first causal mismatch while the honest adapter passes. The QMP-050 transcript/published-cost testkit migration must use an independent literal semantic formula, not call the implementation cost calculator as its oracle. Do not equate relational balance of three fabricated zeros with proof of charged memory.

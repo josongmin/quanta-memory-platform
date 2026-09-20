@@ -5,6 +5,7 @@
 - 이 파일은 ticket inventory, 상태, 우선순위, 의존성, 실행 순서의 SSOT다.
 - 각 `<ticket-id>/TICKET.md`는 해당 ticket의 코드 경계, 구현 계약, 실패 처리, 테스트, 완료 조건의 SSOT다.
 - `AUDIT-BASELINE.md`는 동결된 감사 evidence다. 상태를 표현하지 않는다.
+- `AUDIT-DELTA-2026-09-21.md`는 구현 중 재검증한 신규·수정 finding의 source-bound evidence다. 현재 상태의 권위는 이 inventory다.
 - `REFERENCES.md`는 설계 기준과 외부 reference의 SSOT다.
 - 루트 `AUDIT-2026-09-21.md`와 `SYSTEM-AUDIT-CHECKLIST.md`는 감사 산출물이며 ticket 상태 권위가 아니다.
 - source가 바뀌면 과거 receipt는 해당 SHA에만 유효하다. 현재 상태로 자동 승격하지 않는다.
@@ -43,7 +44,7 @@
 | --- | --- | --- | --- | --- | --- |
 | [QMP-000](QMP-000-campaign-admission/TICKET.md) | P1 | QUALIFIED | source freeze, claim, RED baseline, receipt discipline | — | `tickets/**` only |
 | [QMP-010](QMP-010-policy-totality/TICKET.md) | P1 | IMPLEMENTED | mandatory class totality와 validated policy authority | QMP-000 | core `policy.rs`, `config.rs`, builder/policy tests |
-| [QMP-020](QMP-020-reservation-lifecycle/TICKET.md) | P1 | IMPLEMENTED | reservation typestate, commit-once, abandoned rollback | QMP-010 | core `ledger.rs`, recharge/control seams |
+| [QMP-020](QMP-020-reservation-lifecycle/TICKET.md) | P1 | READY | reservation typestate와 정확한 overflow-safe admission; 신규 RED로 재개방 | QMP-010 | core `ledger.rs`, recharge/control seams |
 | [QMP-030](QMP-030-enforced-builder-runtime-view/TICKET.md) | P1 | IMPLEMENTED | enforced default builder, raw authority 축소, broker-bound runtime scratch | QMP-010, QMP-020 | core/facade builders, broker/control/scratch API, examples |
 | [QMP-040](QMP-040-store-lifecycle/TICKET.md) | P1 | IMPLEMENTED | store construction typestate, close/drain, callback lock discipline | QMP-020, QMP-030 | facade shared builder/accounting + all store services |
 | [QMP-050](QMP-050-total-retained-cost/TICKET.md) | P1 | IN_PROGRESS | total retained-cost accounting | QMP-040 | measure/accounting + store entry cost paths |
@@ -73,9 +74,11 @@
 | P1-08 transcript tombstone unbounded/unaccounted | QMP-060 | count+byte saturation and reuse tests |
 | P1-09 reclaim→in-memory spill loses ownership | QMP-070 | source/destination receipt transfer E2E |
 | P1-10 actual extraction fails | QMP-120 | fresh actual extraction + clean git + locked build |
+| P1-D01 saturated admission issues an unaccounted live ticket (2026-09-21 delta) | QMP-020 | `u64::MAX-10` 뒤 `100` 거부 + exact post-release accounting |
+| P1-D02 generic store delete/remove can abort on panicking destructors (2026-09-21 delta) | QMP-040 | two-field/outer-unwind subprocess + exact refund, repeatable readable postimage |
 | P2-01 inert policy vocabulary | QMP-080 | every public policy field has runtime consumer tests |
 | P2-02 identity reconfigure fails under legal borrow | QMP-080 | current-policy reconfigure under borrow passes |
-| P2-03 public scheduler mutation side channel | QMP-080, QMP-140 | API removal/quarantine + exact reconciliation test |
+| P2-03 public scheduler mutation side channel (baseline; current API removed) | QMP-080, QMP-140 | removal API guard + exact reconciliation test; do not re-add symbol |
 | P2-04 commit has no state / abandoned ticket | QMP-020 | state-machine compile/runtime tests |
 | P2-05 stale reconfigure provenance | QMP-080, QMP-110 | revision/source postimage assertion |
 | P2-06 reclaim ladder disconnected | QMP-080 | broker slow-path reclaim E2E |
@@ -88,6 +91,7 @@
 | P2-13 saturating counter hides live bytes | QMP-040, QMP-050 | checked overflow fail-closed tests |
 | P2-14 noop spill discards and succeeds | QMP-070 | typed unsupported or explicit discard API test |
 | P2-15 public bumpalo bypass | QMP-030, QMP-140 | budgeted wrapper or public removal compile test |
+| P2-D01 client callback panic can poison a live store (2026-09-21 delta) | QMP-040 | callback panic then readable/retryable preimage + no ledger drift, or explicit supported-client contract |
 | Proof: telemetry unwired | QMP-110 | event emission/cardinality tests |
 | Proof: no benchmark/fuzz/loom | QMP-090, QMP-100 | executable rails and receipts |
 | Proof: feature warnings allowed | QMP-100, QMP-120 | `-D warnings` matrix |
@@ -174,7 +178,7 @@ receipt가 없는 “구현됨”, stale SHA, source digest 변경, command 미�
 
 ## 9. Campaign completion gate
 
-전체 campaign은 다음이 모두 참일 때만 `DONE`이다.
+전체 campaign은 다음이 모두 참일 때만 `DONE`이다. 원본 P1 10개에 신규 P1-D01/D02를 더해 추적 대상 P1 finding은 12개다. 원본 동결 판정/숫자는 변경하지 않는다. 신규 finding의 static/RED proof 수준은 delta audit에 명시한다.
 
 - P1 finding 10개가 모두 owning ticket의 negative test로 재현되고 fixed behavior를 통과한다.
 - P2 finding 15개가 구현 또는 명시적 API 제거/정책 결정으로 닫힌다.
