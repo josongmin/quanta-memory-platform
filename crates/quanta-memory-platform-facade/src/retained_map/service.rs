@@ -20,11 +20,12 @@ use crate::retained_map::{
 use crate::shared::accounting::Unbudgeted;
 use crate::shared::accounting::{Budgeted, StoreAccounting};
 use crate::shared::lifecycle::{retire_client_value, BeginClose, DropTransition, StoreLifecycle};
-use crate::shared::measure::ByteSized;
+use crate::shared::measure::{semantic_cost_v1, ByteSized, RetainedCostV1};
 
 #[derive(Debug)]
 struct MapEntry<Value> {
     value: Value,
+    retained_cost: RetainedCostV1,
     charged_bytes: u64,
     /// Single-owner ledger authority in budgeted mode; absent only for the
     /// explicitly distinct unbudgeted product type.
@@ -253,7 +254,7 @@ impl<Key, Value, Mode> Drop for SimpleRetainedMapStore<Key, Value, Mode> {
 
 impl<Key, Value, Mode> SimpleRetainedMapStore<Key, Value, Mode>
 where
-    Key: Clone + Eq + Hash,
+    Key: Clone + Eq + Hash + ByteSized,
     Value: Clone + ByteSized,
 {
     /// Committed retained bytes (sum of live entry charges).
@@ -303,7 +304,8 @@ where
         inserted: Outcome,
     ) -> Result<Outcome, StoreWriteError> {
         let _permit = self.lifecycle.begin_mutation()?;
-        let reserved_bytes = value.byte_size();
+        let value_bytes = value.byte_size();
+        let key_bytes = key.byte_size();
         let mut state = self.take_state()?;
         if let Some(entry) = state.entries.get(&key) {
             let outcome = on_occupied(&entry.value);
@@ -311,6 +313,14 @@ where
             return Ok(outcome);
         }
 
+        let retained_cost = Self::retained_cost_v1(key_bytes, value_bytes);
+        let reserved_bytes = match retained_cost.total() {
+            Ok(total) => total,
+            Err(error) => {
+                self.restore_state(state);
+                return Err(error);
+            }
+        };
         let next_committed_bytes = match Self::committed_bytes_after_replace_v1(
             state.committed_bytes,
             0,
@@ -331,7 +341,13 @@ where
         };
         state.entries.insert(
             key,
-            MapEntry { value, charged_bytes: reserved_bytes, charge, sweep_selected: false },
+            MapEntry {
+                value,
+                retained_cost,
+                charged_bytes: reserved_bytes,
+                charge,
+                sweep_selected: false,
+            },
         );
         state.committed_bytes = next_committed_bytes;
         self.restore_state(state);
@@ -350,11 +366,21 @@ where
             reserved_bytes,
         )
     }
+
+    fn retained_cost_v1(key_bytes: u64, value_bytes: u64) -> RetainedCostV1 {
+        RetainedCostV1 {
+            payload_bytes: value_bytes,
+            key_identity_bytes: key_bytes,
+            index_bytes: semantic_cost_v1::HASH_LINK_BYTES,
+            fixed_overhead_bytes: semantic_cost_v1::ENTRY_STATE_BYTES,
+            ..RetainedCostV1::default()
+        }
+    }
 }
 
 impl<Key, Value, Mode> RetainedMapStore<Key, Value> for SimpleRetainedMapStore<Key, Value, Mode>
 where
-    Key: Clone + Eq + Hash,
+    Key: Clone + Eq + Hash + ByteSized,
     Value: Clone + ByteSized,
 {
     fn binding(&self) -> &StoreBindingHandle {
@@ -363,7 +389,8 @@ where
 
     fn insert_checked(&self, key: Key, value: Value) -> Result<(), StoreWriteError> {
         let _permit = self.lifecycle.begin_mutation()?;
-        let reserved_bytes = value.byte_size();
+        let value_bytes = value.byte_size();
+        let incoming_key_bytes = key.byte_size();
         let mut state = self.take_state()?;
         let mut retired_value = None;
         let MapState { entries, committed_bytes } = &mut *state;
@@ -373,6 +400,9 @@ where
         match entries.entry(key) {
             Entry::Occupied(mut occupied) => {
                 let old_bytes = occupied.get().charged_bytes;
+                let retained_cost =
+                    RetainedCostV1 { payload_bytes: value_bytes, ..occupied.get().retained_cost };
+                let reserved_bytes = retained_cost.total()?;
                 let next = Self::committed_bytes_after_replace_v1(
                     *committed_bytes,
                     old_bytes,
@@ -410,15 +440,19 @@ where
                 }
                 let entry = occupied.get_mut();
                 retired_value = Some(std::mem::replace(&mut entry.value, value));
+                entry.retained_cost = retained_cost;
                 entry.charged_bytes = reserved_bytes;
                 *committed_bytes = next;
             }
             Entry::Vacant(vacant) => {
+                let retained_cost = Self::retained_cost_v1(incoming_key_bytes, value_bytes);
+                let reserved_bytes = retained_cost.total()?;
                 let next =
                     Self::committed_bytes_after_replace_v1(*committed_bytes, 0, reserved_bytes)?;
                 let charge = self.charge_new_entry_v1(reserved_bytes)?;
                 vacant.insert(MapEntry {
                     value,
+                    retained_cost,
                     charged_bytes: reserved_bytes,
                     charge,
                     sweep_selected: false,
@@ -647,7 +681,7 @@ where
 #[cfg(test)]
 impl<Key, Value, Mode> SimpleRetainedMapStore<Key, Value, Mode>
 where
-    Key: Clone + Eq + Hash,
+    Key: Clone + Eq + Hash + ByteSized,
     Value: Clone + ByteSized,
 {
     fn get(&self, key: &Key) -> Option<Value> {
@@ -662,7 +696,7 @@ where
 #[cfg(test)]
 impl<Key, Value, Mode> SimpleRetainedMapStore<Key, Value, Mode>
 where
-    Key: Clone + Eq + Hash + Ord,
+    Key: Clone + Eq + Hash + Ord + ByteSized,
     Value: Clone + ByteSized,
 {
     fn keys(&self) -> Vec<Key> {
@@ -688,6 +722,11 @@ mod tests {
         let binding =
             StoreBindingHandle::new(MemoryClass::MemoResidency, "owner-map".to_string(), None);
         SimpleRetainedMapStore::new_unbudgeted_fixture(binding)
+    }
+
+    fn retained_cost(key: &str, payload_bytes: u64) -> u64 {
+        // Independent oracle: key identity + value + hash link + entry state.
+        payload_bytes + key.len() as u64 + 24 + 16
     }
 
     #[derive(Clone, Debug, PartialEq, Eq)]
@@ -735,9 +774,12 @@ mod tests {
     fn insert_commits_envelope_bytes() {
         let store = store();
         store.insert_checked("k1".to_string(), vec![1u8, 2, 3]).expect("insert");
-        // reserve -> mutate -> commit: committed bytes == envelope byte size.
-        assert_eq!(store.committed_bytes().expect("committed"), 3);
-        assert_eq!(store.stats(), StoreStats { item_count: 1, estimated_bytes: 3 });
+        // The committed charge includes the retained key and index, not just the value.
+        assert_eq!(store.committed_bytes().expect("committed"), retained_cost("k1", 3));
+        assert_eq!(
+            store.stats(),
+            StoreStats { item_count: 1, estimated_bytes: retained_cost("k1", 3) }
+        );
         assert_eq!(store.get(&"k1".to_string()), Some(vec![1u8, 2, 3]));
     }
 
@@ -754,14 +796,17 @@ mod tests {
             .expect_err("overflowing overwrite must fail closed");
         assert!(matches!(overwrite_error, MemoryError::Capacity(_)));
         assert_eq!(store.get_checked(&"stable".to_string()).expect("stable read"), Some(original));
-        assert_eq!(store.committed_bytes().expect("unchanged committed bytes"), 2);
+        assert_eq!(
+            store.committed_bytes().expect("unchanged committed bytes"),
+            retained_cost("stable", 1) + retained_cost("other", 1)
+        );
         assert_eq!(store.stats_checked().expect("unchanged stats").item_count, 2);
 
         let max_store = declared_bytes_store_v1();
         max_store
             .insert_if_absent_checked(
                 "max".to_string(),
-                DeclaredBytesV1 { marker: 7, retained_bytes: u64::MAX },
+                DeclaredBytesV1 { marker: 7, retained_bytes: u64::MAX - retained_cost("max", 0) },
             )
             .expect("the first maximum-sized declaration is representable");
         let insert_error = max_store
@@ -818,7 +863,10 @@ mod tests {
             "all losing callers observe an existing row"
         );
         assert_eq!(store.stats().item_count, 1);
-        assert_eq!(store.committed_bytes().expect("committed bytes"), 1);
+        assert_eq!(
+            store.committed_bytes().expect("committed bytes"),
+            retained_cost("canonical", 1)
+        );
     }
 
     #[test]
@@ -928,6 +976,12 @@ mod tests {
         armed: Arc<AtomicBool>,
     }
 
+    impl ByteSized for PanickingHashKey {
+        fn byte_size(&self) -> u64 {
+            1
+        }
+    }
+
     impl PartialEq for PanickingHashKey {
         fn eq(&self, other: &Self) -> bool {
             self.id == other.id
@@ -951,6 +1005,12 @@ mod tests {
         armed: Arc<AtomicBool>,
         store: Arc<OnceLock<Weak<ReentrantReadStore>>>,
         callbacks: Arc<AtomicUsize>,
+    }
+
+    impl ByteSized for ReentrantReadKey {
+        fn byte_size(&self) -> u64 {
+            1
+        }
     }
 
     impl PartialEq for ReentrantReadKey {
@@ -1005,7 +1065,10 @@ mod tests {
             callbacks: Arc::clone(&callbacks),
         };
         store.insert_checked(key.clone(), vec![1, 2, 3]).expect("seed");
-        assert_eq!(broker.ledger_snapshot().expect("ledger").total_owner_bytes(), 3);
+        assert_eq!(
+            broker.ledger_snapshot().expect("ledger").total_owner_bytes(),
+            retained_cost("x", 3)
+        );
 
         armed.store(true, Ordering::SeqCst);
         assert_eq!(store.get_checked(&key).expect("outer read"), Some(vec![1, 2, 3]));
@@ -1013,9 +1076,12 @@ mod tests {
         assert_eq!(callbacks.load(Ordering::SeqCst), 1, "lookup must invoke the client hash");
         assert_eq!(
             store.stats_checked().expect("published state"),
-            StoreStats { item_count: 1, estimated_bytes: 3 }
+            StoreStats { item_count: 1, estimated_bytes: retained_cost("x", 3) }
         );
-        assert_eq!(broker.ledger_snapshot().expect("unchanged ledger").total_owner_bytes(), 3);
+        assert_eq!(
+            broker.ledger_snapshot().expect("unchanged ledger").total_owner_bytes(),
+            retained_cost("x", 3)
+        );
         store.close().expect("closing phase restored after reentry");
         assert_eq!(broker.ledger_snapshot().expect("released ledger").total_owner_bytes(), 0);
     }
@@ -1045,11 +1111,14 @@ mod tests {
             callbacks: Arc::clone(&callbacks),
         };
         store.insert_checked(key, vec![1, 2, 3]).expect("charged preimage");
-        assert_eq!(broker.ledger_snapshot().expect("preimage ledger").total_owner_bytes(), 3);
+        assert_eq!(
+            broker.ledger_snapshot().expect("preimage ledger").total_owner_bytes(),
+            retained_cost("x", 3)
+        );
 
         armed.store(true, Ordering::SeqCst);
         let swept = store.sweep(SweepHint { target_bytes: 3 }).expect("sweep succeeds");
-        assert_eq!(swept.reclaimed_bytes, 3);
+        assert_eq!(swept.reclaimed_bytes, retained_cost("x", 3));
         assert_eq!(callbacks.load(Ordering::SeqCst), 1, "planning invokes client Hash once");
         assert_eq!(store.stats_checked().expect("complete postimage").item_count, 0);
         assert_eq!(broker.ledger_snapshot().expect("refunded ledger").total_owner_bytes(), 0);
@@ -1084,8 +1153,14 @@ mod tests {
         armed.store(false, Ordering::SeqCst);
 
         assert_eq!(store.get_checked(&key).expect("restored read"), Some(vec![1, 2, 3]));
-        assert_eq!(store.stats_checked().expect("restored stats").estimated_bytes, 3);
-        assert_eq!(broker.ledger_snapshot().expect("ledger").total_owner_bytes(), 3);
+        assert_eq!(
+            store.stats_checked().expect("restored stats").estimated_bytes,
+            retained_cost("x", 3)
+        );
+        assert_eq!(
+            broker.ledger_snapshot().expect("ledger").total_owner_bytes(),
+            retained_cost("x", 3)
+        );
         store.close().expect("terminal release");
         assert_eq!(broker.ledger_snapshot().expect("released").total_owner_bytes(), 0);
     }
@@ -1168,7 +1243,7 @@ mod tests {
         store.insert_checked("k".to_string(), vec![1u8, 2, 3, 4]).expect("put");
         // get returns the stored value; bytes reflect exactly the value size.
         assert_eq!(store.get(&"k".to_string()), Some(vec![1u8, 2, 3, 4]));
-        assert_eq!(store.committed_bytes().expect("after put"), 4);
+        assert_eq!(store.committed_bytes().expect("after put"), retained_cost("k", 4));
 
         let removed = store.remove(&"k".to_string()).expect("remove");
         assert_eq!(removed, Some(vec![1u8, 2, 3, 4]), "remove returns the stored value");
@@ -1187,6 +1262,12 @@ mod tests {
         // The canonical (lowercased) form drives equality; `raw` can differ for
         // two equal keys, exercising the Eq + Hash identity law.
         raw: String,
+    }
+
+    impl ByteSized for CaseInsensitiveKey {
+        fn byte_size(&self) -> u64 {
+            self.raw.len() as u64
+        }
     }
 
     impl PartialEq for CaseInsensitiveKey {
@@ -1221,7 +1302,7 @@ mod tests {
         store
             .insert_checked(CaseInsensitiveKey { raw: "Key".to_string() }, vec![0u8; 10])
             .expect("first put");
-        assert_eq!(store.committed_bytes().expect("c1"), 10);
+        assert_eq!(store.committed_bytes().expect("c1"), retained_cost("Key", 10));
         assert_eq!(store.stats().item_count, 1);
 
         // Re-put under an equal-but-not-identical key form: overwrite in place.
@@ -1230,7 +1311,7 @@ mod tests {
             .expect("overwrite put");
         assert_eq!(
             store.committed_bytes().expect("c2"),
-            3,
+            retained_cost("Key", 3),
             "Eq-equal duplicate must overwrite, never double-count bytes"
         );
         assert_eq!(store.stats().item_count, 1, "equal keys must collapse to one entry");
@@ -1247,6 +1328,12 @@ mod tests {
         id: u64,
         equality_probes: Arc<AtomicUsize>,
         hash_probes: Arc<AtomicUsize>,
+    }
+
+    impl ByteSized for LookupProbeKey {
+        fn byte_size(&self) -> u64 {
+            8
+        }
     }
 
     impl PartialEq for LookupProbeKey {
@@ -1343,13 +1430,13 @@ mod tests {
     fn reinsert_same_key_recharges_to_new_size_not_doubled() {
         let store = store();
         store.insert_checked("k".to_string(), vec![0u8; 10]).expect("insert");
-        assert_eq!(store.committed_bytes().expect("c1"), 10);
+        assert_eq!(store.committed_bytes().expect("c1"), retained_cost("k", 10));
         // Replace with a smaller value: committed bytes track the live charge only,
         // never the sum of both inserts.
         store.insert_checked("k".to_string(), vec![0u8; 4]).expect("reinsert");
         assert_eq!(
             store.committed_bytes().expect("c2"),
-            4,
+            retained_cost("k", 4),
             "replacement must not double-charge the key"
         );
         assert_eq!(store.stats().item_count, 1);
@@ -1375,13 +1462,14 @@ mod tests {
         store.insert_checked("a".to_string(), vec![0u8; 5]).expect("a");
         store.insert_checked("b".to_string(), vec![0u8; 5]).expect("b");
         store.insert_checked("c".to_string(), vec![0u8; 5]).expect("c");
-        assert_eq!(store.committed_bytes().expect("before"), 15);
+        assert_eq!(store.committed_bytes().expect("before"), 3 * retained_cost("a", 5));
 
-        let stats = store.sweep(SweepHint { target_bytes: 6 }).expect("sweep");
-        // Must reclaim until >= target: two entries (10 bytes) cover a 6-byte target.
+        let stats =
+            store.sweep(SweepHint { target_bytes: retained_cost("a", 5) + 1 }).expect("sweep");
+        // Must reclaim until >= target: two retained entries cover a one-entry-plus-one target.
         assert_eq!(stats.reclaimed_items, 2);
-        assert_eq!(stats.reclaimed_bytes, 10);
-        assert_eq!(store.committed_bytes().expect("after sweep"), 5);
+        assert_eq!(stats.reclaimed_bytes, 2 * retained_cost("a", 5));
+        assert_eq!(store.committed_bytes().expect("after sweep"), retained_cost("a", 5));
         assert_eq!(store.stats().item_count, 1);
     }
 
@@ -1396,7 +1484,10 @@ mod tests {
         store.insert_checked("b".to_string(), vec![9, 9]).expect("overwrite b");
         let swept = store.sweep(SweepHint { target_bytes: 1 }).expect("sweep newest");
 
-        assert_eq!(swept, SweepStats { reclaimed_items: 1, reclaimed_bytes: 1 });
+        assert_eq!(
+            swept,
+            SweepStats { reclaimed_items: 1, reclaimed_bytes: retained_cost("c", 1) }
+        );
         assert_eq!(store.get(&"b".to_string()), Some(vec![9, 9]), "overwritten b stays resident");
         assert_eq!(store.get(&"c".to_string()), None, "original newest c is evicted first");
         assert_eq!(store.keys(), vec!["a".to_string(), "b".to_string()]);
@@ -1420,41 +1511,43 @@ mod tests {
     }
 
     #[test]
-    fn byte_targeted_sweep_does_not_over_evict_zero_byte_entries() {
-        // Regression: a byte-targeted sweep must skip zero-byte entries (they free
-        // no memory toward the target) rather than wiping them. Here only the one
-        // byte-bearing entry should be swept; the two zero-byte entries survive.
+    fn byte_targeted_sweep_reclaims_full_cost_of_newest_entry() {
+        // Empty values still retain keys and index state. A small byte target
+        // must reclaim only the newest entry's full semantic cost.
         let store = store();
         store.insert_checked("a".to_string(), vec![]).expect("a"); // 0 bytes
         store.insert_checked("b".to_string(), vec![]).expect("b"); // 0 bytes
         store.insert_checked("c".to_string(), vec![0u8; 8]).expect("c"); // 8 bytes
-        assert_eq!(store.committed_bytes().expect("before"), 8);
+        assert_eq!(
+            store.committed_bytes().expect("before"),
+            retained_cost("a", 0) + retained_cost("b", 0) + retained_cost("c", 8)
+        );
 
         let stats = store.sweep(SweepHint { target_bytes: 6 }).expect("sweep");
-        assert_eq!(stats.reclaimed_items, 1, "only the byte-bearing entry is swept");
-        assert_eq!(stats.reclaimed_bytes, 8);
-        assert_eq!(store.stats().item_count, 2, "both zero-byte entries survive the byte sweep");
+        assert_eq!(stats.reclaimed_items, 1, "only the newest entry is swept");
+        assert_eq!(stats.reclaimed_bytes, retained_cost("c", 8));
+        assert_eq!(store.stats().item_count, 2, "older entries survive the byte sweep");
         assert!(
             store.get(&"a".to_string()).is_some() && store.get(&"b".to_string()).is_some(),
-            "zero-byte entries are retained, not over-evicted"
+            "older entries are retained, not over-evicted"
         );
     }
 
     #[test]
-    fn byte_targeted_sweep_of_all_zero_byte_entries_reclaims_nothing() {
-        // The pathological case: a store of only zero-byte entries can never reach a
-        // POSITIVE byte target, so the sweep must reclaim nothing — NOT wipe the
-        // whole store trying (and failing) to hit the target.
+    fn byte_targeted_sweep_of_empty_values_reclaims_key_and_index_cost() {
+        // An empty value is not a free retained entry: key identity and index
+        // state must be charged and returned by the sweep.
         let store = store();
         for k in ["a", "b", "c"] {
             store.insert_checked(k.to_string(), vec![]).expect("zero-byte insert");
         }
         let stats = store.sweep(SweepHint { target_bytes: 6 }).expect("sweep");
-        assert_eq!(stats.reclaimed_items, 0, "zero-byte entries free no bytes; none swept");
+        assert_eq!(stats.reclaimed_items, 1);
+        assert_eq!(stats.reclaimed_bytes, retained_cost("c", 0));
         assert_eq!(
             store.stats().item_count,
-            3,
-            "a positive byte target must not wipe a zero-byte store"
+            2,
+            "a positive byte target must remove only the byte-bearing entry needed"
         );
     }
 
@@ -1558,7 +1651,7 @@ mod tests {
         store.insert_checked("k".to_string(), vec![0u8; 4096]).expect("insert");
 
         // The store sees its own bytes...
-        assert_eq!(store.committed_bytes().expect("store bytes"), 4096);
+        assert_eq!(store.committed_bytes().expect("store bytes"), retained_cost("k", 4096));
         // ...but the broker ledger (the SSOT) sees none of them: an uncharged store
         // never wires its bytes into the ledger.
         assert_eq!(
@@ -1578,9 +1671,12 @@ mod tests {
         store.insert_checked("rec".to_string(), record.clone()).expect("insert typed");
         // get returns the exact typed value (no codec needed).
         assert_eq!(store.get(&"rec".to_string()), Some(record));
-        // Broker accounting charges the value's own byte_size (4 + 5).
-        assert_eq!(store.committed_bytes().expect("committed"), 9);
-        assert_eq!(store.stats(), StoreStats { item_count: 1, estimated_bytes: 9 });
+        // The value's declared bytes and retained key/index are both charged.
+        assert_eq!(store.committed_bytes().expect("committed"), retained_cost("rec", 9));
+        assert_eq!(
+            store.stats(),
+            StoreStats { item_count: 1, estimated_bytes: retained_cost("rec", 9) }
+        );
     }
 
     // --- Opaque handle: `Arc<dyn Any + Send + Sync>` wrapped in MeasuredValue
@@ -1613,8 +1709,11 @@ mod tests {
         assert_eq!(*downcast, vec![10u32, 20, 30]);
 
         // Broker accounting reflects the caller-supplied size, not Arc::size_of.
-        assert_eq!(store.committed_bytes().expect("committed"), 4096);
-        assert_eq!(store.stats(), StoreStats { item_count: 1, estimated_bytes: 4096 });
+        assert_eq!(store.committed_bytes().expect("committed"), retained_cost("h", 4096));
+        assert_eq!(
+            store.stats(),
+            StoreStats { item_count: 1, estimated_bytes: retained_cost("h", 4096) }
+        );
 
         // NEGATIVE-PAIR: removing the handle releases the caller-supplied charge.
         let removed =
@@ -1662,6 +1761,82 @@ mod tests {
             SimpleRetainedMapStore::new_budgeted(binding, broker.clone())
         }
 
+        #[test]
+        fn empty_value_with_huge_retained_key_is_denied_without_ledger_or_map_mutation() {
+            let broker = live_broker(100);
+            let store = charged(&broker);
+            let huge_key = "k".repeat(1_024);
+            assert!(matches!(
+                store.insert_checked(huge_key.clone(), Vec::new()),
+                Err(MemoryError::Capacity(_))
+            ));
+            assert_eq!(store.stats_checked().expect("unchanged stats"), StoreStats::default());
+            assert_eq!(store.get_checked(&huge_key).expect("absent"), None);
+            assert_eq!(broker.ledger_snapshot().expect("unchanged ledger").total_owner_bytes(), 0);
+        }
+
+        #[derive(Clone, Debug)]
+        struct AliasKey {
+            id: u8,
+            declared_bytes: u64,
+        }
+
+        impl PartialEq for AliasKey {
+            fn eq(&self, other: &Self) -> bool {
+                self.id == other.id
+            }
+        }
+        impl Eq for AliasKey {}
+        impl Hash for AliasKey {
+            fn hash<H: Hasher>(&self, state: &mut H) {
+                self.id.hash(state);
+            }
+        }
+        impl ByteSized for AliasKey {
+            fn byte_size(&self) -> u64 {
+                self.declared_bytes
+            }
+        }
+
+        #[test]
+        fn overwrite_preserves_retained_original_key_cost_and_exact_ledger() {
+            let broker = live_broker(100);
+            let binding =
+                StoreBindingHandle::new(MemoryClass::MemoResidency, "alias-key-owner".into(), None);
+            let store: SimpleRetainedMapStore<AliasKey, Vec<u8>, Budgeted> =
+                SimpleRetainedMapStore::new_budgeted(binding, broker.clone());
+            let original = AliasKey { id: 1, declared_bytes: 2 };
+            store.insert_checked(original.clone(), vec![1; 4]).expect("seed");
+            let initial = 4 + 2 + 24 + 16;
+            assert_eq!(broker.ledger_snapshot().expect("ledger").total_owner_bytes(), initial);
+            let equal_but_huge = AliasKey { id: 1, declared_bytes: 1_024 };
+            store
+                .insert_checked(equal_but_huge, vec![2; 6])
+                .expect("original key remains retained");
+            let expected = initial + 2;
+            assert_eq!(store.committed_bytes().expect("store"), expected);
+            assert_eq!(broker.ledger_snapshot().expect("ledger").total_owner_bytes(), expected);
+            assert_eq!(store.get_checked(&original).expect("lookup"), Some(vec![2; 6]));
+        }
+
+        #[test]
+        fn aggregate_cost_overflow_is_denied_before_new_entry_or_ledger_charge() {
+            let broker = live_broker(1_000);
+            let binding =
+                StoreBindingHandle::new(MemoryClass::MemoResidency, "overflow-owner".into(), None);
+            let store: SimpleRetainedMapStore<String, DeclaredBytesV1, Budgeted> =
+                SimpleRetainedMapStore::new_budgeted(binding, broker.clone());
+            assert!(matches!(
+                store.insert_checked(
+                    "k".into(),
+                    DeclaredBytesV1 { marker: 1, retained_bytes: u64::MAX }
+                ),
+                Err(MemoryError::Capacity(_))
+            ));
+            assert_eq!(store.stats_checked().expect("unchanged stats"), StoreStats::default());
+            assert_eq!(broker.ledger_snapshot().expect("unchanged ledger").total_owner_bytes(), 0);
+        }
+
         #[derive(Clone, Debug)]
         struct PanicOnRetire {
             bytes: u64,
@@ -1704,9 +1879,18 @@ mod tests {
                 )
             }));
             assert!(caught.is_err(), "client destructor did panic");
-            assert_eq!(store.stats_checked().expect("complete postimage").estimated_bytes, 8);
-            assert_eq!(store.committed_bytes().expect("committed postimage"), 8);
-            assert_eq!(broker.ledger_snapshot().expect("ledger postimage").total_owner_bytes(), 8);
+            assert_eq!(
+                store.stats_checked().expect("complete postimage").estimated_bytes,
+                retained_cost("key", 8)
+            );
+            assert_eq!(
+                store.committed_bytes().expect("committed postimage"),
+                retained_cost("key", 8)
+            );
+            assert_eq!(
+                broker.ledger_snapshot().expect("ledger postimage").total_owner_bytes(),
+                retained_cost("key", 8)
+            );
             store.close().expect("close remains possible after client panic");
             assert_eq!(broker.ledger_snapshot().expect("drained ledger").total_owner_bytes(), 0);
         }
@@ -1776,6 +1960,12 @@ mod tests {
             hash_must_panic: Arc<AtomicBool>,
         }
 
+        impl ByteSized for PanicAfterSweepPlanKey {
+            fn byte_size(&self) -> u64 {
+                8
+            }
+        }
+
         impl PartialEq for PanicAfterSweepPlanKey {
             fn eq(&self, other: &Self) -> bool {
                 self.id == other.id
@@ -1802,6 +1992,12 @@ mod tests {
             callbacks: Arc<AtomicUsize>,
         }
 
+        impl ByteSized for AssertChargedDuringHashKey {
+            fn byte_size(&self) -> u64 {
+                8
+            }
+        }
+
         impl PartialEq for AssertChargedDuringHashKey {
             fn eq(&self, other: &Self) -> bool {
                 self.id == other.id
@@ -1818,7 +2014,7 @@ mod tests {
                             .ledger_snapshot()
                             .expect("ledger in client Hash")
                             .total_owner_bytes(),
-                        5,
+                        retained_cost("x1234567", 5),
                         "sweep must never call client Hash after refund"
                     );
                     self.callbacks.fetch_add(1, Ordering::SeqCst);
@@ -1852,7 +2048,7 @@ mod tests {
                 .expect("charged insert");
             armed.store(true, Ordering::SeqCst);
             let swept = store.sweep(SweepHint { target_bytes: 5 }).expect("sweep succeeds");
-            assert_eq!(swept.reclaimed_bytes, 5);
+            assert_eq!(swept.reclaimed_bytes, retained_cost("x1234567", 5));
             assert_eq!(callbacks.load(Ordering::SeqCst), 1);
             assert_eq!(store.stats_checked().expect("postimage").item_count, 0);
             assert_eq!(broker.ledger_snapshot().expect("refunded ledger").total_owner_bytes(), 0);
@@ -1862,6 +2058,12 @@ mod tests {
         struct PanicAfterSweepDropKey {
             id: &'static str,
             panic_once: Arc<AtomicBool>,
+        }
+
+        impl ByteSized for PanicAfterSweepDropKey {
+            fn byte_size(&self) -> u64 {
+                self.id.len() as u64
+            }
         }
 
         impl PartialEq for PanicAfterSweepDropKey {
@@ -1908,11 +2110,17 @@ mod tests {
                 store.sweep(SweepHint { target_bytes: 5 })
             }));
             assert!(result.is_err(), "client Hash panic occurs before refund");
-            assert_eq!(store.stats_checked().expect("charged preimage").estimated_bytes, 5);
-            assert_eq!(broker.ledger_snapshot().expect("charged ledger").total_owner_bytes(), 5);
+            assert_eq!(
+                store.stats_checked().expect("charged preimage").estimated_bytes,
+                retained_cost("x1234567", 5)
+            );
+            assert_eq!(
+                broker.ledger_snapshot().expect("charged ledger").total_owner_bytes(),
+                retained_cost("x1234567", 5)
+            );
             hash_must_panic.store(false, Ordering::SeqCst);
             let stats = store.sweep(SweepHint { target_bytes: 5 }).expect("retry succeeds");
-            assert_eq!(stats.reclaimed_bytes, 5);
+            assert_eq!(stats.reclaimed_bytes, retained_cost("x1234567", 5));
             assert_eq!(store.stats_checked().expect("postimage").estimated_bytes, 0);
             assert_eq!(broker.ledger_snapshot().expect("postimage ledger").total_owner_bytes(), 0);
         }
@@ -1938,7 +2146,7 @@ mod tests {
             }));
             assert_eq!(
                 result.expect("client destructor panic is contained").expect("sweep"),
-                SweepStats { reclaimed_items: 1, reclaimed_bytes: 5 }
+                SweepStats { reclaimed_items: 1, reclaimed_bytes: retained_cost("key", 5) }
             );
             assert_eq!(store.stats_checked().expect("postimage").item_count, 0);
             assert_eq!(store.committed_bytes().expect("postimage bytes"), 0);
@@ -1982,7 +2190,9 @@ mod tests {
 
                 impl Drop for SweepOnOuterUnwind<'_> {
                     fn drop(&mut self) {
-                        *self.result = Some(self.store.sweep(SweepHint { target_bytes: 10 }));
+                        *self.result = Some(
+                            self.store.sweep(SweepHint { target_bytes: retained_cost("a", 5) + 1 }),
+                        );
                     }
                 }
 
@@ -1995,10 +2205,16 @@ mod tests {
                 let swept =
                     result.expect("sweep ran during outer unwind").expect("sweep completes");
                 assert_eq!(swept.reclaimed_items, 2);
-                assert_eq!(swept.reclaimed_bytes, 10);
+                assert_eq!(swept.reclaimed_bytes, retained_cost("a", 5) + retained_cost("b", 5));
                 assert_eq!(store.stats_checked().expect("complete postimage").item_count, 1);
-                assert_eq!(store.committed_bytes().expect("complete postimage"), 7);
-                assert_eq!(broker.ledger_snapshot().expect("exact ledger").total_owner_bytes(), 7);
+                assert_eq!(
+                    store.committed_bytes().expect("complete postimage"),
+                    retained_cost("survivor", 7)
+                );
+                assert_eq!(
+                    broker.ledger_snapshot().expect("exact ledger").total_owner_bytes(),
+                    retained_cost("survivor", 7)
+                );
                 assert!(key_panics[1..].iter().all(|flag| !flag.load(Ordering::SeqCst)));
                 assert!(value_panics[1..].iter().all(|flag| !flag.load(Ordering::SeqCst)));
                 store.close().expect("survivor remains closable");
@@ -2041,10 +2257,13 @@ mod tests {
                 Some(vec![1u8; 30]),
                 "managed recharge denial preserves the charged preimage"
             );
-            assert_eq!(store.stats_checked().expect("checked stats").estimated_bytes, 30);
+            assert_eq!(
+                store.stats_checked().expect("checked stats").estimated_bytes,
+                retained_cost("key", 30)
+            );
             assert_eq!(
                 broker.ledger_snapshot().expect("ledger after recovery").total_owner_bytes(),
-                30,
+                retained_cost("key", 30),
                 "store and ledger retain the same charge authority"
             );
             broker.finish_rebuild().expect("finish rebuild");
@@ -2061,7 +2280,7 @@ mod tests {
             store.insert_checked("k".to_string(), vec![0u8; 100]).expect("insert within cap");
             assert_eq!(
                 broker.ledger_snapshot().expect("snap").total_owner_bytes(),
-                100,
+                retained_cost("k", 100),
                 "the ledger must see the charged map's bytes"
             );
 
@@ -2070,7 +2289,7 @@ mod tests {
             store.insert_checked("k".to_string(), vec![0u8; 40]).expect("overwrite");
             assert_eq!(
                 broker.ledger_snapshot().expect("snap").total_owner_bytes(),
-                40,
+                retained_cost("k", 40),
                 "an overwrite must re-charge to the new size, not double-count"
             );
 
@@ -2085,7 +2304,7 @@ mod tests {
 
         #[test]
         fn atomic_insert_if_absent_never_recharges_or_overwrites_an_existing_entry_v1() {
-            let broker = live_broker(50);
+            let broker = live_broker(100);
             let store = charged(&broker);
             store.insert_checked("canonical".to_string(), vec![1u8; 30]).expect("seed");
 
@@ -2103,17 +2322,20 @@ mod tests {
                 Some(vec![1u8; 30]),
                 "a losing publisher must not replace the canonical payload"
             );
-            assert_eq!(store.stats_checked().expect("checked stats").estimated_bytes, 30);
+            assert_eq!(
+                store.stats_checked().expect("checked stats").estimated_bytes,
+                retained_cost("canonical", 30)
+            );
             assert_eq!(
                 broker.ledger_snapshot().expect("snap").total_owner_bytes(),
-                30,
+                retained_cost("canonical", 30),
                 "a losing publisher must not charge or refund the ledger"
             );
         }
 
         #[test]
         fn denied_atomic_insert_if_absent_publishes_neither_payload_nor_charge_v1() {
-            let broker = live_broker(50);
+            let broker = live_broker(100);
             let store = charged(&broker);
             store.insert_checked("keep".to_string(), vec![0u8; 40]).expect("seed");
             let ledger_before = broker.ledger_snapshot().expect("snap").total_owner_bytes();
@@ -2141,7 +2363,7 @@ mod tests {
         fn charged_insert_over_cap_is_denied_and_fails_closed() {
             // (b) over-cap insert is denied and fails closed: capture ledger + store
             // state before the denied op and assert both are byte-for-byte unchanged.
-            let broker = live_broker(50); // MemoResidency hard cap 50 bytes
+            let broker = live_broker(100); // MemoResidency hard cap 100 semantic bytes
             let store = charged(&broker);
 
             // Seed a surviving entry so the denied op cannot quietly drop it.
@@ -2149,9 +2371,9 @@ mod tests {
             let ledger_before = broker.ledger_snapshot().expect("snap").total_owner_bytes();
             let committed_before = store.committed_bytes().expect("committed before");
             let stats_before = store.stats();
-            assert_eq!(ledger_before, 40);
+            assert_eq!(ledger_before, retained_cost("keep", 40));
 
-            // 40 (existing) + 20 = 60 > 50 hard cap: the new insert must be denied.
+            // Both retained key/index charges make the combined image exceed the cap.
             let denied = store.insert_checked("big".to_string(), vec![0u8; 20]);
             assert!(
                 matches!(denied, Err(MemoryError::Capacity(_))),
@@ -2174,14 +2396,14 @@ mod tests {
             // (b, overwrite variant) a denied overwrite of an existing key must NOT
             // disturb the existing entry's value or its ledger charge — fail-closed
             // before any mutation or refund of the old charge.
-            let broker = live_broker(50);
+            let broker = live_broker(100);
             let store = charged(&broker);
             store.insert_checked("k".to_string(), vec![1u8; 30]).expect("seed");
             let ledger_before = broker.ledger_snapshot().expect("snap").total_owner_bytes();
-            assert_eq!(ledger_before, 30);
+            assert_eq!(ledger_before, retained_cost("k", 30));
 
             // Re-insert the same key with a value that, charged BEFORE the old refund,
-            // would push 30 + 60 = 90 > 50 over the cap: must be denied.
+            // would exceed the semantic cap: must be denied.
             let denied = store.insert_checked("k".to_string(), vec![2u8; 60]);
             assert!(
                 matches!(denied, Err(MemoryError::Capacity(_))),
@@ -2189,7 +2411,7 @@ mod tests {
             );
             // The old entry, its value, and its ledger charge survive untouched.
             assert_eq!(store.get(&"k".to_string()), Some(vec![1u8; 30]), "old value survives");
-            assert_eq!(store.committed_bytes().expect("committed"), 30);
+            assert_eq!(store.committed_bytes().expect("committed"), retained_cost("k", 30));
             assert_eq!(
                 broker.ledger_snapshot().expect("snap").total_owner_bytes(),
                 ledger_before,
@@ -2203,13 +2425,16 @@ mod tests {
             // ticket (the original, or the broker-restored one) — never a stranded
             // non-live ticket. Proven end-to-end: a follow-up remove drains the
             // ledger to zero (a non-live ticket would be rejected and strand bytes).
-            let broker = live_broker(50);
+            let broker = live_broker(100);
             let store = charged(&broker);
             store.insert_checked("k".to_string(), vec![1u8; 30]).expect("seed");
 
             let denied = store.insert_checked("k".to_string(), vec![2u8; 60]);
             assert!(matches!(denied, Err(MemoryError::Capacity(_))), "over-cap overwrite denied");
-            assert_eq!(broker.ledger_snapshot().expect("snap").total_owner_bytes(), 30);
+            assert_eq!(
+                broker.ledger_snapshot().expect("snap").total_owner_bytes(),
+                retained_cost("k", 30)
+            );
 
             // The surviving entry's ticket is refundable: removing it drains the ledger.
             let removed = store.remove(&"k".to_string()).expect("remove must succeed");
@@ -2230,7 +2455,10 @@ mod tests {
             let broker = live_broker(1_000_000);
             let store = charged(&broker);
             store.insert_checked("k".to_string(), vec![1u8; 40]).expect("seed");
-            assert_eq!(broker.ledger_snapshot().expect("snap").total_owner_bytes(), 40);
+            assert_eq!(
+                broker.ledger_snapshot().expect("snap").total_owner_bytes(),
+                retained_cost("k", 40)
+            );
 
             broker.begin_rebuild().expect("begin rebuild");
             let denied = store.insert_checked("k".to_string(), vec![2u8; 20]);
@@ -2239,12 +2467,18 @@ mod tests {
                 "overwrite during rebuild must be rejected, got {denied:?}"
             );
             assert_eq!(store.get(&"k".to_string()), Some(vec![1u8; 40]), "old value intact");
-            assert_eq!(broker.ledger_snapshot().expect("snap").total_owner_bytes(), 40);
+            assert_eq!(
+                broker.ledger_snapshot().expect("snap").total_owner_bytes(),
+                retained_cost("k", 40)
+            );
 
             // After rebuild the entry is still live: it overwrites and removes cleanly.
             broker.finish_rebuild().expect("finish");
             store.insert_checked("k".to_string(), vec![2u8; 20]).expect("overwrite resumes");
-            assert_eq!(broker.ledger_snapshot().expect("snap").total_owner_bytes(), 20);
+            assert_eq!(
+                broker.ledger_snapshot().expect("snap").total_owner_bytes(),
+                retained_cost("k", 20)
+            );
             store.remove(&"k".to_string()).expect("remove");
             assert_eq!(broker.ledger_snapshot().expect("snap").total_owner_bytes(), 0);
         }
@@ -2257,13 +2491,17 @@ mod tests {
             store.insert_checked("a".to_string(), vec![0u8; 5]).expect("a");
             store.insert_checked("b".to_string(), vec![0u8; 5]).expect("b");
             store.insert_checked("c".to_string(), vec![0u8; 5]).expect("c");
-            assert_eq!(broker.ledger_snapshot().expect("snap").total_owner_bytes(), 15);
-
-            let stats = store.sweep(SweepHint { target_bytes: 6 }).expect("sweep");
-            assert_eq!(stats.reclaimed_items, 2, "two 5-byte entries cover a 6-byte target");
             assert_eq!(
                 broker.ledger_snapshot().expect("snap").total_owner_bytes(),
-                5,
+                3 * retained_cost("a", 5)
+            );
+
+            let stats =
+                store.sweep(SweepHint { target_bytes: retained_cost("a", 5) + 1 }).expect("sweep");
+            assert_eq!(stats.reclaimed_items, 2, "two retained entries cover the target");
+            assert_eq!(
+                broker.ledger_snapshot().expect("snap").total_owner_bytes(),
+                retained_cost("a", 5),
                 "sweep must refund the reclaimed bytes to the ledger"
             );
         }
@@ -2275,10 +2513,11 @@ mod tests {
             store.insert_checked("a".to_string(), vec![0u8; 2]).expect("a");
             store.insert_checked("b".to_string(), vec![0u8; 3]).expect("b");
             store.insert_checked("c".to_string(), vec![0u8; 5]).expect("c");
-            assert_eq!(broker.ledger_snapshot().expect("before").total_owner_bytes(), 10);
+            let full_cost = retained_cost("a", 2) + retained_cost("b", 3) + retained_cost("c", 5);
+            assert_eq!(broker.ledger_snapshot().expect("before").total_owner_bytes(), full_cost);
 
-            let swept = store.sweep(SweepHint { target_bytes: 10 }).expect("full sweep");
-            assert_eq!(swept, SweepStats { reclaimed_items: 3, reclaimed_bytes: 10 });
+            let swept = store.sweep(SweepHint { target_bytes: full_cost }).expect("full sweep");
+            assert_eq!(swept, SweepStats { reclaimed_items: 3, reclaimed_bytes: full_cost });
             assert_eq!(store.stats_checked().expect("checked empty stats"), StoreStats::default());
             assert!(store.keys().is_empty(), "full eviction leaves no reachable key");
             assert!(store.entries().is_empty(), "full eviction leaves no reachable entry");
@@ -2307,8 +2546,11 @@ mod tests {
                 Some(vec![0u8; 7]),
                 "entry must survive denial"
             );
-            assert_eq!(store.committed_bytes().expect("committed"), 7);
-            assert_eq!(broker.ledger_snapshot().expect("snap").total_owner_bytes(), 7);
+            assert_eq!(store.committed_bytes().expect("committed"), retained_cost("k", 7));
+            assert_eq!(
+                broker.ledger_snapshot().expect("snap").total_owner_bytes(),
+                retained_cost("k", 7)
+            );
         }
 
         #[test]
@@ -2329,8 +2571,11 @@ mod tests {
             let denied = store.remove(&"k".to_string());
             assert!(matches!(denied, Err(MemoryError::InvalidState(_))), "got {denied:?}");
             assert_eq!(store.get(&"k".to_string()), Some(vec![0u8; 7]));
-            assert_eq!(store.committed_bytes().expect("committed"), 7);
-            assert_eq!(broker.ledger_snapshot().expect("snap").total_owner_bytes(), 7);
+            assert_eq!(store.committed_bytes().expect("committed"), retained_cost("k", 7));
+            assert_eq!(
+                broker.ledger_snapshot().expect("snap").total_owner_bytes(),
+                retained_cost("k", 7)
+            );
             store.state.lock().expect("state").entries.get_mut("k").expect("entry").charge =
                 Some(held);
             store.close().expect("cleanup recovered charge");
@@ -2346,24 +2591,35 @@ mod tests {
             store.insert_checked("c".to_string(), vec![0u8; 5]).expect("c");
             broker.begin_rebuild().expect("begin rebuild");
 
-            let denied = store.sweep(SweepHint { target_bytes: 6 });
+            let denied = store.sweep(SweepHint { target_bytes: retained_cost("a", 5) + 1 });
             assert!(
                 matches!(denied, Err(MemoryError::InvalidState(_))),
                 "sweep during rebuild must fail closed, got {denied:?}"
             );
             assert_eq!(store.keys(), vec!["a".to_string(), "b".to_string(), "c".to_string()]);
-            assert_eq!(store.committed_bytes().expect("committed"), 15);
-            assert_eq!(broker.ledger_snapshot().expect("snap").total_owner_bytes(), 15);
+            assert_eq!(store.committed_bytes().expect("committed"), 3 * retained_cost("a", 5));
+            assert_eq!(
+                broker.ledger_snapshot().expect("snap").total_owner_bytes(),
+                3 * retained_cost("a", 5)
+            );
 
             // A failed refund_many must also leave internal insertion order intact.
             // Once the accounting gate reopens, the original newest entry is still
             // the first one reclaimed.
             broker.finish_rebuild().expect("finish rebuild");
-            let swept = store.sweep(SweepHint { target_bytes: 5 }).expect("sweep after retry");
-            assert_eq!(swept, SweepStats { reclaimed_items: 1, reclaimed_bytes: 5 });
+            let swept = store
+                .sweep(SweepHint { target_bytes: retained_cost("c", 5) })
+                .expect("sweep after retry");
+            assert_eq!(
+                swept,
+                SweepStats { reclaimed_items: 1, reclaimed_bytes: retained_cost("c", 5) }
+            );
             assert_eq!(store.get(&"c".to_string()), None, "c remains newest after denial");
             assert_eq!(store.keys(), vec!["a".to_string(), "b".to_string()]);
-            assert_eq!(broker.ledger_snapshot().expect("snap").total_owner_bytes(), 10);
+            assert_eq!(
+                broker.ledger_snapshot().expect("snap").total_owner_bytes(),
+                2 * retained_cost("a", 5)
+            );
         }
 
         #[test]
@@ -2386,7 +2642,7 @@ mod tests {
             // c is visited first and has a ticket, then b exposes corruption.
             // No refund_many call or keyed removal may happen before all selected
             // entries have proven their ticket invariant.
-            let denied = store.sweep(SweepHint { target_bytes: 10 });
+            let denied = store.sweep(SweepHint { target_bytes: retained_cost("a", 5) + 1 });
             assert!(matches!(denied, Err(MemoryError::InvalidState(_))), "got {denied:?}");
             let insertion_order =
                 store.state.lock().expect("state").entries.keys().cloned().collect::<Vec<_>>();
@@ -2396,8 +2652,11 @@ mod tests {
                 "ticket validation failure must preserve canonical linked order"
             );
             assert_eq!(store.keys(), vec!["a".to_string(), "b".to_string(), "c".to_string()]);
-            assert_eq!(store.committed_bytes().expect("committed"), 15);
-            assert_eq!(broker.ledger_snapshot().expect("snap").total_owner_bytes(), 15);
+            assert_eq!(store.committed_bytes().expect("committed"), 3 * retained_cost("a", 5));
+            assert_eq!(
+                broker.ledger_snapshot().expect("snap").total_owner_bytes(),
+                3 * retained_cost("a", 5)
+            );
             store.state.lock().expect("state").entries.get_mut("b").expect("entry").charge =
                 Some(held);
             store.close().expect("cleanup recovered charge");
@@ -2412,7 +2671,7 @@ mod tests {
             let store: UnbudgetedTestStore<String, Vec<u8>> =
                 SimpleRetainedMapStore::new_unbudgeted_fixture(binding);
             store.insert_checked("k".to_string(), vec![0u8; 7]).expect("insert");
-            assert_eq!(store.committed_bytes().expect("committed"), 7);
+            assert_eq!(store.committed_bytes().expect("committed"), retained_cost("k", 7));
         }
     }
 }

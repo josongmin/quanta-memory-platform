@@ -12,7 +12,7 @@ use crate::payload_store::PayloadStore;
 use crate::shared::accounting::Unbudgeted;
 use crate::shared::accounting::{Budgeted, StoreAccounting};
 use crate::shared::lifecycle::{retire_client_value, BeginClose, DropTransition, StoreLifecycle};
-use crate::shared::measure::{ByteSized, CanonicalKey};
+use crate::shared::measure::{semantic_cost_v1, ByteSized, CanonicalKey, RetainedCostV1};
 
 fn canonical_digest(key: &[u8]) -> u64 {
     use std::hash::{Hash, Hasher};
@@ -182,7 +182,7 @@ impl<PayloadRef, Bytes, Mode> SimplePayloadStore<PayloadRef, Bytes, Mode> {
 
 impl<PayloadRef, Bytes, Mode> SimplePayloadStore<PayloadRef, Bytes, Mode>
 where
-    PayloadRef: Clone + From<String> + PartialEq,
+    PayloadRef: Clone + From<String> + PartialEq + ByteSized,
     Bytes: Clone + ByteSized + CanonicalKey,
 {
     pub fn pin(&self, payload_ref: &PayloadRef) -> MemoryResult<()> {
@@ -228,7 +228,7 @@ where
 impl<PayloadRef, Bytes, Mode> PayloadStore<PayloadRef, Bytes>
     for SimplePayloadStore<PayloadRef, Bytes, Mode>
 where
-    PayloadRef: Clone + From<String> + PartialEq,
+    PayloadRef: Clone + From<String> + PartialEq + ByteSized,
     Bytes: Clone + ByteSized + CanonicalKey,
 {
     fn binding(&self) -> &StoreBindingHandle {
@@ -243,9 +243,8 @@ where
         let context_kind = self.context_kind(&value);
         let canonical_key = value.bytes.canonical_key();
         let digest = canonical_digest(&canonical_key);
-        let charged_bytes = value.bytes.byte_size();
 
-        let (payload_ref, next_ref, next_total) = {
+        let (payload_ref, next_ref) = {
             let state = self.lock()?;
             if let Some(existing) = state.entries.iter().find(|entry| {
                 entry.canonical_digest == digest && entry.bytes.canonical_key() == canonical_key
@@ -256,12 +255,25 @@ where
                 .next_ref
                 .checked_add(1)
                 .ok_or_else(|| MemoryError::capacity("payload reference counter overflow"))?;
-            let next_total = state
-                .charged_total
-                .checked_add(charged_bytes)
-                .ok_or_else(|| MemoryError::capacity("payload byte counter overflow"))?;
-            (PayloadRef::from(format!("payload-{}", state.next_ref)), next_ref, next_total)
+            let payload_ref = PayloadRef::from(format!("payload-{}", state.next_ref));
+            (payload_ref, next_ref)
         };
+        // Client measurement callbacks run with no store state lock held. A
+        // panic or reentry cannot poison the authoritative state or charge the
+        // broker before the complete semantic cost is known.
+        let charged_bytes = RetainedCostV1 {
+            payload_bytes: value.bytes.byte_size(),
+            key_identity_bytes: payload_ref.byte_size(),
+            index_bytes: semantic_cost_v1::DIGEST_BYTES,
+            fixed_overhead_bytes: semantic_cost_v1::ENTRY_STATE_BYTES,
+            ..RetainedCostV1::default()
+        }
+        .total()?;
+        let next_total = self
+            .lock()?
+            .charged_total
+            .checked_add(charged_bytes)
+            .ok_or_else(|| MemoryError::capacity("payload byte counter overflow"))?;
 
         let charge = self.accounting.charge(
             self.binding.class.clone(),
@@ -410,6 +422,11 @@ mod tests {
         RetainedEnvelope::new(bytes.to_vec())
     }
 
+    fn retained_cost(payload_bytes: u64, sequence: u64) -> u64 {
+        // Independent oracle: do not call the production formula or constants.
+        payload_bytes + format!("payload-{sequence}").len() as u64 + 32 + 16
+    }
+
     #[derive(Clone)]
     struct PanickingBytes {
         bytes: Vec<u8>,
@@ -428,6 +445,36 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct ZeroMeasuredHugeCanonicalKey;
+
+    impl ByteSized for ZeroMeasuredHugeCanonicalKey {
+        fn byte_size(&self) -> u64 {
+            0
+        }
+    }
+
+    impl CanonicalKey for ZeroMeasuredHugeCanonicalKey {
+        fn canonical_key(&self) -> Vec<u8> {
+            vec![7; 1_000_000]
+        }
+    }
+
+    #[derive(Clone)]
+    struct MaxMeasuredPayload;
+
+    impl ByteSized for MaxMeasuredPayload {
+        fn byte_size(&self) -> u64 {
+            u64::MAX
+        }
+    }
+
+    impl CanonicalKey for MaxMeasuredPayload {
+        fn canonical_key(&self) -> Vec<u8> {
+            vec![9]
+        }
+    }
+
     impl Drop for PanickingBytes {
         fn drop(&mut self) {
             self.drops.fetch_add(1, Ordering::SeqCst);
@@ -437,6 +484,12 @@ mod tests {
 
     #[derive(Clone, Debug)]
     struct ReentrantPayloadRef(String);
+
+    impl ByteSized for ReentrantPayloadRef {
+        fn byte_size(&self) -> u64 {
+            self.0.len() as u64
+        }
+    }
 
     type ReentrantRefStore = SimplePayloadStore<ReentrantPayloadRef, Vec<u8>, Budgeted>;
 
@@ -508,8 +561,50 @@ mod tests {
         let second = store.put_canonical(envelope(b"same")).expect("dedup");
         assert_eq!(first.payload_ref(), second.payload_ref());
         assert_eq!(store.stats().expect("stats").item_count, 1);
-        assert_eq!(store.charged_bytes().expect("bytes"), 4);
-        assert_eq!(broker.ledger_snapshot().expect("ledger").total_owner_bytes(), 4);
+        assert_eq!(store.charged_bytes().expect("bytes"), retained_cost(4, 0));
+        assert_eq!(
+            broker.ledger_snapshot().expect("ledger").total_owner_bytes(),
+            retained_cost(4, 0)
+        );
+    }
+
+    #[test]
+    fn transient_canonical_key_is_not_charged_but_retained_identity_is() {
+        let broker = live_broker(100, 100);
+        let store =
+            SimplePayloadStore::<String, ZeroMeasuredHugeCanonicalKey, Budgeted>::new_budgeted(
+                binding(),
+                None,
+                broker.clone(),
+            );
+        let first = store
+            .put_canonical(RetainedEnvelope::new(ZeroMeasuredHugeCanonicalKey))
+            .expect("semantic cost fits");
+        let second = store
+            .put_canonical(RetainedEnvelope::new(ZeroMeasuredHugeCanonicalKey))
+            .expect("dedup");
+        assert_eq!(first.payload_ref(), second.payload_ref());
+        assert_eq!(store.charged_bytes().expect("bytes"), retained_cost(0, 0));
+        assert_eq!(
+            broker.ledger_snapshot().expect("ledger").total_owner_bytes(),
+            retained_cost(0, 0)
+        );
+    }
+
+    #[test]
+    fn cost_component_sum_overflow_denies_without_publishing_or_charging() {
+        let broker = live_broker(1_000, 1_000);
+        let store = SimplePayloadStore::<String, MaxMeasuredPayload, Budgeted>::new_budgeted(
+            binding(),
+            None,
+            broker.clone(),
+        );
+        assert!(matches!(
+            store.put_canonical(RetainedEnvelope::new(MaxMeasuredPayload)),
+            Err(MemoryError::Capacity(_))
+        ));
+        assert_eq!(store.stats().expect("unchanged stats").item_count, 0);
+        assert_eq!(broker.ledger_snapshot().expect("unchanged ledger").total_owner_bytes(), 0);
     }
 
     #[test]
@@ -529,7 +624,10 @@ mod tests {
         REF_REENTRY_HITS.with(|hits| assert_eq!(hits.get(), 1));
         REF_REENTRY_STORE.with(|slot| *slot.borrow_mut() = None);
         assert_eq!(store.stats().expect("complete state").item_count, 1);
-        assert_eq!(broker.ledger_snapshot().expect("ledger").total_owner_bytes(), 8);
+        assert_eq!(
+            broker.ledger_snapshot().expect("ledger").total_owner_bytes(),
+            retained_cost(8, 0)
+        );
         store.close().expect("close");
         assert_eq!(broker.ledger_snapshot().expect("refunded").total_owner_bytes(), 0);
     }
@@ -565,7 +663,10 @@ mod tests {
         assert_eq!(first.payload_ref(), replay.payload_ref());
         assert_eq!(hits.load(Ordering::SeqCst), 1);
         assert_eq!(store.stats().expect("complete state").item_count, 1);
-        assert_eq!(broker.ledger_snapshot().expect("charged once").total_owner_bytes(), 4);
+        assert_eq!(
+            broker.ledger_snapshot().expect("charged once").total_owner_bytes(),
+            retained_cost(4, 0)
+        );
         store.close().expect("close");
         assert_eq!(broker.ledger_snapshot().expect("refunded").total_owner_bytes(), 0);
     }
@@ -611,9 +712,15 @@ mod tests {
         let (broker, store) = store();
         store.put_canonical(envelope(b"aa")).expect("a");
         store.put_canonical(envelope(b"bbbb")).expect("b");
-        assert_eq!(store.charged_bytes().expect("bytes"), 6);
+        assert_eq!(
+            store.charged_bytes().expect("bytes"),
+            retained_cost(2, 0) + retained_cost(4, 1)
+        );
         assert_eq!(store.stats().expect("stats").item_count, 2);
-        assert_eq!(broker.ledger_snapshot().expect("ledger").total_owner_bytes(), 6);
+        assert_eq!(
+            broker.ledger_snapshot().expect("ledger").total_owner_bytes(),
+            retained_cost(2, 0) + retained_cost(4, 1)
+        );
     }
 
     #[test]
@@ -632,13 +739,16 @@ mod tests {
 
     #[test]
     fn over_cap_put_is_fail_closed_and_does_not_consume_ref() {
-        let broker = live_broker(1_000, 50);
+        let broker = live_broker(1_000, 110);
         let store = store_with(&broker);
         assert!(matches!(store.put_canonical(envelope(&[0; 100])), Err(MemoryError::Capacity(_))));
         assert_eq!(store.stats().expect("stats").item_count, 0);
         let published = store.put_canonical(envelope(&[0; 40])).expect("within cap");
         assert_eq!(published.payload_ref(), &"payload-0".to_string());
-        assert_eq!(broker.ledger_snapshot().expect("ledger").total_owner_bytes(), 40);
+        assert_eq!(
+            broker.ledger_snapshot().expect("ledger").total_owner_bytes(),
+            retained_cost(40, 0)
+        );
     }
 
     #[test]
@@ -652,7 +762,10 @@ mod tests {
             store.delete_if_unpinned(published.payload_ref()),
             Err(MemoryError::InvalidState(_))
         ));
-        assert_eq!(broker.ledger_snapshot().expect("ledger").total_owner_bytes(), 7);
+        assert_eq!(
+            broker.ledger_snapshot().expect("ledger").total_owner_bytes(),
+            retained_cost(7, 0)
+        );
         store.unpin(published.payload_ref()).expect("unpin");
         store.unpin(published.payload_ref()).expect("unpin again");
         store.delete_if_unpinned(published.payload_ref()).expect("delete");
@@ -685,8 +798,11 @@ mod tests {
             Err(MemoryError::InvalidState(_))
         ));
         assert_eq!(store.stats().expect("preserved stats").item_count, 1);
-        assert_eq!(store.charged_bytes().expect("preserved bytes"), 80);
-        assert_eq!(broker.ledger_snapshot().expect("preserved ledger").total_owner_bytes(), 80);
+        assert_eq!(store.charged_bytes().expect("preserved bytes"), retained_cost(80, 0));
+        assert_eq!(
+            broker.ledger_snapshot().expect("preserved ledger").total_owner_bytes(),
+            retained_cost(80, 0)
+        );
 
         broker.finish_rebuild().expect("finish rebuild");
         store.delete_if_unpinned(published.payload_ref()).expect("delete resumes");
@@ -699,7 +815,7 @@ mod tests {
         let store =
             SimplePayloadStore::<String, Vec<u8>, Unbudgeted>::new_unbudgeted(binding(), None);
         store.put_canonical(envelope(b"free")).expect("put");
-        assert_eq!(store.charged_bytes().expect("bytes"), 4);
+        assert_eq!(store.charged_bytes().expect("bytes"), retained_cost(4, 0));
         assert_eq!(store.stats().expect("stats").item_count, 1);
         store.close().expect("close unbudgeted");
     }
@@ -709,7 +825,10 @@ mod tests {
         let (broker, store) = store();
         store.put_canonical(envelope(b"aa")).expect("a");
         store.put_canonical(envelope(b"bbbb")).expect("b");
-        assert_eq!(broker.ledger_snapshot().expect("before").total_owner_bytes(), 6);
+        assert_eq!(
+            broker.ledger_snapshot().expect("before").total_owner_bytes(),
+            retained_cost(2, 0) + retained_cost(4, 1)
+        );
         store.close().expect("close");
         assert_eq!(broker.ledger_snapshot().expect("after").total_owner_bytes(), 0);
         assert_eq!(store.stats().expect("stats").item_count, 0);
@@ -722,8 +841,11 @@ mod tests {
         broker.begin_rebuild().expect("begin rebuild");
         assert!(matches!(store.close(), Err(MemoryError::InvalidState(_))));
         assert_eq!(store.stats().expect("preserved stats").item_count, 1);
-        assert_eq!(store.charged_bytes().expect("preserved bytes"), 5);
-        assert_eq!(broker.ledger_snapshot().expect("preserved ledger").total_owner_bytes(), 5);
+        assert_eq!(store.charged_bytes().expect("preserved bytes"), retained_cost(5, 0));
+        assert_eq!(
+            broker.ledger_snapshot().expect("preserved ledger").total_owner_bytes(),
+            retained_cost(5, 0)
+        );
         broker.finish_rebuild().expect("finish rebuild");
         store.close().expect("retry close");
         assert_eq!(broker.ledger_snapshot().expect("released").total_owner_bytes(), 0);
@@ -735,7 +857,10 @@ mod tests {
         store.put_canonical(envelope(b"owned")).expect("put");
         broker.begin_rebuild().expect("begin rebuild");
         drop(store);
-        assert_eq!(broker.ledger_snapshot().expect("deferred").total_owner_bytes(), 5);
+        assert_eq!(
+            broker.ledger_snapshot().expect("deferred").total_owner_bytes(),
+            retained_cost(5, 0)
+        );
         broker.finish_rebuild().expect("finish drains");
         assert_eq!(broker.ledger_snapshot().expect("drained").total_owner_bytes(), 0);
     }
@@ -757,7 +882,10 @@ mod tests {
                 }))
                 .expect("put before unwind");
         }
-        assert_eq!(broker.ledger_snapshot().expect("before").total_owner_bytes(), 10);
+        assert_eq!(
+            broker.ledger_snapshot().expect("before").total_owner_bytes(),
+            retained_cost(4, 0) + retained_cost(6, 1)
+        );
 
         let outer = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
             let _store = store;
