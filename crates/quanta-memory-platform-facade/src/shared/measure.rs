@@ -9,6 +9,78 @@
 //! This is shared glue (used by more than one slice) and therefore lives under
 //! `shared/*`, never inside a slice or a backing crate.
 
+use quanta_memory_platform_core::{MemoryError, MemoryResult};
+
+/// Versioned portable *semantic* retention costs. These constants are not
+/// `size_of` claims, allocator capacity, transient copies, or RSS measurements.
+/// Changing a value changes the public admission policy and requires a new
+/// formula version rather than silently rewriting historical receipts.
+pub mod semantic_cost_v1 {
+    /// Per retained entry's logical state and lease ownership.
+    pub const ENTRY_STATE_BYTES: u64 = 16;
+    /// A retained hash key's linkage and lookup slot.
+    pub const HASH_LINK_BYTES: u64 = 24;
+    /// One retained ordered-index node/lookup slot.
+    pub const ORDERED_INDEX_BYTES: u64 = 24;
+    /// One retained FIFO position and lookup slot.
+    pub const FIFO_INDEX_BYTES: u64 = 16;
+    /// A retained BLAKE3 digest or derived token.
+    pub const DIGEST_BYTES: u64 = 32;
+}
+
+/// Checked cost of bytes retained by one store-owned lifetime component.
+///
+/// `total()` is the only conversion to a broker charge. A store must persist
+/// that exact total with its non-Clone lease, then use it for stats and reclaim
+/// instead of remeasuring mutable or caller-owned data on the release path.
+/// A value's [`ByteSized`] implementation remains caller-reported: this model
+/// does not claim to meter arbitrary heap allocations or allocator overhead.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RetainedCostV1 {
+    pub payload_bytes: u64,
+    pub key_identity_bytes: u64,
+    pub index_bytes: u64,
+    pub tombstone_bytes: u64,
+    pub fixed_overhead_bytes: u64,
+}
+
+impl RetainedCostV1 {
+    /// Sum every component without saturating or wrapping a budget authority.
+    pub fn total(self) -> MemoryResult<u64> {
+        [
+            self.payload_bytes,
+            self.key_identity_bytes,
+            self.index_bytes,
+            self.tombstone_bytes,
+            self.fixed_overhead_bytes,
+        ]
+        .into_iter()
+        .try_fold(0u64, |total, component| {
+            total
+                .checked_add(component)
+                .ok_or_else(|| MemoryError::capacity("retained-cost-v1 component sum overflow"))
+        })
+    }
+
+    /// Combine independent retained lifetime components, checking both every
+    /// field and the aggregate sum before returning a usable postimage.
+    pub fn checked_add(self, other: Self) -> MemoryResult<Self> {
+        let add = |a: u64, b: u64| {
+            a.checked_add(b)
+                .ok_or_else(|| MemoryError::capacity("retained-cost-v1 component overflow"))
+        };
+        let combined = Self {
+            payload_bytes: add(self.payload_bytes, other.payload_bytes)?,
+            key_identity_bytes: add(self.key_identity_bytes, other.key_identity_bytes)?,
+            index_bytes: add(self.index_bytes, other.index_bytes)?,
+            tombstone_bytes: add(self.tombstone_bytes, other.tombstone_bytes)?,
+            fixed_overhead_bytes: add(self.fixed_overhead_bytes, other.fixed_overhead_bytes)?,
+        };
+        combined.total()?;
+        Ok(combined)
+    }
+}
+
 /// A value that can report the number of bytes it will charge when retained.
 ///
 /// Blanket impls cover the common portable byte carriers. Callers with a custom
@@ -133,6 +205,37 @@ mod tests {
     use super::*;
     use std::any::Any;
     use std::sync::Arc;
+
+    #[test]
+    fn retained_cost_v1_sums_each_component_exactly_once() {
+        let cost = RetainedCostV1 {
+            payload_bytes: 1,
+            key_identity_bytes: 2,
+            index_bytes: 3,
+            tombstone_bytes: 4,
+            fixed_overhead_bytes: 5,
+        };
+        assert_eq!(cost.total().expect("bounded cost"), 15);
+        assert_eq!(cost.checked_add(cost).expect("combined cost").total().expect("total"), 30);
+    }
+
+    #[test]
+    fn retained_cost_v1_rejects_component_and_cross_component_overflow() {
+        let max_payload = RetainedCostV1 { payload_bytes: u64::MAX, ..Default::default() };
+        assert!(max_payload.checked_add(max_payload).is_err(), "component overflow");
+        assert!(
+            max_payload
+                .checked_add(RetainedCostV1 { key_identity_bytes: 1, ..Default::default() })
+                .is_err(),
+            "individual fields fit, but the aggregate charge does not"
+        );
+        assert!(
+            RetainedCostV1 { payload_bytes: u64::MAX, index_bytes: 1, ..Default::default() }
+                .total()
+                .is_err(),
+            "a direct struct literal must not bypass checked total"
+        );
+    }
 
     #[test]
     fn measured_value_charges_caller_supplied_size_not_inner_len() {

@@ -64,7 +64,9 @@ pub use shared::accounting::Unbudgeted;
 #[cfg(feature = "core-live-accounting")]
 pub use shared::builder::LiveMemoryPlatform;
 pub use shared::builder::MemoryPlatformBuilder;
-pub use shared::measure::{ByteSized, CanonicalKey, MeasuredValue};
+pub use shared::measure::{
+    semantic_cost_v1, ByteSized, CanonicalKey, MeasuredValue, RetainedCostV1,
+};
 
 #[cfg(feature = "payload_store")]
 pub use payload_store::{PayloadStore, PayloadStoreBuilder, SimplePayloadStore};

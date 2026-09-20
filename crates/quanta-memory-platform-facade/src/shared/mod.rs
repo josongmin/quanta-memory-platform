@@ -37,4 +37,4 @@ pub use accounting::Budgeted;
     )
 ))]
 pub use accounting::Unbudgeted;
-pub use measure::{ByteSized, CanonicalKey, MeasuredValue};
+pub use measure::{semantic_cost_v1, ByteSized, CanonicalKey, MeasuredValue, RetainedCostV1};
