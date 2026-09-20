@@ -5,6 +5,11 @@ Lifecycle authority: `tickets/README.md`
 Depends on: QMP-000  
 Blocks: QMP-130, QMP-140
 
+Status: `IMPLEMENTED` at product `e6f69c340239784a2d5af7d685ba8894c47ee0c1`.
+Local exact-content extraction and offline checks passed; the new CI workflow
+has not yet produced a remote run. See
+[`receipts/2026-09-20T233523Z-e6f69c3.md`](receipts/2026-09-20T233523Z-e6f69c3.md).
+
 ## Objective
 
 dry-run이 아니라 fresh destination actual extraction을 재현 가능하게 통과시키고, extracted repository가 필요한 tool/config/lockfile을 모두 자체 보유하며 clean 상태가 되게 한다.
@@ -72,14 +77,17 @@ not dependency-blocked.
 
 ## Acceptance
 
-- [ ] actual extraction이 fresh temp directory에서 exit 0.
-- [ ] extracted repo의 check-workspace와 doctor가 모두 PASS.
-- [ ] all commands use locked dependency resolution.
-- [ ] extracted git status가 clean.
-- [ ] source/extracted digest match.
-- [ ] no Semantica host noun/path dependency introduced.
-- [ ] failure path가 invalid success commit을 만들지 않는다.
-- [ ] release receipt에 rustc/cargo/cargo-deny/semgrep versions가 기록된다.
+- [x] actual extraction이 fresh temp directory에서 exit 0.
+- [x] extracted repo의 check-workspace와 doctor가 모두 PASS.
+- [x] online Cargo rails use `--locked`; separate offline rail uses `--frozen`.
+- [x] extracted git status가 clean.
+- [x] source/extracted digest match.
+- [x] no Semantica host noun/path dependency introduced.
+- [x] failure path가 invalid success commit을 만들지 않는다.
+- [x] release receipt에 rustc/cargo/cargo-deny/semgrep versions가 기록된다.
+
+Remote `.github/workflows/standalone-extraction.yml` execution remains
+unobserved; keep `IMPLEMENTED`, not `QUALIFIED` or `DONE`.
 
 ## Verification
 
