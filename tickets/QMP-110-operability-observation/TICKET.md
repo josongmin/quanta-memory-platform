@@ -11,10 +11,9 @@ corrupted/unavailable state를 empty/zero로 위장하지 않고, memory admissi
 
 ## Confirmed evidence
 
-- payload stats는 poisoned lock에서 default zero: `payload_store/service.rs:240-247`
-- revocable stats도 default zero: `revocable_store/service.rs:157-164`
-- transcript trait stats는 `unwrap_or_default`: `transcript_store/service.rs:403-405`
-- spill retained count도 poison을 zero로 바꾸는 경로가 있다.
+- payload/revocable/transcript store `stats`는 QMP-040 이후 `MemoryResult<StoreStats>`로 변경됐다 (`payload_store/mod.rs:18`, `revocable_store/mod.rs:15`, `transcript_store/mod.rs:231`). 이 세 zero-on-poison 결함은 **historical baseline**이며, 아래 테스트는 regression guards다.
+- 두 public in-memory/Noop spill target의 retained count는 아직 poison을 zero로 바꾼다: `spill/service.rs:164-165,237-238`. redb observation은 이미 fallible이다.
+- core의 `effective_report()` trait는 infallible (`core/src/api/broker.rs:26`); live 구현은 poisoned guard의 실제 report를 복구하지만 poison 상태 자체를 드러내지 않는다 (`api/control.rs:1033-1045`). 이를 fabricated zero로 서술하지 말고 typed observation 계약을 결정한다.
 - metrics/hdr adapters는 존재하지만 broker/store production call site가 없다.
 - reconfigure report provenance는 active value와 stale해질 수 있다.
 
@@ -71,10 +70,11 @@ bounded enum labels로 최소 다음을 집계한다.
 
 ## RED tests to add
 
-- `poisoned_payload_stats_returns_error_not_zero`
-- `poisoned_revocable_stats_returns_error_not_zero`
-- `poisoned_transcript_stats_returns_error_not_zero`
+- `poisoned_payload_stats_returns_error_not_zero` (기존 QMP-040 동작의 regression guard)
+- `poisoned_revocable_stats_returns_error_not_zero` (기존 QMP-040 동작의 regression guard)
+- `poisoned_transcript_stats_returns_error_not_zero` (기존 QMP-040 동작의 regression guard)
 - `poisoned_spill_inventory_returns_error_not_zero`
+- `poisoned_broker_report_exposes_status_without_losing_actual_policy_values` (infallible API의 migration/compatibility 판정 포함)
 - `denial_reason_emits_one_bounded_metric`
 - `allocator_observation_never_mutates_semantic_usage`
 - `metrics_do_not_use_owner_or_runtime_as_labels`

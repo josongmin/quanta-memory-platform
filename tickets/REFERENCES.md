@@ -84,6 +84,25 @@ Required implications:
 
 Owning tickets: QMP-090, QMP-100.
 
+## Panic and destructor boundaries
+
+### Rust `Mutex`, `catch_unwind`, and `Drop`
+
+Sources:
+
+- https://doc.rust-lang.org/std/sync/struct.Mutex.html
+- https://doc.rust-lang.org/std/panic/fn.catch_unwind.html
+- https://doc.rust-lang.org/std/ops/trait.Drop.html
+
+Required implications:
+
+- A client callback panic under a store mutex can poison subsequent access. Poison is advisory, not a transactional rollback mechanism; ignoring it alone does not prove a sound postimage.
+- `catch_unwind` catches unwinding panics, not aborting panics. Do not present it as containment of every client destructor or a double panic during cleanup.
+- Retire independently owned generic fields in separate unwind boundaries after publishing the exact charge/state postimage. Test destructive leaves in a child process so an abort is observable instead of killing the whole suite.
+- Decide whether arbitrary client callback panics are a supported recoverable case; otherwise make the public contract and residual availability risk explicit.
+
+Owning tickets: QMP-040, QMP-090, QMP-140.
+
 ## Public compatibility and feature semantics
 
 Sources:
@@ -129,4 +148,3 @@ Required implications:
 - source/extracted digest와 toolchain을 receipt에 기록한다.
 
 Owning tickets: QMP-120, QMP-130.
-

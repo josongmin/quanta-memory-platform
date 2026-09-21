@@ -28,8 +28,8 @@
 
 | 상태 | 의미 |
 | --- | --- |
-| `READY` | 선행조건 충족. claim 후 구현 가능 |
-| `BLOCKED` | `depends_on` ticket의 receipt가 없음 |
+| `READY` | 선행 계약과 compatible current-source receipt가 충분히 안정적이다. claim 후 구현 가능 |
+| `BLOCKED` | `depends_on`의 현행 호환 receipt/계약이 없거나 재개방돼 불안정하다. read-only design은 가능하지만 owner mutation은 대기 |
 | `IN_PROGRESS` | 한 owner가 claim했고 write set이 잠김 |
 | `IMPLEMENTED` | 코드와 focused tests는 존재하지만 terminal rails 미완료 |
 | `QUALIFIED` | ticket acceptance와 요구 receipt가 exact source에서 모두 통과 |
@@ -44,13 +44,13 @@
 | --- | --- | --- | --- | --- | --- |
 | [QMP-000](QMP-000-campaign-admission/TICKET.md) | P1 | QUALIFIED | source freeze, claim, RED baseline, receipt discipline | — | `tickets/**` only |
 | [QMP-010](QMP-010-policy-totality/TICKET.md) | P1 | IMPLEMENTED | mandatory class totality와 validated policy authority | QMP-000 | core `policy.rs`, `config.rs`, builder/policy tests |
-| [QMP-020](QMP-020-reservation-lifecycle/TICKET.md) | P1 | READY | reservation typestate와 정확한 overflow-safe admission; 신규 RED로 재개방 | QMP-010 | core `ledger.rs`, recharge/control seams |
+| [QMP-020](QMP-020-reservation-lifecycle/TICKET.md) | P1 | IN_PROGRESS | reservation typestate와 overflow-safe admission; `59f0c4f` 코드 통합, integrated proof pending | QMP-010 | core `ledger.rs`, recharge/control seams |
 | [QMP-030](QMP-030-enforced-builder-runtime-view/TICKET.md) | P1 | IMPLEMENTED | enforced default builder, raw authority 축소, broker-bound runtime scratch | QMP-010, QMP-020 | core/facade builders, broker/control/scratch API, examples |
 | [QMP-040](QMP-040-store-lifecycle/TICKET.md) | P1 | IMPLEMENTED | store construction typestate, close/drain, callback lock discipline | QMP-020, QMP-030 | facade shared builder/accounting + all store services |
-| [QMP-050](QMP-050-total-retained-cost/TICKET.md) | P1 | IN_PROGRESS | total retained-cost accounting | QMP-040 | measure/accounting + store entry cost paths |
+| [QMP-050](QMP-050-total-retained-cost/TICKET.md) | P1 | IMPLEMENTED | total retained-cost accounting; b18e47d clean doctor, downstream terminal proof open | QMP-040 | measure/accounting + store entry cost paths |
 | [QMP-060](QMP-060-transcript-tombstones/TICKET.md) | P1 | BLOCKED | bounded transcript tombstone/idempotency lifecycle | QMP-050 | transcript types/service/builder |
 | [QMP-070](QMP-070-spill-transfer-backings/TICKET.md) | P1 | BLOCKED | reclaim→spill receipt transfer, safe spill semantics, real backings | QMP-020, QMP-040, QMP-050 | revocable/spill/backings/builders |
-| [QMP-080](QMP-080-policy-runtime-semantics/TICKET.md) | P2 | READY | reserved/soft/hard/burst/reclaim runtime semantics | QMP-010, QMP-020, QMP-030 | scheduler/controller/control/config |
+| [QMP-080](QMP-080-policy-runtime-semantics/TICKET.md) | P2 | BLOCKED | reserved/soft/hard/burst/reclaim runtime semantics; read-only design may proceed, mutation waits for QMP-020 exactness receipt | QMP-010, QMP-020, QMP-030 | scheduler/controller/control/config |
 | [QMP-090](QMP-090-conformance-model/TICKET.md) | P1 | BLOCKED | independent conformance oracle와 model/concurrency tests | QMP-020, QMP-040, QMP-070 | testkit conformance/fakes/faults |
 | [QMP-100](QMP-100-scaling-benchmarks/TICKET.md) | P2 | BLOCKED | O(N²) 제거와 workload benchmark authority | QMP-040, QMP-050, QMP-070 | payload/revocable containers, benches, CI scripts |
 | [QMP-110](QMP-110-operability-observation/TICKET.md) | P2 | BLOCKED | typed observation, poison truth, bounded telemetry | QMP-030, QMP-040, QMP-080 | stats traits, metrics adapters, broker/store emitters |
@@ -87,7 +87,7 @@
 | P2-09 poison reported as zero | QMP-110 | typed observation failure tests |
 | P2-10 moka/scc compile-only backings | QMP-070 | canonical backing port parity suite or feature removal |
 | P2-11 spill count wrong after restart | QMP-070 | reopened redb controller reconciliation |
-| P2-12 payload/revocable O(N²), global mutex | QMP-100 | asymptotic source cut + benchmark thresholds |
+| P2-12 payload/revocable/core release O(N²), global mutex (59f0c4f static delta) | QMP-100 | affected-slot exact preflight, asymptotic source cut + benchmark thresholds |
 | P2-13 saturating counter hides live bytes | QMP-040, QMP-050 | checked overflow fail-closed tests |
 | P2-14 noop spill discards and succeeds | QMP-070 | typed unsupported or explicit discard API test |
 | P2-15 public bumpalo bypass | QMP-030, QMP-140 | budgeted wrapper or public removal compile test |
@@ -180,8 +180,8 @@ receipt가 없는 “구현됨”, stale SHA, source digest 변경, command 미�
 
 전체 campaign은 다음이 모두 참일 때만 `DONE`이다. 원본 P1 10개에 신규 P1-D01/D02를 더해 추적 대상 P1 finding은 12개다. 원본 동결 판정/숫자는 변경하지 않는다. 신규 finding의 static/RED proof 수준은 delta audit에 명시한다.
 
-- P1 finding 10개가 모두 owning ticket의 negative test로 재현되고 fixed behavior를 통과한다.
-- P2 finding 15개가 구현 또는 명시적 API 제거/정책 결정으로 닫힌다.
+- 원본 P1 10개와 신규 P1-D01/D02, 총 12개가 owning ticket의 negative test로 재현되고 fixed behavior를 통과한다.
+- 원본 P2 15개와 신규 P2-D01, 총 16개가 구현 또는 명시적 API 제거/정책 결정으로 닫힌다.
 - default public example이 실제 cap denial과 ledger drain을 보인다.
 - 모든 retained/scratch path가 하나의 accounting authority 또는 명시적 unbudgeted type에 속한다.
 - conformance suite가 black-hole/commit-swallow/release-swallow/observation-error target을 거부한다.

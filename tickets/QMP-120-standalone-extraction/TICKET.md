@@ -5,9 +5,12 @@ Lifecycle authority: `tickets/README.md`
 Depends on: QMP-000  
 Blocks: QMP-130, QMP-140
 
-Status: `IMPLEMENTED` at product `e6f69c340239784a2d5af7d685ba8894c47ee0c1`.
-Local exact-content extraction and offline checks passed; the new CI workflow
-has not yet produced a remote run. See
+Status: `IMPLEMENTED`. `e6f69c340239784a2d5af7d685ba8894c47ee0c1`
+is the isolated proof branch, not the current main product SHA. The extraction
+implementation was cherry-picked onto main in `4169a20` and `c03b16c`;
+`47021d3` records that integration. Local exact-content extraction and offline
+checks passed on the isolated source, but the new CI workflow has not yet
+produced an observed remote run and later main source needs its own receipt. See
 [`receipts/2026-09-20T233523Z-e6f69c3.md`](receipts/2026-09-20T233523Z-e6f69c3.md).
 
 ## Objective
@@ -21,14 +24,14 @@ scripts/extract-to-standalone-repo.sh /tmp/qmp-boundary-audit.h8nz5W
 exit 7
 ```
 
-Current-source recheck (product `e047215a5c98c2f57f4f53281da4d4c055e82f92`,
+Historical pre-fix RED recheck (product `e047215a5c98c2f57f4f53281da4d4c055e82f92`,
 clean detached worktree, 2026-09-21): actual extraction to fresh
 `/tmp/qmp-120-red-qgMeWA` exits 7 at `regression-guards` after creating
 bootstrap commit `1e6fc5a` **before verification**. Extracted tree contains
 untracked, newly resolved `Cargo.lock`, and lacks
 `tools/semgrep/qmp-regressions.yml`. This is a RED reproduction, not an
-extraction success receipt. QMP-000 is QUALIFIED, so this ticket is `READY`,
-not dependency-blocked.
+extraction success receipt. QMP-000 was QUALIFIED; this RED is not a claim that
+the currently integrated implementation remains `READY` or still fails.
 
 원인:
 

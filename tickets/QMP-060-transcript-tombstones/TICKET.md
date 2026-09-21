@@ -7,16 +7,15 @@ Blocks: QMP-090, QMP-100, QMP-130
 
 ## Objective
 
-transcript의 replay/idempotency evidence가 process lifetime 동안 무제한·무과금 성장하지 않게 하고, 보존 한계에 도달했을 때 silent identity reuse가 아니라 명시적 fail-closed 또는 durable handoff를 수행한다.
+transcript의 replay/idempotency evidence가 process lifetime 동안 무제한 성장하지 않게 하고, 보존 한계에 도달했을 때 silent identity reuse가 아니라 명시적 fail-closed 또는 durable handoff를 수행한다. Evidence/session byte accounting은 QMP-050 소유이며, 여기서는 bound와 horizon을 소유한다.
 
 ## Confirmed evidence
 
-- 지원 retention은 process-lifetime tombstone뿐: `transcript_store/mod.rs:170-193`
-- session state는 active rows 외 두 evidence map을 보유: `service.rs:40-46`
-- truncate는 body ticket을 refund하지만 evidence를 유지: `service.rs:166-212`
-- `retained_bytes`/stats는 active body만 집계: `service.rs:111-133`
+- 지원 retention은 process-lifetime tombstone뿐: `transcript_store/mod.rs`의 `TranscriptRetentionPolicyV1`.
+- session state는 active rows 외 두 evidence map을 보유: `transcript_store/service.rs:94-105`.
+- 현재 QMP-050 구현은 truncate에서 active lease만 환급하고 evidence/session lease와 `retained_bytes`를 유지한다. QMP-050 이전 body-only stats/무과금 evidence는 **historical baseline**, 현행 결함이 아니다.
 - builder에 tombstone count/byte cap이 없다.
-- `ExpiredIdentity` variant는 선언됐지만 실제로 생산되지 않는다.
+- `ExpiredIdentity` variant는 선언됐지만 현재 경로에서 생산되지 않는다.
 
 ## Required decision
 
@@ -69,13 +68,13 @@ Owner symbols:
 - `exact_retry_at_saturation_remains_idempotent`
 - `new_identity_at_fail_closed_saturation_is_rejected_without_mutation`
 - `expired_identity_is_observable_after_horizon_eviction`
-- `truncate_refunds_body_but_preserves_charged_evidence`
+- `truncate_refunds_body_but_preserves_charged_evidence` (QMP-050 regression guard; 이 티켓의 신규 RED가 아님)
 - `retention_reconfigure_below_live_evidence_is_rejected`
 - concurrency: append vs truncate/evict has one linearized result
 
 ## Acceptance
 
-- [ ] active rows가 0이어도 evidence usage가 ledger/stats에 보인다.
+- [ ] QMP-050의 active rows=0 evidence charge를 회귀시키지 않고 count/byte horizon과 일치시킨다.
 - [ ] unique append→truncate 반복이 configured bound를 넘지 않는다.
 - [ ] bound 도달 semantics가 typed result로 공개된다.
 - [ ] exact retry/conflict semantics가 eviction policy와 모순되지 않는다.

@@ -9,12 +9,11 @@ Blocks: campaign DONE
 
 remediation으로 바뀐 public authority를 compatibility 정책에 맞게 노출하고, README/EXTRACTION/verification 문서가 실제 receipt보다 앞서가지 않게 하며 최종 campaign closure를 수행한다.
 
-## Confirmed evidence
+## Baseline evidence requiring final-source reconciliation
 
-- raw ledger/basic broker/simple store constructors가 public tests에 pin되어 있다.
-- builder-first라는 문서 주장과 public backdoors가 모순된다.
+- 최초 감사에서 raw ledger/basic broker/simple store constructors가 public tests에 pin되고 builder-first 주장과 public backdoors가 모순됐다. QMP-030/040 이후 API가 이동했으므로 이를 **현재의 미수정 결함으로 재주장하지 않는다**. 최종 re-export/feature census와 외부 compile-fail로 남은 노출을 판정한다.
 - `docs/verification-scenarios.md`는 benchmark가 없는데 benchmark 비율/gate를 주장한다.
-- 같은 문서는 actual extraction failure가 있는데 standalone green/no known limitation을 주장한다.
+- 최초 감사 시 actual extraction failure와 standalone green/no known limitation 주장이 충돌했다. QMP-120은 local extraction을 수리했으나 remote CI와 최종 product SHA의 extraction은 아직 별도 증거가 필요하다.
 - moka/scc/bumpalo feature 이름이 실제 semantic capability보다 강하게 보인다.
 - packages는 `rust-version` 미지정, `UNLICENSED`, `publish=false`다.
 

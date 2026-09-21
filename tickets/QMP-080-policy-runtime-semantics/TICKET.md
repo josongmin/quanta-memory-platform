@@ -106,8 +106,8 @@ cargo clippy -p quanta-memory-platform-core --all-targets --all-features -- -D w
 - host wall-time/subquery/output enforcement call sites: QMP-130
 - metrics exporter wiring: QMP-110
 
-## Current-source delta audit (2026-09-21, `47021d3`)
+## Delta audit (2026-09-21; pre-fix `47021d3`, integrated `59f0c4f`)
 
 - `core/src/api/control.rs`에는 원본 감사의 `record_group_usage` 공개 API가 없다. P2-03의 제거 작업 자체는 현재 소스에 재적용하지 않는다. 그러나 제거를 증명하는 public compile/API guard와 scheduler truth 검증은 terminal 조건이다.
-- `application/scheduler.rs:47-56,80-96`은 group usage/admission에 saturation을 사용한다. QMP-020의 P1-D01 checked ledger repair와 한 owner 계약으로 직렬화하고 그룹 예산이 장부와 어긋나지 않는 overflow RED를 먼저 만든다.
-- `domain/ledger.rs:344-350`과 `api/control.rs:867-877`은 Headroom이 이미 사용 중일 때 일반 class의 legal state를 다르게 정의한다. 현상은 정적 코드 대조이며 실행 RED는 미실시다. protected band의 의미를 하나로 명시한 뒤 reserve/reconfigure 양쪽에 동일 prospective predicate를 적용한다. 보수적 거부인지 실제 의미 버그인지는 RED와 설계 결정까지 확정하지 않는다.
+- Pre-fix `application/scheduler.rs:47-56,80-96`는 group usage/admission에 saturation을 사용했다. QMP-020 `59f0c4f`는 checked candidate 계산과 scheduler publish-after-ledger-success로 고쳤다. QMP-080은 이를 중복 수리하지 않고 group overflow regression 및 policy runtime semantics를 검증한다. QMP-020 integrated receipt 이전에는 이 ticket의 owner mutation이 `BLOCKED`다.
+- Integrated `domain/ledger.rs:413-420`은 Headroom까지 포함한 total을 non-Headroom reserve ceiling에 비교하며, `api/control.rs:899-908` reconfigure는 Headroom 사용량을 빼고 비교한다. 정적 predicate 불일치가 남지만 실행 RED/보호 대역 의미 판정은 미실시다. protected band의 의미를 하나로 명시한 뒤 reserve/reconfigure 양쪽에 동일 prospective predicate를 적용한다. 보수적 거부인지 실제 의미 버그인지는 RED와 설계 결정까지 확정하지 않는다.

@@ -85,7 +85,7 @@ Owner symbols:
 ## Failure handling
 
 - cost computation overflow: allocation/store mutation 전 typed error
-- caller-supplied cost lie: safe bounds 또는 sealed implementation으로 방지
+- caller-supplied cost lie: arbitrary `ByteSized` 구현의 허위 신고는 generic API로 검증할 수 없다. 지원 범위는 honest-client semantic estimate이며, 외부 erased handle에는 checked `MeasuredValue`를 사용한다. 물리 RSS enforcement는 별도 allocator authority 없이는 주장하지 않는다.
 - replacement cost failure: old entry/charge 보존
 - zero body + nonzero identity: identity cost만큼 반드시 charge
 
@@ -107,18 +107,21 @@ Property tests:
 
 ## Acceptance
 
-- [ ] public store에 retained but unmeasurable generic field가 없다.
-- [ ] zero-value large-key exploit가 cap을 우회하지 못한다.
-- [ ] tombstone/index byte가 stats와 ledger에서 사라지지 않는다.
-- [ ] all arithmetic is checked; saturation으로 drift를 숨기지 않는다.
-- [ ] formula version과 compatibility policy가 문서화된다.
-- [ ] conformance가 exact total cost를 independently 계산한다.
+- [x] public store generic key/identity에 `ByteSized` 또는 checked measured wrapper가 요구된다 (honest-client estimate; 악의적 구현까지 검증하지 않음).
+- [x] tested zero-value large-key/identity 경로는 cap을 우회하지 못한다.
+- [x] tested transcript/prepared tombstone/index byte가 stats와 ledger에서 사라지지 않는다.
+- [x] QMP-050 semantic component/lease arithmetic은 checked이며 saturation으로 cost drift를 숨기지 않는다. **Core ledger 전축 exactness는 별도 QMP-020**의 통합 proof를 요구한다.
+- [ ] formula V1은 명명됐으나 public compatibility/migration policy는 QMP-140에서 확정해야 한다.
+- [ ] prepared/transcript에 independent literal oracle과 underbilling fake RED가 있다. 전체 facade store state-machine oracle은 QMP-090에서 확장한다.
 
 ## Verification
 
 ```bash
-cargo test -p quanta-memory-platform-facade --all-features large_key_with_zero_value_is_charged
-cargo test -p quanta-memory-platform-facade --all-features stats_and_ledger_use_the_same_total_cost
+# Each selector must report at least one executed test, not merely exit 0.
+cargo test -p quanta-memory-platform-facade --all-features large_key_with_zero_value_is_charged_and_denied_without_state_change
+cargo test -p quanta-memory-platform-facade --all-features exact_retry_charges_once_and_truncate_refunds_only_active_body
+cargo test -p quanta-memory-platform-facade --all-features prepared_identity_index_and_tombstone_keep_exact_independent_cost
+cargo test -p quanta-memory-platform-testkit --all-features unbilled_identity
 cargo test -p quanta-memory-platform-facade --all-features
 cargo test -p quanta-memory-platform-testkit --all-features
 ```
@@ -129,11 +132,21 @@ cargo test -p quanta-memory-platform-testkit --all-features
 - tombstone eviction policy: QMP-060
 - data structure performance: QMP-100
 
+## Current scoped implementation receipt
+
+At `b18e47d178297e6d1e781d96439002be46ad94fe`, QMP-050 code and
+clean detached workspace doctor are `IMPLEMENTED`, not terminally qualified.
+See [`receipts/2026-09-21T000848Z-b18e47d.md`](receipts/2026-09-21T000848Z-b18e47d.md).
+The later QMP-020 core integration, final extraction/remote CI, general
+conformance, and external host have independent authorities.
+
 ## Current-source design freeze (2026-09-21)
 
-Source: `fac68ead0487ba66bbec2147f746e440d80c3d6e` (QMP-040
-`IMPLEMENTED`; foreign workspace-lint changes excluded). This is a STATIC
-design decision, not a QMP-050 implementation or GREEN receipt.
+Historical design source: `fac68ead0487ba66bbec2147f746e440d80c3d6e`
+(QMP-040 `IMPLEMENTED`; foreign workspace-lint changes excluded). This section
+records the pre-implementation decision, not a current-source failure or GREEN
+receipt. The current implementation and its scoped evidence are recorded in
+the dated receipt below; historical line numbers remain source-snapshot hints.
 
 ### One portable semantic-cost authority
 
@@ -160,8 +173,8 @@ exact physical-memory enforcement without a separate allocator authority.
 | Payload | `payload_store/service.rs:24-31,238-340`: body, retained reference/digest, pin/entry semantics; temporary canonical-key Vec must **not** be billed twice | Dedup hit has no new lease; deletion releases the entry's full persisted cost. |
 | Retained map | `retained_map/service.rs:25-42,254-435,462-612`: key + value + named hash/link node cost | Add `Key: ByteSized`; overwrite recharges complete old/new cost atomically while preserving retained key identity; sweep targets/refunds complete cost. |
 | Revocable | `revocable_store/service.rs:16-38,121-280`: key + value + FIFO entry cost | Add `Key: ByteSized`; reclaim_one/until and stats use the same total as the lease. |
-| Transcript | `transcript_store/service.rs:24-68,248-377,435-585`: session ID, row/body, three retained message-ID copies, two digests, evidence indexes | At append, issue distinct durable evidence/session and active-row leases. Row removal batch-releases only active-row leases; evidence/session authority survives until eviction (QMP-060) or close. Current full-row refund with surviving evidence is undercounting. |
-| Prepared | `publish_pipeline/prepared_publication.rs:196-240,430-525,541-701`: payload, two identity Vec copies, retained canonical key, token/index overhead | At prepare, separate persistent identity-index/tombstone-compatible lease from active-only lease. Abort/GC batch-releases active-only leases and retains the persistent lease. Move the owned token key into the aborted index rather than clone it if both states use the same named semantic cost. Current `charged_bytes=0` can coexist with live tombstones. |
+| Transcript | pre-fix `transcript_store/service.rs:24-68,248-377,435-585`: session ID, row/body, retained message-ID copies, two digests, evidence indexes | At append, issue distinct durable evidence/session and active-row leases. Row removal batch-releases only active-row leases; evidence/session authority survives until eviction (QMP-060) or close. The pre-fix full-row refund was undercounting; current implementation has separate leases. |
+| Prepared | pre-fix `publish_pipeline/prepared_publication.rs:196-240,430-525,541-701`: payload, retained identity, token/index overhead | At prepare, separate persistent identity-index/tombstone-compatible lease from active-only lease. Abort/GC batch-releases active-only leases and retains the persistent lease. The pre-fix `charged_bytes=0` with live tombstones was undercounting; current implementation retains a persistent lease. |
 
 Use `u64::try_from` for lengths and checked sums before every broker call.
 Public generic bounds, builders, examples, stats, and the independent testkit
