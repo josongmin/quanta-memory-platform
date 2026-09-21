@@ -42,7 +42,8 @@ the direction. The portable library carries no Semantica nouns
 - `0.2.0` is a deliberate pre-1.0 breaking release. There is no deprecated
   compatibility window for an alias that would reopen unbounded or unbudgeted
   authority; internal consumers migrate atomically.
-- Rust 1.95 is the declared MSRV and pinned toolchain.
+- Rust 1.92 is the declared MSRV and pinned toolchain, matching the current
+  Semantica host toolchain.
 - The workspace is internal-only (`UNLICENSED`, `publish = false`). It is not a
   crates.io release candidate.
 - Exact breaking changes and consumer actions are in

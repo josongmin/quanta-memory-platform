@@ -20,7 +20,7 @@ Breaking pre-1.0 hardening release.
   extraction, and machine-validated ticket receipts.
 - Removed non-capability moka/scc/bumpalo feature claims. The only durable
   backing feature is `spill-redb`.
-- Declared Rust 1.95 as MSRV. Distribution remains internal-only,
-  `UNLICENSED`, and `publish = false`.
+- Declared Rust 1.92 as MSRV to match the current Semantica host. Distribution
+  remains internal-only, `UNLICENSED`, and `publish = false`.
 
 See [MIGRATION.md](./MIGRATION.md) for consumer action and compatibility policy.

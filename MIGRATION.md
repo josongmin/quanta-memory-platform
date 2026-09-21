@@ -45,7 +45,7 @@ unbudgeted or unbounded path.
 
 ## Toolchain and distribution policy
 
-- MSRV is Rust 1.95, equal to `rust-toolchain.toml`; every crate declares the
+- MSRV is Rust 1.92, equal to `rust-toolchain.toml`; every crate declares the
   inherited `rust-version`.
 - The repository is internal-only: `UNLICENSED` and `publish = false` are
   intentional. A distributable release requires an explicit license decision,
