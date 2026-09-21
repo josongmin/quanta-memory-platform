@@ -7,8 +7,8 @@ designed to be extracted into its own repository without rewrites.
 > **Current qualification status (2026-09-21): NOT production-ready.** Local
 > standalone extraction, including committed HEAD/tree/blob/mode binding, has
 > passed; remote workflow execution and external host adoption remain
-> unobserved. The final audit still has open authority, lifecycle, performance,
-> and observability tickets. The authoritative
+> unobserved. The final audit still has open authority, performance, and
+> observability tickets. The authoritative
 > remediation inventory, status, dependencies, acceptance criteria, and receipts
 > live in [`tickets/README.md`](./tickets/README.md). Passing a focused test or
 > dry-run does not supersede that status.

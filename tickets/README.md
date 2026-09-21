@@ -27,6 +27,24 @@
 
 구현 시작 시 worker는 현재 `HEAD`, branch, dirty paths를 다시 기록해야 한다. 위 SHA는 발견 근거이지 미래 구현 base를 강제하지 않는다.
 
+### Latest verified product checkpoint
+
+```text
+product source: 0c126a25aeab11f457e20c4a209fc7bb631ea859
+branch/worktree: codex/qmp-remaining-hardening / isolated clean worktree
+workspace tests: 620 passed
+doctor output SHA-256: fe23223aa751c81c06bd2cfa7d43321e013b63606e1d54da80b901f8ecb52bd7
+extraction output SHA-256: b568d1dc60e7572dd3b32d1958aa606350df3d56083b0d93f21722221267a4a3
+extracted bootstrap: 381e25871cc2981ee10759dff38ebd8c2f6283f0 (clean)
+scaling smoke output SHA-256: 87da472630e14467ecc0a5236058f63e9de94585db464b999d4c382dbc0e1a44
+```
+
+This checkpoint qualifies only the ticket scopes whose latest receipts say
+`QUALIFIED`. It does not close QMP-050, QMP-090, QMP-100, QMP-110, remote QMP-120,
+external-host QMP-130, or final SemVer/docs QMP-140. Inventory state below is
+the lifecycle authority; this block is exact proof metadata, not a status
+override.
+
 ## 2. 상태 vocabulary
 
 | 상태 | 의미 |
@@ -56,7 +74,7 @@
 | [QMP-080](QMP-080-policy-runtime-semantics/TICKET.md) | P2 | QUALIFIED | canonical reserve/recharge/reconfigure postimages, protected floors, bounded out-of-lock reclaim, weighted burst and provenance pass at `f9f6d15` | QMP-010, QMP-020, QMP-030 | scheduler/controller/control/config |
 | [QMP-090](QMP-090-conformance-model/TICKET.md) | P1 | IMPLEMENTED | 33 current broken/honest oracle tests pass at `0c126a2`; proptest/Loom/Miri 및 독립 context/group/live-ticket 축 open | QMP-020, QMP-040, QMP-070 | testkit conformance/fakes/faults |
 | [QMP-100](QMP-100-scaling-benchmarks/TICKET.md) | P2 | IMPLEMENTED | payload indexed buckets/slot reuse and revocable VecDeque remove confirmed O(N²) paths; source-bound smoke exists, contention/memory/core threshold proof open | QMP-040, QMP-050, QMP-070 | payload/revocable containers, benches, CI scripts |
-| [QMP-110](QMP-110-operability-observation/TICKET.md) | P2 | BLOCKED | typed observation, poison truth, bounded telemetry | QMP-030, QMP-040, QMP-080 | stats traits, metrics adapters, broker/store emitters |
+| [QMP-110](QMP-110-operability-observation/TICKET.md) | P2 | READY | QMP-030/040/080 prerequisites are qualified; typed observation and bounded broker/store telemetry remain unimplemented | QMP-030, QMP-040, QMP-080 | stats traits, metrics adapters, broker/store emitters |
 | [QMP-120](QMP-120-standalone-extraction/TICKET.md) | P1 | IMPLEMENTED | local HEAD/tree/blob/mode-bound extraction and negative fixtures pass at `4fdac520`; remote workflow remains unobserved | QMP-000 | extraction manifest/scripts, lockfile, release CI |
 | [QMP-130](QMP-130-host-adoption/TICKET.md) | P1 | BLOCKED | Semantica currently resolves adjacent shared-main QMP, not the audited/qualified revision; exact-root qualification absent | QMP-030..QMP-120 | external host repo only; QMP repo read-only except receipts |
 | [QMP-140](QMP-140-semver-docs-closeout/TICKET.md) | P2 | BLOCKED | public API/SemVer, stale test selectors/docs, receipt schema and final closeout | QMP-010..QMP-130 | public exports, README/EXTRACTION/docs, Cargo metadata |

@@ -5,6 +5,10 @@ Lifecycle authority: `tickets/README.md`
 Depends on: QMP-030, QMP-040, QMP-080  
 Blocks: QMP-130, QMP-140
 
+Status: `READY`. QMP-030, QMP-040 and QMP-080 have compatible current-source
+qualification receipts. Start only with a new claim because broker/control and
+store observation paths overlap multiple qualified source authorities.
+
 ## Objective
 
 corrupted/unavailable state를 empty/zero로 위장하지 않고, memory admission/reclaim/spill/reconfigure 결과를 bounded-cardinality telemetry로 관측 가능하게 한다.
