@@ -238,8 +238,9 @@ Pre-freeze dynamic evidence on the implementation tree:
 - testkit `spill` selector: 4 non-zero selected tests passed;
 - workspace all-features: 594 passed, 0 failed.
 
-The code slice is complete. Ticket qualification still requires the terminal
-receipt to bind formatting, clippy, feature matrix, deny, doctor, ticket lint,
-and a real standalone extraction to one committed source SHA. QMP-090 remains
-the owner of broader model-checking work; it is not a QMP-070 transfer-contract
-gap.
+The code slice is `QUALIFIED` at source SHA `76dca153190efe6034b2cf075c6a34ad28df2900`.
+The terminal qmp-receipt-v1 binds formatting, clippy, feature matrix, deny,
+doctor, ticket lint, 594 workspace tests, focused non-zero spill suites, and a
+real standalone extraction to that SHA. QMP-090 remains the owner of broader
+model-checking work; it is not a QMP-070 transfer-contract gap. QMP-130 owns
+external host rewiring, so this ticket does not claim `DONE` or activation.
