@@ -529,6 +529,8 @@ fn scheduler_admission_group_cardinality(
     scheduler.record_usage(&target, 1_000).expect("record target hard-cap usage");
 
     let mut latencies = Vec::with_capacity(entries);
+    let allocated_before_admission = allocations.allocated.load(Ordering::Relaxed);
+    let deallocated_before_admission = allocations.deallocated.load(Ordering::Relaxed);
     let started = Instant::now();
     for _ in 0..entries {
         let operation = Instant::now();
@@ -537,6 +539,16 @@ fn scheduler_admission_group_cardinality(
         latencies.push(operation.elapsed().as_nanos() as u64);
     }
     let elapsed = started.elapsed();
+    assert_eq!(
+        allocations.allocated.load(Ordering::Relaxed),
+        allocated_before_admission,
+        "scheduler admission must not allocate after policy construction"
+    );
+    assert_eq!(
+        allocations.deallocated.load(Ordering::Relaxed),
+        deallocated_before_admission,
+        "scheduler admission must not deallocate policy state"
+    );
     drop(scheduler);
     drop(target);
     let latency = summarize_latencies(latencies);
