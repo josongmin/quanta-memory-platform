@@ -14,25 +14,26 @@ the inventory in [`README.md`](README.md) and each ticket's latest transition
 receipt.
 
 ```text
-portable product source: 2dfb7bcf7b4cd34234dbde8cd941dbe62b17c021
-qualification SSOT commit: f1d45c9bb28982f2c5ee3fcaac4a5d8ce4329be9
-pre-host-checkpoint documentation HEAD: f3d01c9
+portable product source: f2b74979b9d0aa4d2cd957d4d86f13d18865ae23
+qualification SSOT base: a23bda308e57c7bcaab9f70bedfe9757fd399fb2
+session-hardening receipt: tickets/QMP-100-scaling-benchmarks/receipts/2026-09-21T124849Z-f2b7497.md
 branch: codex/qmp-remaining-hardening
 local worktree: clean at closeout checkpoint
 ```
 
 Current evidence:
 
-- `scripts/memory-platform-doctor`: PASS on Rust 1.92, 638 tests plus fmt, clippy
+- `scripts/memory-platform-doctor`: PASS on Rust 1.92, 639 tests plus fmt, clippy
   `-D warnings`, Semgrep, compile feature matrix, ten runtime feature-capability
   lanes, examples, documented-selector resolution and `cargo deny`.
 - documented selector validator: PASS, 166 selectors resolve.
 - focused Miri: core reservation lifecycle 1/1 and facade spill ownership 1/1.
-- scaling: prior complete 160-sample/source-bound distribution remains
-  authoritative; current `0.2.0` source passes the 30-sample smoke with zero
-  semantic and allocator residual bytes.
-- actual extraction at `f3d01c9`: PASS; source tree `833ed138`, canonical
-  manifest `1932615b`, extracted commit `8329bc4`, clean Git status, 638-test
+- scaling: prior complete 160-sample/source-bound distribution remains the
+  historical baseline; current `0.2.0` source passes the expanded 33-sample
+  smoke, including scheduler group cardinality, with zero semantic and
+  allocator residual bytes.
+- actual extraction at `f2b7497`: PASS; source tree `ad5b1ec4`, canonical
+  manifest `984f4ecb`, extracted commit `f0aca0b3`, clean Git status, 639-test
   doctor, ticket validator and PM lint.
 - local ticket admission, QMP-010 through QMP-110 behavior owners, conformance,
   performance and operability are `QUALIFIED` where shown in the inventory.
@@ -48,7 +49,9 @@ Remaining authority gaps, not local code defects:
    passes direct host/composer/budget suites 129/129 + 46/46 + 86/86 on Rust
    1.92. Its exact-root identity gate and registered production-composition QBC
    suite pass 5/5 + 2/2. The remaining two QBC suite lanes could not be created
-   by the same Codex task because QBC admits only one new lane per task. The
+   by the same Codex task because QBC admits only one new lane per task. Those
+   receipts predate the current `f2b7497` scheduler/performance hardening and
+   therefore do not qualify the current portable source. The
    gate still correctly rejects the committed live
    resolution because Cargo points at adjacent shared QMP 0.1.0, not qualified
    QMP 0.2. Repointing/publishing and the two missing same-source QBC receipts

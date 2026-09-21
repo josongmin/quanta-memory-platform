@@ -173,3 +173,26 @@ At `6d082ee71226b687b2fb500e1cba767d48457f48`, QMP-100 is `QUALIFIED`:
 
 The exact-source qualification receipt is
 [`receipts/2026-09-21T095245Z-6d082ee.md`](receipts/2026-09-21T095245Z-6d082ee.md).
+
+## Session-hardening checkpoint (2026-09-21)
+
+At `951ebe403783fd326ba59834ada860ec80e9650b`, a source audit found one
+remaining admission-cardinality defect that the earlier qualification did not
+measure: every `WeightedResourceGroupScheduler::admits` call recomputed total
+weight, allocated a remainder vector and sorted all groups. Hamilton allocation
+depends only on installed policy, so the scheduler now computes it once during
+construction/reconfiguration and performs cached lookups on admission. Public
+`record_usage`/`record_release` also reject unknown groups before they can grow
+the internal usage map.
+
+At `f2b74979b9d0aa4d2cd957d4d86f13d18865ae23`, the Rust 1.92 performance
+rail was repaired after reproducing two independent proof defects: a false
+64-byte residual from the tracking allocator's own process state and a TLS
+allocator abort at the first contention lane. The benchmark now uses an
+allocation-free atomic `GlobalAlloc` wrapper, creates and retires all measured
+objects inside each epoch, and includes a required scheduler group-cardinality
+lane. The verifier rejects a missing scheduler lane. The current smoke contains
+33 samples; every sample has zero semantic and allocator residual bytes.
+
+Current receipt:
+[`receipts/2026-09-21T124849Z-f2b7497.md`](receipts/2026-09-21T124849Z-f2b7497.md).
