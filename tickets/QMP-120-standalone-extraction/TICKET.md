@@ -12,6 +12,10 @@ implementation was cherry-picked onto main in `4169a20` and `c03b16c`;
 checks passed on the isolated source, but the new CI workflow has not yet
 produced an observed remote run and later main source needs its own receipt. See
 [`receipts/2026-09-20T233523Z-e6f69c3.md`](receipts/2026-09-20T233523Z-e6f69c3.md).
+An integrated post-QMP-020/QMP-050 fresh actual extraction at `2a827af`
+also passed locally with clean extracted git; see
+[`receipts/2026-09-21T003556Z-2a827af.md`](receipts/2026-09-21T003556Z-2a827af.md).
+Remote CI, external host rewire, and exact later ticket-doc SHA are still open.
 
 ## Objective
 

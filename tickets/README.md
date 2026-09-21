@@ -44,17 +44,17 @@
 | --- | --- | --- | --- | --- | --- |
 | [QMP-000](QMP-000-campaign-admission/TICKET.md) | P1 | QUALIFIED | source freeze, claim, RED baseline, receipt discipline | — | `tickets/**` only |
 | [QMP-010](QMP-010-policy-totality/TICKET.md) | P1 | IMPLEMENTED | mandatory class totality와 validated policy authority | QMP-000 | core `policy.rs`, `config.rs`, builder/policy tests |
-| [QMP-020](QMP-020-reservation-lifecycle/TICKET.md) | P1 | IMPLEMENTED | reservation typestate와 overflow-safe admission; `59f0c4f` isolated core GREEN, integrated proof pending | QMP-010 | core `ledger.rs`, recharge/control seams |
+| [QMP-020](QMP-020-reservation-lifecycle/TICKET.md) | P1 | IMPLEMENTED | reservation typestate와 overflow-safe admission; `59f0c4f` doctor, `2a827af` local extraction, host terminal gap | QMP-010 | core `ledger.rs`, recharge/control seams |
 | [QMP-030](QMP-030-enforced-builder-runtime-view/TICKET.md) | P1 | IMPLEMENTED | enforced default builder, raw authority 축소, broker-bound runtime scratch | QMP-010, QMP-020 | core/facade builders, broker/control/scratch API, examples |
 | [QMP-040](QMP-040-store-lifecycle/TICKET.md) | P1 | IMPLEMENTED | store construction typestate, close/drain, callback lock discipline | QMP-020, QMP-030 | facade shared builder/accounting + all store services |
 | [QMP-050](QMP-050-total-retained-cost/TICKET.md) | P1 | IMPLEMENTED | total retained-cost accounting; b18e47d clean doctor, downstream terminal proof open | QMP-040 | measure/accounting + store entry cost paths |
-| [QMP-060](QMP-060-transcript-tombstones/TICKET.md) | P1 | BLOCKED | bounded transcript tombstone/idempotency lifecycle | QMP-050 | transcript types/service/builder |
-| [QMP-070](QMP-070-spill-transfer-backings/TICKET.md) | P1 | BLOCKED | reclaim→spill receipt transfer, safe spill semantics, real backings | QMP-020, QMP-040, QMP-050 | revocable/spill/backings/builders |
-| [QMP-080](QMP-080-policy-runtime-semantics/TICKET.md) | P2 | BLOCKED | reserved/soft/hard/burst/reclaim runtime semantics; read-only design may proceed, mutation waits for QMP-020 exactness receipt | QMP-010, QMP-020, QMP-030 | scheduler/controller/control/config |
+| [QMP-060](QMP-060-transcript-tombstones/TICKET.md) | P1 | READY | bounded transcript tombstone/idempotency lifecycle; QMP-050 formula frozen at b18e47d | QMP-050 | transcript types/service/builder |
+| [QMP-070](QMP-070-spill-transfer-backings/TICKET.md) | P1 | READY | reclaim→spill receipt transfer, safe spill semantics, real backings; coordinate revocable owner with QMP-040 | QMP-020, QMP-040, QMP-050 | revocable/spill/backings/builders |
+| [QMP-080](QMP-080-policy-runtime-semantics/TICKET.md) | P2 | READY | reserved/soft/hard/burst/reclaim runtime semantics; QMP-020 clean doctor and scoped receipt available | QMP-010, QMP-020, QMP-030 | scheduler/controller/control/config |
 | [QMP-090](QMP-090-conformance-model/TICKET.md) | P1 | BLOCKED | independent conformance oracle와 model/concurrency tests | QMP-020, QMP-040, QMP-070 | testkit conformance/fakes/faults |
 | [QMP-100](QMP-100-scaling-benchmarks/TICKET.md) | P2 | BLOCKED | O(N²) 제거와 workload benchmark authority | QMP-040, QMP-050, QMP-070 | payload/revocable containers, benches, CI scripts |
 | [QMP-110](QMP-110-operability-observation/TICKET.md) | P2 | BLOCKED | typed observation, poison truth, bounded telemetry | QMP-030, QMP-040, QMP-080 | stats traits, metrics adapters, broker/store emitters |
-| [QMP-120](QMP-120-standalone-extraction/TICKET.md) | P1 | IMPLEMENTED | deterministic standalone extraction/release | QMP-000 | extraction manifest/scripts, lockfile, release CI |
+| [QMP-120](QMP-120-standalone-extraction/TICKET.md) | P1 | IMPLEMENTED | deterministic standalone extraction/release; `2a827af` actual local PASS, remote CI unobserved | QMP-000 | extraction manifest/scripts, lockfile, release CI |
 | [QMP-130](QMP-130-host-adoption/TICKET.md) | P1 | BLOCKED | Semantica host adoption과 exact-head qualification | QMP-030..QMP-120 | external host repo only; QMP repo read-only except receipts |
 | [QMP-140](QMP-140-semver-docs-closeout/TICKET.md) | P2 | BLOCKED | public API SemVer, docs truth, final closeout | QMP-010..QMP-130 | public exports, README/EXTRACTION/docs, Cargo metadata |
 

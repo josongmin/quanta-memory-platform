@@ -126,7 +126,7 @@ DataFusion reservation과 Tokio owned permit처럼 capacity authority를 owner l
 - Product implementation commit: `783d0bbfdf32efad97103b1dc6d8ac774abaa9ed`
 - Receipt: [`receipts/2026-09-20T184809Z-783d0bb.md`](receipts/2026-09-20T184809Z-783d0bb.md)
 - Historical receipt는 당시 reservation typestate 및 focused tests에만 유효하다. P1-D01의 RED로 ticket을 재개방했고, 격리 수정 `4533146`을 `59f0c4f`에 통합했다. QMP-040/050의 과거 receipt를 파기하지 않지만 QMP-020 및 의존 ticket의 terminal qualification은 fresh integrated proof 전 금지한다.
-- P1-D01 scoped implementation receipt: [`receipts/2026-09-21T001438Z-59f0c4f.md`](receipts/2026-09-21T001438Z-59f0c4f.md). Isolated core 177+7+14+11 GREEN, main integration and clean integrated doctor complete; actual final extraction and external host migration are separate gates. Status `IMPLEMENTED`, not `QUALIFIED`.
+- P1-D01 scoped implementation receipt: [`receipts/2026-09-21T001438Z-59f0c4f.md`](receipts/2026-09-21T001438Z-59f0c4f.md). Isolated core 177+7+14+11 GREEN, main integration and clean integrated doctor complete. QMP-120's later integrated `2a827af` local actual extraction also passed; external host migration, remote CI and terminal cross-ticket model remain separate gates. Status `IMPLEMENTED`, not `QUALIFIED`.
 
 ## Reopened P1-D01 — saturating admission loses a live ticket (2026-09-21)
 
