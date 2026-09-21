@@ -86,6 +86,8 @@ Generated agent guidance를 수정해야 할 경우 `tools/pm/sources/**`만 수
 - [ ] workspace, extraction, host, performance receipts share declared exact revisions.
 - [ ] all P1/P2 crosswalk entries are closed.
 - [ ] final `tickets/README.md` lifecycle is internally consistent.
+- [ ] every documented named test selects at least one test; zero-test GREEN is rejected.
+- [ ] ticket/receipt schema enforces state, claim, identity, SHA and selected-count truth.
 
 ## Verification
 
@@ -107,3 +109,20 @@ scripts/verify-tickets.sh
 
 - 새로운 product feature 추가
 - receipt 없이 “SOTA”, “production-ready”, “no known limitation” 선언
+
+## Final-audit documentation/proof drift
+
+- `docs/verification-scenarios.md` still describes saturating ledger totals and
+  names a removed saturation test, while current code uses checked aggregation
+  and a different overflow-denial oracle.
+- `EXTRACTION.md` names host test targets absent from the current Semantica tree.
+- The feature matrix compiles and clippy-checks leaf features but does not execute runtime
+  capability tests; this cannot qualify advertised moka/scc backings.
+- `README.md` describes historical extraction failure at the audit base but does
+  not clearly distinguish the later local extraction passes from unobserved
+  remote CI and the new HEAD-binding gap.
+
+Add a docs/test-selector linter that resolves every command against `cargo test
+-- --list` or the host suite registry, a runtime bite test for every advertised
+leaf feature, and machine-readable receipt validation from QMP-000. Remove or
+quarantine features whose canonical builder path is not reachable.

@@ -95,6 +95,8 @@ Canonical host symbols/call sites to revalidate:
 - [ ] focused host suites and owning product suites pass.
 - [ ] full required QBC/CI authority passes on the same source.
 - [ ] QMP standalone GREEN is not used as substitute for host GREEN.
+- [ ] top-level and nested host metadata resolve the same frozen QMP root/tree.
+- [ ] gate target and Cargo-resolved QMP mismatch is a terminal RED.
 
 ## Verification
 
@@ -112,3 +114,21 @@ cargo test -p quanta-runtime-memory-compose --all-features
 
 - unrelated Semantica dirty-main repair
 - host architecture refactor outside memory/budget consumers
+
+## Final-audit P1-F04 — host verification and Cargo resolution are split
+
+At the audited host snapshot (`1dc185fb9f3d54a1c4ee85d569adbbd405113969`,
+dirty shared main), Cargo resolves the adjacent QMP checkout at shared-main
+`2cfccc685275521bc148491eb6cf10e9a6b37ba7`, not audited QMP `dfb58a6`.
+`MEMORY_PLATFORM_REPO` selects which checkout the doctor/lint gate inspects but
+does not change Cargo resolution. A gate can therefore verify one QMP while the
+host compiles another.
+
+Required host receipt fields/gates:
+
+1. top-level and nested `cargo metadata --locked` resolved core/facade manifest
+   paths, package IDs, QMP HEAD/tree ID and canonical digest;
+2. host HEAD/dirty fingerprint and QMP HEAD/dirty fingerprint from the same run;
+3. hard failure when `MEMORY_PLATFORM_REPO` differs from the Cargo-resolved root;
+4. exact suite-registry/QBC profile IDs and results bound to both source IDs;
+5. no raw invented selectors: resolve current registry entries first.

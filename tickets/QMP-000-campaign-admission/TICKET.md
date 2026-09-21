@@ -89,3 +89,37 @@ python3 tools/pm/pm.py lint
 
 - Validator implementation commits: `fd4fdf08c362131193856898a4d7aeb539f59d53`, `dc2e7d0373911ec4fa943a5c0129ebf680ca0817`, `b91044e4972a550a8d56c781df1e5721c6429172`
 - Receipt: [`receipts/2026-09-20T183609Z-b91044e.md`](receipts/2026-09-20T183609Z-b91044e.md)
+
+## Reopened proof-integrity gap — a GREEN command may execute zero tests
+
+Final audit at `dfb58a68ff2a859e829e18e4649a8da80ddd262c` executed three documented
+verification selectors. All returned exit 0 while selecting zero tests:
+
+- QMP-080 `reserved_floor_protects_class_from_peer_consumption`;
+- QMP-070 `spill_transfer_preserves_total_charge_until_source_release`;
+- QMP-070 `redb_reopen_reconciles_controller_count`.
+
+The corresponding behaviors have tests under different names in some cases,
+but a command that reports `0 passed` is not evidence. The validator currently
+checks ticket topology and receipt fields only; it does not verify allowed state
+vocabulary, claim/status correspondence, receipt identity, filename SHA, command
+exit/count, or whether named selectors resolve.
+
+Required governance hardening:
+
+1. Represent receipt commands and results in a machine-readable schema.
+2. Require every named-test row to record `selected > 0`; `0 tests` is RED even
+   when Cargo exits 0.
+3. Validate allowed states and `IN_PROGRESS iff exactly one matching claim`.
+4. Match receipt `ticket`, directory, filename SHA prefix, and full `HEAD`; verify
+   both commits exist.
+5. Require the latest transition receipt, not any historical receipt, for
+   `IMPLEMENTED`/terminal states.
+6. Recompute source status/digest at execution time instead of trusting the
+   literal `source changed during run: no` field.
+7. Add negative fixtures for zero-test selection, mismatched receipt identity,
+   invalid status, orphan claim, missing claim, stale transition receipt, and
+   command/source drift.
+
+Until this is implemented, `scripts/verify-tickets.sh` GREEN proves structural
+consistency only. It is not qualification evidence by itself.

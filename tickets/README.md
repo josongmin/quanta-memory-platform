@@ -6,6 +6,7 @@
 - 각 `<ticket-id>/TICKET.md`는 해당 ticket의 코드 경계, 구현 계약, 실패 처리, 테스트, 완료 조건의 SSOT다.
 - `AUDIT-BASELINE.md`는 동결된 감사 evidence다. 상태를 표현하지 않는다.
 - `AUDIT-DELTA-2026-09-21.md`는 구현 중 재검증한 신규·수정 finding의 source-bound evidence다. 현재 상태의 권위는 이 inventory다.
+- `FINAL-AUDIT-2026-09-21.md`는 `dfb58a6` 제품 source에 대한 최종 adversarial audit, 신규 finding, 실행 순서와 hellgate의 SSOT다.
 - `REFERENCES.md`는 설계 기준과 외부 reference의 SSOT다.
 - 루트 `AUDIT-2026-09-21.md`와 `SYSTEM-AUDIT-CHECKLIST.md`는 감사 산출물이며 ticket 상태 권위가 아니다.
 - source가 바뀌면 과거 receipt는 해당 SHA에만 유효하다. 현재 상태로 자동 승격하지 않는다.
@@ -19,8 +20,10 @@
 | Audit date | `2026-09-21` |
 | Product source dirty at freeze | 없음 |
 | Auditor-owned untracked at freeze | `AUDIT-2026-09-21.md`, `SYSTEM-AUDIT-CHECKLIST.md` |
+| Final re-audit product source | `dfb58a68ff2a859e829e18e4649a8da80ddd262c` on `codex/qmp070-spill-contract`, clean before audit-doc edits |
 | Overall verdict | `FAIL` |
-| Confirmed severity | P0 0 / P1 10 / P2 15 |
+| Frozen baseline severity | P0 0 / P1 10 / P2 15 |
+| Current cumulative severity | P0 0 / P1 17 / P2 20 |
 
 구현 시작 시 worker는 현재 `HEAD`, branch, dirty paths를 다시 기록해야 한다. 위 SHA는 발견 근거이지 미래 구현 base를 강제하지 않는다.
 
@@ -42,21 +45,21 @@
 
 | ID | 우선순위 | 상태 | 목적 | depends_on | 주요 write set |
 | --- | --- | --- | --- | --- | --- |
-| [QMP-000](QMP-000-campaign-admission/TICKET.md) | P1 | QUALIFIED | source freeze, claim, RED baseline, receipt discipline | — | `tickets/**` only |
+| [QMP-000](QMP-000-campaign-admission/TICKET.md) | P1 | IMPLEMENTED | structural validator exists; zero-test, status/claim, receipt identity and command-count admission remain open | — | `tickets/**` only |
 | [QMP-010](QMP-010-policy-totality/TICKET.md) | P1 | IMPLEMENTED | mandatory class totality와 validated policy authority | QMP-000 | core `policy.rs`, `config.rs`, builder/policy tests |
-| [QMP-020](QMP-020-reservation-lifecycle/TICKET.md) | P1 | IMPLEMENTED | reservation typestate와 overflow-safe admission; `59f0c4f` doctor, `2a827af` local extraction, host terminal gap | QMP-010 | core `ledger.rs`, recharge/control seams |
-| [QMP-030](QMP-030-enforced-builder-runtime-view/TICKET.md) | P1 | IMPLEMENTED | enforced default builder, raw authority 축소, broker-bound runtime scratch | QMP-010, QMP-020 | core/facade builders, broker/control/scratch API, examples |
+| [QMP-020](QMP-020-reservation-lifecycle/TICKET.md) | P1 | IMPLEMENTED | overflow-safe admission exists; public cloneable raw ticket leak and poisoned commit rollback loss remain | QMP-010 | core `ledger.rs`, recharge/control seams |
+| [QMP-030](QMP-030-enforced-builder-runtime-view/TICKET.md) | P1 | IMPLEMENTED | enforced default builder exists; root-exported raw ledger authority still bypasses guard lifecycle | QMP-010, QMP-020 | core/facade builders, broker/control/scratch API, examples |
 | [QMP-040](QMP-040-store-lifecycle/TICKET.md) | P1 | IMPLEMENTED | store construction typestate, close/drain, callback lock discipline | QMP-020, QMP-030 | facade shared builder/accounting + all store services |
 | [QMP-050](QMP-050-total-retained-cost/TICKET.md) | P1 | IMPLEMENTED | total retained-cost accounting; b18e47d clean doctor, downstream terminal proof open | QMP-040 | measure/accounting + store entry cost paths |
 | [QMP-060](QMP-060-transcript-tombstones/TICKET.md) | P1 | READY | bounded transcript tombstone/idempotency lifecycle; QMP-050 formula frozen at b18e47d | QMP-050 | transcript types/service/builder |
-| [QMP-070](QMP-070-spill-transfer-backings/TICKET.md) | P1 | IMPLEMENTED | typed in-process/durable transfer and redb inventory; moka/scc removal, concurrency and intent recovery still open | QMP-020, QMP-040, QMP-050 | revocable/spill/backings/builders |
+| [QMP-070](QMP-070-spill-transfer-backings/TICKET.md) | P1 | IMPLEMENTED | typed transfer exists; redb commit ambiguity/sequence ABA, controller panic ownership, retry fencing and backing parity remain | QMP-020, QMP-040, QMP-050 | revocable/spill/backings/builders |
 | [QMP-080](QMP-080-policy-runtime-semantics/TICKET.md) | P2 | READY | reserved/soft/hard/burst/reclaim runtime semantics; QMP-020 clean doctor and scoped receipt available | QMP-010, QMP-020, QMP-030 | scheduler/controller/control/config |
 | [QMP-090](QMP-090-conformance-model/TICKET.md) | P1 | IMPLEMENTED | independent literal oracle와 broken-fake/model trace implemented; proptest/Loom/Miri 및 독립 context/group/live-ticket 축 open | QMP-020, QMP-040, QMP-070 | testkit conformance/fakes/faults |
 | [QMP-100](QMP-100-scaling-benchmarks/TICKET.md) | P2 | BLOCKED | O(N²) 제거와 workload benchmark authority | QMP-040, QMP-050, QMP-070 | payload/revocable containers, benches, CI scripts |
 | [QMP-110](QMP-110-operability-observation/TICKET.md) | P2 | BLOCKED | typed observation, poison truth, bounded telemetry | QMP-030, QMP-040, QMP-080 | stats traits, metrics adapters, broker/store emitters |
-| [QMP-120](QMP-120-standalone-extraction/TICKET.md) | P1 | IMPLEMENTED | deterministic standalone extraction/release; `2a827af` actual local PASS, remote CI unobserved | QMP-000 | extraction manifest/scripts, lockfile, release CI |
-| [QMP-130](QMP-130-host-adoption/TICKET.md) | P1 | BLOCKED | Semantica host adoption과 exact-head qualification | QMP-030..QMP-120 | external host repo only; QMP repo read-only except receipts |
-| [QMP-140](QMP-140-semver-docs-closeout/TICKET.md) | P2 | BLOCKED | public API SemVer, docs truth, final closeout | QMP-010..QMP-130 | public exports, README/EXTRACTION/docs, Cargo metadata |
+| [QMP-120](QMP-120-standalone-extraction/TICKET.md) | P1 | IMPLEMENTED | local extraction passes, but script copies working-tree bytes from a HEAD file list and omits executable-mode authority | QMP-000 | extraction manifest/scripts, lockfile, release CI |
+| [QMP-130](QMP-130-host-adoption/TICKET.md) | P1 | BLOCKED | Semantica currently resolves adjacent shared-main QMP, not the audited/qualified revision; exact-root qualification absent | QMP-030..QMP-120 | external host repo only; QMP repo read-only except receipts |
+| [QMP-140](QMP-140-semver-docs-closeout/TICKET.md) | P2 | BLOCKED | public API/SemVer, stale test selectors/docs, receipt schema and final closeout | QMP-010..QMP-130 | public exports, README/EXTRACTION/docs, Cargo metadata |
 
 상태를 바꿀 때 이 표와 ticket receipt를 같은 change에서 갱신한다.
 
@@ -76,6 +79,11 @@
 | P1-10 actual extraction fails | QMP-120 | fresh actual extraction + clean git + locked build |
 | P1-D01 saturated admission issues an unaccounted live ticket (2026-09-21 delta) | QMP-020 | `u64::MAX-10` 뒤 `100` 거부 + exact post-release accounting |
 | P1-D02 generic store delete/remove can abort on panicking destructors (2026-09-21 delta) | QMP-040 | two-field/outer-unwind subprocess + exact refund, repeatable readable postimage |
+| P1-F01 public cloneable raw ticket can be dropped while charge remains live | QMP-020, QMP-030, QMP-140 | raw ticket/root exports removed or made owned RAII; compile-fail bypass probe + drop/refund E2E |
+| P1-F02 durable spill has ambiguous commit/retry outcomes, sequence ABA and panic ownership loss | QMP-070, QMP-090 | persisted intent/idempotency fence, monotonic identity, fault-injected reconcile/retry/panic tests |
+| P1-F03 extraction is not bound to committed HEAD bytes or executable modes | QMP-120, QMP-140 | dirty tracked-byte/mode negative fixtures + HEAD/tree digest equality |
+| P1-F04 host gate target and Cargo-resolved QMP revision can diverge | QMP-130 | canonical dependency metadata emits path+SHA; gate fails mismatch before tests |
+| P1-F05 documented test selectors can exit 0 after selecting zero tests | QMP-000, QMP-140 | machine-readable command/count receipt; every named selector requires selected > 0 |
 | P2-01 inert policy vocabulary | QMP-080 | every public policy field has runtime consumer tests |
 | P2-02 identity reconfigure fails under legal borrow | QMP-080 | current-policy reconfigure under borrow passes |
 | P2-03 public scheduler mutation side channel (baseline; current API removed) | QMP-080, QMP-140 | removal API guard + exact reconciliation test; do not re-add symbol |
@@ -92,6 +100,10 @@
 | P2-14 noop spill discards and succeeds | QMP-070 | typed unsupported or explicit discard API test |
 | P2-15 public bumpalo bypass | QMP-030, QMP-140 | budgeted wrapper or public removal compile test |
 | P2-D01 client callback panic can poison a live store (2026-09-21 delta) | QMP-040 | callback panic then readable/retryable preimage + no ledger drift, or explicit supported-client contract |
+| P2-F01 poisoned commit can consume its rollback ticket and strand accounting | QMP-020, QMP-110 | poisoned-lock commit fault test; rollback retains authority or reports recoverable owned error |
+| P2-F02 conformance model omits group/context/live-ticket/overflow/rebuild/concurrency axes | QMP-090 | independent state expansion + shrinkable property traces + Loom/Miri rails |
+| P2-F03 docs and ticket commands name stale semantics/nonexistent selectors | QMP-000, QMP-140 | doc-command execution audit with selected-count checks and generated current-source claims |
+| P2-F04 in-process spill deep-clones uncharged binding strings per entry | QMP-050, QMP-070 | shared/bounded binding identity or exact charged cost; adversarial long-identity accounting test |
 | Proof: telemetry unwired | QMP-110 | event emission/cardinality tests |
 | Proof: no benchmark/fuzz/loom | QMP-090, QMP-100 | executable rails and receipts |
 | Proof: feature warnings allowed | QMP-100, QMP-120 | `-D warnings` matrix |
@@ -178,15 +190,20 @@ receipt가 없는 “구현됨”, stale SHA, source digest 변경, command 미�
 
 ## 9. Campaign completion gate
 
-전체 campaign은 다음이 모두 참일 때만 `DONE`이다. 원본 P1 10개에 신규 P1-D01/D02를 더해 추적 대상 P1 finding은 12개다. 원본 동결 판정/숫자는 변경하지 않는다. 신규 finding의 static/RED proof 수준은 delta audit에 명시한다.
+전체 campaign은 다음이 모두 참일 때만 `DONE`이다. 원본 P1 10개, delta P1 2개, final audit P1 5개로 누적 P1은 17개다. 원본 P2 15개, delta P2 1개, final audit P2 4개로 누적 P2는 20개다. 원본 동결 판정/숫자는 변경하지 않는다. 신규 finding의 proof 수준은 delta/final audit에 명시한다.
 
-- 원본 P1 10개와 신규 P1-D01/D02, 총 12개가 owning ticket의 negative test로 재현되고 fixed behavior를 통과한다.
-- 원본 P2 15개와 신규 P2-D01, 총 16개가 구현 또는 명시적 API 제거/정책 결정으로 닫힌다.
+- 누적 P1 17개가 owning ticket의 negative test로 재현되고 fixed behavior를 통과한다.
+- 누적 P2 20개가 구현 또는 명시적 API 제거/정책 결정으로 닫힌다.
+- public raw reservation ticket를 drop/clone해도 charge authority를 유실할 수 없다.
+- redb spill의 commit 성공/실패/unknown outcome이 persisted intent와 idempotent reconcile로 수렴한다.
 - default public example이 실제 cap denial과 ledger drain을 보인다.
 - 모든 retained/scratch path가 하나의 accounting authority 또는 명시적 unbudgeted type에 속한다.
 - conformance suite가 black-hole/commit-swallow/release-swallow/observation-error target을 거부한다.
 - actual extraction이 `--locked`로 통과하고 extracted git status가 clean이다.
+- extraction byte/mode manifest가 committed HEAD tree와 일치하고 dirty tracked source를 거부한다.
 - Semantica host가 exact QMP revision으로 rewire되어 runtime/store behavior tests를 통과한다.
+- host gate가 실제 Cargo-resolved QMP root와 SHA를 검증하고 다른 checkout을 검사할 수 없다.
+- 모든 receipt의 named selector가 1개 이상의 test를 실행하며 command/result/count/source identity가 machine-check된다.
 - README, EXTRACTION, verification docs의 claim이 receipt와 일치한다.
 - 최종 source SHA에서 workspace, extraction, host, perf 요구 receipt가 모두 존재한다.
 

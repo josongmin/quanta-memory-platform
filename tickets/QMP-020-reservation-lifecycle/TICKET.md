@@ -100,6 +100,8 @@ Owner symbols:
 - [x] 테스트한 class/owner/context/kind/group admission/release/recharge/rollback에서 overflow는 mutation 전 거부되고 snapshot은 exact하다 (`59f0c4f` clean doctor PASS). 전체 transition의 모델 오라클은 QMP-090, 최종 extraction·host compatibility는 별도 게이트다.
 - [x] public store가 raw clone ticket에 의존하지 않도록 migration path가 문서화된다.
 - [x] existing recharge fail-closed semantics가 유지된다.
+- [ ] external safe API가 clone 가능한 raw `ReservationTicket`을 발급하지 않는다.
+- [ ] poisoned commit+rollback exceptional path도 pending authority를 잃지 않는다.
 
 ## Verification
 
@@ -142,3 +144,32 @@ Owner-level repair, in order:
 4. Record the observed isolated RED→GREEN owner proof and fresh integrated core/workspace/extraction delta receipt before restoring `IMPLEMENTED`; no original receipt is an overflow qualification. Public scheduler `record_usage`/`record_release` now return `MemoryResult<u64>`; QMP-140 owns SemVer notes and QMP-130 owns external host compile. The full-snapshot validation in hot-path release is a QMP-100 measured performance follow-up, not permission to reintroduce saturation.
 
 Public observation compatibility: `LedgerSnapshot` fields remain constructible by callers, while its infallible `total_*` getters now use `checked_add(...).expect(...)` (`ledger.rs:229-268`) and panic on a forged unrepresentable snapshot instead of saturating. Broker-produced snapshots call `validate_exact()` first and return typed `InvalidState`; those two claims are different. QMP-110/140 must decide whether to add a fallible public snapshot observation API or explicitly document the precondition/breaking panic behavior; add an external forged-snapshot test. This is a compatibility/observation contract gap, not evidence that a valid broker ledger panics.
+
+## Reopened P1-F01/P2-F01 — raw-ticket Drop leak and poison rollback loss
+
+At final audit source `dfb58a6`, `ReservationTicket` remains `Clone` and is
+re-exported from the crate root. Public `LiveProcessMemoryBroker::{reserve,
+reserve_committed,commit,release,release_many}` expose the raw lifecycle. Dropping
+the result of `reserve_committed` has no RAII owner and leaves ledger and resource-
+group usage live indefinitely. An external probe observed
+`raw_ticket_drop_owner_bytes=100`. The owned APIs are sound on the tested healthy
+path, but their existence does not make the raw safe API fail-closed.
+
+The poison exceptional path also loses authority: `PendingReservation::commit`
+takes its ticket before calling commit; if commit and the subsequent normal
+rollback both fail on the poisoned mutex, `self.ticket` is empty and `Drop`
+cannot invoke the emergency rollback path.
+
+Required repair:
+
+1. Make raw reserve/commit/release and `ReservationTicket` crate-private, or put
+   them behind an explicitly unsupported/deprecated advanced feature.
+2. Make `reserve_committed` return only non-clone `CommittedCharge`/
+   `ManagedCharge` ownership.
+3. Replace the public-surface test that pins `ReservationTicket` with compile-fail
+   absence tests for every raw lifecycle entry point.
+4. On failed `PendingReservation::commit`, restore the ticket into `self` until
+   rollback succeeds or return a typed recovery owner containing the exact ticket.
+5. Hellgates: raw authority drop drains all axes/group to zero; poisoned commit
+   followed by object drop drains the recovered inner state to zero; original
+   commit and rollback errors remain distinguishable.

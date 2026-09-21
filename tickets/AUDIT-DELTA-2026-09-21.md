@@ -1,5 +1,10 @@
 # Current-source adversarial audit delta — 2026-09-21
 
+> Historical implementation delta: the later `dfb58a6` final current-source
+> audit, newly confirmed findings, execution plan, and hellgates are authoritative
+> in [`FINAL-AUDIT-2026-09-21.md`](FINAL-AUDIT-2026-09-21.md). This file remains
+> the evidence record for the earlier `59f0c4f`/`b18e47d` audit window.
+
 This is source-bound evidence supplementing [`AUDIT-BASELINE.md`](AUDIT-BASELINE.md), not a second ticket inventory. Status, owner, dependencies and acceptance are authoritative only in [`README.md`](README.md) and each ticket. The frozen baseline at `e103771670da3143e2ffebb8950a5dfc7e3d4515` remains historical; this document never silently upgrades its GREEN or repeats its failures as current facts after repairs.
 
 ## Source and proof boundary

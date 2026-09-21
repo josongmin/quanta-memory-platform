@@ -92,6 +92,8 @@ the currently integrated implementation remains `READY` or still fails.
 - [x] no Semantica host noun/path dependency introduced.
 - [x] failure path가 invalid success commit을 만들지 않는다.
 - [x] release receipt에 rustc/cargo/cargo-deny/semgrep versions가 기록된다.
+- [ ] extraction input가 declared `HEAD` tree/mode와 동일함을 검증한다.
+- [ ] dirty tracked source와 executable-bit drift negative fixtures가 RED다.
 
 Remote `.github/workflows/standalone-extraction.yml` execution remains
 unobserved; keep `IMPLEMENTED`, not `QUALIFIED` or `DONE`.
@@ -111,3 +113,23 @@ cargo metadata --locked --format-version 1 --manifest-path "${qmp_extract_dir}/C
 
 - Semantica rewire: QMP-130
 - crates.io publish decision: QMP-140
+
+## Final-audit P1-F03 — canonical digest is not HEAD-bound
+
+The extractor builds its file list with `git ls-files` but copies bytes from the
+working tree. It neither rejects tracked dirtiness nor compares copied blobs and
+modes with `HEAD`. The current digest covers path and content, not executable
+mode. A receipt can therefore name `HEAD=X` while extracting different tracked
+content, and the destination's fresh bootstrap commit hides that source dirtiness.
+
+Required repair:
+
+1. Freeze source `HEAD` and tree ID; reject relevant tracked/index dirtiness at
+   both start and end, or extract directly from the frozen tree object.
+2. Derive the manifest from `git ls-tree -r HEAD` and bind mode, blob ID, path,
+   content digest, and destination mode.
+3. Emit the frozen tree ID and canonical manifest digest in the receipt.
+4. Add dirty-tracked, staged-only, executable-bit, omitted-source, verification-
+   failure-before-commit, final-dirty-injection, and repeated-extraction fixtures.
+5. Two extractions from the same tree must produce the same canonical manifest
+   digest; a different tree may never reuse the prior receipt.

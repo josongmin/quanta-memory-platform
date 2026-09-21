@@ -125,4 +125,42 @@ The next checkpoint removes the controller's duplicate atomic count. `SpillInven
 
 The durable revocable checkpoint adds a separate encoded-byte protocol. `spill_one_durable` keeps the source entry and charge live through encoding and destination commit, restores the original FIFO entry on encoder error/panic or returned destination error, and releases the source only after `SpillReceipt::Durable`. Reverse transfer uses `prepare_restore` to read without deletion, admits the exact source charge, then deletes the exact durable sequence and publishes locally. Admission or a known-retained delete failure leaves the durable record authoritative and rolls back the provisional source charge. A commit-ambiguous delete publishes a conservatively charged source and returns `DurableRestoreOutcome::RecoveryRequired { sequence, ... }`; it does not claim exactly-once completion. The redb round-trip, denial, retained-error, and ambiguity-classification paths execute this protocol.
 
-These tests prove the scoped in-process path, ordinary returned errors, typed tier receipt, restart-safe inventory observation, and the normal/returned-error durable transfer path. They **do not** prove canonical moka/scc integration or removal, concurrent spill/reclaim/restore, or the complete panic/abort and I/O ambiguity model. In particular, a custom `SpillController` that panics after consuming a handle can still lose source recovery authority. redb's `commit()` may return after entering its commit path, so a storage-level commit error requires persisted intent/reconciliation before the returned byte handle can safely be retried or an exact restore deletion can be classified. The current protocol must not be advertised as transactional across untrusted callbacks or ambiguous durable commits. Keep QMP-070 `IN_PROGRESS` until those remaining acceptance items have source-bound receipts.
+These tests prove the scoped in-process path, ordinary returned errors, typed tier receipt, restart-safe inventory observation, and the normal/returned-error durable transfer path. They **do not** prove canonical moka/scc integration or removal, concurrent spill/reclaim/restore, or the complete panic/abort and I/O ambiguity model. In particular, a custom `SpillController` that panics after consuming a handle can still lose source recovery authority. redb's `commit()` may return after entering its commit path, so a storage-level commit error requires persisted intent/reconciliation before the returned byte handle can safely be retried or an exact restore deletion can be classified. The current protocol must not be advertised as transactional across untrusted callbacks or ambiguous durable commits. Keep QMP-070 `IMPLEMENTED`, never `QUALIFIED`/`DONE`, until those remaining acceptance items have source-bound receipts.
+
+## Final-audit P1-F02 — durable commit ambiguity has no reconciliation owner
+
+`spill/backings/redb.rs:82-115` maps every write-transaction commit error to
+ordinary `SpillFailure` and returns the encoded bytes. `spill_one_durable`
+(`revocable_store/service.rs:360-375`) consequently restores the original source
+entry and charge. If redb durably committed but lost the acknowledgement, the
+durable record and source are both authoritative. The inverse path classifies
+delete ambiguity, but publishes a conservatively charged local entry while the
+same durable sequence may remain visible; a second restore can duplicate it.
+
+Required repair:
+
+1. Add a durable-write outcome distinct from precommit `SpillFailure`:
+   `RetainedSource`, `Committed(receipt)`, or `RecoveryRequired(intent_id,
+   sequence?, error)`.
+2. Persist an idempotency/transfer intent before source retirement and reconcile
+   it on reopen. Encoded payload identity must be stable across retry.
+3. Fence an ambiguous sequence from ordinary FIFO restore until reconciliation;
+   repeated restore may not republish the same record.
+4. Record redb durability mode explicitly and test crash points before write,
+   after table mutation, during commit, after durable commit/before response,
+   and during exact delete.
+5. Assert after every recovery that exactly one authority is active and that
+   inventory, source state, charge total, and intent table agree.
+6. Remove the destructive generic redb `SpillTarget::restore` path or make it
+   return the prepared bytes together with retained/ambiguous commit outcome.
+   It currently discards the only in-memory candidate when delete commit is
+   ambiguous; if the record was deleted, that is permanent data loss.
+7. Persist a monotonic generation/next-sequence authority. Computing the next
+   key from `table.last()` reuses sequence 0 after a full drain, so a stale
+   `commit_restore(0)` can delete a newly inserted record (ABA).
+8. Make controller panic an explicit trust boundary: seal trusted controllers or
+   hold a panic-safe transfer guard. Test panic before accept and panic after
+   destination commit separately; the latter still requires reconciliation.
+
+Use redb's transaction durability guarantee only for successful `commit` return;
+it does not turn an error return into proof that no durable postimage exists.

@@ -205,3 +205,21 @@ later denial after an earlier successful recharge splits the batch. Allocate
 separate lifetime leases at ingress and use existing atomic `release_many` for
 the active component. Any alternate delta design needs one atomic managed
 batch operation with a QMP-020 owner receipt.
+
+## Final-audit retained-cost delta — in-process spill identity clone
+
+`RevocableSpillHandle` stores a cloned `StoreBindingHandle` per transferred
+entry, while the retained-cost formula charges only the original key, value and
+entry overhead. Large owner/runtime identifiers can therefore be deep-cloned
+into many in-process tier handles without a corresponding delta charge.
+
+QMP-050 owns the cost decision and QMP-070 owns the transfer implementation:
+
+- make binding identity shared/interned (`Arc`-style) so transfer does not add a
+  per-entry deep allocation, or
+- include the destination identity delta in the transfer receipt and charge it
+  before source publication is finalized.
+
+Hellgate: many entries with large owner/runtime identifiers move to the in-
+process tier and `ledger == source retained cost + destination-only delta`
+after every move, restore, source close and tier drop.

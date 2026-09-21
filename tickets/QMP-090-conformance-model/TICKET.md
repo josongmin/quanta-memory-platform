@@ -136,3 +136,13 @@ Canonical change order: make observation fallible and a failed verdict; construc
 - `property_trace_matches_independent_model` drives the same dependency-free 256-step deterministic operation generator against the honest fake and real broker, comparing exact postimage after every operation and final drain. It is a useful model trace, but it is **not** proptest and has no shrinker.
 
 Open before acceptance: actual `proptest` arbitrary/shrinking rail, `ReentrantSink` negative target, Loom models, Miri execution, resource-group exact observation, and ticket-live-set observation. Their Cargo/dev-dependency changes overlap foreign-owned shared-main manifests, so no manifest mutation is made in this checkpoint.
+
+Final-audit detail: the honest fake does not own an independent context map;
+`AccountingView.total_context_bytes` is copied from owner total. `partition_sum`
+uses saturating addition, exact family checks accept `contains` instead of an
+exact allowed set, and the deterministic trace omits rebuild, denial, allocator
+observation, overflow, group state, and transfer commands. Exact-zero counters
+also do not prove an empty live-ticket set. Add independent context/group/live-
+ticket axes, checked view arithmetic, a no-context broken fake, exact causal
+family assertions, proptest shrinking/persisted seeds, registered Loom models,
+and an executed Miri subset before `QUALIFIED`.

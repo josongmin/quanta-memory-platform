@@ -32,6 +32,24 @@ Required implications:
 
 Owning tickets: QMP-020, QMP-050, QMP-070.
 
+## Durable transaction outcomes
+
+### redb transactions and durability
+
+Sources:
+
+- https://docs.rs/redb/latest/redb/
+- https://docs.rs/redb/latest/redb/enum.Durability.html
+
+Required implications:
+
+- a successful durable commit establishes a persisted postimage, but a generic commit error must not automatically be interpreted as “no state was written”.
+- source refund/restore after an uncertain destination commit requires a persisted transfer intent, idempotency key, and reconciliation protocol; an in-memory error enum is not durable authority.
+- queue identity must remain monotonic across empty-table/reopen cycles, or stale acknowledgements can target a new entry with the same sequence.
+- these links describe the current upstream architecture. This repository locks redb `2.6.3`; fault injection and API assertions must be version-specific to that lockfile rather than inferred from latest docs.
+
+Owning tickets: QMP-070, QMP-090.
+
 ### Tokio Semaphore permits
 
 Source: https://docs.rs/tokio/latest/tokio/sync/struct.Semaphore.html
@@ -63,6 +81,18 @@ Required implications:
 Owning tickets: QMP-030, QMP-040, QMP-140.
 
 ## Concurrency verification
+
+### proptest TestRunner
+
+Source: https://docs.rs/proptest/latest/proptest/test_runner/struct.TestRunner.html
+
+Required implications:
+
+- a conformance trace must derive operations/arguments from a strategy and shrink a failure to a minimal reproducible case.
+- persisted failing seeds/cases and explicit runner configuration are part of the receipt.
+- one hand-written deterministic trace, even when repeated under one seed, is not equivalent to generative property testing.
+
+Owning ticket: QMP-090.
 
 ### Tokio Loom
 

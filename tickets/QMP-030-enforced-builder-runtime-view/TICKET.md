@@ -121,7 +121,7 @@ report 출력만 하는 예제는 `effective_budget_report`로 분리한다.
 - [x] README 권장 happy path가 실제 enforcement를 증명한다.
 - [x] live runtime view에서 uncharged scratch path가 없다.
 - [x] report-only와 enforced product가 같은 type/name으로 혼동되지 않는다.
-- [x] raw authority가 external safe API에서 제거된다.
+- [ ] raw authority가 external safe API에서 제거된다. `dfb58a6`에서 clone 가능한 `ReservationTicket`과 raw reserve/commit/release가 여전히 public이다.
 - [x] override layer가 default build에서 무시되지 않는다.
 - [x] all public API/compile-fail tests가 새 surface를 고정한다.
 
@@ -145,3 +145,13 @@ Public/Cargo use path 변경이므로 QMP-120 actual extraction과 QMP-130 host 
   [`receipts/2026-09-20T192334Z-cde6e0a.md`](receipts/2026-09-20T192334Z-cde6e0a.md)
 - Lifecycle: `BLOCKED -> IMPLEMENTED`. QMP-120 actual extraction과 QMP-130
   host adoption 전에는 `QUALIFIED`/`DONE`으로 승격하지 않는다.
+
+## Final-audit correction — builder-first is bypassable
+
+The enforced default builder and broker-bound runtime scratch are present, but
+the safe public surface still re-exports `ReservationTicket` and exposes raw
+`reserve`, `reserve_committed`, `commit`, `release`, and `release_many`.
+`core/tests/public_api_surface.rs` currently pins that export instead of rejecting
+it. Therefore the previous checked acceptance claim was false. QMP-020 owns the
+authority/lifecycle repair; QMP-030 owns removal from the recommended public
+surface; QMP-140 owns the breaking-change/deprecation decision.
