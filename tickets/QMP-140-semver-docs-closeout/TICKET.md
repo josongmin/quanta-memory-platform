@@ -145,21 +145,32 @@ quarantine features whose canonical builder path is not reachable.
 
 ## Local closeout checkpoint (2026-09-21)
 
-Implemented at product source `aeeffe3588561398dcc1ad8c12332fe740f5f655`:
+Implemented and reverified at product source
+`2dfb7bcf7b4cd34234dbde8cd941dbe62b17c021`:
 
-- package version `0.2.0`, MSRV 1.95, internal-only `UNLICENSED`/`publish=false`
+- package version `0.2.0`, MSRV 1.92 aligned with the current Semantica host,
+  internal-only `UNLICENSED`/`publish=false`
   policy, `CHANGELOG.md`, and a breaking-change `MIGRATION.md`;
 - runtime bite tests for ten reachable feature compositions;
 - a docs selector validator resolving 166 named selectors and rejecting stale
   commands;
 - corrected extraction/host documentation and explicit separation of local,
   remote and host qualification;
-- current doctor (638 tests), focused Miri, performance smoke and actual
-  extraction evidence recorded in ticket receipts.
+- current Rust 1.92 doctor (638 tests), focused Miri and performance smoke
+  evidence recorded in ticket receipts. The most recent actual extraction is
+  source `f3d01c9`; it predates the MSRV-only `2dfb7bc` change and is not
+  upgraded to exact-current-source proof.
 
 The two unchecked acceptance rows are one external boundary: Semantica Cargo
 must resolve this exact QMP source and obtain a canonical same-source QBC
-receipt. The local focused host suites passed, but the host metadata currently
-resolves adjacent shared QMP `2cfccc6`; therefore QMP-130 and this ticket remain
-`BLOCKED`. Remote standalone CI for QMP-120 is also unobserved. Neither gap is
-papered over as local `QUALIFIED` or campaign `DONE`.
+receipt. Host commit `8e23e123` implements the adapter/runtime/budget wiring,
+0.1/0.2 contract bridge, suite registration and fail-closed identity gate. A
+clean manifest-only qualification commit resolving exact QMP `2dfb7bc` passes
+direct host/composer/budget suites 129/129 + 46/46 + 86/86 on Rust 1.92,
+identity verifier tests 5/5 and registered production-composition QBC 2/2.
+QBC's one-new-lane-per-task admission prevented the same task from creating the
+host-full-wiring and execution-budget lanes, so those two canonical receipts
+remain absent. The committed host metadata still resolves adjacent QMP 0.1.0
+rather than qualified `2dfb7bc` 0.2.0. Therefore QMP-130 and this ticket remain `BLOCKED`.
+Remote standalone CI for QMP-120 is also unobserved. Neither gap is papered over
+as local `QUALIFIED` or campaign `DONE`.

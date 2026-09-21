@@ -132,3 +132,74 @@ Required host receipt fields/gates:
 3. hard failure when `MEMORY_PLATFORM_REPO` differs from the Cargo-resolved root;
 4. exact suite-registry/QBC profile IDs and results bound to both source IDs;
 5. no raw invented selectors: resolve current registry entries first.
+
+## Implementation checkpoint — 2026-09-21
+
+Host repository implementation is committed on isolated branch
+`codex/qmp130-main-hardening`:
+
+```text
+host commit: 8e23e1233d333d12ec3afe4c07686d73c1a3b188
+host tree: f4aad2aeb317a4ec12c3cd898f405d3e8e486b87
+host worktree: clean after commit
+change size from frozen parent: 45 files, 1802 insertions, 582 deletions
+```
+
+Implemented scope:
+
+- production memory composition, host runtime/retrieval/session adapters and
+  execution-budget call sites use the QMP authority;
+- focused production, live-authority and boundary+1 budget contracts exist;
+- canonical suite registry and feature-isolation entries are registered;
+- top-level and nested lockfiles are synchronized;
+- `tools/ci/qmp130_dependency_identity.py` derives both Cargo metadata roots,
+  package identities and Git identities, rejects dirty/mismatched targets, and
+  is wired through `gate-qmp130-host-adoption.sh`;
+- five verifier unit tests include top/nested root mismatch, expected-root
+  mismatch, expected-SHA mismatch and dirty-target rejection.
+- host tests assert complete retained semantic cost rather than obsolete
+  payload-only byte counts;
+- transcript policy and poison-error bridges compile against both QMP 0.1 and
+  0.2, and the product owns a typed version-neutral retention rejection.
+
+Current-source direct execution at host commit `8e23e123` while Cargo resolves
+the adjacent QMP 0.1 checkout:
+
+| Proof | Result | Output SHA-256 |
+| --- | --- | --- |
+| dependency-identity verifier unit tests | PASS, 5/5 | `b1041454c8482d1c88ba7a305a289586858ae837d1364c913ca9a5f7fd5b2a00` |
+| production composition contract | PASS, 2/2 | `b02b07e468b4a4ffe3d0bf1d5ecc8ad1f605e39ac1c467bc74c28b87490d31ef` |
+| live host authority contract | PASS, 1/1 | `6e6944907308974673e7335d0f41e29aa474fb349dd5709ae05d11d9cc11a05f` |
+| execution-budget authority contract | PASS, 1/1 | `ed2aa70e5119d4432238126c8dd02c66d50d6a57ff405f038aa4f8cacb882f38` |
+| host crate all-features | PASS, 129/129 | `0170d78a2f7586e94521e9038e6b121f080d94342257f1dca4df1d04c131f57b` |
+| production composer crate all-features | PASS, 46/46 | `3e5813fcfa0aed71436c6459d6da6ceb4324b87417957a1f457e0f969058185c` |
+| execution-budget crate all-features | PASS, 86/86 | `057612e95fb89f203cffade97de9be94d90c43d8356f23c640fb6447b2ee1011` |
+
+The final compatibility probe is recorded in
+[`EVIDENCE-2026-09-21.md`](EVIDENCE-2026-09-21.md). In summary, a clean
+throwaway host commit changed only the two manifests and lockfiles to exact,
+clean QMP `2dfb7bc` 0.2.0. On Rust 1.92 it passed direct host 129/129, composer
+46/46 and execution-budget 86/86, plus identity verifier 5/5 and registered QBC
+production composition 2/2. This closes the MSRV and 0.2 compatibility risk.
+It does not activate that dependency in the committed host branch.
+
+The terminal dependency gate is intentionally RED and demonstrates that the
+host still compiles the adjacent shared QMP checkout instead of the qualified
+isolated QMP source:
+
+```text
+resolved: /Users/songmin/Documents/code-new/quanta-memory-platform (0.1.0)
+expected: /Users/songmin/.codex/worktrees/qmp-remaining-hardening/quanta-memory-platform (0.2.0)
+gate output SHA-256: a27216732073ca1d6c55e3d97c59aeb1c235375fc050e0fe4efbffae3b70a50d
+```
+
+Therefore the implementation is present and focused behavior passes, but this
+ticket remains `BLOCKED`. Closing it requires an authorized dependency
+activation/publish/repoint action followed by QBC receipts for the remaining
+host-full-wiring and execution-budget suites. Direct Cargo tests are not a
+substitute for that QBC authority. The host commit
+used `--no-verify` because the repository-wide pre-commit registry rejected six
+pre-existing extra IDs outside this write set; repo-wide `cargo fmt --all
+--check` also has unrelated baseline drift and crate-wide strict clippy reaches
+unrelated dependency violations. These facts must remain visible in
+the eventual host receipt.

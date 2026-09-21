@@ -30,12 +30,12 @@
 ### Latest verified product checkpoint
 
 ```text
-product source: 6d082ee71226b687b2fb500e1cba767d48457f48
+verified product source: 2dfb7bcf7b4cd34234dbde8cd941dbe62b17c021
 branch/worktree: codex/qmp-remaining-hardening / isolated clean worktree
-workspace tests: 637 passed
-doctor output SHA-256: 75b343dc25dd4b8c1a15d505544477b667c0d4d329a14c6fb7ec00f3f4ce863c
-extraction dry-run output SHA-256: 214c36042bfc395dcf44bf0a4feb888a5667fe9140e0152bfc2cef1b8f991efe
-last actual extracted bootstrap: 373d1d6bd4e45a9a591781aba9491fe1cea166ab (product source 163d28f; clean)
+workspace tests: 638 passed
+doctor output SHA-256: 57d197d3098716d111300a6c0674b97fd9ff2cdb3e3c644d4255e4fd28f33784
+last actual extracted bootstrap: 8329bc4168cf705fd157e85d90116119b5a78142 (source f3d01c9; clean)
+actual extraction output SHA-256: c32c383451865a7a70a90111c404f17fc76d66a123c3580af923ed2602f0fc21
 scaling full output SHA-256: 358d1970b4466dcf05e6b8415c012aa55b728c5a635f9f529fe462b73d53a0c0
 scaling baseline-gate output SHA-256: c8bcfdd32682fa20e46ef7d20b2f1b43927bdb3738d19801d5920e8a25fa4538
 ```
@@ -69,16 +69,16 @@ override.
 | [QMP-020](QMP-020-reservation-lifecycle/TICKET.md) | P1 | QUALIFIED | raw/discardable authority sealed behind managed RAII; duplicate commit and pending-drop rollback pass at `aeeffe3` | QMP-010 | core `ledger.rs`, recharge/control seams |
 | [QMP-030](QMP-030-enforced-builder-runtime-view/TICKET.md) | P1 | QUALIFIED | enforced builder/runtime scratch and managed RAII authority; current builder/control/public surface refreshed at `f9f6d15` | QMP-010, QMP-020 | core/facade builders, broker/control/scratch API, examples |
 | [QMP-040](QMP-040-store-lifecycle/TICKET.md) | P1 | QUALIFIED | five-store lifecycle, exact close/drop authority and hostile panic containment remain green at `aeeffe3` | QMP-020, QMP-030 | facade shared lifecycle + all store services |
-| [QMP-050](QMP-050-total-retained-cost/TICKET.md) | P1 | QUALIFIED | total retained-cost, independent underbilling oracles, documented 0.2 migration and shared spill identity pass at `aeeffe3` | QMP-040 | measure/accounting + store entry cost paths |
+| [QMP-050](QMP-050-total-retained-cost/TICKET.md) | P1 | QUALIFIED | total retained-cost, independent underbilling oracles and 0.2 migration pass the Rust 1.92 doctor at `2dfb7bc` | QMP-040 | measure/accounting + store entry cost paths |
 | [QMP-060](QMP-060-transcript-tombstones/TICKET.md) | P1 | QUALIFIED | bounded fail-closed evidence horizon, typed stats/reconfigure, 620-test doctor and real extraction refreshed at `0c126a2` | QMP-050 | transcript types/service/builder |
 | [QMP-070](QMP-070-spill-transfer-backings/TICKET.md) | P1 | QUALIFIED | recovery-payload/ack protocol and shared binding identity remain green at `aeeffe3` | QMP-020, QMP-040, QMP-050 | revocable/spill/backings/builders |
 | [QMP-080](QMP-080-policy-runtime-semantics/TICKET.md) | P2 | QUALIFIED | canonical reserve/recharge/reconfigure postimages, protected floors, bounded out-of-lock reclaim, weighted burst and provenance pass at `f9f6d15` | QMP-010, QMP-020, QMP-030 | scheduler/controller/control/config |
-| [QMP-090](QMP-090-conformance-model/TICKET.md) | P1 | QUALIFIED | independent model, negative-family mapping, five Loom models and focused core/facade Miri remain green at `aeeffe3` | QMP-020, QMP-040, QMP-070 | testkit conformance/fakes/faults |
+| [QMP-090](QMP-090-conformance-model/TICKET.md) | P1 | QUALIFIED | independent model, negative-family mapping, five Loom models and workspace rails pass Rust 1.92 at `2dfb7bc`; focused Miri remains bound to `aeeffe3` | QMP-020, QMP-040, QMP-070 | testkit conformance/fakes/faults |
 | [QMP-100](QMP-100-scaling-benchmarks/TICKET.md) | P2 | QUALIFIED | full 160-sample qualification remains authoritative; current 0.2 source passes 30-sample smoke and doctor at `aeeffe3` | QMP-040, QMP-050, QMP-070 | payload/revocable containers, benches, CI scripts |
-| [QMP-110](QMP-110-operability-observation/TICKET.md) | P2 | QUALIFIED | typed one-lock observation, poison truth and bounded events remain green at `aeeffe3` | QMP-030, QMP-040, QMP-080 | stats traits, metrics adapters, broker/store emitters |
+| [QMP-110](QMP-110-operability-observation/TICKET.md) | P2 | QUALIFIED | typed one-lock observation, poison truth and bounded events pass the Rust 1.92 doctor at `2dfb7bc` | QMP-030, QMP-040, QMP-080 | stats traits, metrics adapters, broker/store emitters |
 | [QMP-120](QMP-120-standalone-extraction/TICKET.md) | P1 | IMPLEMENTED | local HEAD/tree/blob/mode-bound extraction, 638-test doctor and clean extracted commit pass at `f1d45c9`; remote workflow remains unobserved | QMP-000 | extraction manifest/scripts, lockfile, release CI |
-| [QMP-130](QMP-130-host-adoption/TICKET.md) | P1 | BLOCKED | isolated host code and focused composition/execution-budget suites pass, but Cargo resolves adjacent shared QMP `2cfccc6`, not qualified `aeeffe3`; exact-root QBC absent | QMP-030..QMP-120 | external host repo only; QMP repo read-only except receipts |
-| [QMP-140](QMP-140-semver-docs-closeout/TICKET.md) | P2 | BLOCKED | local 0.2 SemVer/migration, feature runtime and 166-selector docs validation complete; exact host revision and remote extraction proof remain | QMP-010..QMP-130 | public exports, README/EXTRACTION/docs, Cargo metadata |
+| [QMP-130](QMP-130-host-adoption/TICKET.md) | P1 | BLOCKED | host `8e23e123` implementation plus clean exact-QMP-`2dfb7bc` probe pass direct 129+46+86 and registered QBC production 2/2; committed Cargo still resolves adjacent QMP 0.1.0 and the other two QBC lanes lack receipts | QMP-030..QMP-120 | external host repo only; QMP repo read-only except receipts |
+| [QMP-140](QMP-140-semver-docs-closeout/TICKET.md) | P2 | BLOCKED | local 0.2 SemVer/MSRV, feature runtime and 166-selector docs validation complete; committed exact-host activation, two QBC receipts and remote extraction proof remain | QMP-010..QMP-130 | public exports, README/EXTRACTION/docs, Cargo metadata |
 
 상태를 바꿀 때 이 표와 ticket receipt를 같은 change에서 갱신한다.
 
