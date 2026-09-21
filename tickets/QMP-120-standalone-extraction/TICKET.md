@@ -101,6 +101,15 @@ postcondition. See
 [`receipts/2026-09-21T105625Z-f1d45c9.md`](receipts/2026-09-21T105625Z-f1d45c9.md).
 The remote workflow remains unobserved, so lifecycle stays `IMPLEMENTED`.
 
+Current-source session-hardening refresh: actual extraction of
+`557213b01ed93a20c1a45d3c69b2dae20ab90e70` produced canonical digest
+`da315e42ec3d2c8a028119db9c26082130f763bd2256c269f099012dcb0fc8c3`,
+bootstrap commit `6f744cac4e36d9dae5439c832d5a0a41f7809199`, and a clean extracted
+worktree after the complete 639-test doctor, ticket validator and PM lint.
+See
+[`receipts/2026-09-21T131415Z-557213b.md`](receipts/2026-09-21T131415Z-557213b.md).
+Remote workflow observation remains the only QMP-120 gap.
+
 ## Verification
 
 ```bash

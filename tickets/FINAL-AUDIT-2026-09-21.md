@@ -14,9 +14,9 @@ the inventory in [`README.md`](README.md) and each ticket's latest transition
 receipt.
 
 ```text
-portable product source: f2b74979b9d0aa4d2cd957d4d86f13d18865ae23
+portable product source: 557213b01ed93a20c1a45d3c69b2dae20ab90e70
 qualification SSOT base: a23bda308e57c7bcaab9f70bedfe9757fd399fb2
-session-hardening receipt: tickets/QMP-100-scaling-benchmarks/receipts/2026-09-21T124849Z-f2b7497.md
+session-hardening receipt: tickets/QMP-100-scaling-benchmarks/receipts/2026-09-21T131415Z-557213b.md
 branch: codex/qmp-remaining-hardening
 local worktree: clean at closeout checkpoint
 ```
@@ -30,11 +30,12 @@ Current evidence:
 - focused Miri: core reservation lifecycle 1/1 and facade spill ownership 1/1.
 - scaling: prior complete 160-sample/source-bound distribution remains the
   historical baseline; current `0.2.0` source passes the expanded 33-sample
-  smoke, including scheduler group cardinality, with zero semantic and
-  allocator residual bytes.
-- actual extraction at `f2b7497`: PASS; source tree `ad5b1ec4`, canonical
-  manifest `984f4ecb`, extracted commit `f0aca0b3`, clean Git status, 639-test
-  doctor, ticket validator and PM lint.
+  smoke from a fresh Cargo target, including scheduler group cardinality and an
+  allocation-free admission-loop oracle, with zero semantic and allocator
+  residual bytes.
+- actual extraction at `557213b`: PASS; source tree `16d84b4c`, canonical
+  manifest `da315e42`, extracted commit `6f744cac`, extracted tree `559bffe0`,
+  clean Git status, 639-test doctor, ticket validator and PM lint.
 - local ticket admission, QMP-010 through QMP-110 behavior owners, conformance,
   performance and operability are `QUALIFIED` where shown in the inventory.
 
@@ -50,7 +51,7 @@ Remaining authority gaps, not local code defects:
    1.92. Its exact-root identity gate and registered production-composition QBC
    suite pass 5/5 + 2/2. The remaining two QBC suite lanes could not be created
    by the same Codex task because QBC admits only one new lane per task. Those
-   receipts predate the current `f2b7497` scheduler/performance hardening and
+   receipts predate the current `557213b` scheduler/performance hardening and
    therefore do not qualify the current portable source. The
    gate still correctly rejects the committed live
    resolution because Cargo points at adjacent shared QMP 0.1.0, not qualified

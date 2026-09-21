@@ -195,4 +195,12 @@ lane. The verifier rejects a missing scheduler lane. The current smoke contains
 33 samples; every sample has zero semantic and allocator residual bytes.
 
 Current receipt:
-[`receipts/2026-09-21T124849Z-f2b7497.md`](receipts/2026-09-21T124849Z-f2b7497.md).
+[`receipts/2026-09-21T131415Z-557213b.md`](receipts/2026-09-21T131415Z-557213b.md).
+
+At `557213b01ed93a20c1a45d3c69b2dae20ab90e70`, the scheduler-cardinality
+lane also snapshots allocator counters immediately before the admission loop
+and fails on any allocation or deallocation inside it. This closes the proof
+gap where an implementation could rebuild and free the Hamilton table per
+request while still ending with zero residual bytes. Qualification was rerun
+from a fresh Cargo target after a stale optimized artifact was detected; the
+stale run is not accepted as evidence.
