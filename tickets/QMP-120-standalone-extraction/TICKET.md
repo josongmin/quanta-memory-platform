@@ -10,8 +10,9 @@ committed HEAD/tree, derives the copy manifest from Git tree objects, binds each
 path to mode/blob/content identity, rejects tracked/index/mode drift, and passed
 a fresh actual extraction with clean destination commit. See
 [`receipts/2026-09-21T055538Z-4fdac52.md`](receipts/2026-09-21T055538Z-4fdac52.md).
-Remote workflow observation and external host rewiring remain open, so this is
-not promoted to `QUALIFIED` or `DONE`.
+The repository does not use GitHub Actions as extraction authority. A fresh
+repo-local actual extraction of the workflow-free canonical set is required
+before promotion to `QUALIFIED`.
 
 ## Objective
 
@@ -49,7 +50,7 @@ the currently integrated implementation remains `READY` or still fails.
 - `tools/semgrep/**`
 - `tools/ci/feature-matrix.sh`
 - root `Cargo.lock`, `.cargo/**`, toolchain/MSRV config as decided
-- extraction tests/CI
+- extraction tests and repo-local qualification scripts
 
 ## Required implementation
 
@@ -64,7 +65,8 @@ the currently integrated implementation remains `READY` or still fails.
 9. final `git status --porcelain`이 empty인지 검사한다.
 10. cargo-deny/tool absence를 release lane에서 skip하지 않는다.
 11. feature matrix는 each feature alone + `-D warnings`를 적용한다.
-12. temp destination을 사용한 actual extraction을 CI에서 실행한다.
+12. clean/frozen source에서 temp destination을 사용한 actual extraction을
+    qualification front door로 실행한다.
 
 ## RED tests/scenarios
 
@@ -91,15 +93,11 @@ the currently integrated implementation remains `READY` or still fails.
 - [x] extraction input가 declared `HEAD` tree/mode와 동일함을 검증한다.
 - [x] dirty tracked source와 executable-bit drift negative fixtures가 RED다.
 
-Remote `.github/workflows/standalone-extraction.yml` execution remains
-unobserved; keep `IMPLEMENTED`, not `QUALIFIED` or `DONE`.
-
 Current-source refresh: actual extraction of
 `f1d45c9bb28982f2c5ee3fcaac4a5d8ce4329be9` passed the complete 638-test
 doctor, feature-runtime lanes, selector validator, PM lint, deny and clean Git
 postcondition. See
 [`receipts/2026-09-21T105625Z-f1d45c9.md`](receipts/2026-09-21T105625Z-f1d45c9.md).
-The remote workflow remains unobserved, so lifecycle stays `IMPLEMENTED`.
 
 Current-source session-hardening refresh: actual extraction of
 `557213b01ed93a20c1a45d3c69b2dae20ab90e70` produced canonical digest
@@ -108,7 +106,12 @@ bootstrap commit `6f744cac4e36d9dae5439c832d5a0a41f7809199`, and a clean extract
 worktree after the complete 639-test doctor, ticket validator and PM lint.
 See
 [`receipts/2026-09-21T131415Z-557213b.md`](receipts/2026-09-21T131415Z-557213b.md).
-Remote workflow observation remains the only QMP-120 gap.
+
+Policy correction (2026-09-22): `.github/workflows/standalone-extraction.yml`
+was not an operational rail and is removed from the repository and canonical
+copy set. Historical receipts that recorded it as unobserved remain immutable
+history; they are not a current acceptance requirement. QMP-120 closes from an
+exact-source repo-local actual extraction receipt.
 
 ## Verification
 

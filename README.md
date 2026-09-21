@@ -6,8 +6,8 @@ designed to be extracted into its own repository without rewrites.
 
 > **Current qualification status (2026-09-21): NOT production-ready.** Local
 > standalone extraction, including committed HEAD/tree/blob/mode binding, has
-> passed; remote workflow execution and external host adoption remain
-> unobserved on the current release candidate. Standalone performance,
+> passed; external host adoption remains unobserved on the current release
+> candidate. Standalone performance,
 > observability, extraction, and conformance rails are locally qualified; they
 > do not substitute for host-product GREEN. The authoritative
 > remediation inventory, status, dependencies, acceptance criteria, and receipts

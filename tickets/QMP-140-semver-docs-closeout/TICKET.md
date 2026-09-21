@@ -13,7 +13,7 @@ remediation으로 바뀐 public authority를 compatibility 정책에 맞게 노�
 
 - 최초 감사에서 raw ledger/basic broker/simple store constructors가 public tests에 pin되고 builder-first 주장과 public backdoors가 모순됐다. QMP-030/040 이후 API가 이동했으므로 이를 **현재의 미수정 결함으로 재주장하지 않는다**. 최종 re-export/feature census와 외부 compile-fail로 남은 노출을 판정한다.
 - `docs/verification-scenarios.md`는 benchmark가 없는데 benchmark 비율/gate를 주장한다.
-- 최초 감사 시 actual extraction failure와 standalone green/no known limitation 주장이 충돌했다. QMP-120은 local extraction을 수리했으나 remote CI와 최종 product SHA의 extraction은 아직 별도 증거가 필요하다.
+- 최초 감사 시 actual extraction failure와 standalone green/no known limitation 주장이 충돌했다. QMP-120은 local extraction을 수리했다. 최종 product SHA의 repo-local actual extraction은 별도 증거가 필요하지만, 운영하지 않는 GitHub Actions workflow는 acceptance가 아니다.
 - moka/scc/bumpalo feature 이름이 실제 semantic capability보다 강하게 보인다.
 - packages는 `rust-version` 미지정, `UNLICENSED`, `publish=false`다.
 - QMP-060 removes the misleading unbounded `TranscriptRetentionPolicyV1`
@@ -154,8 +154,8 @@ Implemented and reverified at product source
 - runtime bite tests for ten reachable feature compositions;
 - a docs selector validator resolving 166 named selectors and rejecting stale
   commands;
-- corrected extraction/host documentation and explicit separation of local,
-  remote and host qualification;
+- corrected extraction/host documentation and explicit separation of portable
+  local qualification from host qualification;
 - focused Miri evidence recorded in ticket receipts.
 
 The local product proof was refreshed at
@@ -178,5 +178,7 @@ host-full-wiring and execution-budget lanes, so those two canonical receipts
 remain absent. The committed host metadata still resolves adjacent QMP 0.1.0
 rather than current `557213b` 0.2.0, and the observed host proof predates that
 source. Therefore QMP-130 and this ticket remain `BLOCKED`.
-Remote standalone CI for QMP-120 is also unobserved. Neither gap is papered over
-as local `QUALIFIED` or campaign `DONE`.
+QMP-120 uses repo-local actual extraction as its terminal authority; the
+removed GitHub Actions workflow is not a remaining gap. Host activation and
+same-source QBC remain the only terminal external boundary and are not papered
+over as campaign `DONE`.

@@ -120,7 +120,9 @@ dependency direction. Not prose: every step is a command or a verifiable gate.
 - Source/extracted tree-bound canonical digests and file modes match, the source
   stays at the frozen clean `HEAD`, and the extracted git worktree is clean.
 - All Cargo resolution is locked; missing Semgrep or cargo-deny fails closed.
-- The fresh extraction test in `.github/workflows/standalone-extraction.yml` passes.
+- Qualification runs the fresh actual extraction command directly from a clean,
+  frozen source checkout. This repository intentionally has no GitHub Actions
+  workflow; a nonexistent remote job is not an acceptance dependency.
 
 Host adapter compilation and Semantica static guards are QMP-130 adoption
 proof, not evidence that this repo-local extraction rail passed.
