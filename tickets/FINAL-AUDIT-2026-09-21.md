@@ -15,6 +15,7 @@ receipt.
 
 ```text
 portable product source: cdbf94f8c409ecb60493eac5c222712f7010bbf9
+host-qualified QMP revision: 4d0857923b20df75520b28d8700198f51c4159e4
 qualification SSOT base: a23bda308e57c7bcaab9f70bedfe9757fd399fb2
 session-hardening receipt: tickets/QMP-100-scaling-benchmarks/receipts/2026-09-21T131415Z-557213b.md
 branch: codex/qmp-remaining-hardening
@@ -36,27 +37,21 @@ Current evidence:
 - actual extraction at `cdbf94f`: PASS; source tree `66eaac21`, canonical
   manifest `75355851`, extracted commit `5bd3f743`, extracted tree `6a2f420e`,
   clean Git status, 639-test doctor, ticket validator and PM lint.
-- local ticket admission, QMP-010 through QMP-110 behavior owners, conformance,
-  performance and operability are `QUALIFIED` where shown in the inventory.
+- local ticket admission, QMP-010 through QMP-130 behavior/adoption owners,
+  conformance, performance and operability are `QUALIFIED` where shown in the
+  inventory.
 
 Remaining authority gaps, not local code defects:
 
-1. QMP-130 remains `BLOCKED`: host commit `8e23e123` implements the production
-   composition, host adapters, execution-budget enforcement, suite registration
-   and fail-closed dependency-identity gate. A clean throwaway qualification
-   commit changing only the two manifests and locks to exact QMP `2dfb7bc`
-   passes direct host/composer/budget suites 129/129 + 46/46 + 86/86 on Rust
-   1.92. Its exact-root identity gate and registered production-composition QBC
-   suite pass 5/5 + 2/2. The remaining two QBC suite lanes could not be created
-   by the same Codex task because QBC admits only one new lane per task. Those
-   receipts predate the current `cdbf94f` portable source and
-   therefore do not qualify the current portable source. The
-   gate still correctly rejects the committed live
-   resolution because Cargo points at adjacent shared QMP 0.1.0, not qualified
-   QMP 0.2. Repointing/publishing and the two missing same-source QBC receipts
-   are external integration actions.
-2. QMP-140 remains `BLOCKED` only on the same exact-revision host proof;
-   its local SemVer, migration, feature-runtime and documentation work is done.
+1. QMP-130 is `QUALIFIED`: clean pushed host branch
+   `codex/qmp130-main-hardening` at `986d59b6455028bbf423797ba8b745e46e0cad83`
+   resolves exact Git QMP `4d0857923b20df75520b28d8700198f51c4159e4`.
+   The fail-closed dependency identity verifier passes 9/9. Registered QBC
+   production-composition, host-full-wiring and execution-budget suites pass
+   2/2 + 1/1 + 1/1 on one unchanged source digest.
+2. QMP-140 remains `BLOCKED` on merging/activating that qualified host branch
+   and cutting the final campaign-wide exact-source reconciliation receipt. Its
+   local SemVer, migration, feature-runtime and documentation work is done.
 
 Do not report the campaign as production/host `DONE` until these host proof
 boundaries are closed. Do not reopen the historical findings below without a
@@ -395,8 +390,8 @@ exist in the inventory.
 | QMP-100 | BLOCKED | remove measured O(N²) owners and set frozen workload thresholds |
 | QMP-110 | BLOCKED | fallible typed observation and bounded live telemetry after policy semantics freeze |
 | QMP-120 | QUALIFIED | exact workflow-free repo-local extraction binds bytes and modes to the committed tree |
-| QMP-130 | BLOCKED | resolve host Cargo/gate identity, then exact-head host behavior qualification |
-| QMP-140 | BLOCKED | SemVer migration, executable docs, governance schema and final evidence reconciliation |
+| QMP-130 | QUALIFIED | exact Git QMP identity and all registered host QBC suites pass on clean pushed host `986d59b` |
+| QMP-140 | BLOCKED | merge/activate qualified host branch, then cut final exact-source reconciliation receipt |
 
 No ticket is `DONE`. `IMPLEMENTED` means partial code/focused proof exists; it is
 not production or host qualification.

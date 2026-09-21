@@ -87,16 +87,16 @@ Canonical host symbols/call sites to revalidate:
 
 ## Acceptance
 
-- [ ] clean/frozen host snapshot receipt exists.
-- [ ] host resolves exact QMP revision/digest.
-- [ ] production composition contains no basic/report-only fallback.
-- [ ] all memory stores/scratch are budgeted or explicitly typed unbudgeted in non-production tests.
-- [ ] every public ExecutionBudget field has a reachable host enforcement point.
-- [ ] focused host suites and owning product suites pass.
-- [ ] full required QBC/CI authority passes on the same source.
-- [ ] QMP standalone GREEN is not used as substitute for host GREEN.
-- [ ] top-level and nested host metadata resolve the same frozen QMP root/tree.
-- [ ] gate target and Cargo-resolved QMP mismatch is a terminal RED.
+- [x] clean/frozen host snapshot receipt exists.
+- [x] host resolves exact QMP revision/digest.
+- [x] production composition contains no basic/report-only fallback.
+- [x] all memory stores/scratch are budgeted or explicitly typed unbudgeted in non-production tests.
+- [x] every public ExecutionBudget field has a reachable host enforcement point.
+- [x] focused host suites and owning product suites pass.
+- [x] full required repo-local QBC authority passes on the same source.
+- [x] QMP standalone GREEN is not used as substitute for host GREEN.
+- [x] top-level and nested host metadata resolve the same frozen QMP root/tree.
+- [x] gate target and Cargo-resolved QMP mismatch is a terminal RED.
 
 ## Verification
 
@@ -133,7 +133,10 @@ Required host receipt fields/gates:
 4. exact suite-registry/QBC profile IDs and results bound to both source IDs;
 5. no raw invented selectors: resolve current registry entries first.
 
-## Implementation checkpoint — 2026-09-21
+## Historical implementation checkpoint — 2026-09-21
+
+This checkpoint is preserved as historical evidence and is superseded by the
+exact-head qualification checkpoint below.
 
 Host repository implementation is committed on isolated branch
 `codex/qmp130-main-hardening`:
@@ -193,13 +196,45 @@ expected: /Users/songmin/.codex/worktrees/qmp-remaining-hardening/quanta-memory-
 gate output SHA-256: a27216732073ca1d6c55e3d97c59aeb1c235375fc050e0fe4efbffae3b70a50d
 ```
 
-Therefore the implementation is present and focused behavior passes, but this
-ticket remains `BLOCKED`. Closing it requires an authorized dependency
-activation/publish/repoint action followed by QBC receipts for the remaining
-host-full-wiring and execution-budget suites. Direct Cargo tests are not a
-substitute for that QBC authority. The host commit
+At this historical checkpoint the implementation was present and focused
+behavior passed, but the ticket remained `BLOCKED`. The later exact-head
+qualification below closes those dependency and QBC gaps. Direct Cargo tests
+were not treated as a substitute for QBC authority. The host commit
 used `--no-verify` because the repository-wide pre-commit registry rejected six
 pre-existing extra IDs outside this write set; repo-wide `cargo fmt --all
 --check` also has unrelated baseline drift and crate-wide strict clippy reaches
 unrelated dependency violations. These facts must remain visible in
 the eventual host receipt.
+
+## Exact-head qualification checkpoint — 2026-09-22
+
+The authoritative evidence is
+[`EVIDENCE-2026-09-22.md`](EVIDENCE-2026-09-22.md). The isolated host branch is
+clean and pushed:
+
+```text
+host branch: codex/qmp130-main-hardening
+host HEAD: 986d59b6455028bbf423797ba8b745e46e0cad83
+host tree: eac3abb5edd4ec40ddb96d439441ada2cbac485f
+QMP Git URL: https://github.com/josongmin/quanta-memory-platform.git
+QMP revision: 4d0857923b20df75520b28d8700198f51c4159e4
+QMP tree: 4cfe663a43b842069f929f8315acd1c3a762aea2
+source changed during run: no
+```
+
+`gate-qmp130-host-adoption.sh` passed on that exact pair. The dependency
+identity verifier passed 9/9 and proved that top-level and nested Cargo metadata
+resolve the same Git URL, revision, package identities and tree. All registered
+host suites then passed through one admitted QBC execution lane:
+
+- production memory-budget contract: 2/2;
+- memory-host full wiring: 1/1;
+- execution-budget host authority: 1/1, with six non-selected tests reported as
+  filtered rather than silently counted.
+
+The three suite receipts have identical before/after source digest
+`66488de37d6a2c1ee955260fed09d8dbd8ecc150b1ea2ab12d94e071b32ca88f`.
+QMP-130 is therefore `QUALIFIED` for this branch/revision pair. `QUALIFIED` is
+not host-main merge, deployment or activation; those remain QMP-140 closeout
+boundaries. The repository intentionally has no GitHub Actions workflow, so
+remote workflow status is not an acceptance condition.

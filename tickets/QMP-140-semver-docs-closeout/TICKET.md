@@ -166,19 +166,17 @@ bootstrap commit `5bd3f743`, and the same complete standalone rails. Local
 workspace/extraction/performance proof is therefore exact-current for that
 product source.
 
-The two unchecked acceptance rows are one external boundary: Semantica Cargo
-must resolve this exact QMP source and obtain a canonical same-source QBC
-receipt. Host commit `8e23e123` implements the adapter/runtime/budget wiring,
-0.1/0.2 contract bridge, suite registration and fail-closed identity gate. A
-clean manifest-only qualification commit resolving exact QMP `2dfb7bc` passes
-direct host/composer/budget suites 129/129 + 46/46 + 86/86 on Rust 1.92,
-identity verifier tests 5/5 and registered production-composition QBC 2/2.
-QBC's one-new-lane-per-task admission prevented the same task from creating the
-host-full-wiring and execution-budget lanes, so those two canonical receipts
-remain absent. The committed host metadata still resolves adjacent QMP 0.1.0
-rather than current `cdbf94f` 0.2.0, and the observed host proof predates that
-source. Therefore QMP-130 and this ticket remain `BLOCKED`.
-QMP-120 uses repo-local actual extraction as its terminal authority; the
-removed GitHub Actions workflow is not a remaining gap. Host activation and
-same-source QBC remain the only terminal external boundary and are not papered
-over as campaign `DONE`.
+QMP-130 is now exact-head `QUALIFIED`: clean pushed host branch
+`codex/qmp130-main-hardening` at
+`986d59b6455028bbf423797ba8b745e46e0cad83` resolves exact Git QMP
+`4d0857923b20df75520b28d8700198f51c4159e4`. Its dependency identity verifier
+passes 9/9, and the registered production-composition, host-full-wiring and
+execution-budget QBC suites pass 2/2 + 1/1 + 1/1 with one unchanged source
+digest. This closes the former Cargo-resolution and missing-receipt gaps.
+
+This ticket remains `BLOCKED` because the qualified host branch is not merged
+or activated on host main, and the final campaign-wide exact-source receipt has
+not been cut after that integration. QMP-120 uses repo-local actual extraction
+as its terminal authority; the intentionally absent GitHub Actions workflow is
+not a remaining gap. Branch qualification is not deployment or campaign
+`DONE`.

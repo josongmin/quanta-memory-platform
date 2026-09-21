@@ -31,6 +31,7 @@
 
 ```text
 verified product source: cdbf94f8c409ecb60493eac5c222712f7010bbf9
+host-qualified QMP revision: 4d0857923b20df75520b28d8700198f51c4159e4
 branch/worktree: codex/qmp-remaining-hardening / isolated clean worktree
 workspace tests: 639 passed
 doctor output SHA-256: c7188fa1e0da4f8494802ef6df549ab6b28a14f2cec53cda847ea7363a32b71a
@@ -39,10 +40,14 @@ actual extraction output SHA-256: fb86a214ed538226d378c6d8860c7ac9e388d1e48bc935
 scaling smoke output SHA-256: 224480acfcb3e09c6a2adf6664c228db1b6ea3ae4a0678952172f764cff36945
 scaling full output SHA-256: 358d1970b4466dcf05e6b8415c012aa55b728c5a635f9f529fe462b73d53a0c0
 scaling baseline-gate output SHA-256: c8bcfdd32682fa20e46ef7d20b2f1b43927bdb3738d19801d5920e8a25fa4538
+host qualification HEAD/tree: 986d59b6455028bbf423797ba8b745e46e0cad83 / eac3abb5edd4ec40ddb96d439441ada2cbac485f
+host qualification gate SHA-256: e368e406130e69320abb3079df91842a9e6cab2eba6d18069e42ffd2fa3e5834
+host suite receipt SHA-256: df6e44a63d105a19faf54314873fdfd918fd0925e9c5ac90b62c266cbb686bc3 / 751d2a5ba5428f8ccc45b137b53246e8b8461414ea33af3892ae753e96fb2ab5 / e56e48cc2a6cac18f616b4d4e96a4d85f11d9035c2ea06ef44e52765963c2f23
 ```
 
 This checkpoint qualifies only the ticket scopes whose latest receipts say
-`QUALIFIED`. It does not close external-host QMP-130 or final SemVer/docs
+`QUALIFIED`. It closes QMP-130 for the exact host branch/QMP revision pair, but
+does not merge or activate that host branch and therefore does not close
 QMP-140. Inventory state below is
 the lifecycle authority; this block is exact proof metadata, not a status
 override.
@@ -78,8 +83,8 @@ override.
 | [QMP-100](QMP-100-scaling-benchmarks/TICKET.md) | P2 | QUALIFIED | cached weighted admission removes per-request group sorting; the fresh-build 33-sample rail directly rejects hot-loop allocations and passes zero-drift plus the 639-test doctor at `557213b` | QMP-040, QMP-050, QMP-070 | payload/revocable containers, scheduler, benches, CI scripts |
 | [QMP-110](QMP-110-operability-observation/TICKET.md) | P2 | QUALIFIED | typed one-lock observation, poison truth and bounded events pass the Rust 1.92 doctor at `2dfb7bc` | QMP-030, QMP-040, QMP-080 | stats traits, metrics adapters, broker/store emitters |
 | [QMP-120](QMP-120-standalone-extraction/TICKET.md) | P1 | QUALIFIED | workflow-free local HEAD/tree/blob/mode-bound extraction, 639-test doctor and clean extracted commit pass at `cdbf94f`; repo-local actual extraction is terminal authority | QMP-000 | extraction manifest/scripts, lockfile, release qualification |
-| [QMP-130](QMP-130-host-adoption/TICKET.md) | P1 | BLOCKED | host `8e23e123` plus exact-QMP-`2dfb7bc` probe passed direct 129+46+86 and one QBC lane, but those receipts predate current `cdbf94f`; committed Cargo still resolves adjacent QMP 0.1.0 and two QBC lanes are missing | QMP-030..QMP-120 | external host repo only; QMP repo read-only except receipts |
-| [QMP-140](QMP-140-semver-docs-closeout/TICKET.md) | P2 | BLOCKED | local 0.2 SemVer/MSRV, feature runtime, selectors, performance and workflow-free extraction are complete; current-`cdbf94f` host activation and two QBC receipts remain | QMP-010..QMP-130 | public exports, README/EXTRACTION/docs, Cargo metadata |
+| [QMP-130](QMP-130-host-adoption/TICKET.md) | P1 | QUALIFIED | clean pushed host `986d59b` resolves exact Git QMP `4d08579`; identity 9/9 and all registered QBC suites pass 2/2 + 1/1 + 1/1 on unchanged source | QMP-030..QMP-120 | external host repo only; QMP repo read-only except receipts |
+| [QMP-140](QMP-140-semver-docs-closeout/TICKET.md) | P2 | BLOCKED | local 0.2 SemVer/MSRV, feature runtime, selectors, performance, workflow-free extraction and exact-head host qualification are complete; host-main merge/activation and final exact-source reconciliation remain | QMP-010..QMP-130 | public exports, README/EXTRACTION/docs, Cargo metadata |
 
 상태를 바꿀 때 이 표와 ticket receipt를 같은 change에서 갱신한다.
 
