@@ -29,6 +29,7 @@ def sample(mode: str, threads: int, repetition: int) -> dict[str, object]:
         "allocator_deallocated_bytes": 200,
         "allocator_live_bytes": 0,
         "allocator_high_water_bytes": 200,
+        "allocator_underflowed": False,
         "busy_retries": 0,
     }
 

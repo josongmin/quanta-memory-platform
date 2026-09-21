@@ -1,6 +1,6 @@
 use std::alloc::System;
 use std::hint::black_box;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -22,6 +22,7 @@ struct AllocationCounters {
     deallocated: AtomicU64,
     live: AtomicU64,
     high_water: AtomicU64,
+    underflowed: AtomicBool,
 }
 
 #[derive(Clone, Debug)]
@@ -51,7 +52,14 @@ impl AllocationTracker for BenchAllocationTracker {
     ) {
         let bytes = object_size as u64;
         self.0.deallocated.fetch_add(bytes, Ordering::Relaxed);
-        self.0.live.fetch_sub(bytes, Ordering::Relaxed);
+        if self
+            .0
+            .live
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |live| live.checked_sub(bytes))
+            .is_err()
+        {
+            self.0.underflowed.store(true, Ordering::Relaxed);
+        }
     }
 }
 
@@ -85,6 +93,7 @@ struct AllocationSample {
     deallocated: u64,
     live: u64,
     high_water: u64,
+    underflowed: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -145,6 +154,7 @@ fn begin_allocation_epoch(counters: &AllocationCounters) {
     counters.allocated.store(0, Ordering::Relaxed);
     counters.deallocated.store(0, Ordering::Relaxed);
     counters.high_water.store(0, Ordering::Relaxed);
+    counters.underflowed.store(false, Ordering::Relaxed);
     AllocationRegistry::enable_tracking();
 }
 
@@ -155,6 +165,7 @@ fn end_allocation_epoch(counters: &AllocationCounters) -> AllocationSample {
         deallocated: counters.deallocated.load(Ordering::Relaxed),
         live: counters.live.load(Ordering::Relaxed),
         high_water: counters.high_water.load(Ordering::Relaxed),
+        underflowed: counters.underflowed.load(Ordering::Relaxed),
     }
 }
 
@@ -201,6 +212,7 @@ fn emit(
             "\"allocator_deallocated_bytes\":{deallocated},",
             "\"allocator_live_bytes\":{live},",
             "\"allocator_high_water_bytes\":{high_water},",
+            "\"allocator_underflowed\":{underflowed},",
             "\"busy_retries\":{busy_retries}}}"
         ),
         operation = operation,
@@ -219,6 +231,7 @@ fn emit(
         deallocated = allocation.deallocated,
         live = allocation.live,
         high_water = allocation.high_water,
+        underflowed = allocation.underflowed,
         busy_retries = busy_retries,
     );
 }

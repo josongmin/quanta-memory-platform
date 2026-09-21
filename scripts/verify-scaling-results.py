@@ -92,6 +92,8 @@ def validate(
             raise ValidationError(
                 f"{key}: allocator drift allocated={allocated} deallocated={deallocated} live={live}"
             )
+        if sample.get("allocator_underflowed") is not False:
+            raise ValidationError(f"{key}: allocator live-byte counter underflowed")
         if integer(sample, "allocator_high_water_bytes") < live:
             raise ValidationError(f"{key}: allocator high-water is below live bytes")
         if integer(sample, "busy_retries") < 0:
