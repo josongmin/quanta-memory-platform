@@ -95,7 +95,7 @@ Owner symbols:
 - [x] destructive discard는 persistence API에서 제거됐다. `NoopSpillController`는 원본 handle을 포함한 typed failure를 반환한다.
 - [x] restart 후 retained inventory와 controller telemetry가 일치한다.
 - [x] 유일한 advertised production backing인 redb가 canonical revocable durable transfer에서 reachable하다. 계약을 구현하지 않던 moka/scc feature와 dependency는 제거됐다.
-- [ ] 모든 backing이 동일 semantic conformance suite를 통과한다.
+- [x] 모든 advertised backing이 semantic contract 검증을 통과한다. Production durable backing은 redb 하나이며, in-process/noop/redb 경로는 facade all-features와 testkit spill suite에서 함께 검증된다. 계약을 구현하지 않던 moka/scc feature는 제거됐다.
 
 ## Verification
 
@@ -212,3 +212,34 @@ Remaining qualification/architecture gaps:
    a durable recovery-payload/ack phase, not another in-memory flag.
 4. QMP-090 still owns concurrency/model proof across spill, restore, reclaim,
    restart and panic schedules. Static compilation is not that proof.
+
+## Terminal hardening checkpoint (2026-09-21; supersedes the deferred gaps above)
+
+QMP-070 now persists the payload between destructive FIFO removal and resident
+acknowledgement in a separate redb recovery table. The active restore claim is
+kept until `finalize_restore`, so a process restart can distinguish and resume
+both `Prepared` and `Committed` phases. The store establishes the exact resident
+charge, publishes behind its mutation permit, and only then acknowledges removal
+of the durable recovery payload. A finalize error or panic moves the provisional
+resident entry back behind `pending_restores` before readers can observe it;
+reconciliation applies the same panic fence on every retry.
+
+Deterministic redb fault seams now cover failure before a write transaction,
+lost write-commit acknowledgement, lost restore-commit acknowledgement, and
+lost finalize acknowledgement. Reopen tests cover a persisted prepared claim
+and a committed recovery payload. The store tests additionally cover encoder
+panic reuse and repeated controller-finalize panic without mutex poisoning,
+double authority, unreadable charge loss, or payload loss.
+
+Pre-freeze dynamic evidence on the implementation tree:
+
+- facade all-features: 252 unit + 18 hellgate + 21 public API + 19 doctest =
+  310 passed;
+- testkit `spill` selector: 4 non-zero selected tests passed;
+- workspace all-features: 594 passed, 0 failed.
+
+The code slice is complete. Ticket qualification still requires the terminal
+receipt to bind formatting, clippy, feature matrix, deny, doctor, ticket lint,
+and a real standalone extraction to one committed source SHA. QMP-090 remains
+the owner of broader model-checking work; it is not a QMP-070 transfer-contract
+gap.

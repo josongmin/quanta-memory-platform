@@ -17,7 +17,7 @@ use crate::shared::measure::{semantic_cost_v1, ByteSized, RetainedCostV1};
 #[cfg(feature = "spill")]
 use crate::spill::{
     DurableCommitFailure, DurableRecordId, DurableRecordResolution, DurableRestoreController,
-    DurableRestoreOutcome, DurableWriteFailure, InProcessSpillController,
+    DurableRestoreOutcome, DurableRestorePhase, DurableWriteFailure, InProcessSpillController,
     ReconciledDurableSpillController, SpillFailure, SpillReceipt,
 };
 
@@ -366,9 +366,11 @@ impl<Key, Value> SimpleRevocableStore<Key, Value, Budgeted> {
                 return Ok(None);
             };
             self.require_charge_shape(entry, "durable spill transfer")?;
-            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let encoded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 encode(&entry.key, &entry.value)
-            })) {
+            }));
+            drop(state);
+            match encoded {
                 Ok(result) => result?,
                 Err(panic) => std::panic::resume_unwind(panic),
             }
@@ -500,21 +502,60 @@ impl<Key, Value> SimpleRevocableStore<Key, Value, Budgeted> {
         let Some(candidate) = controller.prepare_restore()? else {
             return Ok(DurableRestoreOutcome::Empty);
         };
+        self.restore_durable_candidate(controller, candidate, DurableRestorePhase::Prepared, decode)
+    }
+
+    /// Resume the single persisted restore claim after process restart. This is
+    /// deliberately separate from ordinary FIFO restore: callers must invoke it
+    /// only after the previous volatile owner is gone. The redb file lock and
+    /// exclusive persisted claim prevent another ordinary restore from passing.
+    pub fn recover_active_durable_restore<C, Decode>(
+        &self,
+        controller: &C,
+        decode: Decode,
+    ) -> MemoryResult<DurableRestoreOutcome>
+    where
+        C: DurableRestoreController,
+        Decode: FnOnce(&[u8]) -> MemoryResult<(Key, Value)>,
+        Key: ByteSized,
+        Value: ByteSized,
+    {
+        let _mutation = self.lifecycle.begin_mutation()?;
+        if !self.lock_state()?.pending_restores.is_empty() {
+            return Err(MemoryError::OperationInProgress(
+                "the live store already owns a fenced durable restore; reconcile it instead".into(),
+            ));
+        }
+        let Some(recovery) = controller.recover_active_restore()? else {
+            return Ok(DurableRestoreOutcome::Empty);
+        };
+        self.restore_durable_candidate(controller, recovery.candidate, recovery.phase, decode)
+    }
+
+    fn restore_durable_candidate<C, Decode>(
+        &self,
+        controller: &C,
+        candidate: crate::spill::DurableRestoreCandidate,
+        phase: DurableRestorePhase,
+        decode: Decode,
+    ) -> MemoryResult<DurableRestoreOutcome>
+    where
+        C: DurableRestoreController,
+        Decode: FnOnce(&[u8]) -> MemoryResult<(Key, Value)>,
+        Key: ByteSized,
+        Value: ByteSized,
+    {
         let decoded =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| decode(&candidate.bytes)));
         let (key, value) = match decoded {
             Ok(Ok(decoded)) => decoded,
             Ok(Err(error)) => {
-                return match controller.abort_restore(candidate.sequence) {
-                    Ok(()) => Err(error),
-                    Err(abort_error) => Err(MemoryError::OperationInProgress(format!(
-                        "decode failed ({error}) and durable restore {} claim abort failed ({abort_error})",
-                        candidate.sequence
-                    ))),
-                }
+                return self.finish_failed_restore_prepare(controller, &candidate, phase, error)
             }
             Err(panic) => {
-                let _ = controller.abort_restore(candidate.sequence);
+                if phase == DurableRestorePhase::Prepared {
+                    let _ = controller.abort_restore(candidate.sequence);
+                }
                 std::panic::resume_unwind(panic)
             }
         };
@@ -523,13 +564,7 @@ impl<Key, Value> SimpleRevocableStore<Key, Value, Budgeted> {
             Err(error) => {
                 retire_client_value(key);
                 retire_client_value(value);
-                return match controller.abort_restore(candidate.sequence) {
-                    Ok(()) => Err(error),
-                    Err(abort_error) => Err(MemoryError::OperationInProgress(format!(
-                        "restore sizing failed ({error}) and durable restore {} claim abort failed ({abort_error})",
-                        candidate.sequence
-                    ))),
-                };
+                return self.finish_failed_restore_prepare(controller, &candidate, phase, error);
             }
         };
         let next_committed = match self.lock_state()?.committed_bytes.checked_add(charged_bytes) {
@@ -538,13 +573,7 @@ impl<Key, Value> SimpleRevocableStore<Key, Value, Budgeted> {
                 retire_client_value(key);
                 retire_client_value(value);
                 let error = MemoryError::capacity("revocable restore byte accounting overflow");
-                return match controller.abort_restore(candidate.sequence) {
-                    Ok(()) => Err(error),
-                    Err(abort_error) => Err(MemoryError::OperationInProgress(format!(
-                        "restore accounting overflowed and durable restore {} claim abort failed ({abort_error})",
-                        candidate.sequence
-                    ))),
-                };
+                return self.finish_failed_restore_prepare(controller, &candidate, phase, error);
             }
         };
         let charge = match self.accounting.charge(
@@ -558,48 +587,109 @@ impl<Key, Value> SimpleRevocableStore<Key, Value, Budgeted> {
             Err(error) => {
                 retire_client_value(key);
                 retire_client_value(value);
-                return match controller.abort_restore(candidate.sequence) {
-                    Ok(()) => Err(error),
-                    Err(abort_error) => Err(MemoryError::OperationInProgress(format!(
-                        "restore admission failed ({error}) and durable restore {} claim abort failed ({abort_error})",
-                        candidate.sequence
-                    ))),
-                };
+                return self.finish_failed_restore_prepare(controller, &candidate, phase, error);
             }
         };
 
-        match controller.commit_restore(candidate.sequence) {
-            Ok(()) => {
-                let mut state = self.lock_state_for_commit();
-                state.entries.push(RevocableEntry { key, value, charged_bytes, charge });
-                state.committed_bytes = next_committed;
-                Ok(DurableRestoreOutcome::Restored { sequence: candidate.sequence })
-            }
-            Err(DurableCommitFailure::Retained(error)) => {
-                drop(charge);
-                retire_client_value(key);
-                retire_client_value(value);
-                match controller.abort_restore(candidate.sequence) {
-                    Ok(()) => Err(*error),
-                    Err(abort_error) => Err(MemoryError::OperationInProgress(format!(
-                        "durable delete retained record after error ({error}) but restore {} claim abort failed ({abort_error})",
-                        candidate.sequence
-                    ))),
+        if phase == DurableRestorePhase::Prepared {
+            match controller.commit_restore(candidate.sequence) {
+                Ok(()) => {}
+                Err(DurableCommitFailure::Retained(error)) => {
+                    drop(charge);
+                    retire_client_value(key);
+                    retire_client_value(value);
+                    return match controller.abort_restore(candidate.sequence) {
+                        Ok(()) => Err(*error),
+                        Err(abort_error) => Err(MemoryError::OperationInProgress(format!(
+                            "durable delete retained record after error ({error}) but restore {} claim abort failed ({abort_error})",
+                            candidate.sequence
+                        ))),
+                    };
+                }
+                Err(DurableCommitFailure::Ambiguous(commit_error)) => {
+                    self.fence_durable_restore(
+                        DurableRecordId::new(candidate.sequence),
+                        RevocableEntry { key, value, charged_bytes, charge },
+                        next_committed,
+                    );
+                    return Ok(DurableRestoreOutcome::RecoveryRequired {
+                        sequence: candidate.sequence,
+                        commit_error,
+                    });
                 }
             }
-            Err(DurableCommitFailure::Ambiguous(commit_error)) => {
-                let record_id = DurableRecordId::new(candidate.sequence);
-                let mut state = self.lock_state_for_commit();
-                state
-                    .pending_restores
-                    .insert(record_id, RevocableEntry { key, value, charged_bytes, charge });
-                state.committed_bytes = next_committed;
+        }
+
+        // Publish into the store state before deleting the durable recovery
+        // payload. The mutation permit keeps readers out until finalize returns,
+        // so there is no visible double owner and no delete-before-publication
+        // crash window.
+        {
+            let mut state = self.lock_state_for_commit();
+            state.entries.push(RevocableEntry { key, value, charged_bytes, charge });
+            state.committed_bytes = next_committed;
+        }
+        let finalized = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            controller.finalize_restore(candidate.sequence)
+        }));
+        match finalized {
+            Ok(Ok(())) => Ok(DurableRestoreOutcome::Restored { sequence: candidate.sequence }),
+            Ok(Err(finalize_error)) => {
+                self.fence_published_restore(candidate.sequence);
                 Ok(DurableRestoreOutcome::RecoveryRequired {
                     sequence: candidate.sequence,
-                    commit_error,
+                    commit_error: Box::new(finalize_error),
                 })
             }
+            Err(panic) => {
+                self.fence_published_restore(candidate.sequence);
+                std::panic::resume_unwind(panic)
+            }
         }
+    }
+
+    fn finish_failed_restore_prepare<C>(
+        &self,
+        controller: &C,
+        candidate: &crate::spill::DurableRestoreCandidate,
+        phase: DurableRestorePhase,
+        error: MemoryError,
+    ) -> MemoryResult<DurableRestoreOutcome>
+    where
+        C: DurableRestoreController,
+    {
+        if phase == DurableRestorePhase::Committed {
+            return Err(MemoryError::OperationInProgress(format!(
+                "durable restore {} is committed to recovery but resident preparation failed ({error}); retry recovery",
+                candidate.sequence
+            )));
+        }
+        match controller.abort_restore(candidate.sequence) {
+            Ok(()) => Err(error),
+            Err(abort_error) => Err(MemoryError::OperationInProgress(format!(
+                "resident preparation failed ({error}) and durable restore {} claim abort failed ({abort_error})",
+                candidate.sequence
+            ))),
+        }
+    }
+
+    fn fence_durable_restore(
+        &self,
+        record_id: DurableRecordId,
+        entry: RevocableEntry<Key, Value>,
+        next_committed: u64,
+    ) {
+        let mut state = self.lock_state_for_commit();
+        let replaced = state.pending_restores.insert(record_id, entry);
+        debug_assert!(replaced.is_none(), "mutation permit prevents duplicate restore fencing");
+        state.committed_bytes = next_committed;
+    }
+
+    fn fence_published_restore(&self, sequence: u64) {
+        let mut state = self.lock_state_for_commit();
+        let entry = state.entries.pop().expect("restore entry was published before finalization");
+        let replaced = state.pending_restores.insert(DurableRecordId::new(sequence), entry);
+        debug_assert!(replaced.is_none(), "mutation permit prevents duplicate restore fencing");
     }
 
     /// IDs whose provisional resident copies are fenced after an unresolved
@@ -658,6 +748,21 @@ impl<Key, Value> SimpleRevocableStore<Key, Value, Budgeted> {
                     .remove(&record_id)
                     .expect("pending restore was checked under the mutation permit");
                 state.entries.push(entry);
+                drop(state);
+                let finalized = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    controller.finalize_restore(record_id.get())
+                }));
+                match finalized {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
+                        self.fence_published_restore(record_id.get());
+                        return Err(error);
+                    }
+                    Err(panic) => {
+                        self.fence_published_restore(record_id.get());
+                        std::panic::resume_unwind(panic);
+                    }
+                }
             }
             DurableRecordResolution::Absent => {
                 return Err(MemoryError::InvalidState(format!(
@@ -1365,6 +1470,108 @@ mod tests {
 
     #[cfg(feature = "spill-redb")]
     #[test]
+    fn durable_redb_committed_restore_recovers_after_process_restart() {
+        use crate::spill::backings::redb::RedbSpillBacking;
+        static DB_SEQ: AtomicUsize = AtomicUsize::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "qmp-revocable-crash-recovery-{}-{}.redb",
+            std::process::id(),
+            DB_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_file(&path);
+        {
+            let controller =
+                RoutedSpillController::new(RedbSpillBacking::create(&path).expect("redb 1"));
+            let record_id = controller.reserve_record_id().expect("reserve");
+            let _receipt =
+                controller.commit_spill(record_id, b"recovered\0payload").expect("seed durable");
+            let candidate = controller.prepare_restore().expect("prepare").expect("candidate");
+            controller
+                .commit_restore(candidate.sequence)
+                .expect("persist recovery payload before simulated crash");
+            assert_eq!(controller.active_restore(), Ok(Some(record_id)));
+            // No finalize: dropping this controller simulates a process that
+            // dies after durable delete but before resident acknowledgement.
+        }
+
+        let broker = live_broker(1_000_000);
+        let store = store_with_broker(&broker);
+        let controller =
+            RoutedSpillController::new(RedbSpillBacking::create(&path).expect("redb 2"));
+        let outcome = store
+            .recover_active_durable_restore(&controller, |bytes| {
+                let separator = bytes
+                    .iter()
+                    .position(|byte| *byte == 0)
+                    .ok_or_else(|| MemoryError::report("missing separator"))?;
+                Ok((
+                    String::from_utf8(bytes[..separator].to_vec())
+                        .map_err(|error| MemoryError::report(format!("invalid key: {error}")))?,
+                    bytes[separator + 1..].to_vec(),
+                ))
+            })
+            .expect("restart recovery");
+        assert!(matches!(outcome, DurableRestoreOutcome::Restored { sequence: 0 }));
+        assert_eq!(controller.active_restore(), Ok(None));
+        assert_eq!(controller.spilled_count(), Ok(0));
+        assert_eq!(store.reclaim_one().expect("read recovered").expect("entry").0, "recovered");
+        assert_eq!(broker.ledger_snapshot().expect("drained ledger").total_owner_bytes(), 0);
+
+        drop(controller);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(feature = "spill-redb")]
+    #[test]
+    fn durable_redb_prepared_restore_recovers_after_process_restart() {
+        use crate::spill::backings::redb::RedbSpillBacking;
+        static DB_SEQ: AtomicUsize = AtomicUsize::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "qmp-revocable-prepared-recovery-{}-{}.redb",
+            std::process::id(),
+            DB_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_file(&path);
+        {
+            let controller =
+                RoutedSpillController::new(RedbSpillBacking::create(&path).expect("redb 1"));
+            let record_id = controller.reserve_record_id().expect("reserve");
+            let _receipt =
+                controller.commit_spill(record_id, b"prepared\0payload").expect("seed durable");
+            let candidate = controller.prepare_restore().expect("prepare").expect("candidate");
+            assert_eq!(candidate.sequence, record_id.get());
+            // No commit: the durable queue plus persisted claim must survive.
+        }
+
+        let broker = live_broker(1_000_000);
+        let store = store_with_broker(&broker);
+        let controller =
+            RoutedSpillController::new(RedbSpillBacking::create(&path).expect("redb 2"));
+        let outcome = store
+            .recover_active_durable_restore(&controller, |bytes| {
+                let separator = bytes
+                    .iter()
+                    .position(|byte| *byte == 0)
+                    .ok_or_else(|| MemoryError::report("missing separator"))?;
+                Ok((
+                    String::from_utf8(bytes[..separator].to_vec())
+                        .map_err(|error| MemoryError::report(format!("invalid key: {error}")))?,
+                    bytes[separator + 1..].to_vec(),
+                ))
+            })
+            .expect("restart recovery");
+        assert!(matches!(outcome, DurableRestoreOutcome::Restored { sequence: 0 }));
+        assert_eq!(controller.active_restore(), Ok(None));
+        assert_eq!(controller.spilled_count(), Ok(0));
+        assert_eq!(store.reclaim_one().expect("read recovered").expect("entry").0, "prepared");
+        assert_eq!(broker.ledger_snapshot().expect("drained ledger").total_owner_bytes(), 0);
+
+        drop(controller);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(feature = "spill-redb")]
+    #[test]
     fn denied_durable_restore_leaves_redb_record_authoritative() {
         use crate::spill::backings::redb::RedbSpillBacking;
         static DB_SEQ: AtomicUsize = AtomicUsize::new(0);
@@ -1425,6 +1632,10 @@ mod tests {
                 )))
             }
 
+            fn finalize_restore(&self, _sequence: u64) -> MemoryResult<()> {
+                Ok(())
+            }
+
             fn abort_restore(&self, _sequence: u64) -> MemoryResult<()> {
                 Ok(())
             }
@@ -1435,6 +1646,12 @@ mod tests {
 
             fn active_restore(&self) -> MemoryResult<Option<DurableRecordId>> {
                 Ok(Some(DurableRecordId::new(9)))
+            }
+
+            fn recover_active_restore(
+                &self,
+            ) -> MemoryResult<Option<crate::spill::DurableRestoreRecovery>> {
+                Ok(None)
             }
         }
 
@@ -1510,6 +1727,10 @@ mod tests {
                 )))
             }
 
+            fn finalize_restore(&self, _sequence: u64) -> MemoryResult<()> {
+                Ok(())
+            }
+
             fn abort_restore(&self, _sequence: u64) -> MemoryResult<()> {
                 Ok(())
             }
@@ -1524,6 +1745,12 @@ mod tests {
 
             fn active_restore(&self) -> MemoryResult<Option<DurableRecordId>> {
                 Ok(Some(DurableRecordId::new(11)))
+            }
+
+            fn recover_active_restore(
+                &self,
+            ) -> MemoryResult<Option<crate::spill::DurableRestoreRecovery>> {
+                Ok(None)
             }
         }
 
@@ -1549,6 +1776,132 @@ mod tests {
             store
                 .reconcile_durable_restore(&controller, DurableRecordId::new(11))
                 .expect("absent durable record publishes resident source"),
+            DurableRecordResolution::Finalized
+        );
+        assert!(store.pending_durable_restores().expect("resolved IDs").is_empty());
+        assert_eq!(store.reclaim_one().expect("published source").expect("entry").0, "restored");
+        assert_eq!(broker.ledger_snapshot().expect("released source").total_owner_bytes(), 0);
+    }
+
+    #[cfg(feature = "spill")]
+    #[test]
+    fn panicking_finalize_fences_published_source_until_reconciliation() {
+        struct PanickingFinalizeTarget {
+            finalize_calls: AtomicUsize,
+        }
+
+        impl crate::spill::service::sealed::DurableSpillTarget<Vec<u8>> for PanickingFinalizeTarget {}
+        impl SpillInventory for PanickingFinalizeTarget {
+            fn retained_count(&self) -> MemoryResult<u64> {
+                Ok(1)
+            }
+        }
+        impl SpillTarget<Vec<u8>> for PanickingFinalizeTarget {
+            fn is_available(&self) -> bool {
+                true
+            }
+
+            fn accept(&self, _handle: Vec<u8>) -> Result<SpillReceipt, SpillFailure<Vec<u8>>> {
+                unreachable!("restore test does not spill")
+            }
+        }
+        impl DurableSpillTarget<Vec<u8>> for PanickingFinalizeTarget {}
+        impl DurableRestoreTarget for PanickingFinalizeTarget {
+            fn prepare_restore(&self) -> MemoryResult<Option<DurableRestoreCandidate>> {
+                Ok(Some(DurableRestoreCandidate {
+                    sequence: 13,
+                    bytes: b"restored\0payload".to_vec(),
+                }))
+            }
+
+            fn commit_restore(
+                &self,
+                sequence: u64,
+            ) -> Result<(), crate::spill::DurableCommitFailure> {
+                assert_eq!(sequence, 13);
+                Ok(())
+            }
+
+            fn finalize_restore(&self, sequence: u64) -> MemoryResult<()> {
+                assert_eq!(sequence, 13);
+                if self.finalize_calls.fetch_add(1, Ordering::SeqCst) < 2 {
+                    panic!("injected finalize panic");
+                }
+                Ok(())
+            }
+
+            fn abort_restore(&self, _sequence: u64) -> MemoryResult<()> {
+                Ok(())
+            }
+
+            fn reconcile_restore(&self, sequence: u64) -> MemoryResult<DurableRecordResolution> {
+                assert_eq!(sequence, 13);
+                Ok(DurableRecordResolution::Finalized)
+            }
+
+            fn active_restore(&self) -> MemoryResult<Option<DurableRecordId>> {
+                Ok(Some(DurableRecordId::new(13)))
+            }
+
+            fn recover_active_restore(
+                &self,
+            ) -> MemoryResult<Option<crate::spill::DurableRestoreRecovery>> {
+                Ok(Some(crate::spill::DurableRestoreRecovery {
+                    candidate: DurableRestoreCandidate {
+                        sequence: 13,
+                        bytes: b"restored\0payload".to_vec(),
+                    },
+                    phase: crate::spill::DurableRestorePhase::Committed,
+                }))
+            }
+        }
+
+        let broker = live_broker(1_000_000);
+        let store = store_with_broker(&broker);
+        let controller = RoutedSpillController::new(PanickingFinalizeTarget {
+            finalize_calls: AtomicUsize::new(0),
+        });
+
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = store
+                .restore_one_durable(&controller, |bytes| {
+                    let separator = bytes
+                        .iter()
+                        .position(|byte| *byte == 0)
+                        .ok_or_else(|| MemoryError::report("missing separator"))?;
+                    Ok((
+                        String::from_utf8(bytes[..separator].to_vec()).map_err(|error| {
+                            MemoryError::report(format!("invalid key: {error}"))
+                        })?,
+                        bytes[separator + 1..].to_vec(),
+                    ))
+                })
+                .expect("finalize panic occurs after resident preparation");
+        }));
+        assert!(panic.is_err());
+        assert_eq!(
+            store.pending_durable_restores().expect("fenced restore"),
+            vec![DurableRecordId::new(13)]
+        );
+        assert!(store.reclaim_one().expect("fenced source is not readable").is_none());
+        assert!(broker.ledger_snapshot().expect("source remains charged").total_owner_bytes() > 0);
+
+        let reconcile_panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = store
+                .reconcile_durable_restore(&controller, DurableRecordId::new(13))
+                .expect("second finalize panic occurs after provisional publication");
+        }));
+        assert!(reconcile_panic.is_err());
+        assert_eq!(
+            store.pending_durable_restores().expect("refenced restore"),
+            vec![DurableRecordId::new(13)]
+        );
+        assert!(store.reclaim_one().expect("refenced source is not readable").is_none());
+
+        assert_eq!(
+            store
+                .reconcile_durable_restore(&controller, DurableRecordId::new(13))
+                .expect("retry publishes and acknowledges the resident copy"),
             DurableRecordResolution::Finalized
         );
         assert!(store.pending_durable_restores().expect("resolved IDs").is_empty());

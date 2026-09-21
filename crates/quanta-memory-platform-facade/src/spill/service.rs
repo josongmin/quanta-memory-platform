@@ -6,7 +6,7 @@ use quanta_memory_platform_core::{MemoryError, MemoryResult};
 
 use crate::spill::{
     DurableCommitFailure, DurableRecordId, DurableRecordResolution, DurableRestoreCandidate,
-    DurableRestoreController, DurableSpillController, DurableWriteFailure,
+    DurableRestoreController, DurableRestoreRecovery, DurableSpillController, DurableWriteFailure,
     InProcessSpillController, ReconciledDurableSpillController, SpillController,
 };
 
@@ -139,9 +139,11 @@ pub trait DurableRestoreTarget: DurableSpillTarget<Vec<u8>> {
     /// Remove exactly the prepared FIFO sequence and classify failure as known
     /// retained or commit-ambiguous.
     fn commit_restore(&self, sequence: u64) -> Result<(), DurableCommitFailure>;
+    fn finalize_restore(&self, sequence: u64) -> MemoryResult<()>;
     fn abort_restore(&self, sequence: u64) -> MemoryResult<()>;
     fn reconcile_restore(&self, sequence: u64) -> MemoryResult<DurableRecordResolution>;
     fn active_restore(&self) -> MemoryResult<Option<DurableRecordId>>;
+    fn recover_active_restore(&self) -> MemoryResult<Option<DurableRestoreRecovery>>;
 }
 
 /// A missing spill tier: fail closed and return the original handle.
@@ -267,6 +269,10 @@ where
         self.target.commit_restore(sequence)
     }
 
+    fn finalize_restore(&self, sequence: u64) -> MemoryResult<()> {
+        self.target.finalize_restore(sequence)
+    }
+
     fn abort_restore(&self, sequence: u64) -> MemoryResult<()> {
         self.target.abort_restore(sequence)
     }
@@ -277,6 +283,10 @@ where
 
     fn active_restore(&self) -> MemoryResult<Option<DurableRecordId>> {
         self.target.active_restore()
+    }
+
+    fn recover_active_restore(&self) -> MemoryResult<Option<DurableRestoreRecovery>> {
+        self.target.recover_active_restore()
     }
 }
 

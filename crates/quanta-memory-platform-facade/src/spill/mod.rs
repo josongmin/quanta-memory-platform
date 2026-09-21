@@ -129,6 +129,23 @@ pub struct DurableRestoreCandidate {
     pub bytes: Vec<u8>,
 }
 
+/// Persisted phase of an interrupted durable restore.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DurableRestorePhase {
+    /// The record is still in the ordinary durable queue under an active claim.
+    Prepared,
+    /// The record was removed from the queue but its bytes remain in the
+    /// durable recovery slot until resident publication is acknowledged.
+    Committed,
+}
+
+/// Restart recovery material for the single persisted restore claim.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DurableRestoreRecovery {
+    pub candidate: DurableRestoreCandidate,
+    pub phase: DurableRestorePhase,
+}
+
 /// Classification of a failed durable-delete commit.
 #[derive(Debug)]
 pub enum DurableCommitFailure {
@@ -160,10 +177,15 @@ pub enum DurableRestoreOutcome {
 pub trait DurableRestoreController: DurableSpillController<Vec<u8>> {
     fn prepare_restore(&self) -> MemoryResult<Option<DurableRestoreCandidate>>;
     fn commit_restore(&self, sequence: u64) -> Result<(), DurableCommitFailure>;
+    /// Delete the durable recovery payload only after the resident copy has a
+    /// live charge and is ready for publication.
+    fn finalize_restore(&self, sequence: u64) -> MemoryResult<()>;
     /// Release a prepared claim when decode or destination admission fails.
     fn abort_restore(&self, sequence: u64) -> MemoryResult<()>;
     /// Resolve an ambiguous exact-delete outcome and release a retained claim.
     fn reconcile_restore(&self, sequence: u64) -> MemoryResult<DurableRecordResolution>;
     /// Persisted claim left by an interrupted or ambiguous restore.
     fn active_restore(&self) -> MemoryResult<Option<DurableRecordId>>;
+    /// Read restart recovery material without changing its persisted phase.
+    fn recover_active_restore(&self) -> MemoryResult<Option<DurableRestoreRecovery>>;
 }

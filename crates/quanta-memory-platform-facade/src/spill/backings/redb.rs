@@ -7,6 +7,8 @@
 //! surface (boundary rule: no backing-specific nouns leak out of the slice).
 
 use std::path::Path;
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 
 use quanta_memory_platform_core::{MemoryError, MemoryResult};
 use redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition};
@@ -14,12 +16,16 @@ use redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition};
 use crate::spill::service::ReconciledDurableSpillTarget;
 use crate::spill::{
     DurableCommitFailure, DurableRecordId, DurableRecordResolution, DurableRestoreCandidate,
-    DurableRestoreTarget, DurableSpillTarget, DurableWriteFailure, SpillFailure, SpillInventory,
-    SpillReceipt, SpillTarget,
+    DurableRestorePhase, DurableRestoreRecovery, DurableRestoreTarget, DurableSpillTarget,
+    DurableWriteFailure, SpillFailure, SpillInventory, SpillReceipt, SpillTarget,
 };
 
 /// The single FIFO queue table: monotonic sequence -> opaque handle bytes.
 const SPILL_QUEUE: TableDefinition<'static, u64, &[u8]> = TableDefinition::new("qmp_spill_queue");
+/// Payloads removed from the ordinary queue but not yet acknowledged by the
+/// resident destination. This closes the delete-to-publication crash window.
+const SPILL_RECOVERY: TableDefinition<'static, u64, &[u8]> =
+    TableDefinition::new("qmp_spill_recovery");
 /// Persistent allocator state. Queue emptiness must never reset sequence
 /// identity, otherwise a stale restore token can delete a later record (ABA).
 const SPILL_META: TableDefinition<'static, &str, u64> = TableDefinition::new("qmp_spill_meta");
@@ -32,6 +38,17 @@ const FINALIZED_THROUGH: &str = "finalized_through";
 #[derive(Debug)]
 pub struct RedbSpillBacking {
     database: Database,
+    #[cfg(test)]
+    faults: RedbFaults,
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct RedbFaults {
+    fail_write_before_transaction: AtomicBool,
+    lose_write_commit_ack: AtomicBool,
+    lose_restore_commit_ack: AtomicBool,
+    lose_finalize_commit_ack: AtomicBool,
 }
 
 impl RedbSpillBacking {
@@ -47,6 +64,9 @@ impl RedbSpillBacking {
         {
             let queue = txn.open_table(SPILL_QUEUE).map_err(|e| {
                 MemoryError::build(format!("redb spill queue initialization failed: {e}"))
+            })?;
+            let _recovery = txn.open_table(SPILL_RECOVERY).map_err(|e| {
+                MemoryError::build(format!("redb spill recovery initialization failed: {e}"))
             })?;
             let mut meta = txn.open_table(SPILL_META).map_err(|e| {
                 MemoryError::build(format!("redb spill metadata initialization failed: {e}"))
@@ -99,7 +119,7 @@ impl RedbSpillBacking {
                     .map(|(key, _)| key.value());
                 let finalized = first_retained
                     .and_then(|first| first.checked_sub(1))
-                    .or_else(|| (first_retained.is_none() && next > 0).then_some(next - 1));
+                    .or_else(|| (first_retained.is_none() && next > 0).then(|| next - 1));
                 if let Some(finalized) = finalized {
                     meta.insert(FINALIZED_THROUGH, finalized).map_err(|e| {
                         MemoryError::build(format!(
@@ -111,7 +131,31 @@ impl RedbSpillBacking {
         }
         txn.commit()
             .map_err(|e| MemoryError::build(format!("redb spill metadata commit failed: {e}")))?;
-        Ok(Self { database })
+        Ok(Self {
+            database,
+            #[cfg(test)]
+            faults: RedbFaults::default(),
+        })
+    }
+
+    #[cfg(test)]
+    fn inject_fail_write_before_transaction(&self) {
+        self.faults.fail_write_before_transaction.store(true, AtomicOrdering::SeqCst);
+    }
+
+    #[cfg(test)]
+    fn inject_lost_write_commit_ack(&self) {
+        self.faults.lose_write_commit_ack.store(true, AtomicOrdering::SeqCst);
+    }
+
+    #[cfg(test)]
+    fn inject_lost_restore_commit_ack(&self) {
+        self.faults.lose_restore_commit_ack.store(true, AtomicOrdering::SeqCst);
+    }
+
+    #[cfg(test)]
+    fn inject_lost_finalize_commit_ack(&self) {
+        self.faults.lose_finalize_commit_ack.store(true, AtomicOrdering::SeqCst);
     }
 
     /// Number of handles currently retained (restorable). For diagnostics/tests.
@@ -122,7 +166,18 @@ impl RedbSpillBacking {
             .map_err(|e| MemoryError::report(format!("redb spill read txn failed: {e}")))?;
         match read.open_table(SPILL_QUEUE) {
             Ok(table) => {
-                table.len().map_err(|e| MemoryError::report(format!("redb spill len failed: {e}")))
+                let recovery = read.open_table(SPILL_RECOVERY).map_err(|e| {
+                    MemoryError::report(format!("redb spill recovery table open failed: {e}"))
+                })?;
+                let queue_len = table
+                    .len()
+                    .map_err(|e| MemoryError::report(format!("redb spill len failed: {e}")))?;
+                let recovery_len = recovery
+                    .len()
+                    .map_err(|e| MemoryError::report(format!("redb recovery len failed: {e}")))?;
+                queue_len
+                    .checked_add(recovery_len)
+                    .ok_or_else(|| MemoryError::capacity("redb spill inventory exceeds u64"))
             }
             Err(redb::TableError::TableDoesNotExist(_)) => Ok(0),
             Err(e) => Err(MemoryError::report(format!("redb spill table open failed: {e}"))),
@@ -231,6 +286,12 @@ impl ReconciledDurableSpillTarget for RedbSpillBacking {
         bytes: &[u8],
     ) -> Result<SpillReceipt, DurableWriteFailure> {
         let not_committed = |error| DurableWriteFailure::NotCommitted(Box::new(error));
+        #[cfg(test)]
+        if self.faults.fail_write_before_transaction.swap(false, AtomicOrdering::SeqCst) {
+            return Err(not_committed(MemoryError::report(
+                "injected redb failure before write transaction",
+            )));
+        }
         let txn = self.database.begin_write().map_err(|e| {
             not_committed(MemoryError::report(format!("redb spill write transaction failed: {e}")))
         })?;
@@ -306,36 +367,46 @@ impl ReconciledDurableSpillTarget for RedbSpillBacking {
             }
         };
 
-        match txn.commit() {
-            Ok(()) => Ok(SpillReceipt::Durable { sequence: record_id.get(), inventory_after }),
-            Err(error) => {
-                let commit_error = MemoryError::report(format!(
-                    "redb spill commit acknowledgement failed: {error}"
-                ));
-                match self.resolve_record(record_id) {
-                    Ok(DurableRecordResolution::Present { inventory_after }) => {
-                        Ok(SpillReceipt::Durable { sequence: record_id.get(), inventory_after })
-                    }
-                    Ok(DurableRecordResolution::Absent) => {
-                        Err(DurableWriteFailure::NotCommitted(Box::new(commit_error)))
-                    }
-                    Ok(DurableRecordResolution::Finalized) => {
-                        let inventory_after = self.retained_count().map_err(|probe_error| {
-                            DurableWriteFailure::RecoveryRequired {
-                                record_id,
-                                commit_error: Box::new(commit_error),
-                                probe_error: Box::new(probe_error),
-                            }
-                        })?;
-                        Ok(SpillReceipt::Durable { sequence: record_id.get(), inventory_after })
-                    }
-                    Err(probe_error) => Err(DurableWriteFailure::RecoveryRequired {
-                        record_id,
-                        commit_error: Box::new(commit_error),
-                        probe_error: Box::new(probe_error),
-                    }),
+        let commit_error = match txn.commit() {
+            Ok(()) => {
+                #[cfg(test)]
+                if self.faults.lose_write_commit_ack.swap(false, AtomicOrdering::SeqCst) {
+                    Some(MemoryError::report("injected lost redb spill commit acknowledgement"))
+                } else {
+                    None
                 }
+                #[cfg(not(test))]
+                None
             }
+            Err(error) => Some(MemoryError::report(format!(
+                "redb spill commit acknowledgement failed: {error}"
+            ))),
+        };
+        match commit_error {
+            None => Ok(SpillReceipt::Durable { sequence: record_id.get(), inventory_after }),
+            Some(commit_error) => match self.resolve_record(record_id) {
+                Ok(DurableRecordResolution::Present { inventory_after }) => {
+                    Ok(SpillReceipt::Durable { sequence: record_id.get(), inventory_after })
+                }
+                Ok(DurableRecordResolution::Absent) => {
+                    Err(DurableWriteFailure::NotCommitted(Box::new(commit_error)))
+                }
+                Ok(DurableRecordResolution::Finalized) => {
+                    let inventory_after = self.retained_count().map_err(|probe_error| {
+                        DurableWriteFailure::RecoveryRequired {
+                            record_id,
+                            commit_error: Box::new(commit_error),
+                            probe_error: Box::new(probe_error),
+                        }
+                    })?;
+                    Ok(SpillReceipt::Durable { sequence: record_id.get(), inventory_after })
+                }
+                Err(probe_error) => Err(DurableWriteFailure::RecoveryRequired {
+                    record_id,
+                    commit_error: Box::new(commit_error),
+                    probe_error: Box::new(probe_error),
+                }),
+            },
         }
     }
 
@@ -345,14 +416,29 @@ impl ReconciledDurableSpillTarget for RedbSpillBacking {
         })?;
         match read.open_table(SPILL_QUEUE) {
             Ok(table) => {
-                if table
+                let recovery = read.open_table(SPILL_RECOVERY).map_err(|error| {
+                    MemoryError::report(format!(
+                        "redb spill recovery probe table open failed: {error}"
+                    ))
+                })?;
+                let queue_present = table
                     .get(record_id.get())
                     .map_err(|e| MemoryError::report(format!("redb spill probe failed: {e}")))?
-                    .is_some()
-                {
+                    .is_some();
+                let recovery_present = recovery
+                    .get(record_id.get())
+                    .map_err(|e| MemoryError::report(format!("redb recovery probe failed: {e}")))?
+                    .is_some();
+                if queue_present || recovery_present {
+                    let queue_len = table.len().map_err(|e| {
+                        MemoryError::report(format!("redb spill probe inventory failed: {e}"))
+                    })?;
+                    let recovery_len = recovery.len().map_err(|e| {
+                        MemoryError::report(format!("redb recovery probe inventory failed: {e}"))
+                    })?;
                     Ok(DurableRecordResolution::Present {
-                        inventory_after: table.len().map_err(|e| {
-                            MemoryError::report(format!("redb spill probe inventory failed: {e}"))
+                        inventory_after: queue_len.checked_add(recovery_len).ok_or_else(|| {
+                            MemoryError::capacity("redb spill inventory exceeds u64")
                         })?,
                     })
                 } else {
@@ -448,6 +534,11 @@ impl DurableRestoreTarget for RedbSpillBacking {
                     "redb spill table open failed: {e}"
                 )))
             })?;
+            let mut recovery = txn.open_table(SPILL_RECOVERY).map_err(|e| {
+                DurableCommitFailure::retained(MemoryError::report(format!(
+                    "redb spill recovery table open failed: {e}"
+                )))
+            })?;
             let mut meta = txn.open_table(SPILL_META).map_err(|e| {
                 DurableCommitFailure::retained(MemoryError::report(format!(
                     "redb spill metadata table failed: {e}"
@@ -466,6 +557,17 @@ impl DurableRestoreTarget for RedbSpillBacking {
                     "durable restore candidate {sequence} is not the active claim {active:?}"
                 ))));
             }
+            if recovery
+                .get(sequence)
+                .map_err(|e| {
+                    DurableCommitFailure::retained(MemoryError::report(format!(
+                        "redb recovery idempotency read failed: {e}"
+                    )))
+                })?
+                .is_some()
+            {
+                return Ok(());
+            }
             let first_sequence = table
                 .first()
                 .map_err(|e| {
@@ -481,19 +583,22 @@ impl DurableRestoreTarget for RedbSpillBacking {
                     ),
                 )));
             }
-            let removed = table.pop_first().map_err(|e| {
+            let removed = table
+                .remove(sequence)
+                .map_err(|e| {
+                    DurableCommitFailure::retained(MemoryError::report(format!(
+                        "redb spill exact remove failed: {e}"
+                    )))
+                })?
+                .map(|bytes| bytes.value().to_vec())
+                .ok_or_else(|| {
+                    DurableCommitFailure::retained(MemoryError::InvalidState(
+                        "durable restore candidate vanished before commit".into(),
+                    ))
+                })?;
+            recovery.insert(sequence, removed.as_slice()).map_err(|e| {
                 DurableCommitFailure::retained(MemoryError::report(format!(
-                    "redb spill pop failed: {e}"
-                )))
-            })?;
-            if removed.is_none() {
-                return Err(DurableCommitFailure::retained(MemoryError::InvalidState(
-                    "durable restore candidate vanished before commit".into(),
-                )));
-            }
-            meta.remove(ACTIVE_RESTORE_SEQUENCE).map_err(|e| {
-                DurableCommitFailure::retained(MemoryError::report(format!(
-                    "redb active restore clear failed: {e}"
+                    "redb recovery payload write failed: {e}"
                 )))
             })?;
             let finalized = meta
@@ -512,11 +617,89 @@ impl DurableRestoreTarget for RedbSpillBacking {
                 })?;
             }
         }
-        txn.commit().map_err(|e| {
-            DurableCommitFailure::ambiguous(MemoryError::report(format!(
-                "redb spill restore commit outcome is ambiguous: {e}"
-            )))
-        })
+        match txn.commit() {
+            Ok(()) => {
+                #[cfg(test)]
+                if self.faults.lose_restore_commit_ack.swap(false, AtomicOrdering::SeqCst) {
+                    return Err(DurableCommitFailure::ambiguous(MemoryError::report(
+                        "injected lost redb restore commit acknowledgement",
+                    )));
+                }
+                Ok(())
+            }
+            Err(error) => Err(DurableCommitFailure::ambiguous(MemoryError::report(format!(
+                "redb spill restore commit outcome is ambiguous: {error}"
+            )))),
+        }
+    }
+
+    fn finalize_restore(&self, sequence: u64) -> MemoryResult<()> {
+        let txn = self.database.begin_write().map_err(|e| {
+            MemoryError::report(format!("redb restore-finalize transaction failed: {e}"))
+        })?;
+        {
+            let mut recovery = txn.open_table(SPILL_RECOVERY).map_err(|e| {
+                MemoryError::report(format!("redb spill recovery table open failed: {e}"))
+            })?;
+            let mut meta = txn.open_table(SPILL_META).map_err(|e| {
+                MemoryError::report(format!("redb spill metadata table failed: {e}"))
+            })?;
+            let active = meta
+                .get(ACTIVE_RESTORE_SEQUENCE)
+                .map_err(|e| MemoryError::report(format!("redb active restore read failed: {e}")))?
+                .map(|value| value.value());
+            let recovery_present = recovery
+                .get(sequence)
+                .map_err(|e| MemoryError::report(format!("redb recovery read failed: {e}")))?
+                .is_some();
+            match (active, recovery_present) {
+                (Some(active), true) if active == sequence => {
+                    recovery.remove(sequence).map_err(|e| {
+                        MemoryError::report(format!("redb recovery payload clear failed: {e}"))
+                    })?;
+                    meta.remove(ACTIVE_RESTORE_SEQUENCE).map_err(|e| {
+                        MemoryError::report(format!("redb active restore clear failed: {e}"))
+                    })?;
+                }
+                (None, false) => return Ok(()),
+                (Some(active), _) => {
+                    return Err(MemoryError::InvalidState(format!(
+                        "cannot finalize restore {sequence}; active claim is {active} and recovery_present={recovery_present}"
+                    )))
+                }
+                (None, true) => {
+                    return Err(MemoryError::InvalidState(format!(
+                        "restore {sequence} has recovery bytes without an active claim"
+                    )))
+                }
+            }
+        }
+        let commit_error = match txn.commit() {
+            Ok(()) => {
+                #[cfg(test)]
+                if self.faults.lose_finalize_commit_ack.swap(false, AtomicOrdering::SeqCst) {
+                    Some("injected lost redb restore-finalize acknowledgement".to_string())
+                } else {
+                    None
+                }
+                #[cfg(not(test))]
+                None
+            }
+            Err(error) => Some(error.to_string()),
+        };
+        match commit_error {
+            None => Ok(()),
+            Some(error) => {
+                let recovery = self.recover_active_restore()?;
+                if recovery.is_none() {
+                    Ok(())
+                } else {
+                    Err(MemoryError::report(format!(
+                        "redb restore-finalize commit outcome remains unresolved: {error}"
+                    )))
+                }
+            }
+        }
     }
 
     fn abort_restore(&self, sequence: u64) -> MemoryResult<()> {
@@ -524,6 +707,9 @@ impl DurableRestoreTarget for RedbSpillBacking {
             MemoryError::report(format!("redb restore-abort transaction failed: {e}"))
         })?;
         {
+            let recovery = txn.open_table(SPILL_RECOVERY).map_err(|e| {
+                MemoryError::report(format!("redb spill recovery table open failed: {e}"))
+            })?;
             let mut meta = txn.open_table(SPILL_META).map_err(|e| {
                 MemoryError::report(format!("redb spill metadata table failed: {e}"))
             })?;
@@ -533,6 +719,17 @@ impl DurableRestoreTarget for RedbSpillBacking {
                 .map(|value| value.value());
             match active {
                 Some(active) if active == sequence => {
+                    if recovery
+                        .get(sequence)
+                        .map_err(|e| {
+                            MemoryError::report(format!("redb recovery read failed: {e}"))
+                        })?
+                        .is_some()
+                    {
+                        return Err(MemoryError::InvalidState(format!(
+                            "restore {sequence} is already committed to durable recovery and cannot be aborted"
+                        )));
+                    }
                     meta.remove(ACTIVE_RESTORE_SEQUENCE).map_err(|e| {
                         MemoryError::report(format!("redb active restore clear failed: {e}"))
                     })?;
@@ -567,12 +764,19 @@ impl DurableRestoreTarget for RedbSpillBacking {
         let table = read
             .open_table(SPILL_QUEUE)
             .map_err(|e| MemoryError::report(format!("redb spill table open failed: {e}")))?;
+        let recovery = read.open_table(SPILL_RECOVERY).map_err(|e| {
+            MemoryError::report(format!("redb spill recovery table open failed: {e}"))
+        })?;
         let meta = read
             .open_table(SPILL_META)
             .map_err(|e| MemoryError::report(format!("redb spill metadata table failed: {e}")))?;
         let present = table
             .get(sequence)
             .map_err(|e| MemoryError::report(format!("redb restore probe failed: {e}")))?
+            .is_some();
+        let recovery_present = recovery
+            .get(sequence)
+            .map_err(|e| MemoryError::report(format!("redb recovery probe failed: {e}")))?
             .is_some();
         let inventory_after = table
             .len()
@@ -586,6 +790,7 @@ impl DurableRestoreTarget for RedbSpillBacking {
             .map_err(|e| MemoryError::report(format!("redb finalized watermark read failed: {e}")))?
             .map(|value| value.value());
         drop(meta);
+        drop(recovery);
         drop(table);
         drop(read);
 
@@ -599,6 +804,14 @@ impl DurableRestoreTarget for RedbSpillBacking {
                 self.abort_restore(sequence)?;
             }
             return Ok(DurableRecordResolution::Present { inventory_after });
+        }
+        if recovery_present {
+            if active != Some(sequence) {
+                return Err(MemoryError::InvalidState(format!(
+                    "restore {sequence} has recovery bytes but active claim is {active:?}"
+                )));
+            }
+            return Ok(DurableRecordResolution::Finalized);
         }
         if finalized.is_some_and(|value| sequence <= value) {
             return Ok(DurableRecordResolution::Finalized);
@@ -618,6 +831,49 @@ impl DurableRestoreTarget for RedbSpillBacking {
         meta.get(ACTIVE_RESTORE_SEQUENCE)
             .map_err(|e| MemoryError::report(format!("redb active restore read failed: {e}")))
             .map(|active| active.map(|value| DurableRecordId::new(value.value())))
+    }
+
+    fn recover_active_restore(&self) -> MemoryResult<Option<DurableRestoreRecovery>> {
+        let read = self.database.begin_read().map_err(|e| {
+            MemoryError::report(format!("redb active restore recovery transaction failed: {e}"))
+        })?;
+        let meta = read
+            .open_table(SPILL_META)
+            .map_err(|e| MemoryError::report(format!("redb spill metadata table failed: {e}")))?;
+        let Some(sequence) = meta
+            .get(ACTIVE_RESTORE_SEQUENCE)
+            .map_err(|e| MemoryError::report(format!("redb active restore read failed: {e}")))?
+            .map(|value| value.value())
+        else {
+            return Ok(None);
+        };
+        let recovery = read.open_table(SPILL_RECOVERY).map_err(|e| {
+            MemoryError::report(format!("redb spill recovery table open failed: {e}"))
+        })?;
+        if let Some(bytes) = recovery
+            .get(sequence)
+            .map_err(|e| MemoryError::report(format!("redb recovery payload read failed: {e}")))?
+        {
+            return Ok(Some(DurableRestoreRecovery {
+                candidate: DurableRestoreCandidate { sequence, bytes: bytes.value().to_vec() },
+                phase: DurableRestorePhase::Committed,
+            }));
+        }
+        let queue = read
+            .open_table(SPILL_QUEUE)
+            .map_err(|e| MemoryError::report(format!("redb spill table open failed: {e}")))?;
+        if let Some(bytes) = queue
+            .get(sequence)
+            .map_err(|e| MemoryError::report(format!("redb spill payload read failed: {e}")))?
+        {
+            return Ok(Some(DurableRestoreRecovery {
+                candidate: DurableRestoreCandidate { sequence, bytes: bytes.value().to_vec() },
+                phase: DurableRestorePhase::Prepared,
+            }));
+        }
+        Err(MemoryError::InvalidState(format!(
+            "active restore {sequence} has neither queued nor recovery payload"
+        )))
     }
 }
 
@@ -646,6 +902,7 @@ mod tests {
                 *error
             }
         })?;
+        backing.finalize_restore(candidate.sequence)?;
         Ok(Some(bytes))
     }
 
@@ -661,6 +918,7 @@ mod tests {
                 *error
             }
         })?;
+        controller.finalize_restore(candidate.sequence)?;
         Ok(Some(bytes))
     }
 
@@ -746,6 +1004,7 @@ mod tests {
         assert_eq!(first, SpillReceipt::Durable { sequence: 0, inventory_after: 1 });
         let stale = backing.prepare_restore().expect("prepare").expect("candidate");
         backing.commit_restore(stale.sequence).expect("drain first");
+        backing.finalize_restore(stale.sequence).expect("acknowledge first restore");
 
         let replacement = spill_backing(&backing, b"replacement").expect("accept after full drain");
         assert_eq!(replacement, SpillReceipt::Durable { sequence: 1, inventory_after: 1 });
@@ -788,6 +1047,101 @@ mod tests {
         ));
         assert_eq!(backing.active_restore(), Ok(None));
         assert_eq!(backing.prepare_restore().expect("prepare after recovery").unwrap().sequence, 0);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn committed_restore_payload_survives_reopen_until_resident_ack() {
+        let path = temp_db_path();
+        let _ = std::fs::remove_file(&path);
+        {
+            let backing = RedbSpillBacking::create(&path).expect("open 1");
+            let _receipt = spill_backing(&backing, b"crash-safe").expect("seed");
+            let candidate = backing.prepare_restore().expect("prepare").expect("candidate");
+            backing.commit_restore(candidate.sequence).expect("move to recovery");
+            assert_eq!(backing.retained_count(), Ok(1));
+            assert_eq!(backing.active_restore(), Ok(Some(DurableRecordId::new(0))));
+        }
+
+        let backing = RedbSpillBacking::create(&path).expect("open 2");
+        let recovery =
+            backing.recover_active_restore().expect("read recovery").expect("persisted recovery");
+        assert_eq!(recovery.phase, DurableRestorePhase::Committed);
+        assert_eq!(recovery.candidate.sequence, 0);
+        assert_eq!(recovery.candidate.bytes, b"crash-safe");
+        assert!(matches!(backing.prepare_restore(), Err(MemoryError::OperationInProgress(_))));
+
+        backing.finalize_restore(0).expect("resident publication acknowledgement");
+        assert_eq!(backing.active_restore(), Ok(None));
+        assert_eq!(backing.retained_count(), Ok(0));
+        assert_eq!(
+            backing.resolve_record(DurableRecordId::new(0)),
+            Ok(DurableRecordResolution::Finalized)
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn injected_write_crash_points_converge_without_duplicate_records() {
+        let path = temp_db_path();
+        let _ = std::fs::remove_file(&path);
+        let backing = RedbSpillBacking::create(&path).expect("open");
+
+        let first = backing.reserve_record_id().expect("reserve first");
+        backing.inject_fail_write_before_transaction();
+        assert!(matches!(
+            backing.commit_spill(first, b"first"),
+            Err(DurableWriteFailure::NotCommitted(_))
+        ));
+        assert_eq!(backing.resolve_record(first), Ok(DurableRecordResolution::Absent));
+
+        let second = backing.reserve_record_id().expect("reserve second");
+        backing.inject_lost_write_commit_ack();
+        let receipt = backing
+            .commit_spill(second, b"second")
+            .expect("post-commit probe converts lost ack to committed");
+        assert_eq!(receipt, SpillReceipt::Durable { sequence: 1, inventory_after: 1 });
+        let retry = backing
+            .commit_spill(second, b"second")
+            .expect("same record and payload are idempotent");
+        assert_eq!(retry, receipt);
+        assert_eq!(backing.retained_count(), Ok(1));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn injected_restore_and_finalize_ack_loss_preserve_recovery_authority() {
+        let path = temp_db_path();
+        let _ = std::fs::remove_file(&path);
+        let backing = RedbSpillBacking::create(&path).expect("open");
+        let _receipt = spill_backing(&backing, b"recoverable").expect("seed");
+        let candidate = backing.prepare_restore().expect("prepare").expect("candidate");
+
+        backing.inject_lost_restore_commit_ack();
+        assert!(matches!(
+            backing.commit_restore(candidate.sequence),
+            Err(DurableCommitFailure::Ambiguous(_))
+        ));
+        let recovery = backing
+            .recover_active_restore()
+            .expect("probe recovery")
+            .expect("committed recovery payload");
+        assert_eq!(recovery.phase, DurableRestorePhase::Committed);
+        assert_eq!(recovery.candidate.bytes, b"recoverable");
+        assert_eq!(
+            backing.reconcile_restore(candidate.sequence),
+            Ok(DurableRecordResolution::Finalized)
+        );
+
+        backing.inject_lost_finalize_commit_ack();
+        backing
+            .finalize_restore(candidate.sequence)
+            .expect("post-finalize probe converts lost ack to success");
+        assert_eq!(backing.active_restore(), Ok(None));
+        assert_eq!(backing.retained_count(), Ok(0));
 
         let _ = std::fs::remove_file(&path);
     }
