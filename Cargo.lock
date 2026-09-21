@@ -418,6 +418,7 @@ dependencies = [
  "hashlink",
  "quanta-memory-platform-core",
  "redb",
+ "tracking-allocator",
 ]
 
 [[package]]

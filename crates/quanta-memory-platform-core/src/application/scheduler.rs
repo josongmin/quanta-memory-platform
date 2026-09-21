@@ -35,30 +35,70 @@ pub struct WeightedResourceGroupScheduler {
     groups: BTreeMap<String, ResourceGroup>,
     usage: BTreeMap<String, u64>,
     shared_burst_pool_bytes: u64,
+    /// Sum of `max(group.reserved_bytes - live_usage, 0)`. Kept as u128 so a
+    /// large group registry cannot overflow while the externally enforced
+    /// non-headroom band remains u64.
+    unused_reserved_floor_bytes: u128,
 }
 
 impl WeightedResourceGroupScheduler {
     #[must_use]
     pub fn new(groups: BTreeMap<String, ResourceGroup>, shared_burst_pool_bytes: u64) -> Self {
-        Self { groups, usage: BTreeMap::new(), shared_burst_pool_bytes }
+        let unused_reserved_floor_bytes =
+            groups.values().fold(0u128, |total, group| total + u128::from(group.reserved_bytes));
+        Self {
+            groups,
+            usage: BTreeMap::new(),
+            shared_burst_pool_bytes,
+            unused_reserved_floor_bytes,
+        }
+    }
+
+    fn unused_floor_for(&self, group_name: &str, usage: u64) -> u64 {
+        self.groups.get(group_name).map_or(0, |group| group.reserved_bytes.saturating_sub(usage))
+    }
+
+    /// Checked growth postimage without mutating scheduler state.
+    pub(crate) fn usage_after_growth(&self, group_name: &str, delta: u64) -> MemoryResult<u64> {
+        self.current_usage(group_name)
+            .checked_add(delta)
+            .ok_or_else(|| MemoryError::capacity("resource-group usage exceeds u64"))
+    }
+
+    /// Checked release postimage without mutating scheduler state.
+    pub(crate) fn usage_after_release(&self, group_name: &str, delta: u64) -> MemoryResult<u64> {
+        self.current_usage(group_name)
+            .checked_sub(delta)
+            .ok_or_else(|| MemoryError::InvalidState("resource-group release exceeds usage".into()))
     }
 
     /// Record committed growth for a group so subsequent admission decisions see
     /// live usage. Returns the new usage total for that group.
     pub fn record_usage(&mut self, group_name: &str, delta: u64) -> MemoryResult<u64> {
-        let after = self
-            .current_usage(group_name)
-            .checked_add(delta)
-            .ok_or_else(|| MemoryError::capacity("resource-group usage exceeds u64"))?;
+        let before = self.current_usage(group_name);
+        let after = self.usage_after_growth(group_name, delta)?;
+        let unused_before = self.unused_floor_for(group_name, before);
+        let unused_after = self.unused_floor_for(group_name, after);
+        self.unused_reserved_floor_bytes = self
+            .unused_reserved_floor_bytes
+            .checked_sub(u128::from(unused_before))
+            .and_then(|total| total.checked_add(u128::from(unused_after)))
+            .expect("scheduler floor aggregate mirrors registered groups");
         self.usage.insert(group_name.to_string(), after);
         Ok(after)
     }
 
     /// Record a release for a group.
     pub fn record_release(&mut self, group_name: &str, delta: u64) -> MemoryResult<u64> {
-        let after = self.current_usage(group_name).checked_sub(delta).ok_or_else(|| {
-            MemoryError::InvalidState("resource-group release exceeds usage".into())
-        })?;
+        let before = self.current_usage(group_name);
+        let after = self.usage_after_release(group_name, delta)?;
+        let unused_before = self.unused_floor_for(group_name, before);
+        let unused_after = self.unused_floor_for(group_name, after);
+        self.unused_reserved_floor_bytes = self
+            .unused_reserved_floor_bytes
+            .checked_sub(u128::from(unused_before))
+            .and_then(|total| total.checked_add(u128::from(unused_after)))
+            .expect("scheduler floor aggregate mirrors registered groups");
         self.usage.insert(group_name.to_string(), after);
         Ok(after)
     }
@@ -76,16 +116,56 @@ impl WeightedResourceGroupScheduler {
         non_headroom_usage: u64,
         non_headroom_band: u64,
     ) -> MemoryResult<()> {
-        let unused_floor = self.groups.iter().try_fold(0u64, |total, (name, group)| {
-            total
-                .checked_add(group.reserved_bytes.saturating_sub(self.current_usage(name)))
-                .ok_or_else(|| MemoryError::capacity("resource-group reserved floor exceeds u64"))
-        })?;
+        self.protected_floor_fits_with_unused(
+            non_headroom_usage,
+            non_headroom_band,
+            self.unused_reserved_floor_bytes,
+        )
+    }
+
+    /// Validate the floor after one prospective group growth without cloning
+    /// the scheduler or scanning every configured group.
+    pub(crate) fn protected_floor_fits_after_growth(
+        &self,
+        group_name: Option<&str>,
+        delta: u64,
+        non_headroom_usage: u64,
+        non_headroom_band: u64,
+    ) -> MemoryResult<()> {
+        let prospective_unused = if let Some(group_name) = group_name {
+            let before = self.current_usage(group_name);
+            let after = self.usage_after_growth(group_name, delta)?;
+            self.unused_reserved_floor_bytes
+                .checked_sub(u128::from(self.unused_floor_for(group_name, before)))
+                .and_then(|total| {
+                    total.checked_add(u128::from(self.unused_floor_for(group_name, after)))
+                })
+                .ok_or_else(|| {
+                    MemoryError::InvalidState(
+                        "resource-group floor aggregate is inconsistent".into(),
+                    )
+                })?
+        } else {
+            self.unused_reserved_floor_bytes
+        };
+        self.protected_floor_fits_with_unused(
+            non_headroom_usage,
+            non_headroom_band,
+            prospective_unused,
+        )
+    }
+
+    fn protected_floor_fits_with_unused(
+        &self,
+        non_headroom_usage: u64,
+        non_headroom_band: u64,
+        unused_floor: u128,
+    ) -> MemoryResult<()> {
         let protected_postimage =
-            non_headroom_usage.checked_add(unused_floor).ok_or_else(|| {
-                MemoryError::capacity("resource-group protected postimage exceeds u64")
+            u128::from(non_headroom_usage).checked_add(unused_floor).ok_or_else(|| {
+                MemoryError::capacity("resource-group protected postimage exceeds u128")
             })?;
-        if protected_postimage > non_headroom_band {
+        if protected_postimage > u128::from(non_headroom_band) {
             return Err(MemoryError::capacity(format!(
                 "resource-group usage {non_headroom_usage} plus unused floors {unused_floor} \
                  exceeds non-headroom band {non_headroom_band}"
@@ -237,6 +317,31 @@ mod tests {
         assert!(!s.admits("fg", 1), "no more burst available");
         s.record_release("fg", 300).expect("release"); // give back the borrowed share
         assert!(s.admits("fg", 200), "released capacity becomes admissible again");
+    }
+
+    #[test]
+    fn prospective_floor_aggregate_matches_committed_growth_and_release() {
+        let mut groups = BTreeMap::new();
+        let mut a = group(1_000, 1);
+        a.reserved_bytes = 100;
+        let mut b = group(1_000, 1);
+        b.reserved_bytes = 200;
+        groups.insert("a".to_string(), a);
+        groups.insert("b".to_string(), b);
+        let mut scheduler = WeightedResourceGroupScheduler::new(groups, 0);
+
+        scheduler
+            .protected_floor_fits_after_growth(Some("a"), 100, 800, 1_000)
+            .expect("prospective growth consumes a's floor exactly");
+        assert!(matches!(
+            scheduler.protected_floor_fits_after_growth(Some("a"), 100, 801, 1_000),
+            Err(MemoryError::Capacity(_))
+        ));
+
+        scheduler.record_usage("a", 100).expect("commit growth");
+        scheduler.protected_floor_fits(800, 1_000).expect("committed aggregate matches preview");
+        scheduler.record_release("a", 100).expect("release growth");
+        scheduler.protected_floor_fits(700, 1_000).expect("release restores reserved floor");
     }
 
     // scenario D-local: an empty scheduler (no groups) has total_weight == 0.

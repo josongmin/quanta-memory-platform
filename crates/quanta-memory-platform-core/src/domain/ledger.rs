@@ -321,6 +321,12 @@ pub(crate) struct AccountingLedger {
     class_usage: BTreeMap<MemoryClass, UsageBreakdown>,
     owner_usage: BTreeMap<OwnerKey, UsageBreakdown>,
     context_usage: BTreeMap<MemoryContextKind, UsageBreakdown>,
+    /// Exact O(1) aggregate used by admission. The three public accounting
+    /// axes remain the reporting authority; every mutation updates all four
+    /// representations in the same fail-closed transaction.
+    total_usage: UsageBreakdown,
+    /// Exact subset of `total_usage` excluding the reserved Headroom class.
+    non_headroom_bytes: u64,
     /// This ledger's process-unique instance tag, stamped on every issued ticket.
     instance_id: u64,
     /// Canonical reservation state machine. An id exists exactly while its
@@ -329,6 +335,8 @@ pub(crate) struct AccountingLedger {
     /// `None` means the u64 id space was exhausted. IDs never wrap or reuse.
     next_ticket_id: Option<u64>,
     rebuild_in_progress: bool,
+    #[cfg(test)]
+    last_release_preflight_axis_probes: usize,
 }
 
 #[cfg(feature = "live_control")]
@@ -340,10 +348,14 @@ impl AccountingLedger {
             class_usage: BTreeMap::new(),
             owner_usage: BTreeMap::new(),
             context_usage: BTreeMap::new(),
+            total_usage: UsageBreakdown::default(),
+            non_headroom_bytes: 0,
             instance_id: LEDGER_INSTANCE.fetch_add(1, Ordering::Relaxed),
             ticket_states: BTreeMap::new(),
             next_ticket_id: Some(1),
             rebuild_in_progress: false,
+            #[cfg(test)]
+            last_release_preflight_axis_probes: 0,
         }
     }
 
@@ -373,6 +385,11 @@ impl AccountingLedger {
         self.rebuild_in_progress = false;
     }
 
+    #[must_use]
+    pub(crate) fn rebuild_in_progress(&self) -> bool {
+        self.rebuild_in_progress
+    }
+
     /// Current usage on a class axis.
     #[must_use]
     pub fn class_usage(&self, class: &MemoryClass) -> UsageBreakdown {
@@ -383,6 +400,118 @@ impl AccountingLedger {
     #[must_use]
     pub fn owner_usage(&self, owner: &OwnerKey) -> UsageBreakdown {
         self.owner_usage.get(owner).copied().unwrap_or_default()
+    }
+
+    /// Exact semantic usage without cloning or scanning reporting maps.
+    pub(crate) fn total_semantic_bytes(&self) -> u64 {
+        self.total_usage.total()
+    }
+
+    /// Exact non-headroom usage without cloning or scanning class maps.
+    pub(crate) fn non_headroom_bytes(&self) -> u64 {
+        self.non_headroom_bytes
+    }
+
+    /// Exact live-scratch usage without cloning or scanning owner maps.
+    pub(crate) fn total_live_scratch_bytes(&self) -> u64 {
+        self.total_usage.live_scratch_bytes
+    }
+
+    /// Validate one reservation from the current known-valid state by reading
+    /// only the affected owner/class slots plus the fixed policy taxonomy.
+    /// This is equivalent to `validate_policy_postimage(..., Some(delta))`
+    /// without cloning all live owner and context maps under the broker lock.
+    fn validate_reserve_postimage(
+        &self,
+        class: &MemoryClass,
+        owner: &OwnerKey,
+        bytes: u64,
+    ) -> MemoryResult<()> {
+        let policy = self.policy();
+        if !policy.classes.contains_key(class) {
+            return Err(MemoryError::capacity(format!(
+                "class {class:?} is not configured in the active residency policy"
+            )));
+        }
+
+        let global_after = self
+            .total_semantic_bytes()
+            .checked_add(bytes)
+            .ok_or_else(|| MemoryError::capacity("global postimage exceeds u64"))?;
+        if global_after > policy.global_hard_limit_bytes {
+            return Err(MemoryError::capacity(format!(
+                "global hard limit {} below postimage {global_after}",
+                policy.global_hard_limit_bytes
+            )));
+        }
+
+        let mut non_headroom_after = 0u64;
+        let mut unused_class_floor = 0u64;
+        let mut total_borrow = 0u64;
+        for (candidate, budget) in &policy.classes {
+            let current = self.class_usage(candidate).checked_total()?;
+            let used = if candidate == class {
+                current
+                    .checked_add(bytes)
+                    .ok_or_else(|| MemoryError::capacity("class postimage exceeds u64"))?
+            } else {
+                current
+            };
+            if *candidate != MemoryClass::Headroom {
+                non_headroom_after = non_headroom_after
+                    .checked_add(used)
+                    .ok_or_else(|| MemoryError::capacity("non-headroom postimage exceeds u64"))?;
+                unused_class_floor = unused_class_floor
+                    .checked_add(budget.reserved_bytes.saturating_sub(used))
+                    .ok_or_else(|| MemoryError::capacity("class reserved floor exceeds u64"))?;
+            }
+            if used > budget.hard_cap_bytes {
+                if !budget.borrow_from_shared_pool {
+                    return Err(MemoryError::capacity(format!(
+                        "non-borrowing class {candidate:?} hard cap {} below postimage {used}",
+                        budget.hard_cap_bytes
+                    )));
+                }
+                total_borrow = total_borrow
+                    .checked_add(used - budget.hard_cap_bytes)
+                    .ok_or_else(|| MemoryError::capacity("class borrow exceeds u64"))?;
+            }
+        }
+        if total_borrow > policy.shared_burst_pool_bytes {
+            return Err(MemoryError::capacity(format!(
+                "class borrow {total_borrow} exceeds shared pool {}",
+                policy.shared_burst_pool_bytes
+            )));
+        }
+        let non_headroom_band =
+            policy
+                .global_hard_limit_bytes
+                .checked_sub(policy.headroom_bytes)
+                .ok_or_else(|| MemoryError::capacity("headroom exceeds global hard limit"))?;
+        let protected_postimage = non_headroom_after
+            .checked_add(unused_class_floor)
+            .ok_or_else(|| MemoryError::capacity("class protected postimage exceeds u64"))?;
+        if protected_postimage > non_headroom_band {
+            return Err(MemoryError::capacity(format!(
+                "non-headroom usage {non_headroom_after} plus unused class floors \
+                 {unused_class_floor} exceeds band {non_headroom_band}"
+            )));
+        }
+
+        if let Some(quota) = policy.owner_quotas.get(owner) {
+            let owner_after = self
+                .owner_usage(owner)
+                .checked_total()?
+                .checked_add(bytes)
+                .ok_or_else(|| MemoryError::capacity("owner postimage exceeds u64"))?;
+            if owner_after > quota.hard_cap_bytes {
+                return Err(MemoryError::capacity(format!(
+                    "owner {owner} hard cap {} below postimage {owner_after}",
+                    quota.hard_cap_bytes
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Canonical legal-state predicate shared by reserve and live reconfigure.
@@ -529,8 +658,7 @@ impl AccountingLedger {
 
         // --- pure checks, no mutation yet ---
 
-        let snapshot = self.snapshot();
-        Self::validate_policy_postimage(self.policy(), &snapshot, Some((&class, &owner, bytes)))?;
+        self.validate_reserve_postimage(&class, &owner, bytes)?;
         self.context_usage
             .get(&context)
             .copied()
@@ -542,6 +670,7 @@ impl AccountingLedger {
             self.class_usage.get(&class),
             self.owner_usage.get(&owner),
             self.context_usage.get(&context),
+            Some(&self.total_usage),
         ] {
             if usage.map_or(0, |u| u.slot(kind)).checked_add(bytes).is_none() {
                 return Err(MemoryError::capacity("ledger charge-kind slot exceeds u64"));
@@ -561,6 +690,13 @@ impl AccountingLedger {
             self.class_usage.entry(class.clone()).or_default().add(kind, bytes);
             self.owner_usage.entry(owner.clone()).or_default().add(kind, bytes);
             self.context_usage.entry(context).or_default().add(kind, bytes);
+            self.total_usage.add(kind, bytes);
+            if class != MemoryClass::Headroom {
+                self.non_headroom_bytes = self
+                    .non_headroom_bytes
+                    .checked_add(bytes)
+                    .expect("ledger reserve preflight checked non-headroom aggregate");
+            }
         }
 
         Ok(ReservationTicket { id, ledger: self.instance_id, class, owner, context, kind, bytes })
@@ -700,28 +836,86 @@ impl AccountingLedger {
         Ok(())
     }
 
-    fn preflight_release_batch(&self, tickets: &[ReservationTicket]) -> MemoryResult<()> {
-        let mut snapshot = self.snapshot();
-        snapshot.validate_exact()?;
+    fn preflight_release_batch(&mut self, tickets: &[ReservationTicket]) -> MemoryResult<()> {
+        let mut class_refunds = BTreeMap::<(MemoryClass, ChargeKind), u64>::new();
+        let mut owner_refunds = BTreeMap::<(OwnerKey, ChargeKind), u64>::new();
+        let mut context_refunds = BTreeMap::<(MemoryContextKind, ChargeKind), u64>::new();
+        let mut total_refunds = UsageBreakdown::default();
+        let mut non_headroom_refund = 0u64;
         for ticket in tickets {
             if ticket.bytes == 0 {
                 continue;
             }
-            for usage in [
-                snapshot.class_usage.get_mut(&ticket.class),
-                snapshot.owner_usage.get_mut(&ticket.owner),
-                snapshot.context_usage.get_mut(&ticket.context),
+            for (slot, label) in [
+                (
+                    class_refunds.entry((ticket.class.clone(), ticket.kind)).or_default(),
+                    "class release batch exceeds u64",
+                ),
+                (
+                    owner_refunds.entry((ticket.owner.clone(), ticket.kind)).or_default(),
+                    "owner release batch exceeds u64",
+                ),
             ] {
-                let Some(usage) = usage else {
-                    return Err(MemoryError::InvalidState("release axis is missing".into()));
-                };
-                let slot = usage.slot_mut(ticket.kind);
-                *slot = slot.checked_sub(ticket.bytes).ok_or_else(|| {
-                    MemoryError::InvalidState("release exceeds charged axis slot".into())
-                })?;
+                *slot = slot
+                    .checked_add(ticket.bytes)
+                    .ok_or_else(|| MemoryError::InvalidState(label.into()))?;
+            }
+            let context_slot = context_refunds.entry((ticket.context, ticket.kind)).or_default();
+            *context_slot = context_slot.checked_add(ticket.bytes).ok_or_else(|| {
+                MemoryError::InvalidState("context release batch exceeds u64".into())
+            })?;
+            total_refunds.add(ticket.kind, ticket.bytes);
+            if ticket.class != MemoryClass::Headroom {
+                non_headroom_refund =
+                    non_headroom_refund.checked_add(ticket.bytes).ok_or_else(|| {
+                        MemoryError::InvalidState("non-headroom release batch exceeds u64".into())
+                    })?;
             }
         }
-        snapshot.validate_exact()
+
+        #[cfg(test)]
+        {
+            self.last_release_preflight_axis_probes =
+                class_refunds.len() + owner_refunds.len() + context_refunds.len();
+        }
+
+        for ((class, kind), bytes) in &class_refunds {
+            let usage = self
+                .class_usage
+                .get(class)
+                .ok_or_else(|| MemoryError::InvalidState("release class axis is missing".into()))?;
+            usage.slot(*kind).checked_sub(*bytes).ok_or_else(|| {
+                MemoryError::InvalidState("release exceeds charged class slot".into())
+            })?;
+        }
+        for ((owner, kind), bytes) in &owner_refunds {
+            let usage = self
+                .owner_usage
+                .get(owner)
+                .ok_or_else(|| MemoryError::InvalidState("release owner axis is missing".into()))?;
+            usage.slot(*kind).checked_sub(*bytes).ok_or_else(|| {
+                MemoryError::InvalidState("release exceeds charged owner slot".into())
+            })?;
+        }
+        for ((context, kind), bytes) in &context_refunds {
+            let usage = self.context_usage.get(context).ok_or_else(|| {
+                MemoryError::InvalidState("release context axis is missing".into())
+            })?;
+            usage.slot(*kind).checked_sub(*bytes).ok_or_else(|| {
+                MemoryError::InvalidState("release exceeds charged context slot".into())
+            })?;
+        }
+        for kind in
+            [ChargeKind::RetainedPayload, ChargeKind::RetainedMetadata, ChargeKind::LiveScratch]
+        {
+            self.total_usage.slot(kind).checked_sub(total_refunds.slot(kind)).ok_or_else(|| {
+                MemoryError::InvalidState("release exceeds charged aggregate slot".into())
+            })?;
+        }
+        self.non_headroom_bytes.checked_sub(non_headroom_refund).ok_or_else(|| {
+            MemoryError::InvalidState("release exceeds non-headroom aggregate".into())
+        })?;
+        Ok(())
     }
 
     fn validate_release_ticket(&self, ticket: &ReservationTicket) -> MemoryResult<()> {
@@ -793,6 +987,13 @@ impl AccountingLedger {
         if self.context_usage.get(&ticket.context).is_some_and(|u| u.total() == 0) {
             self.context_usage.remove(&ticket.context);
         }
+        self.total_usage.sub(ticket.kind, ticket.bytes);
+        if ticket.class != MemoryClass::Headroom {
+            self.non_headroom_bytes = self
+                .non_headroom_bytes
+                .checked_sub(ticket.bytes)
+                .expect("ledger release preflight checked non-headroom aggregate");
+        }
     }
 
     /// Restore a ticket removed by this ledger's in-lock replacement primitive.
@@ -807,6 +1008,13 @@ impl AccountingLedger {
         self.class_usage.entry(ticket.class.clone()).or_default().add(ticket.kind, ticket.bytes);
         self.owner_usage.entry(ticket.owner.clone()).or_default().add(ticket.kind, ticket.bytes);
         self.context_usage.entry(ticket.context).or_default().add(ticket.kind, ticket.bytes);
+        self.total_usage.add(ticket.kind, ticket.bytes);
+        if ticket.class != MemoryClass::Headroom {
+            self.non_headroom_bytes = self
+                .non_headroom_bytes
+                .checked_add(ticket.bytes)
+                .expect("released ticket restoration returns a previously charged aggregate");
+        }
     }
 
     /// Immutable usage snapshot for reporting and invariant assertions.
@@ -1285,6 +1493,81 @@ mod tests {
         assert_eq!(ledger.snapshot(), before, "preflight failure must not release first ticket");
         assert!(ledger.ticket_states.contains_key(&first.id()));
         assert!(ledger.ticket_states.contains_key(&second.id()));
+    }
+
+    #[test]
+    fn single_release_preflight_is_bounded_by_affected_slots_at_10k_owners() {
+        let mut ledger = ledger_from_policy(ResidencyPolicy::new(20_000));
+        let mut tickets = Vec::with_capacity(10_000);
+        for owner in 0..10_000 {
+            tickets.push(
+                reserve(&mut ledger, MemoryClass::ArtifactCache, &format!("owner-{owner}"), 1)
+                    .expect("reserve one byte per owner"),
+            );
+        }
+        assert_eq!(ledger.total_semantic_bytes(), 10_000);
+        assert_eq!(ledger.non_headroom_bytes(), 10_000);
+
+        let released = tickets.pop().expect("one ticket");
+        ledger.release(&released).expect("single owner release");
+
+        assert_eq!(
+            ledger.last_release_preflight_axis_probes, 3,
+            "one release probes exactly one class/kind, owner/kind and context/kind slot"
+        );
+        assert_eq!(ledger.owner_usage.len(), 9_999, "unaffected owner cardinality is preserved");
+        assert_eq!(ledger.total_semantic_bytes(), 9_999);
+        assert_eq!(ledger.non_headroom_bytes(), 9_999);
+        assert_axes_balanced(&ledger.snapshot());
+
+        ledger.release_batch(&tickets).expect("drain remaining tickets");
+        assert_eq!(ledger.total_semantic_bytes(), 0);
+        assert_eq!(ledger.non_headroom_bytes(), 0);
+        assert_axes_balanced(&ledger.snapshot());
+    }
+
+    #[test]
+    fn aggregate_usage_tracks_charge_kinds_and_headroom() {
+        let mut ledger = ledger_from_policy(ResidencyPolicy::new(1_000));
+        let payload = reserve_kind(
+            &mut ledger,
+            MemoryClass::ArtifactCache,
+            "payload",
+            MemoryContextKind::Request,
+            ChargeKind::RetainedPayload,
+            100,
+        )
+        .expect("payload");
+        let scratch = reserve_kind(
+            &mut ledger,
+            MemoryClass::ExecutionScratch,
+            "scratch",
+            MemoryContextKind::Generation,
+            ChargeKind::LiveScratch,
+            200,
+        )
+        .expect("scratch");
+        let headroom = reserve_kind(
+            &mut ledger,
+            MemoryClass::Headroom,
+            "headroom",
+            MemoryContextKind::Runtime,
+            ChargeKind::RetainedMetadata,
+            50,
+        )
+        .expect("headroom");
+
+        assert_eq!(ledger.total_semantic_bytes(), 350);
+        assert_eq!(ledger.total_live_scratch_bytes(), 200);
+        assert_eq!(ledger.non_headroom_bytes(), 300);
+        ledger.release(&scratch).expect("scratch release");
+        assert_eq!(ledger.total_semantic_bytes(), 150);
+        assert_eq!(ledger.total_live_scratch_bytes(), 0);
+        assert_eq!(ledger.non_headroom_bytes(), 100);
+        ledger.release_batch(&[payload, headroom]).expect("final release");
+        assert_eq!(ledger.total_semantic_bytes(), 0);
+        assert_eq!(ledger.non_headroom_bytes(), 0);
+        assert_axes_balanced(&ledger.snapshot());
     }
 
     #[test]

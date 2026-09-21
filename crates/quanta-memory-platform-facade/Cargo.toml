@@ -59,3 +59,6 @@ blake3 = { workspace = true, optional = true }
 hashlink = { workspace = true, optional = true }
 quanta-memory-platform-core = { path = "../quanta-memory-platform-core", default-features = false }
 redb = { workspace = true, optional = true }
+
+[dev-dependencies]
+tracking-allocator.workspace = true

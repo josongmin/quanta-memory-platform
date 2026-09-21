@@ -626,24 +626,7 @@ impl LiveProcessMemoryBroker {
         // non-headroom charge and adding the replacement. Without this check a
         // peer group could consume another group's reserved floor by growing an
         // already-live charge instead of issuing a fresh reserve.
-        let snapshot = core.ledger.snapshot();
-        snapshot.validate_exact().map_err(|error| RechargeError {
-            error,
-            recovery: RechargeRecoveryV1::OldChargePreserved,
-        })?;
-        let non_headroom_current = snapshot
-            .class_usage
-            .iter()
-            .filter(|(candidate, _)| **candidate != MemoryClass::Headroom)
-            .try_fold(0u64, |total, (_, usage)| {
-                total
-                    .checked_add(usage.checked_total()?)
-                    .ok_or_else(|| MemoryError::capacity("non-headroom usage exceeds u64"))
-            })
-            .map_err(|error| RechargeError {
-                error,
-                recovery: RechargeRecoveryV1::OldChargePreserved,
-            })?;
+        let non_headroom_current = core.ledger.non_headroom_bytes();
         let without_old = if *old.class() == MemoryClass::Headroom {
             non_headroom_current
         } else {
@@ -680,7 +663,7 @@ impl LiveProcessMemoryBroker {
         // ledger so the atomic primitive cannot bypass this outer authority.
         if let Some(max) = core.report.execution.max_execution_scratch_bytes {
             let max = u64::try_from(max).unwrap_or(u64::MAX);
-            let current = core.ledger.snapshot().total_live_scratch_bytes();
+            let current = core.ledger.total_live_scratch_bytes();
             let without_old = if old.kind() == ChargeKind::LiveScratch {
                 current.checked_sub(old.bytes()).ok_or_else(|| RechargeError {
                     error: MemoryError::InvalidState(
@@ -966,26 +949,45 @@ impl LiveProcessMemoryBroker {
         }
     }
 
-    /// Release on an already-held lock guard (ledger release + group bookkeeping),
-    /// fail-closed before any scheduler mutation.
+    /// Release on an already-held lock guard (ledger release + group bookkeeping).
+    /// Scheduler state is preflighted and transactionally restored if the
+    /// ledger rejects the ticket, avoiding a full scheduler clone.
     fn release_on(core: &mut BrokerCore, ticket: &ReservationTicket) -> MemoryResult<()> {
-        let mut next_scheduler = core.scheduler.clone();
-        if let Some(group) = core.ticket_groups.get(&ticket.id()) {
-            next_scheduler.record_release(group, ticket.bytes())?;
+        let group = core.ticket_groups.get(&ticket.id()).cloned();
+        if let Some(group) = &group {
+            core.scheduler.usage_after_release(group, ticket.bytes())?;
+            core.scheduler.record_release(group, ticket.bytes())?;
         }
-        core.ledger.release(ticket)?;
-        core.scheduler = next_scheduler;
+        if let Err(error) = core.ledger.release(ticket) {
+            if let Some(group) = &group {
+                core.scheduler.record_usage(group, ticket.bytes()).map_err(|rollback| {
+                    MemoryError::InvalidState(format!(
+                        "ledger release failed ({error}); scheduler rollback also failed ({rollback})"
+                    ))
+                })?;
+            }
+            return Err(error);
+        }
         core.ticket_groups.remove(&ticket.id());
         Ok(())
     }
 
     fn rollback_pending_on(core: &mut BrokerCore, ticket: &ReservationTicket) -> MemoryResult<()> {
-        let mut next_scheduler = core.scheduler.clone();
-        if let Some(group) = core.ticket_groups.get(&ticket.id()) {
-            next_scheduler.record_release(group, ticket.bytes())?;
+        let group = core.ticket_groups.get(&ticket.id()).cloned();
+        if let Some(group) = &group {
+            core.scheduler.usage_after_release(group, ticket.bytes())?;
+            core.scheduler.record_release(group, ticket.bytes())?;
         }
-        core.ledger.rollback_pending(ticket)?;
-        core.scheduler = next_scheduler;
+        if let Err(error) = core.ledger.rollback_pending(ticket) {
+            if let Some(group) = &group {
+                core.scheduler.record_usage(group, ticket.bytes()).map_err(|rollback| {
+                    MemoryError::InvalidState(format!(
+                        "ledger pending rollback failed ({error}); scheduler rollback also failed ({rollback})"
+                    ))
+                })?;
+            }
+            return Err(error);
+        }
         core.ticket_groups.remove(&ticket.id());
         Ok(())
     }
@@ -1019,7 +1021,7 @@ impl LiveProcessMemoryBroker {
         let ticket = charge.ticket;
         let bytes = ticket.bytes();
         let mut core = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
-        if core.ledger.snapshot().rebuild_in_progress {
+        if core.ledger.rebuild_in_progress() {
             core.deferred_committed_releases.push(ticket);
             drop(core);
             self.emit(MemoryEvent::new(MemoryOperation::Release, MemoryOutcome::Busy, Some(bytes)));
@@ -1041,14 +1043,40 @@ impl LiveProcessMemoryBroker {
     }
 
     fn release_many_on(core: &mut BrokerCore, tickets: &[ReservationTicket]) -> MemoryResult<()> {
-        let mut next_scheduler = core.scheduler.clone();
+        let mut group_refunds = BTreeMap::<String, u64>::new();
         for ticket in tickets {
             if let Some(group) = core.ticket_groups.get(&ticket.id()) {
-                next_scheduler.record_release(group, ticket.bytes())?;
+                let refund = group_refunds.entry(group.clone()).or_default();
+                *refund = refund.checked_add(ticket.bytes()).ok_or_else(|| {
+                    MemoryError::InvalidState("resource-group batch release exceeds u64".into())
+                })?;
             }
         }
-        core.ledger.release_batch(tickets)?;
-        core.scheduler = next_scheduler;
+        for (group, refund) in &group_refunds {
+            core.scheduler.usage_after_release(group, *refund)?;
+        }
+        let mut applied: Vec<(String, u64)> = Vec::with_capacity(group_refunds.len());
+        for (group, refund) in &group_refunds {
+            if let Err(error) = core.scheduler.record_release(group, *refund) {
+                for (applied_group, applied_refund) in applied {
+                    core.scheduler
+                        .record_usage(&applied_group, applied_refund)
+                        .expect("preflighted scheduler batch rollback");
+                }
+                return Err(error);
+            }
+            applied.push((group.clone(), *refund));
+        }
+        if let Err(error) = core.ledger.release_batch(tickets) {
+            for (group, refund) in applied {
+                core.scheduler.record_usage(&group, refund).map_err(|rollback| {
+                    MemoryError::InvalidState(format!(
+                        "ledger batch release failed ({error}); scheduler rollback also failed ({rollback})"
+                    ))
+                })?;
+            }
+            return Err(error);
+        }
         for ticket in tickets {
             core.ticket_groups.remove(&ticket.id());
         }
@@ -1072,27 +1100,16 @@ impl LiveProcessMemoryBroker {
         // D: resource-group admission. An owner mapped to a group must pass the
         // weighted-fair scheduler (anti-starvation) before it can reserve.
         let group = core.ledger.policy().owner_groups.get(&owner).cloned();
-        let mut next_scheduler = core.scheduler.clone();
         if let Some(ref group) = group {
-            if !next_scheduler.admits(group, bytes) {
+            if !core.scheduler.admits(group, bytes) {
                 return Err(MemoryError::capacity(format!(
                     "resource group {group} admission denied for owner {owner} reserve of {bytes} bytes"
                 )));
             }
-            next_scheduler.record_usage(group, bytes)?;
+            core.scheduler.usage_after_growth(group, bytes)?;
         }
         if class != MemoryClass::Headroom {
-            let snapshot = core.ledger.snapshot();
-            snapshot.validate_exact()?;
-            let non_headroom_current = snapshot
-                .class_usage
-                .iter()
-                .filter(|(candidate, _)| **candidate != MemoryClass::Headroom)
-                .try_fold(0u64, |total, (_, usage)| {
-                    total
-                        .checked_add(usage.checked_total()?)
-                        .ok_or_else(|| MemoryError::capacity("non-headroom usage exceeds u64"))
-                })?;
+            let non_headroom_current = core.ledger.non_headroom_bytes();
             let non_headroom_after = non_headroom_current
                 .checked_add(bytes)
                 .ok_or_else(|| MemoryError::capacity("non-headroom reserve total exceeds u64"))?;
@@ -1102,7 +1119,12 @@ impl LiveProcessMemoryBroker {
                 .global_hard_limit_bytes
                 .checked_sub(core.ledger.policy().headroom_bytes)
                 .ok_or_else(|| MemoryError::capacity("headroom exceeds global hard limit"))?;
-            next_scheduler.protected_floor_fits(non_headroom_after, band)?;
+            core.scheduler.protected_floor_fits_after_growth(
+                group.as_deref(),
+                bytes,
+                non_headroom_after,
+                band,
+            )?;
         }
 
         // ExecutionBudget: the memory-relevant cap is `max_execution_scratch_bytes`,
@@ -1112,12 +1134,8 @@ impl LiveProcessMemoryBroker {
         if kind == ChargeKind::LiveScratch {
             if let Some(max) = core.report.execution.max_execution_scratch_bytes {
                 let max = u64::try_from(max).unwrap_or(u64::MAX);
-                let live_after = core
-                    .ledger
-                    .snapshot()
-                    .total_live_scratch_bytes()
-                    .checked_add(bytes)
-                    .ok_or_else(|| {
+                let live_after =
+                    core.ledger.total_live_scratch_bytes().checked_add(bytes).ok_or_else(|| {
                         MemoryError::capacity("execution scratch reserve total exceeds u64")
                     })?;
                 if live_after > max {
@@ -1129,10 +1147,17 @@ impl LiveProcessMemoryBroker {
         }
 
         let ticket = core.ledger.reserve(class, owner, context, kind, bytes)?;
-        core.scheduler = next_scheduler;
         // Keep scheduler usage in sync so admission reflects live group usage, and
         // remember the issuing group so release is symmetric across reconfigure.
         if let Some(group) = group {
+            if let Err(error) = core.scheduler.record_usage(&group, bytes) {
+                core.ledger.rollback_pending(&ticket).map_err(|rollback| {
+                    MemoryError::InvalidState(format!(
+                        "scheduler commit failed ({error}); ledger rollback also failed ({rollback})"
+                    ))
+                })?;
+                return Err(error);
+            }
             core.ticket_groups.insert(ticket.id(), group);
         }
         Ok(ticket)
