@@ -600,7 +600,7 @@ fn transcript_builder_exposes_public_charged_path() {
 fn spill_controller_round_trips_a_handle_via_restore() {
     let controller = RoutedSpillController::new(InMemorySpillTarget::<u64>::available());
 
-    let spilled: MemoryResult<()> = controller.spill(42);
+    let spilled = controller.spill(42);
     assert!(spilled.is_ok(), "an available target must accept the spill: {spilled:?}");
     assert_eq!(controller.spilled_count(), 1, "a successful spill increments the count");
 
@@ -619,18 +619,20 @@ fn spill_controller_round_trips_a_handle_via_restore() {
 #[test]
 fn spill_controller_fails_closed_when_target_unavailable() {
     let controller = RoutedSpillController::new(InMemorySpillTarget::<u64>::unavailable());
-    let result: MemoryResult<()> = controller.spill(7);
-    assert!(result.is_err(), "an unavailable spill target must fail closed, got Ok");
+    let result = controller.spill(7);
+    let failure = result.expect_err("an unavailable spill target must fail closed");
+    assert!(matches!(failure.error(), quanta_memory_platform_core::MemoryError::Capacity(_)));
+    assert_eq!(failure.into_parts().1, 7, "failed spill returns the only handle");
     assert_eq!(controller.spilled_count(), 0, "a failed spill must not increment the count");
 }
 
-/// The `NoopSpillController` always succeeds and never retains — the documented
-/// no-op contract for hosts without a configured spill backend.
+/// No configured target must not certify a destructive discard as persistence.
 #[cfg(feature = "spill")]
 #[test]
-fn noop_spill_controller_succeeds_and_restores_nothing() {
+fn noop_spill_controller_rejects_and_restores_nothing() {
     let controller = NoopSpillController;
-    assert!(SpillController::<u64>::spill(&controller, 1).is_ok(), "noop spill always succeeds");
+    let failure = SpillController::<u64>::spill(&controller, 1).expect_err("no target");
+    assert_eq!(failure.into_parts().1, 1);
     assert_eq!(
         SpillController::<u64>::restore(&controller).expect("noop restore succeeds"),
         None,

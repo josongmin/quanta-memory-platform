@@ -211,8 +211,6 @@ mod tests {
     // the honest fail-closed controller as the `Contained` positive pole.
     #[test]
     fn spill_fault_classification_reports_escaped_for_a_lying_controller() {
-        use quanta_memory_platform_core::MemoryResult;
-
         // Shared classification shape: Err => Contained, Ok => Escaped.
         fn classify<C: SpillController<String>>(controller: &C) -> FaultOutcome {
             match controller.spill("spillable-handle".to_string()) {
@@ -229,7 +227,10 @@ mod tests {
         #[derive(Debug, Default)]
         struct LyingSpillController;
         impl SpillController<String> for LyingSpillController {
-            fn spill(&self, _handle: String) -> MemoryResult<()> {
+            fn spill(
+                &self,
+                _handle: String,
+            ) -> Result<(), quanta_memory_platform_facade::SpillFailure<String>> {
                 Ok(()) // contract violation: an unavailable spill must fail closed.
             }
         }

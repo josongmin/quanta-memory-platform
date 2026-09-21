@@ -1237,7 +1237,8 @@ fn run_spill_slice() -> Vec<AssertionVerdict> {
     vec![
         round_trip,
         fail_closed.assert_that(
-            matches!(&spill_denied, Err(MemoryError::Capacity(_))) && offline_spilled_after == 0,
+            matches!(&spill_denied, Err(failure) if matches!(failure.error(), MemoryError::Capacity(_)) && failure.handle() == "handle-b")
+                && offline_spilled_after == 0,
             format!("spill_denied={spill_denied:?} offline_spilled_after={offline_spilled_after}",),
         ),
     ]
@@ -1248,8 +1249,6 @@ mod tests {
     use super::*;
     use crate::conformance::target::{AccountingView, AllocatorAdvisoryView};
     use crate::fake::{AccountingFidelity, FakeProcessBroker};
-    #[cfg(feature = "fixtures")]
-    use quanta_memory_platform_core::MemoryResult;
     use quanta_memory_platform_core::{
         LiveProcessMemoryBroker, MemoryBudgetManifest, MemoryClass, MemoryClassBudget,
         MemoryPreset, ReclaimPriority, ResidencyPolicy, StoreBindingHandle,
@@ -2186,7 +2185,10 @@ mod tests {
         fn is_available(&self) -> bool {
             true
         }
-        fn accept(&self, _handle: String) -> MemoryResult<()> {
+        fn accept(
+            &self,
+            _handle: String,
+        ) -> Result<(), quanta_memory_platform_facade::SpillFailure<String>> {
             Ok(()) // BUG under test: reports success but drops the handle.
         }
         // restore uses the trait default -> always Ok(None): nothing comes back.

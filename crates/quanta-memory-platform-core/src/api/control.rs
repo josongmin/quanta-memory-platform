@@ -233,6 +233,14 @@ pub struct ManagedCharge {
 }
 
 impl ManagedCharge {
+    /// Whether this live lease was issued by the given broker authority.
+    /// Transfer consumers must check this before attaching a charge to a
+    /// different store; matching ticket numbers are not broker identity.
+    #[must_use]
+    pub fn belongs_to(&self, broker: &LiveProcessMemoryBroker) -> bool {
+        Arc::ptr_eq(&self.broker.inner, &broker.inner)
+    }
+
     #[must_use]
     pub fn is_active(&self) -> bool {
         self.charge.is_some()

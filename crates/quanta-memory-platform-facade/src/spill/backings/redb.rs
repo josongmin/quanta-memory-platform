@@ -11,7 +11,7 @@ use std::path::Path;
 use quanta_memory_platform_core::{MemoryError, MemoryResult};
 use redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition};
 
-use crate::spill::SpillTarget;
+use crate::spill::{SpillFailure, SpillTarget};
 
 /// The single FIFO queue table: monotonic sequence -> opaque handle bytes.
 const SPILL_QUEUE: TableDefinition<'static, u64, &[u8]> = TableDefinition::new("qmp_spill_queue");
@@ -76,39 +76,36 @@ impl SpillTarget<Vec<u8>> for RedbSpillBacking {
         true
     }
 
-    fn accept(&self, handle: Vec<u8>) -> MemoryResult<()> {
-        let txn = self
-            .database
-            .begin_write()
-            .map_err(|e| MemoryError::report(format!("redb spill write txn failed: {e}")))?;
-        {
-            let mut table = txn
-                .open_table(SPILL_QUEUE)
-                .map_err(|e| MemoryError::report(format!("redb spill table open failed: {e}")))?;
-            // Derive the next FIFO key INSIDE the write transaction (redb serializes
-            // writers), so sequence assignment + insert are atomic: concurrent
-            // accepts stay strictly FIFO and a failed/rolled-back txn burns no key
-            // (the table itself is the single source of truth, also restart-safe).
-            let last_key = table
-                .last()
-                .map_err(|e| MemoryError::report(format!("redb spill scan failed: {e}")))?
-                .map(|(k, _)| k.value());
-            // `checked_add` is the single guard: an exhausted keyspace (last key ==
-            // u64::MAX) would otherwise reuse the key and OVERWRITE a retained
-            // handle. Reject it fail-closed (astronomically unreachable) rather than
-            // losing a handle.
-            let next = match last_key {
-                Some(k) => k.checked_add(1).ok_or_else(|| {
-                    MemoryError::capacity("redb spill queue key space exhausted (u64::MAX)")
-                })?,
-                None => 0,
-            };
-            table
-                .insert(next, handle.as_slice())
-                .map_err(|e| MemoryError::report(format!("redb spill insert failed: {e}")))?;
-        }
-        txn.commit().map_err(|e| MemoryError::report(format!("redb spill commit failed: {e}")))?;
-        Ok(())
+    fn accept(&self, handle: Vec<u8>) -> Result<(), SpillFailure<Vec<u8>>> {
+        let commit = (|| -> MemoryResult<()> {
+            let txn = self
+                .database
+                .begin_write()
+                .map_err(|e| MemoryError::report(format!("redb spill write txn failed: {e}")))?;
+            {
+                let mut table = txn.open_table(SPILL_QUEUE).map_err(|e| {
+                    MemoryError::report(format!("redb spill table open failed: {e}"))
+                })?;
+                // The FIFO key and insertion share one serialized transaction.
+                let last_key = table
+                    .last()
+                    .map_err(|e| MemoryError::report(format!("redb spill scan failed: {e}")))?
+                    .map(|(k, _)| k.value());
+                let next = match last_key {
+                    Some(k) => k.checked_add(1).ok_or_else(|| {
+                        MemoryError::capacity("redb spill queue key space exhausted (u64::MAX)")
+                    })?,
+                    None => 0,
+                };
+                table
+                    .insert(next, handle.as_slice())
+                    .map_err(|e| MemoryError::report(format!("redb spill insert failed: {e}")))?;
+            }
+            txn.commit()
+                .map_err(|e| MemoryError::report(format!("redb spill commit failed: {e}")))?;
+            Ok(())
+        })();
+        commit.map_err(|error| SpillFailure::new(error, handle))
     }
 
     fn restore(&self) -> MemoryResult<Option<Vec<u8>>> {
@@ -237,7 +234,8 @@ mod tests {
 
         let err = SpillTarget::accept(&backing, b"overflow".to_vec())
             .expect_err("accept at an exhausted keyspace must be rejected");
-        assert!(matches!(err, MemoryError::Capacity(_)), "got {err:?}");
+        assert!(matches!(err.error(), MemoryError::Capacity(_)), "got {err:?}");
+        assert_eq!(err.into_parts().1, b"overflow", "failed write returns the original bytes");
 
         // The retained handle at u64::MAX was NOT overwritten or lost.
         assert_eq!(backing.retained_count().expect("len"), 1, "the seeded handle survives");

@@ -5,12 +5,13 @@ use quanta_memory_platform_core::MemoryResult;
 
 pub use service::{
     InMemorySpillTarget, NoopSpillController, RetainingSpillTarget, RoutedSpillController,
-    SpillTarget,
+    SpillFailure, SpillTarget,
 };
 
 pub trait SpillController<Handle> {
-    /// Offload a handle to the spill tier.
-    fn spill(&self, handle: Handle) -> MemoryResult<()>;
+    /// Offload a handle to the spill tier. On failure the caller regains the
+    /// original handle and remains responsible for its accounting authority.
+    fn spill(&self, handle: Handle) -> Result<(), SpillFailure<Handle>>;
 
     /// Restore a previously spilled handle (oldest first), or `None` if the tier
     /// holds nothing to bring back. Default: nothing to restore (a write-only /

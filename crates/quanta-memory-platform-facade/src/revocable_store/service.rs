@@ -12,6 +12,8 @@ use crate::shared::accounting::Unbudgeted;
 use crate::shared::accounting::{Budgeted, StoreAccounting};
 use crate::shared::lifecycle::{retire_client_value, BeginClose, StoreLifecycle};
 use crate::shared::measure::{semantic_cost_v1, ByteSized, RetainedCostV1};
+#[cfg(feature = "spill")]
+use crate::spill::{SpillController, SpillFailure};
 
 #[derive(Debug)]
 struct RevocableEntry<Key, Value> {
@@ -22,12 +24,57 @@ struct RevocableEntry<Key, Value> {
     charge: Option<ManagedCharge>,
 }
 
+/// In-process transfer authority. The value, its semantic cost, and the
+/// issuing broker lease move together; dropping an un-restored handle retires
+/// them together. This is not a durable serialization format.
+#[cfg(feature = "spill")]
+#[derive(Debug)]
+pub struct RevocableSpillHandle<Key, Value> {
+    binding: StoreBindingHandle,
+    entry: Option<RevocableEntry<Key, Value>>,
+}
+
+#[cfg(feature = "spill")]
+impl<Key, Value> RevocableSpillHandle<Key, Value> {
+    #[must_use]
+    pub fn key(&self) -> &Key {
+        &self.entry.as_ref().expect("live spill handle").key
+    }
+
+    #[must_use]
+    pub fn value(&self) -> &Value {
+        &self.entry.as_ref().expect("live spill handle").value
+    }
+
+    #[must_use]
+    pub fn charged_bytes(&self) -> u64 {
+        self.entry.as_ref().expect("live spill handle").charged_bytes
+    }
+
+    fn into_entry(mut self) -> RevocableEntry<Key, Value> {
+        self.entry.take().expect("live spill handle")
+    }
+}
+
+#[cfg(feature = "spill")]
+impl<Key, Value> Drop for RevocableSpillHandle<Key, Value> {
+    fn drop(&mut self) {
+        if let Some(entry) = self.entry.take() {
+            retire_entry(entry);
+        }
+    }
+}
+
+fn retire_entry<Key, Value>(entry: RevocableEntry<Key, Value>) {
+    let RevocableEntry { key, value, charge, .. } = entry;
+    drop(charge);
+    retire_client_value(key);
+    retire_client_value(value);
+}
+
 fn retire_entries<Key, Value>(entries: Vec<RevocableEntry<Key, Value>>) {
     for entry in entries {
-        let RevocableEntry { key, value, charge, .. } = entry;
-        drop(charge);
-        retire_client_value(key);
-        retire_client_value(value);
+        retire_entry(entry);
     }
 }
 
@@ -210,6 +257,103 @@ impl<Key, Value> SimpleRevocableStore<Key, Value, Budgeted> {
     }
 }
 
+#[cfg(feature = "spill")]
+impl<Key, Value> SimpleRevocableStore<Key, Value, Budgeted> {
+    /// Transfer the oldest entry to an in-process tier without refunding its
+    /// process-resident charge. A failed destination returns the exact handle,
+    /// which is restored at its original FIFO position before the error escapes.
+    pub fn spill_one_into<C>(&self, controller: &C) -> MemoryResult<bool>
+    where
+        C: SpillController<RevocableSpillHandle<Key, Value>>,
+    {
+        let _mutation = self.lifecycle.begin_mutation()?;
+        let (entry, next_committed) = {
+            let mut state = self.lock_state()?;
+            let Some(entry) = state.entries.first() else {
+                return Ok(false);
+            };
+            self.require_charge_shape(entry, "spill transfer")?;
+            let next_committed =
+                state.committed_bytes.checked_sub(entry.charged_bytes).ok_or_else(|| {
+                    MemoryError::InvalidState(
+                        "revocable committed bytes are smaller than transferred entry".into(),
+                    )
+                })?;
+            (state.entries.remove(0), next_committed)
+        };
+
+        let handle = RevocableSpillHandle { binding: self.binding.clone(), entry: Some(entry) };
+        match controller.spill(handle) {
+            Ok(()) => {
+                self.lock_state_for_commit().committed_bytes = next_committed;
+                Ok(true)
+            }
+            Err(failure) => {
+                let (error, handle) = failure.into_parts();
+                self.lock_state_for_commit().entries.insert(0, handle.into_entry());
+                Err(error)
+            }
+        }
+    }
+
+    /// Reattach an in-process tier handle to its original broker/binding. If
+    /// admission fails, the caller receives the still-charged handle back and
+    /// can retry or explicitly retire it; no hidden release occurs on `Err`.
+    pub fn accept_restored(
+        &self,
+        handle: RevocableSpillHandle<Key, Value>,
+    ) -> Result<(), SpillFailure<RevocableSpillHandle<Key, Value>>> {
+        let _mutation = match self.lifecycle.begin_mutation() {
+            Ok(permit) => permit,
+            Err(error) => return Err(SpillFailure::new(error, handle)),
+        };
+        if handle.binding != self.binding {
+            return Err(SpillFailure::new(
+                MemoryError::InvalidState("restored handle has a foreign store binding".into()),
+                handle,
+            ));
+        }
+        let (charged_bytes, valid_charge) = {
+            let entry = handle.entry.as_ref().expect("live spill handle");
+            let charge = entry.charge.as_ref().expect("budgeted spill handle owns a charge");
+            let broker = self.accounting.broker().expect("budgeted store owns a broker");
+            (
+                entry.charged_bytes,
+                charge.belongs_to(broker)
+                    && charge.bytes() == Some(entry.charged_bytes)
+                    && charge.class() == Some(&self.binding.class)
+                    && charge.owner() == Some(&self.binding.owner)
+                    && charge.context() == Some(MemoryContextKind::Runtime)
+                    && charge.kind() == Some(ChargeKind::LiveScratch),
+            )
+        };
+        if !valid_charge {
+            return Err(SpillFailure::new(
+                MemoryError::InvalidState(
+                    "restored handle carries foreign charge authority".into(),
+                ),
+                handle,
+            ));
+        }
+        let mut state = match self.lock_state() {
+            Ok(state) => state,
+            Err(error) => return Err(SpillFailure::new(error, handle)),
+        };
+        let next_committed = match state.committed_bytes.checked_add(charged_bytes) {
+            Some(total) => total,
+            None => {
+                return Err(SpillFailure::new(
+                    MemoryError::capacity("restored revocable byte total exceeds u64"),
+                    handle,
+                ));
+            }
+        };
+        state.entries.push(handle.into_entry());
+        state.committed_bytes = next_committed;
+        Ok(())
+    }
+}
+
 #[cfg(feature = "unbudgeted-stores")]
 impl<Key, Value> SimpleRevocableStore<Key, Value, Unbudgeted> {
     pub(crate) fn new_unbudgeted(binding: StoreBindingHandle) -> Self {
@@ -349,6 +493,10 @@ fn restore_charges<Key, Value>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "spill")]
+    use crate::spill::{
+        InMemorySpillTarget, NoopSpillController, RoutedSpillController, SpillTarget,
+    };
     use quanta_memory_platform_core::{
         ExecutionBudget, MemoryBudgetManifest, MemoryClass, MemoryClassBudget, MemoryPreset,
         ProcessMemoryBrokerBuilder, ReclaimPriority, ResidencyPolicy,
@@ -448,6 +596,121 @@ mod tests {
             broker.ledger_snapshot().expect("ledger").total_owner_bytes(),
             expected_entry_cost("second", 6)
         );
+    }
+
+    #[cfg(feature = "spill")]
+    #[test]
+    fn reclaim_to_in_memory_tier_keeps_bytes_charged() {
+        let broker = live_broker(1_000_000);
+        let store = store_with_broker(&broker);
+        store.insert_checked("first".into(), vec![1; 4]).expect("first");
+        store.insert_checked("second".into(), vec![2; 6]).expect("second");
+        let total = expected_entry_cost("first", 4) + expected_entry_cost("second", 6);
+        let controller = RoutedSpillController::new(InMemorySpillTarget::available());
+
+        assert!(store.spill_one_into(&controller).expect("transfer"));
+        assert_eq!(store.stats().expect("source stats").item_count, 1);
+        assert_eq!(
+            store.committed_bytes().expect("source bytes"),
+            expected_entry_cost("second", 6)
+        );
+        assert_eq!(controller.spilled_count(), 1);
+        assert_eq!(
+            broker.ledger_snapshot().expect("retained tier charge").total_owner_bytes(),
+            total
+        );
+
+        let handle = controller.restore().expect("restore").expect("retained handle");
+        assert_eq!(handle.key(), "first");
+        assert_eq!(handle.value(), &vec![1; 4]);
+        assert_eq!(handle.charged_bytes(), expected_entry_cost("first", 4));
+        assert_eq!(controller.spilled_count(), 0);
+        store.accept_restored(handle).expect("reattach original authority");
+        assert_eq!(store.stats().expect("restored stats").item_count, 2);
+        assert_eq!(broker.ledger_snapshot().expect("restored ledger").total_owner_bytes(), total);
+        assert_eq!(store.reclaim_one().expect("remaining FIFO").expect("entry").0, "second");
+        assert_eq!(store.reclaim_one().expect("restored entry").expect("entry").0, "first");
+        assert_eq!(broker.ledger_snapshot().expect("drained ledger").total_owner_bytes(), 0);
+    }
+
+    #[cfg(feature = "spill")]
+    #[test]
+    fn failed_destination_write_preserves_source_entry_and_charge() {
+        struct RejectingTarget;
+        impl<Handle> SpillTarget<Handle> for RejectingTarget {
+            fn is_available(&self) -> bool {
+                true
+            }
+            fn accept(&self, handle: Handle) -> Result<(), SpillFailure<Handle>> {
+                Err(SpillFailure::new(MemoryError::capacity("injected write failure"), handle))
+            }
+        }
+        let broker = live_broker(1_000_000);
+        let store = store_with_broker(&broker);
+        store.insert_checked("first".into(), vec![1; 4]).expect("first");
+        store.insert_checked("second".into(), vec![2; 6]).expect("second");
+        let total = store.committed_bytes().expect("before");
+        let controller = RoutedSpillController::new(RejectingTarget);
+
+        assert!(matches!(store.spill_one_into(&controller), Err(MemoryError::Capacity(_))));
+        assert_eq!(controller.spilled_count(), 0);
+        assert_eq!(store.committed_bytes().expect("unchanged"), total);
+        assert_eq!(store.stats().expect("source stats").item_count, 2);
+        assert_eq!(broker.ledger_snapshot().expect("unchanged ledger").total_owner_bytes(), total);
+        assert_eq!(store.reclaim_one().expect("FIFO").expect("first").0, "first");
+    }
+
+    #[cfg(feature = "spill")]
+    #[test]
+    fn noop_spill_does_not_discard_source() {
+        let broker = live_broker(1_000_000);
+        let store = store_with_broker(&broker);
+        store.insert_checked("first".into(), vec![1; 4]).expect("insert");
+        let total = store.committed_bytes().expect("before");
+        assert!(matches!(
+            store.spill_one_into(&NoopSpillController),
+            Err(MemoryError::Capacity(_))
+        ));
+        assert_eq!(store.stats().expect("after").item_count, 1);
+        assert_eq!(broker.ledger_snapshot().expect("after").total_owner_bytes(), total);
+        assert_eq!(store.reclaim_one().expect("source").expect("entry").0, "first");
+    }
+
+    #[cfg(feature = "spill")]
+    #[test]
+    fn foreign_store_cannot_adopt_spill_charge() {
+        let broker = live_broker(1_000_000);
+        let source = store_with_broker(&broker);
+        let foreign = store_with_broker(&live_broker(1_000_000));
+        source.insert_checked("first".into(), vec![1; 4]).expect("insert");
+        let total = source.committed_bytes().expect("before");
+        let controller = RoutedSpillController::new(InMemorySpillTarget::available());
+        assert!(source.spill_one_into(&controller).expect("spill"));
+
+        let handle = controller.restore().expect("restore").expect("entry");
+        let (error, handle) =
+            foreign.accept_restored(handle).expect_err("foreign broker must reject").into_parts();
+        assert!(matches!(error, MemoryError::InvalidState(_)));
+        assert_eq!(broker.ledger_snapshot().expect("original charge").total_owner_bytes(), total);
+        source.accept_restored(handle).expect("original owner can restore");
+        assert_eq!(source.stats().expect("source").item_count, 1);
+        assert_eq!(broker.ledger_snapshot().expect("charge").total_owner_bytes(), total);
+    }
+
+    #[cfg(feature = "spill")]
+    #[test]
+    fn source_close_does_not_refund_live_in_process_tier() {
+        let broker = live_broker(1_000_000);
+        let store = store_with_broker(&broker);
+        store.insert_checked("first".into(), vec![1; 4]).expect("insert");
+        let total = store.committed_bytes().expect("before");
+        let controller = RoutedSpillController::new(InMemorySpillTarget::available());
+
+        assert!(store.spill_one_into(&controller).expect("spill"));
+        store.close().expect("close source");
+        assert_eq!(broker.ledger_snapshot().expect("tier authority").total_owner_bytes(), total);
+        drop(controller);
+        assert_eq!(broker.ledger_snapshot().expect("tier retired").total_owner_bytes(), 0);
     }
 
     #[test]

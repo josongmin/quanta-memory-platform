@@ -6,6 +6,39 @@ use quanta_memory_platform_core::{MemoryError, MemoryResult};
 
 use crate::spill::SpillController;
 
+/// A failed spill returns the exact handle supplied by the caller. Losing the
+/// handle on a pre-commit error would make source rollback impossible.
+#[derive(Debug)]
+#[must_use = "recover the handle or explicitly retire it"]
+pub struct SpillFailure<Handle> {
+    error: MemoryError,
+    handle: Box<Handle>,
+}
+
+impl<Handle> SpillFailure<Handle> {
+    pub fn new(error: MemoryError, handle: Handle) -> Self {
+        Self { error, handle: Box::new(handle) }
+    }
+
+    pub fn error(&self) -> &MemoryError {
+        &self.error
+    }
+
+    pub fn handle(&self) -> &Handle {
+        &self.handle
+    }
+
+    pub fn into_parts(self) -> (MemoryError, Handle) {
+        (self.error, *self.handle)
+    }
+}
+
+impl<Handle> std::fmt::Display for SpillFailure<Handle> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(formatter)
+    }
+}
+
 /// A destination a spillable handle can be flushed to — and restored from.
 ///
 /// Domain-neutral: the target only knows whether it can currently accept a spill,
@@ -21,7 +54,7 @@ pub trait SpillTarget<Handle> {
     fn is_available(&self) -> bool;
 
     /// Accept the spilled handle. Only called when [`Self::is_available`] is true.
-    fn accept(&self, handle: Handle) -> MemoryResult<()>;
+    fn accept(&self, handle: Handle) -> Result<(), SpillFailure<Handle>>;
 
     /// Restore the next previously spilled handle (oldest first).
     ///
@@ -40,14 +73,13 @@ pub trait SpillTarget<Handle> {
     }
 }
 
-/// A spill controller that does nothing and always succeeds. Useful where the host
-/// has not configured a spill target and spilling is a no-op.
+/// A missing spill tier: fail closed and return the original handle.
 #[derive(Clone, Debug, Default)]
 pub struct NoopSpillController;
 
 impl<Handle> SpillController<Handle> for NoopSpillController {
-    fn spill(&self, _handle: Handle) -> MemoryResult<()> {
-        Ok(())
+    fn spill(&self, handle: Handle) -> Result<(), SpillFailure<Handle>> {
+        Err(SpillFailure::new(MemoryError::capacity("spill target not configured"), handle))
     }
 }
 
@@ -78,23 +110,26 @@ impl<Handle, T> SpillController<Handle> for RoutedSpillController<T>
 where
     T: SpillTarget<Handle>,
 {
-    fn spill(&self, handle: Handle) -> MemoryResult<()> {
+    fn spill(&self, handle: Handle) -> Result<(), SpillFailure<Handle>> {
         if !self.target.is_available() {
-            return Err(MemoryError::capacity("spill target unavailable"));
+            return Err(SpillFailure::new(
+                MemoryError::capacity("spill target unavailable"),
+                handle,
+            ));
         }
         // Reserve the count slot BEFORE accept so a concurrent restore can never
         // decrement past a not-yet-counted spill and permanently drift the count
         // (the saturating_sub floor would otherwise lose that decrement). Roll the
         // increment back if accept fails, so a failed spill still counts nothing.
         self.spilled_count.fetch_add(1, Ordering::SeqCst);
-        if let Err(err) = self.target.accept(handle) {
+        if let Err(failure) = self.target.accept(handle) {
             // Roll back the reservation with a SATURATING decrement, symmetric with
             // the restore path: a plain fetch_sub could wrap to u64::MAX if a
             // concurrent restore already drove the count to 0.
             let _ = self
                 .spilled_count
                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |c| Some(c.saturating_sub(1)));
-            return Err(err);
+            return Err(failure);
         }
         Ok(())
     }
@@ -171,17 +206,26 @@ impl<Handle> SpillTarget<Handle> for InMemorySpillTarget<Handle> {
         self.available.load(Ordering::SeqCst)
     }
 
-    fn accept(&self, handle: Handle) -> MemoryResult<()> {
+    fn accept(&self, handle: Handle) -> Result<(), SpillFailure<Handle>> {
         if !self.available.load(Ordering::SeqCst) {
-            return Err(MemoryError::capacity("spill target unavailable at accept time"));
+            return Err(SpillFailure::new(
+                MemoryError::capacity("spill target unavailable at accept time"),
+                handle,
+            ));
         }
         // Retain the handle so it can be restored later (two-way tier). Pushed
         // BEFORE bumping the accepted counter so a poisoned-lock failure leaves the
         // counter untouched (fail-closed: a rejected accept counts nothing).
-        self.store
-            .lock()
-            .map_err(|_| MemoryError::InvalidState("spill target store poisoned".to_string()))?
-            .push_back(handle);
+        let mut store = match self.store.lock() {
+            Ok(store) => store,
+            Err(_) => {
+                return Err(SpillFailure::new(
+                    MemoryError::InvalidState("spill target store poisoned".to_string()),
+                    handle,
+                ));
+            }
+        };
+        store.push_back(handle);
         self.accepted.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
@@ -244,14 +288,23 @@ impl<Handle> SpillTarget<Handle> for RetainingSpillTarget<Handle> {
         self.available.load(Ordering::SeqCst)
     }
 
-    fn accept(&self, handle: Handle) -> MemoryResult<()> {
+    fn accept(&self, handle: Handle) -> Result<(), SpillFailure<Handle>> {
         if !self.available.load(Ordering::SeqCst) {
-            return Err(MemoryError::capacity("spill target unavailable at accept time"));
+            return Err(SpillFailure::new(
+                MemoryError::capacity("spill target unavailable at accept time"),
+                handle,
+            ));
         }
-        self.store
-            .lock()
-            .map_err(|_| MemoryError::InvalidState("spill target store poisoned".to_string()))?
-            .push_back(handle);
+        let mut store = match self.store.lock() {
+            Ok(store) => store,
+            Err(_) => {
+                return Err(SpillFailure::new(
+                    MemoryError::InvalidState("spill target store poisoned".to_string()),
+                    handle,
+                ));
+            }
+        };
+        store.push_back(handle);
         Ok(())
     }
 
@@ -275,6 +328,36 @@ mod tests {
     use super::*;
 
     #[test]
+    fn unavailable_spill_returns_the_only_handle_without_dropping_it() {
+        #[derive(Debug)]
+        struct DropProbe(std::sync::Arc<AtomicU64>);
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let drops = std::sync::Arc::new(AtomicU64::new(0));
+        let controller = RoutedSpillController::new(InMemorySpillTarget::unavailable());
+        let failure = controller.spill(DropProbe(drops.clone())).expect_err("offline target");
+        assert_eq!(drops.load(Ordering::SeqCst), 0, "denial must return ownership");
+        let (error, handle) = failure.into_parts();
+        assert!(matches!(error, MemoryError::Capacity(_)));
+        assert_eq!(controller.spilled_count(), 0);
+        drop(handle);
+        assert_eq!(drops.load(Ordering::SeqCst), 1, "caller alone retires the handle");
+    }
+
+    #[test]
+    fn noop_spill_rejects_and_returns_the_handle() {
+        let failure = SpillController::spill(&NoopSpillController, "live".to_string())
+            .expect_err("Noop must not certify persistence");
+        let (error, handle) = failure.into_parts();
+        assert!(matches!(error, MemoryError::Capacity(_)));
+        assert_eq!(handle, "live");
+    }
+
+    #[test]
     fn routed_spill_to_available_target_succeeds_and_counts() {
         let controller = RoutedSpillController::new(InMemorySpillTarget::available());
         controller.spill("handle-1".to_string()).expect("spill to available");
@@ -292,8 +375,8 @@ mod tests {
         fn is_available(&self) -> bool {
             true // passes the controller's guard...
         }
-        fn accept(&self, _handle: Handle) -> MemoryResult<()> {
-            Err(MemoryError::capacity("accept always fails")) // ...but accept fails.
+        fn accept(&self, handle: Handle) -> Result<(), SpillFailure<Handle>> {
+            Err(SpillFailure::new(MemoryError::capacity("accept always fails"), handle))
         }
     }
 
@@ -303,7 +386,11 @@ mod tests {
         // is_available() is true, so we pass the guard and increment the count;
         // accept then fails and the increment is rolled back (saturating): 0.
         let r = controller.spill("h".to_string());
-        assert!(matches!(r, Err(MemoryError::Capacity(_))), "accept failure surfaces, got {r:?}");
+        assert!(
+            matches!(&r, Err(failure) if matches!(failure.error(), MemoryError::Capacity(_))),
+            "accept failure surfaces, got {r:?}"
+        );
+        assert_eq!(r.expect_err("accept denied").into_parts().1, "h");
         assert_eq!(controller.spilled_count(), 0, "a failed spill counts nothing (rollback)");
         // Repeated failures never drift the count or wrap it negative.
         let _ = controller.spill("h2".to_string());
@@ -316,9 +403,10 @@ mod tests {
         let controller = RoutedSpillController::new(InMemorySpillTarget::unavailable());
         let err = controller.spill("handle".to_string()).expect_err("must fail when unavailable");
         assert!(
-            matches!(err, MemoryError::Capacity(_)),
+            matches!(err.error(), MemoryError::Capacity(_)),
             "unavailable spill must be a Capacity error, got {err:?}"
         );
+        assert_eq!(err.into_parts().1, "handle");
         assert_eq!(
             controller.spilled_count(),
             0,
@@ -336,14 +424,18 @@ mod tests {
 
         let offline = RoutedSpillController::new(InMemorySpillTarget::unavailable());
         let err = offline.spill(2u32).expect_err("offline rejects");
-        assert!(matches!(err, MemoryError::Capacity(_)), "got {err:?}");
+        assert!(matches!(err.error(), MemoryError::Capacity(_)), "got {err:?}");
+        assert_eq!(err.into_parts().1, 2);
         assert_eq!(offline.spilled_count(), 0);
     }
 
     #[test]
-    fn noop_controller_always_succeeds_without_a_target() {
+    fn noop_controller_rejects_without_a_target_and_returns_handle() {
         let controller = NoopSpillController;
-        SpillController::spill(&controller, "anything".to_string()).expect("noop spill");
+        let failure = SpillController::spill(&controller, "anything".to_string())
+            .expect_err("Noop is not persistence");
+        assert!(matches!(failure.error(), MemoryError::Capacity(_)));
+        assert_eq!(failure.into_parts().1, "anything");
     }
 
     #[test]
@@ -363,7 +455,11 @@ mod tests {
         let offline = RoutedSpillController::new(InMemorySpillTarget::unavailable());
         let count_before = offline.spilled_count();
         let denied = offline.spill("blocked".to_string());
-        assert!(matches!(denied, Err(MemoryError::Capacity(_))), "got {denied:?}");
+        assert!(
+            matches!(&denied, Err(failure) if matches!(failure.error(), MemoryError::Capacity(_))),
+            "got {denied:?}"
+        );
+        assert_eq!(denied.expect_err("offline").into_parts().1, "blocked");
         assert_eq!(
             offline.spilled_count(),
             count_before,
@@ -378,7 +474,8 @@ mod tests {
         assert_eq!(target.accepted_count(), 1);
         target.set_available(false);
         let err = SpillTarget::accept(&target, 2u32).expect_err("accept while offline must fail");
-        assert!(matches!(err, MemoryError::Capacity(_)), "got {err:?}");
+        assert!(matches!(err.error(), MemoryError::Capacity(_)), "got {err:?}");
+        assert_eq!(err.into_parts().1, 2);
         assert_eq!(target.accepted_count(), 1, "rejected accept must not increment count");
     }
 
@@ -468,7 +565,8 @@ mod tests {
     fn retaining_target_offline_rejects_accept_but_state_unchanged() {
         let target = RetainingSpillTarget::<u32>::unavailable();
         let err = SpillTarget::accept(&target, 1u32).expect_err("offline accept rejected");
-        assert!(matches!(err, MemoryError::Capacity(_)), "got {err:?}");
+        assert!(matches!(err.error(), MemoryError::Capacity(_)), "got {err:?}");
+        assert_eq!(err.into_parts().1, 1);
         assert_eq!(target.retained_count(), 0, "rejected accept retains nothing");
     }
 

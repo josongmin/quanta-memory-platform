@@ -82,6 +82,8 @@ pub use retained_map::{
     BoundRetainedMapStoreBuilder, RetainedMapInsertOrExistingV1, RetainedMapInsertOutcomeV1,
     RetainedMapStore, RetainedMapStoreBuilder, SimpleRetainedMapStore,
 };
+#[cfg(all(feature = "revocable_store", feature = "spill"))]
+pub use revocable_store::RevocableSpillHandle;
 #[cfg(feature = "revocable_store")]
 pub use revocable_store::{RevocableStore, RevocableStoreBuilder, SimpleRevocableStore};
 #[cfg(feature = "publish_pipeline")]
@@ -91,7 +93,7 @@ pub use shared::builder::SessionTranscriptStoreBuilder;
 #[cfg(feature = "spill")]
 pub use spill::{
     InMemorySpillTarget, NoopSpillController, RetainingSpillTarget, RoutedSpillController,
-    SpillController, SpillTarget,
+    SpillController, SpillFailure, SpillTarget,
 };
 #[cfg(feature = "transcript")]
 pub use transcript_store::{
