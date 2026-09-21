@@ -16,6 +16,8 @@ use crate::conformance::target::{
 #[cfg(feature = "fixtures")]
 use crate::fixtures::{MemoryFixture, MemoryTestKit};
 use quanta_memory_platform_core::MemoryError;
+#[cfg(test)]
+use quanta_memory_platform_facade::TranscriptRetentionPolicyV2;
 use quanta_memory_platform_facade::{
     AbortDispositionV1, Budgeted, PrepareDispositionV1, PreparedPublicationErrorV1,
     PreparedPublicationIdentityV1, PreparedPublicationRequestV1, PreparedPublicationService,
@@ -287,8 +289,8 @@ impl TranscriptAppendConformanceTarget
     }
 }
 
-/// Exercise exact replay, all three collision axes, ordered load, and a
-/// truncate-late-retry tombstone against any transcript target.
+/// Exercise exact replay, all three collision axes, truncate-late-retry, and
+/// fail-closed saturation against a target configured for two evidence entries.
 pub fn run_transcript_append_suite<T>(target: &T) -> Vec<AssertionVerdict>
 where
     T: TranscriptAppendConformanceTarget,
@@ -312,6 +314,10 @@ where
         ContractFamily::ReclaimAccounting,
         "transcript_truncate_preserves_retry_tombstone",
     );
+    let saturation = InvariantAssertion::new(
+        ContractFamily::ReserveFailClosed,
+        "transcript_new_identity_fails_closed_at_retention_bound",
+    );
 
     let first = target.append(b"s", 0, b"m0", b"one");
     let replayed = target.append(b"s", 0, b"m0", b"one");
@@ -326,6 +332,9 @@ where
     let late_retry = target.append(b"s", 1, b"m1", b"four");
     let rows_after_late_retry = target.load(b"s");
     let bytes_after_late_retry = target.retained_bytes();
+    let saturated = target.append(b"s", 2, b"m2", b"five");
+    let rows_after_saturation = target.load(b"s");
+    let bytes_after_saturation = target.retained_bytes();
 
     vec![
         replay.assert_that(
@@ -360,6 +369,20 @@ where
                 && matches!(bytes_after_late_retry, Ok(bytes) if bytes == after_truncate_expected),
             format!(
                 "second={second:?} truncate={truncate:?} late={late_retry:?} rows={rows_after_late_retry:?} bytes={bytes_after_late_retry:?}"
+            ),
+        ),
+        saturation.assert_that(
+            matches!(
+                saturated,
+                Err(TranscriptAppendErrorV1::RetentionSaturated {
+                    evidence_count: 2,
+                    max_evidence_count: 2,
+                    ..
+                })
+            ) && rows_after_saturation == rows_after_late_retry
+                && bytes_after_saturation == bytes_after_late_retry,
+            format!(
+                "saturated={saturated:?} rows_before={rows_after_late_retry:?} rows_after={rows_after_saturation:?} bytes_before={bytes_after_late_retry:?} bytes_after={bytes_after_saturation:?}"
             ),
         ),
     ]
@@ -1894,6 +1917,7 @@ mod tests {
                 "transcript-conformance".to_string(),
                 None,
             ))
+            .with_retention_policy(TranscriptRetentionPolicyV2::fail_closed(2, u64::MAX))
             .build()
             .expect("bound transcript builder");
         let verdicts = run_transcript_append_suite(&store);
@@ -1957,6 +1981,35 @@ mod tests {
         );
     }
 
+    #[test]
+    fn transcript_suite_rejects_target_that_ignores_declared_horizon() {
+        let platform = MemoryPlatformBuilder::new()
+            .with_preset(MemoryPreset::Development)
+            .build()
+            .expect("platform");
+        let wrong_horizon = platform
+            .transcript_store_builder::<Vec<u8>, Vec<u8>, Vec<u8>>()
+            .bind(StoreBindingHandle::new(
+                MemoryClass::SessionTranscript,
+                "wrong-horizon-transcript".to_string(),
+                None,
+            ))
+            .with_retention_policy(TranscriptRetentionPolicyV2::fail_closed(3, u64::MAX))
+            .build()
+            .expect("target with wrong horizon");
+        let verdicts = run_transcript_append_suite(&wrong_horizon);
+        assert!(verdicts.iter().any(|verdict| {
+            verdict.name == "transcript_new_identity_fails_closed_at_retention_bound"
+                && !verdict.held()
+        }));
+        assert!(verdicts
+            .iter()
+            .filter(|verdict| {
+                verdict.name != "transcript_new_identity_fails_closed_at_retention_bound"
+            })
+            .all(AssertionVerdict::held));
+    }
+
     struct UnderbillingTranscriptTarget<'a, T>(&'a T);
 
     impl<T: TranscriptAppendConformanceTarget> TranscriptAppendConformanceTarget
@@ -1998,6 +2051,7 @@ mod tests {
                 "underbilling-transcript".to_string(),
                 None,
             ))
+            .with_retention_policy(TranscriptRetentionPolicyV2::fail_closed(2, u64::MAX))
             .build()
             .expect("store");
         let verdicts = run_transcript_append_suite(&UnderbillingTranscriptTarget(&store));

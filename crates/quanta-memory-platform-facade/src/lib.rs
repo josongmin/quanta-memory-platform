@@ -103,6 +103,6 @@ pub use spill::{
 pub use transcript_store::{
     SessionTranscriptStore, SimpleSessionTranscriptStore, TranscriptAppendDispositionV1,
     TranscriptAppendErrorV1, TranscriptAppendIdentityV1, TranscriptAppendRequestV1,
-    TranscriptRecordV1, TranscriptRetainDispositionV1, TranscriptRetentionPolicyV1,
-    TranscriptSnapshotV1,
+    TranscriptRecordV1, TranscriptRetainDispositionV1, TranscriptRetentionPolicyV2,
+    TranscriptRetentionReconfigureErrorV2, TranscriptRetentionStatsV2, TranscriptSnapshotV1,
 };

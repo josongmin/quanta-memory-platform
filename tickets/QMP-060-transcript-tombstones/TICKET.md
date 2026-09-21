@@ -34,6 +34,26 @@ transcript의 replay/idempotency evidence가 process lifetime 동안 무제한 �
 
 무제한 process-lifetime in-memory 보존은 허용하지 않는다.
 
+## Implemented policy and external design references
+
+`fail-closed saturation`을 선택한다. Identity evidence는 `close` 전까지
+evict/expire하지 않고, configured count/byte horizon에 도달하면 기존 exact
+retry와 conflict 판정은 계속 수행하되 새로운 identity만 typed error로
+거부한다. 이 정책은 restart durability를 주장하지 않는다.
+
+- [AWS Builders' Library — Making retries safe with idempotent APIs](https://aws.amazon.com/builders-library/making-retries-safe-with-idempotent-APIs/):
+  caller-provided request identity, same-token semantic equivalence, parameter
+  mismatch rejection, token+mutation atomicity가 이 구현의 replay/conflict/
+  atomic-publication 계약과 일치한다.
+- [AWS Lambda Powertools idempotency](https://docs.aws.amazon.com/powertools/python/develop/utilities/idempotency/):
+  idempotency horizon은 explicit policy여야 하고 storage TTL의 eventual
+  deletion만으로 expiry를 판정하지 않는다. QMP in-memory backing은 clock/
+  durable tier가 없으므로 time expiry를 가장하지 않는다.
+- [Redis key eviction policy](https://redis.io/docs/latest/develop/reference/eviction/):
+  identity evidence가 cache가 아닌 correctness state인 경우 `noeviction`
+  방식처럼 기존 state를 버리지 않고 새 write를 거부한다. QMP는 이를
+  typed `RetentionSaturated`와 no-charge/no-mutation postcondition으로 강화한다.
+
 ## Canonical write set
 
 - `facade/src/transcript_store/mod.rs`

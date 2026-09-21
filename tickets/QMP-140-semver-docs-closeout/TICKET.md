@@ -16,6 +16,12 @@ remediation으로 바뀐 public authority를 compatibility 정책에 맞게 노�
 - 최초 감사 시 actual extraction failure와 standalone green/no known limitation 주장이 충돌했다. QMP-120은 local extraction을 수리했으나 remote CI와 최종 product SHA의 extraction은 아직 별도 증거가 필요하다.
 - moka/scc/bumpalo feature 이름이 실제 semantic capability보다 강하게 보인다.
 - packages는 `rust-version` 미지정, `UNLICENSED`, `publish=false`다.
+- QMP-060 removes the misleading unbounded `TranscriptRetentionPolicyV1`
+  surface in favor of bounded `TranscriptRetentionPolicyV2`, adds typed
+  saturation/reconfigure/stats contracts, and adds a required trait method.
+  This is a deliberate pre-1.0 breaking change that needs final migration and
+  semver reporting in this ticket; do not reintroduce a compatibility alias
+  that restores unbounded behavior.
 
 ## Canonical write set
 

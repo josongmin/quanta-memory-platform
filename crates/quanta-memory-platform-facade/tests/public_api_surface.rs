@@ -184,7 +184,8 @@ fn names_revocable_store_reexports() {
 use quanta_memory_platform_facade::{
     SessionTranscriptStore, SessionTranscriptStoreBuilder, SimpleSessionTranscriptStore,
     TranscriptAppendDispositionV1, TranscriptAppendErrorV1, TranscriptAppendIdentityV1,
-    TranscriptAppendRequestV1, TranscriptRecordV1, TranscriptRetentionPolicyV1,
+    TranscriptAppendRequestV1, TranscriptRecordV1, TranscriptRetentionPolicyV2,
+    TranscriptRetentionReconfigureErrorV2, TranscriptRetentionStatsV2,
 };
 
 /// Pins the `transcript` slice's public exports.
@@ -199,7 +200,9 @@ fn names_transcript_reexports() {
     type _Record = TranscriptRecordV1<String, String>;
     type _Error = TranscriptAppendErrorV1;
     type _Disposition = TranscriptAppendDispositionV1;
-    type _Retention = TranscriptRetentionPolicyV1;
+    type _Retention = TranscriptRetentionPolicyV2;
+    type _RetentionStats = TranscriptRetentionStatsV2;
+    type _RetentionReconfigureError = TranscriptRetentionReconfigureErrorV2;
 }
 
 #[cfg(feature = "publish_pipeline")]
@@ -590,7 +593,7 @@ fn transcript_builder_exposes_public_charged_path() {
     let store: SimpleSessionTranscriptStore<String, String, String, Budgeted> = platform
         .transcript_store_builder::<String, String, String>()
         .bind(binding)
-        .with_retention_policy(TranscriptRetentionPolicyV1::process_lifetime())
+        .with_retention_policy(TranscriptRetentionPolicyV2::default())
         .build()
         .expect("budgeted transcript builder must build");
 
@@ -603,6 +606,10 @@ fn transcript_builder_exposes_public_charged_path() {
     assert_eq!(disposition, TranscriptAppendDispositionV1::Applied);
     assert_eq!(store.load(&"s".to_string()).expect("load").len(), 1);
     assert_eq!(store.stats().expect("checked transcript stats").estimated_bytes, 236);
+    let retention = store.retention_stats().expect("retention stats");
+    assert_eq!(retention.active_row_count, 1);
+    assert_eq!(retention.evidence_count, 1);
+    assert_eq!(retention.total_retained_bytes, 236);
     assert_eq!(platform.broker().ledger_snapshot().expect("snap").total_owner_bytes(), 236);
 }
 

@@ -4,10 +4,11 @@ Portable, host-independent memory-platform workspace. It is consumed by the
 Semantica monorepo through a dedicated host adapter (`quanta-memory-host`) and is
 designed to be extracted into its own repository without rewrites.
 
-> **Current qualification status (2026-09-21): NOT production-ready and NOT
-> extraction-ready at audit base `e103771670da3143e2ffebb8950a5dfc7e3d4515`.**
-> Workspace rails pass, but the final audit confirmed accounting-authority and
-> lifecycle gaps, and actual standalone extraction fails. The authoritative
+> **Current qualification status (2026-09-21): NOT production-ready.** Local
+> standalone extraction, including committed HEAD/tree/blob/mode binding, has
+> passed; remote workflow execution and external host adoption remain
+> unobserved. The final audit still has open authority, lifecycle, performance,
+> and observability tickets. The authoritative
 > remediation inventory, status, dependencies, acceptance criteria, and receipts
 > live in [`tickets/README.md`](./tickets/README.md). Passing a focused test or
 > dry-run does not supersede that status.
@@ -71,6 +72,13 @@ public:
   same-store reentry from client `Hash`/`Clone`/`CanonicalKey` callbacks;
   callers may retry after the in-flight operation. A successful `close()` is
   terminal and repeated close is idempotent; later writes return `Closed`.
+- Transcript idempotency evidence is finite by default. Configure
+  `TranscriptRetentionPolicyV2::fail_closed(count, bytes)` on the transcript
+  builder when the default 65,536-entry/64-MiB horizon is unsuitable. Exact
+  retries and identity conflicts remain deterministic at saturation; a new
+  identity returns typed `RetentionSaturated` without charging or mutation.
+  `retention_stats()` separates active, evidence, and session-key cost, and
+  `close()` explicitly terminates the process-lifetime replay horizon.
 - Runtime scratch obtained through `LiveMemoryPlatform::attach_runtime` is
   charged against the same broker ledger, execution-scratch cap, class cap,
   owner/group admission, and release lifecycle as direct broker charges.
