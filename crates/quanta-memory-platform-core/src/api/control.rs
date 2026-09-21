@@ -552,6 +552,60 @@ impl LiveProcessMemoryBroker {
             })?;
         }
 
+        // Recharge is an admission operation too. Validate the same complete
+        // resource-group floor postimage as reserve, after removing the old
+        // non-headroom charge and adding the replacement. Without this check a
+        // peer group could consume another group's reserved floor by growing an
+        // already-live charge instead of issuing a fresh reserve.
+        let snapshot = core.ledger.snapshot();
+        snapshot.validate_exact().map_err(|error| RechargeError {
+            error,
+            recovery: RechargeRecoveryV1::OldChargePreserved,
+        })?;
+        let non_headroom_current = snapshot
+            .class_usage
+            .iter()
+            .filter(|(candidate, _)| **candidate != MemoryClass::Headroom)
+            .try_fold(0u64, |total, (_, usage)| {
+                total
+                    .checked_add(usage.checked_total()?)
+                    .ok_or_else(|| MemoryError::capacity("non-headroom usage exceeds u64"))
+            })
+            .map_err(|error| RechargeError {
+                error,
+                recovery: RechargeRecoveryV1::OldChargePreserved,
+            })?;
+        let without_old = if *old.class() == MemoryClass::Headroom {
+            non_headroom_current
+        } else {
+            non_headroom_current.checked_sub(old.bytes()).ok_or_else(|| RechargeError {
+                error: MemoryError::InvalidState(
+                    "non-headroom recharge old charge exceeds live usage".into(),
+                ),
+                recovery: RechargeRecoveryV1::OldChargePreserved,
+            })?
+        };
+        let non_headroom_after = if class == MemoryClass::Headroom {
+            without_old
+        } else {
+            without_old.checked_add(bytes).ok_or_else(|| RechargeError {
+                error: MemoryError::capacity("non-headroom recharge total exceeds u64"),
+                recovery: RechargeRecoveryV1::OldChargePreserved,
+            })?
+        };
+        let non_headroom_band = core
+            .ledger
+            .policy()
+            .global_hard_limit_bytes
+            .checked_sub(core.ledger.policy().headroom_bytes)
+            .ok_or_else(|| RechargeError {
+                error: MemoryError::capacity("headroom exceeds global hard limit"),
+                recovery: RechargeRecoveryV1::OldChargePreserved,
+            })?;
+        next_scheduler.protected_floor_fits(non_headroom_after, non_headroom_band).map_err(
+            |error| RechargeError { error, recovery: RechargeRecoveryV1::OldChargePreserved },
+        )?;
+
         // The execution scratch ceiling is a broker-owned admission axis, not a
         // ledger class cap. Evaluate the same replacement postimage used by the
         // ledger so the atomic primitive cannot bypass this outer authority.
@@ -3453,6 +3507,70 @@ mod tests {
             "group must be exactly at 70k usage (no phantom drift), so 31k overflows"
         );
         b.release(&old).expect("release preserved ticket");
+    }
+
+    #[test]
+    fn recharge_cannot_consume_peer_group_reserved_floor() {
+        use crate::domain::policy::ResourceGroup;
+        let protected = ResourceGroup {
+            reserved_bytes: 400,
+            soft_cap_bytes: 500,
+            hard_cap_bytes: 600,
+            burst_percent: 0,
+            reclaim_priority: ReclaimPriority::First,
+            admission_weight: 1,
+        };
+        let peer = ResourceGroup {
+            reserved_bytes: 0,
+            soft_cap_bytes: 700,
+            hard_cap_bytes: 1_000,
+            burst_percent: 0,
+            reclaim_priority: ReclaimPriority::Last,
+            admission_weight: 1,
+        };
+        let policy = ResidencyPolicy::new(1_000)
+            .with_class_budget(MemoryClass::ArtifactCache, class_budget(0, 1_000, 1_000, false))
+            .with_resource_group("protected", protected)
+            .with_resource_group("peer", peer)
+            .with_owner_group("protected-owner", "protected")
+            .with_owner_group("peer-owner", "peer");
+        let broker = LiveProcessMemoryBroker::from_report(report_with(policy)).expect("broker");
+        let old = broker
+            .reserve_committed(
+                MemoryClass::ArtifactCache,
+                "peer-owner".into(),
+                MemoryContextKind::Request,
+                ChargeKind::RetainedPayload,
+                500,
+            )
+            .expect("seed peer usage inside unprotected band");
+
+        let denied = broker
+            .recharge(
+                &old,
+                MemoryClass::ArtifactCache,
+                "peer-owner".into(),
+                MemoryContextKind::Request,
+                ChargeKind::RetainedPayload,
+                601,
+            )
+            .expect_err("recharge must preserve the other group's 400-byte floor");
+        assert!(matches!(denied.error, MemoryError::Capacity(_)));
+        assert_eq!(denied.recovery, RechargeRecoveryV1::OldChargePreserved);
+        assert_eq!(broker.ledger_snapshot().expect("snapshot").total_owner_bytes(), 500);
+
+        let replacement = broker
+            .recharge(
+                &old,
+                MemoryClass::ArtifactCache,
+                "peer-owner".into(),
+                MemoryContextKind::Request,
+                ChargeKind::RetainedPayload,
+                600,
+            )
+            .expect("replacement exactly at the unprotected boundary is legal");
+        assert_eq!(broker.ledger_snapshot().expect("snapshot").total_owner_bytes(), 600);
+        broker.release(&replacement).expect("release replacement");
     }
 
     fn poison_broker_lock(broker: &LiveProcessMemoryBroker) {
