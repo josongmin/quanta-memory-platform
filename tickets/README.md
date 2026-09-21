@@ -57,7 +57,7 @@
 | [QMP-090](QMP-090-conformance-model/TICKET.md) | P1 | IMPLEMENTED | independent literal oracle와 broken-fake/model trace implemented; proptest/Loom/Miri 및 독립 context/group/live-ticket 축 open | QMP-020, QMP-040, QMP-070 | testkit conformance/fakes/faults |
 | [QMP-100](QMP-100-scaling-benchmarks/TICKET.md) | P2 | BLOCKED | O(N²) 제거와 workload benchmark authority | QMP-040, QMP-050, QMP-070 | payload/revocable containers, benches, CI scripts |
 | [QMP-110](QMP-110-operability-observation/TICKET.md) | P2 | BLOCKED | typed observation, poison truth, bounded telemetry | QMP-030, QMP-040, QMP-080 | stats traits, metrics adapters, broker/store emitters |
-| [QMP-120](QMP-120-standalone-extraction/TICKET.md) | P1 | IMPLEMENTED | local extraction passes, but script copies working-tree bytes from a HEAD file list and omits executable-mode authority | QMP-000 | extraction manifest/scripts, lockfile, release CI |
+| [QMP-120](QMP-120-standalone-extraction/TICKET.md) | P1 | IN_PROGRESS | binding extraction input to committed HEAD blobs, modes and deterministic manifest digest | QMP-000 | extraction manifest/scripts, lockfile, release CI |
 | [QMP-130](QMP-130-host-adoption/TICKET.md) | P1 | BLOCKED | Semantica currently resolves adjacent shared-main QMP, not the audited/qualified revision; exact-root qualification absent | QMP-030..QMP-120 | external host repo only; QMP repo read-only except receipts |
 | [QMP-140](QMP-140-semver-docs-closeout/TICKET.md) | P2 | BLOCKED | public API/SemVer, stale test selectors/docs, receipt schema and final closeout | QMP-010..QMP-130 | public exports, README/EXTRACTION/docs, Cargo metadata |
 

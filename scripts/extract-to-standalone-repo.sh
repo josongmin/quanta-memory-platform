@@ -100,44 +100,30 @@ done
 cargo metadata --locked --format-version 1 | \
   python3 scripts/lib/check-extracted-metadata.py "${repo_root}"
 
-# Copy only tracked source files. The manifest is also the canonical digest
-# authority; ignored or untracked local files never leak into a release.
-file_manifest="$(mktemp /tmp/qmp-extract-files.XXXXXX)"
-trap 'rm -f "${file_manifest}"' EXIT
-git ls-files -z -- "${SELF_HOSTING_COPY_PATHS[@]}" > "${file_manifest}"
-if [[ ! -s "${file_manifest}" ]]; then
-  echo "FAIL: empty tracked extraction manifest" >&2
+# Freeze the exact committed source tree. The manifest binds tree ID, Git mode,
+# blob ID, path, and a content SHA-256. Relevant staged, unstaged, or mode-only
+# drift is rejected rather than silently copied under a misleading HEAD claim.
+source_head="$(git rev-parse --verify 'HEAD^{commit}')"
+source_tree="$(git rev-parse "${source_head}^{tree}")"
+tree_manifest="$(mktemp /tmp/qmp-extract-tree.XXXXXX)"
+path_manifest="$(mktemp /tmp/qmp-extract-paths.XXXXXX)"
+trap 'rm -f "${tree_manifest}" "${path_manifest}"' EXIT
+python3 scripts/lib/extraction_manifest.py assert-clean \
+  --repo "${repo_root}" --commit "${source_head}" "${SELF_HOSTING_COPY_PATHS[@]}"
+manifest_output="$(python3 scripts/lib/extraction_manifest.py snapshot \
+  --repo "${repo_root}" --revision "${source_head}" --output "${tree_manifest}" \
+  "${SELF_HOSTING_COPY_PATHS[@]}")"
+source_digest="$(sed -n 's/^digest=//p' <<<"${manifest_output}")"
+if [[ -z "${source_digest}" ]]; then
+  echo "FAIL: extraction manifest did not emit a canonical digest" >&2
   exit 1
 fi
-
-canonical_digest() {
-  python3 - "${file_manifest}" "$1" <<'PY'
-import hashlib
-from pathlib import Path
-import sys
-
-manifest, root = Path(sys.argv[1]), Path(sys.argv[2])
-digest = hashlib.sha256()
-for raw in manifest.read_bytes().split(b"\0"):
-    if not raw:
-        continue
-    relative = Path(raw.decode("utf-8"))
-    path = root / relative
-    if not path.is_file():
-        raise SystemExit(f"missing canonical file: {path}")
-    data = path.read_bytes()
-    digest.update(len(raw).to_bytes(8, "big"))
-    digest.update(raw)
-    digest.update(len(data).to_bytes(8, "big"))
-    digest.update(data)
-print(digest.hexdigest())
-PY
-}
-
-source_digest="$(canonical_digest "${repo_root}")"
+python3 scripts/lib/extraction_manifest.py paths --manifest "${tree_manifest}" > "${path_manifest}"
 
 echo "      pre-flight OK: core <- facade <- testkit, no escaping path deps"
 echo "      self-hosting OK: canonical extracted file set present, no tools/ci/gates in copy plan"
+echo "      frozen HEAD: ${source_head}"
+echo "      frozen tree: ${source_tree}"
 
 # ---------------------------------------------------------------------------
 # Step 1: create destination and copy the canonical set.
@@ -152,24 +138,22 @@ run mkdir -p "${dest}"
 
 echo "[2/5] copying canonical files"
 if [[ "${dry_run}" -eq 0 ]]; then
-  while IFS= read -r -d '' p; do
-    mkdir -p "${dest}/$(dirname "${p}")"
-    cp -p "${p}" "${dest}/${p}"
-  done < "${file_manifest}"
+  git archive --format=tar "${source_head}" -- "${SELF_HOSTING_COPY_PATHS[@]}" | tar -xf - -C "${dest}"
 else
-  echo "DRY-RUN: copy $(python3 -c 'from pathlib import Path; import sys; print(Path(sys.argv[1]).read_bytes().count(b"\0"))' "${file_manifest}") tracked files"
+  echo "DRY-RUN: export frozen tree ${source_tree} from HEAD ${source_head}"
 fi
 
 if [[ "${dry_run}" -eq 0 ]]; then
   self_hosting_assert_extracted_layout "${dest}"
-  extracted_digest="$(canonical_digest "${dest}")"
+  extracted_digest="$(python3 scripts/lib/extraction_manifest.py verify \
+    --manifest "${tree_manifest}" --destination "${dest}")"
   if [[ "${source_digest}" != "${extracted_digest}" ]]; then
     echo "FAIL: source/extracted canonical digest mismatch" >&2
     exit 1
   fi
   echo "      canonical SHA-256: ${source_digest}"
 else
-  echo "DRY-RUN: assert extracted layout and canonical SHA-256 ${source_digest}"
+  echo "DRY-RUN: assert extracted layout, modes, and canonical SHA-256 ${source_digest}"
 fi
 
 # ---------------------------------------------------------------------------
@@ -182,7 +166,9 @@ if [[ "${dry_run}" -eq 0 ]]; then
     cd "${dest}"
     cargo metadata --locked --format-version 1 | \
       python3 scripts/lib/check-extracted-metadata.py "${dest}"
-    python3 -m unittest -v scripts/tests/test_extraction_metadata.py
+    python3 -m unittest -v \
+      scripts/tests/test_extraction_metadata.py \
+      scripts/tests/test_extraction_manifest.py
     scripts/tests/extraction-contracts.sh
     scripts/scaffold-external-repo.sh
     scripts/check-workspace.sh
@@ -190,7 +176,8 @@ if [[ "${dry_run}" -eq 0 ]]; then
     scripts/verify-tickets.sh
     python3 tools/pm/pm.py lint
   )
-  if [[ "$(canonical_digest "${dest}")" != "${source_digest}" ]]; then
+  if [[ "$(python3 scripts/lib/extraction_manifest.py verify \
+    --manifest "${tree_manifest}" --destination "${dest}")" != "${source_digest}" ]]; then
     echo "FAIL: verification changed canonical extracted files" >&2
     exit 1
   fi
@@ -203,8 +190,10 @@ fi
 # ---------------------------------------------------------------------------
 
 echo "[4/5] initializing verified git repo at ${dest}"
+python3 scripts/lib/extraction_manifest.py assert-clean \
+  --repo "${repo_root}" --commit "${source_head}" "${SELF_HOSTING_COPY_PATHS[@]}"
 run git -C "${dest}" init -q
-run git -C "${dest}" add --pathspec-from-file="${file_manifest}" --pathspec-file-nul
+run git -C "${dest}" add --pathspec-from-file="${path_manifest}" --pathspec-file-nul
 if [[ "${dry_run}" -eq 0 ]] && \
    git -C "${dest}" status --porcelain --untracked-files=all | grep -q '^?? '; then
   echo "FAIL: verification left non-canonical untracked files in destination" >&2

@@ -18,7 +18,7 @@ jobs:
           echo "$RUNNER_TEMP/qmp-semgrep/bin" >> "$GITHUB_PATH"
       - name: Negative extraction contracts and actual extraction
         run: |
-          python3 -m unittest -v scripts/tests/test_extraction_metadata.py
+          python3 -m unittest -v scripts/tests/test_extraction_metadata.py scripts/tests/test_extraction_manifest.py
           scripts/tests/extraction-contracts.sh
           qmp_extract_dir="$(mktemp -d /tmp/qmp-ci-extraction.XXXXXX)"
           scripts/extract-to-standalone-repo.sh "${qmp_extract_dir}"

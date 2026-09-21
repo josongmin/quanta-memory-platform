@@ -47,9 +47,12 @@ dependency direction. Not prose: every step is a command or a verifiable gate.
    scripts/extract-to-standalone-repo.sh /path/to/new/quanta-memory-platform
    ```
 
-   This copies only tracked canonical files and compares source/extracted
-   SHA-256 digests. It verifies the extracted workspace before `git init` or
-   any bootstrap commit, using:
+   This freezes `HEAD` and its tree ID, rejects relevant staged, unstaged, or
+   executable-bit drift, and exports bytes directly from that committed tree.
+   The canonical manifest binds every path to its Git mode, blob ID, and
+   content SHA-256. Source and extracted manifest digests must match. It
+   verifies the extracted workspace before `git init` or any bootstrap commit,
+   using:
 
    ```bash
    scripts/check-workspace.sh
@@ -76,7 +79,7 @@ dependency direction. Not prose: every step is a command or a verifiable gate.
    scripts/memory-platform-doctor      # repo-local doctor rail, includes workspace tests, no tools/ci/gates dependency
    scripts/check-workspace-offline.sh  # separate frozen/cache-only recheck
    scripts/tests/extraction-contracts.sh # negative release-rail contracts
-   python3 -m unittest -v scripts/tests/test_extraction_metadata.py # dependency-graph negative fixtures
+   python3 -m unittest -v scripts/tests/test_extraction_metadata.py scripts/tests/test_extraction_manifest.py # dependency/tree negative fixtures
    cargo metadata --locked --format-version 1 # no re-resolution
    ```
 
@@ -114,7 +117,8 @@ dependency direction. Not prose: every step is a command or a verifiable gate.
 
 - Extracted repo: `scripts/check-workspace.sh`, `scripts/memory-platform-doctor`,
   `scripts/scaffold-external-repo.sh`, ticket validation, and PM lint all pass.
-- Source/extracted canonical digests match and the extracted git worktree is clean.
+- Source/extracted tree-bound canonical digests and file modes match, the source
+  stays at the frozen clean `HEAD`, and the extracted git worktree is clean.
 - All Cargo resolution is locked; missing Semgrep or cargo-deny fails closed.
 - The fresh extraction test in `.github/workflows/standalone-extraction.yml` passes.
 
