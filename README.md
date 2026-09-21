@@ -82,6 +82,24 @@ public:
 - Runtime scratch obtained through `LiveMemoryPlatform::attach_runtime` is
   charged against the same broker ledger, execution-scratch cap, class cap,
   owner/group admission, and release lifecycle as direct broker charges.
+- Runtime policy fields are active, not report-only vocabulary:
+  - `reserved_bytes` protects each class axis and resource-group axis
+    independently. The axes may describe the same bytes, so their floors are
+    each checked against `global - headroom` and are not added together.
+  - `soft_cap_bytes` crossing emits one bounded reclaim request. Configure the
+    callback before construction with `MemoryPlatformBuilder::with_reclaimer`.
+    It runs without the broker mutex; callback-reported bytes are advisory and
+    the broker remeasures the ledger before admission.
+  - `hard_cap_bytes` remains the deny boundary after at most one reclaim retry.
+    Class borrowing is bounded by the shared pool. Group borrowing is bounded
+    by `min(shared_pool * burst_percent / 100, weighted_share)`, where weighted
+    shares use deterministic largest-remainder allocation so no pool byte is
+    silently stranded.
+  - reclaim candidates are ordered `Last`, then `Normal`, then protected
+    `First`, with stable class/group identity as the tie break.
+  - accepted live reconfiguration preserves legal class borrow and group burst,
+    applies the same headroom/floor postimage rules, increments
+    `policy_revision`, and records `RuntimeReconfigure` provenance atomically.
 
 Examples (compile against the real public APIs):
 

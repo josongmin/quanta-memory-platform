@@ -68,18 +68,59 @@ impl WeightedResourceGroupScheduler {
         self.usage.get(group_name).copied().unwrap_or(0)
     }
 
-    fn total_weight(&self) -> u64 {
-        self.groups.values().map(|g| u64::from(g.admission_weight)).sum()
+    fn total_weight(&self) -> u128 {
+        self.groups.values().map(|g| u128::from(g.admission_weight)).sum()
     }
 
-    /// Weighted fair share of the shared burst pool for one group.
-    fn fair_burst_share(&self, group: &ResourceGroup) -> u64 {
+    /// Weighted fair share of the shared burst pool for one named group.
+    ///
+    /// Uses Hamilton's largest-remainder allocation: every group receives the
+    /// floor of its exact weighted share, then leftover bytes are assigned by
+    /// descending fractional remainder with the stable group name as the tie
+    /// break. The sum is exactly the configured pool, including huge inputs.
+    fn fair_burst_share(&self, group_name: &str) -> u64 {
+        let Some(group) = self.groups.get(group_name) else {
+            return 0;
+        };
         let total = self.total_weight();
         if total == 0 {
             return 0;
         }
-        // floor division; deterministic for a fixed weight set.
-        (self.shared_burst_pool_bytes / total).saturating_mul(u64::from(group.admission_weight))
+        let pool = u128::from(self.shared_burst_pool_bytes);
+        let numerator = pool * u128::from(group.admission_weight);
+        let base = numerator / total;
+        let allocated_base: u128 = self
+            .groups
+            .values()
+            .map(|candidate| pool * u128::from(candidate.admission_weight) / total)
+            .sum();
+        let leftover = usize::try_from(pool - allocated_base).unwrap_or(usize::MAX);
+
+        let mut remainders: Vec<(&str, u128)> = self
+            .groups
+            .iter()
+            .map(|(name, candidate)| {
+                (name.as_str(), pool * u128::from(candidate.admission_weight) % total)
+            })
+            .collect();
+        remainders.sort_by(|(left_name, left_remainder), (right_name, right_remainder)| {
+            right_remainder.cmp(left_remainder).then_with(|| left_name.cmp(right_name))
+        });
+        let remainder_byte =
+            if remainders.iter().take(leftover).any(|(name, _)| *name == group_name) {
+                1
+            } else {
+                0
+            };
+        u64::try_from(base + remainder_byte).unwrap_or(u64::MAX)
+    }
+
+    fn burst_allowance(&self, group_name: &str, group: &ResourceGroup) -> u64 {
+        let percentage_cap = u64::try_from(
+            u128::from(self.shared_burst_pool_bytes) * u128::from(group.burst_percent) / 100,
+        )
+        .unwrap_or(u64::MAX);
+        self.fair_burst_share(group_name).min(percentage_cap)
     }
 }
 
@@ -100,7 +141,7 @@ impl ResourceGroupScheduler for WeightedResourceGroupScheduler {
         // Above hard cap: only admit the overflow if it fits within this
         // group's weighted fair share of the shared burst pool.
         let borrow = after - group.hard_cap_bytes;
-        borrow <= self.fair_burst_share(group)
+        borrow <= self.burst_allowance(group_name, group)
     }
 }
 
@@ -114,7 +155,7 @@ mod tests {
             reserved_bytes: 0,
             soft_cap_bytes: hard / 2,
             hard_cap_bytes: hard,
-            burst_percent: 0,
+            burst_percent: 100,
             reclaim_priority: ReclaimPriority::Normal,
             admission_weight: weight,
         }
@@ -183,7 +224,7 @@ mod tests {
         assert!(!s.admits("fg", 100), "unknown group denied (fail-closed, no panic)");
         // Burst share for a stray group definition is exactly 0 when total
         // weight is 0 (documents the no-divide-by-zero contract).
-        assert_eq!(s.fair_burst_share(&group(1_000, 5)), 0, "zero total weight => zero share");
+        assert_eq!(s.fair_burst_share("fg"), 0, "unknown group => zero share");
     }
 
     // scenario D-local: a single registered group still funds burst, but a group
@@ -197,28 +238,35 @@ mod tests {
         assert!(!s.admits("unregistered", 1), "unregistered group denied despite pool headroom");
     }
 
-    // scenario D-local: floor-division of the pool leaves a remainder that is
-    // deliberately NOT handed out — the sum of fair shares can be below the pool.
-    // This documents the leftover-pool behavior so it is intentional, not a bug.
+    // The complete shared pool is assigned deterministically. Integer division
+    // may leave a remainder, but it must not become unreachable capacity.
     #[test]
-    fn floor_division_pool_remainder_is_left_unallocated() {
+    fn weighted_share_distributes_remainder_work_conservingly() {
         let mut groups = BTreeMap::new();
         // total weight 3, pool 400 => 400/3 = 133 (floor), remainder 1 byte.
         groups.insert("a".to_string(), group(0, 1));
         groups.insert("b".to_string(), group(0, 1));
         groups.insert("c".to_string(), group(0, 1));
         let s = WeightedResourceGroupScheduler::new(groups, 400);
-        let share = s.fair_burst_share(&group(0, 1));
-        assert_eq!(share, 133, "floor(400/3)*1 == 133");
-        let total_shares = share * 3;
-        assert_eq!(total_shares, 399, "sum of floor shares is 399");
-        assert!(
-            total_shares < 400,
-            "leftover pool remainder (1 byte) is intentionally unallocated, not over-committed"
-        );
-        // Each group may borrow exactly its floor share and not one byte more.
-        assert!(s.admits("a", 133), "group may borrow its full floor share");
-        assert!(!s.admits("a", 134), "group cannot reach into the unallocated remainder");
+        let a = s.fair_burst_share("a");
+        let b = s.fair_burst_share("b");
+        let c = s.fair_burst_share("c");
+        assert_eq!(a + b + c, 400, "all shared bytes must have a deterministic owner");
+        assert_eq!((a, b, c), (134, 133, 133), "name order breaks equal remainders");
+        assert!(s.admits("a", 134));
+        assert!(!s.admits("a", 135));
+    }
+
+    #[test]
+    fn burst_percent_changes_admission_outcome() {
+        let mut groups = BTreeMap::new();
+        let mut capped = group(1_000, 1);
+        capped.burst_percent = 10;
+        groups.insert("capped".to_string(), capped);
+        let s = WeightedResourceGroupScheduler::new(groups, 1_000);
+
+        assert!(s.admits("capped", 1_100), "10% permits 100 bytes above hard");
+        assert!(!s.admits("capped", 1_101), "burst percent caps weighted pool access");
     }
 
     // scenario D-local: record_usage then record_release is a clean round-trip
@@ -246,9 +294,10 @@ mod tests {
         groups.insert("heavy".to_string(), group(0, u16::MAX));
         groups.insert("light".to_string(), group(0, 1));
         let s = WeightedResourceGroupScheduler::new(groups, u64::MAX);
-        let heavy = group(0, u16::MAX);
-        let share = s.fair_burst_share(&heavy);
-        let expected = (u64::MAX / (u64::from(u16::MAX) + 1)).saturating_mul(u64::from(u16::MAX));
+        let share = s.fair_burst_share("heavy");
+        let expected =
+            u64::try_from(u128::from(u64::MAX) * u128::from(u16::MAX) / (u128::from(u16::MAX) + 1))
+                .expect("weighted share fits u64");
         assert_eq!(share, expected, "fair share math must stay exact under huge inputs");
         assert!(s.admits("heavy", share), "group may borrow exactly its computed fair share");
         assert!(

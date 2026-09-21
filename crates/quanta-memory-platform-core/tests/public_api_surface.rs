@@ -51,6 +51,7 @@ use quanta_memory_platform_core::{
     // ports::store
     PublishedPayload,
     ReclaimPriority,
+    ReclaimRuntimeStats,
     ResidencyPolicy,
     ResolvedBudget,
     ResourceGroup,
@@ -80,9 +81,10 @@ use quanta_memory_platform_core::{
 
 #[cfg(feature = "live_control")]
 use quanta_memory_platform_core::{
-    LadderPressureController, LiveProcessMemoryBroker, ManagedCharge, PendingReservation,
-    PressureController, PressureThresholds, ReclaimRung, ResourceGroupScheduler,
-    WeightedResourceGroupScheduler,
+    LadderPressureController, LiveProcessMemoryBroker, ManagedCharge, MemoryReclaimer,
+    PendingReservation, PressureController, PressureThresholds, ReclaimCandidate,
+    ReclaimGroupCandidate, ReclaimOutcome, ReclaimRequest, ReclaimRung, ReclaimTrigger,
+    ResourceGroupScheduler, WeightedResourceGroupScheduler,
 };
 
 /// Names EVERY public re-export from the crate root in type position. Never
@@ -127,6 +129,15 @@ fn names_every_public_reexport() {
     type _Ledger = (ChargeKind, LedgerSnapshot, UsageBreakdown);
     #[cfg(feature = "live_control")]
     type _OwnedAuthority = (PendingReservation, ManagedCharge);
+    #[cfg(feature = "live_control")]
+    type _Reclaim = (
+        Box<dyn MemoryReclaimer>,
+        ReclaimCandidate,
+        ReclaimGroupCandidate,
+        ReclaimOutcome,
+        ReclaimRequest,
+        ReclaimTrigger,
+    );
     type _Policy = (
         ExecutionBudget,
         MemoryBudgetManifest,
@@ -138,7 +149,8 @@ fn names_every_public_reexport() {
         ResidencyPolicy,
         ResourceGroup,
     );
-    type _Stats = (AllocatorSnapshot, EffectiveMemoryBudgetReport, PressureState);
+    type _Stats =
+        (AllocatorSnapshot, EffectiveMemoryBudgetReport, PressureState, ReclaimRuntimeStats);
     #[cfg(feature = "unbudgeted_pin")]
     type _UnbudgetedPin = (
         UnbudgetedPinRegistry,

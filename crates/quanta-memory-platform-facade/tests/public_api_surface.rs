@@ -66,7 +66,8 @@ fn names_always_on_reexports() {
 }
 
 /// Live accounting exposes one sealed platform factory and its broker view, not
-/// a user-implemented callback or a detachable sink.
+/// a user-implemented accounting callback or a detachable sink. The separate
+/// reclaim port may request eviction but cannot mutate counters directly.
 #[cfg(feature = "core-live-accounting")]
 #[test]
 fn live_broker_bridge_is_present_only_with_core_live_accounting() {
@@ -458,6 +459,28 @@ fn default_builder_and_report_only_share_override_resolution() {
         actual.override_provenance.last().map(|record| record.source),
         Some(OverrideSource::TestFixture)
     );
+}
+
+#[cfg(feature = "core-live-accounting")]
+#[test]
+fn platform_builder_installs_reclaimer_before_live_construction() {
+    use quanta_memory_platform_core::{
+        MemoryReclaimer, MemoryResult, ReclaimOutcome, ReclaimRequest,
+    };
+
+    struct NoopReclaimer;
+    impl MemoryReclaimer for NoopReclaimer {
+        fn reclaim(&self, _request: &ReclaimRequest) -> MemoryResult<ReclaimOutcome> {
+            Ok(ReclaimOutcome::default())
+        }
+    }
+
+    let platform = MemoryPlatformBuilder::new()
+        .with_preset(MemoryPreset::Ci)
+        .with_reclaimer(std::sync::Arc::new(NoopReclaimer))
+        .build()
+        .expect("builder accepts the reclaim port before construction");
+    assert_eq!(platform.broker().reclaim_runtime_stats().expect("stats").attempts, 0);
 }
 
 /// The `payload_store` builder yields a `SimplePayloadStore`, and a fresh store

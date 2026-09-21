@@ -13,15 +13,20 @@ use std::sync::{Arc, Mutex, PoisonError};
 use crate::adapters::scratch::BrokerBoundScratchAllocator;
 use crate::application::controller::LadderPressureController;
 use crate::application::scheduler::WeightedResourceGroupScheduler;
-use crate::domain::config::ValidatedResidencyPolicy;
+use crate::domain::config::{OverrideRecord, OverrideSource, ValidatedResidencyPolicy};
 use crate::domain::context::{
     MemoryContextHandle, MemoryContextKind, OwnerKey, RuntimeId, RuntimeKind,
 };
 use crate::domain::errors::{MemoryError, MemoryResult};
 use crate::domain::ledger::{AccountingLedger, ChargeKind, LedgerSnapshot, ReservationTicket};
-use crate::domain::policy::{MemoryClass, ResidencyPolicy};
+use crate::domain::policy::{MemoryClass, ReclaimPriority, ResidencyPolicy};
 use crate::domain::recharge::{RechargeError, RechargeRecoveryV1};
-use crate::domain::stats::{AllocatorSnapshot, EffectiveMemoryBudgetReport, PressureState};
+use crate::domain::stats::{
+    AllocatorSnapshot, EffectiveMemoryBudgetReport, PressureState, ReclaimRuntimeStats,
+};
+use crate::ports::reclaim::{
+    MemoryReclaimer, ReclaimCandidate, ReclaimGroupCandidate, ReclaimRequest, ReclaimTrigger,
+};
 use crate::ports::scratch::ScratchAllocator;
 use crate::ports::store::StoreBindingHandle;
 use crate::ports::telemetry::AllocatorAdvisory;
@@ -49,6 +54,8 @@ struct BrokerCore {
     /// fence was closed. They remain charged until `finish_rebuild` opens the
     /// fence and releases the complete batch atomically.
     deferred_committed_releases: Vec<ReservationTicket>,
+    reclaimer: Option<Arc<dyn MemoryReclaimer>>,
+    reclaim_stats: ReclaimRuntimeStats,
 }
 
 /// An owned pending reservation. This type is intentionally not `Clone`.
@@ -344,7 +351,15 @@ impl LiveProcessMemoryBroker {
     /// Build a live broker from a validated effective report. The residency
     /// policy is re-validated here so a broker can never come up on an invalid
     /// policy.
+    #[cfg(test)]
     pub(crate) fn from_report(report: EffectiveMemoryBudgetReport) -> MemoryResult<Self> {
+        Self::from_report_with_reclaimer(report, None)
+    }
+
+    pub(crate) fn from_report_with_reclaimer(
+        report: EffectiveMemoryBudgetReport,
+        reclaimer: Option<Arc<dyn MemoryReclaimer>>,
+    ) -> MemoryResult<Self> {
         let validated = ValidatedResidencyPolicy::try_from(report.residency.clone())?;
         let residency = validated.as_policy();
         let scheduler = WeightedResourceGroupScheduler::new(
@@ -365,6 +380,8 @@ impl LiveProcessMemoryBroker {
                 report,
                 ticket_groups: BTreeMap::new(),
                 deferred_committed_releases: Vec::new(),
+                reclaimer,
+                reclaim_stats: ReclaimRuntimeStats::default(),
             })),
         })
     }
@@ -386,8 +403,7 @@ impl LiveProcessMemoryBroker {
         kind: ChargeKind,
         bytes: u64,
     ) -> MemoryResult<ReservationTicket> {
-        let mut core = self.lock()?;
-        Self::reserve_on(&mut core, class, owner, context, kind, bytes)
+        self.reserve_with_reclaim(class, owner, context, kind, bytes, false)
     }
 
     /// Canonical single-owner reservation path. If the returned value is
@@ -416,8 +432,7 @@ impl LiveProcessMemoryBroker {
         kind: ChargeKind,
         bytes: u64,
     ) -> MemoryResult<ReservationTicket> {
-        let mut core = self.lock()?;
-        Self::reserve_committed_on(&mut core, class, owner, context, kind, bytes)
+        self.reserve_with_reclaim(class, owner, context, kind, bytes, true)
     }
 
     /// Canonical atomic reserve+commit path returning non-clone authority.
@@ -604,6 +619,212 @@ impl LiveProcessMemoryBroker {
         Ok(ticket)
     }
 
+    fn soft_threshold_request(
+        core: &BrokerCore,
+        class: &MemoryClass,
+        owner: &OwnerKey,
+        bytes: u64,
+    ) -> MemoryResult<Option<ReclaimRequest>> {
+        let policy = core.ledger.policy();
+        let class_current = core.ledger.class_usage(class).checked_total()?;
+        let class_after = class_current
+            .checked_add(bytes)
+            .ok_or_else(|| MemoryError::capacity("class prospective usage exceeds u64"))?;
+        let class_crossed = policy.classes.get(class).is_some_and(|budget| {
+            class_current <= budget.soft_cap_bytes && class_after > budget.soft_cap_bytes
+        });
+
+        let owner_current = core.ledger.owner_usage(owner).checked_total()?;
+        let owner_after = owner_current
+            .checked_add(bytes)
+            .ok_or_else(|| MemoryError::capacity("owner prospective usage exceeds u64"))?;
+        let owner_crossed = policy.owner_quotas.get(owner).is_some_and(|quota| {
+            owner_current <= quota.soft_cap_bytes && owner_after > quota.soft_cap_bytes
+        });
+
+        let group = policy.owner_groups.get(owner).cloned();
+        let group_crossed = group.as_ref().is_some_and(|name| {
+            policy.resource_groups.get(name).is_some_and(|budget| {
+                let current = core.scheduler.current_usage(name);
+                current <= budget.soft_cap_bytes
+                    && current.checked_add(bytes).is_some_and(|after| after > budget.soft_cap_bytes)
+            })
+        });
+
+        if !(class_crossed || owner_crossed || group_crossed) {
+            return Ok(None);
+        }
+        Self::reclaim_request(core, class, owner, group, bytes, ReclaimTrigger::SoftThreshold)
+            .map(Some)
+    }
+
+    fn reclaim_request(
+        core: &BrokerCore,
+        class: &MemoryClass,
+        owner: &OwnerKey,
+        group: Option<String>,
+        bytes: u64,
+        trigger: ReclaimTrigger,
+    ) -> MemoryResult<ReclaimRequest> {
+        let snapshot = core.ledger.snapshot();
+        snapshot.validate_exact()?;
+        let prospective = snapshot
+            .total_owner_bytes()
+            .checked_add(bytes)
+            .ok_or_else(|| MemoryError::capacity("reclaim prospective usage exceeds u64"))?;
+        let classified = core.controller.classify_semantic(prospective);
+        let pressure = match (trigger, classified) {
+            (ReclaimTrigger::SoftThreshold, PressureState::Normal) => PressureState::Soft,
+            (ReclaimTrigger::CapacityDenial, PressureState::Normal | PressureState::Soft) => {
+                PressureState::Hard
+            }
+            _ => classified,
+        };
+        let mut candidates: Vec<ReclaimCandidate> = core
+            .ledger
+            .policy()
+            .classes
+            .iter()
+            .filter(|(_, budget)| budget.hard_cap_bytes > 0)
+            .map(|(candidate, budget)| ReclaimCandidate {
+                class: candidate.clone(),
+                priority: budget.reclaim_priority,
+            })
+            .collect();
+        candidates.sort_by_key(|candidate| {
+            let priority = match candidate.priority {
+                ReclaimPriority::Last => 0,
+                ReclaimPriority::Normal => 1,
+                ReclaimPriority::First => 2,
+            };
+            (priority, candidate.class.clone())
+        });
+        let mut group_candidates: Vec<ReclaimGroupCandidate> = core
+            .ledger
+            .policy()
+            .resource_groups
+            .iter()
+            .map(|(name, budget)| ReclaimGroupCandidate {
+                group: name.clone(),
+                priority: budget.reclaim_priority,
+            })
+            .collect();
+        group_candidates.sort_by_key(|candidate| {
+            let priority = match candidate.priority {
+                ReclaimPriority::Last => 0,
+                ReclaimPriority::Normal => 1,
+                ReclaimPriority::First => 2,
+            };
+            (priority, candidate.group.clone())
+        });
+        Ok(ReclaimRequest {
+            trigger,
+            requested_class: class.clone(),
+            requested_owner: owner.clone(),
+            resource_group: group,
+            requested_bytes: bytes,
+            pressure,
+            rungs: core.controller.ladder_for(pressure),
+            candidates,
+            group_candidates,
+            max_attempts: 1,
+        })
+    }
+
+    fn run_reclaim(&self, reclaimer: Arc<dyn MemoryReclaimer>, request: &ReclaimRequest) {
+        let outcome =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| reclaimer.reclaim(request)));
+        let mut core = match self.lock() {
+            Ok(core) => core,
+            Err(_) => return,
+        };
+        core.reclaim_stats.attempts += 1;
+        match outcome {
+            Ok(Ok(outcome)) => {
+                core.reclaim_stats.successes += 1;
+                core.reclaim_stats.reported_reclaimed_bytes += u128::from(outcome.reclaimed_bytes);
+            }
+            Ok(Err(_)) => core.reclaim_stats.failures += 1,
+            Err(payload) => {
+                core.reclaim_stats.failures += 1;
+                // A hostile panic payload may itself panic on Drop. This is an
+                // exceptional, bounded leak that keeps a client callback from
+                // aborting the process during panic-payload retirement.
+                std::mem::forget(payload);
+            }
+        }
+    }
+
+    fn reserve_with_reclaim(
+        &self,
+        class: MemoryClass,
+        owner: OwnerKey,
+        context: MemoryContextKind,
+        kind: ChargeKind,
+        bytes: u64,
+        commit: bool,
+    ) -> MemoryResult<ReservationTicket> {
+        let soft_work = {
+            let core = self.lock()?;
+            let request = Self::soft_threshold_request(&core, &class, &owner, bytes)?;
+            request.and_then(|request| core.reclaimer.clone().map(|reclaimer| (reclaimer, request)))
+        };
+        let attempted_soft = soft_work.is_some();
+        if let Some((reclaimer, request)) = soft_work {
+            self.run_reclaim(reclaimer, &request);
+        }
+
+        let first = {
+            let mut core = self.lock()?;
+            if commit {
+                Self::reserve_committed_on(
+                    &mut core,
+                    class.clone(),
+                    owner.clone(),
+                    context,
+                    kind,
+                    bytes,
+                )
+            } else {
+                Self::reserve_on(&mut core, class.clone(), owner.clone(), context, kind, bytes)
+            }
+        };
+        let first_error = match first {
+            Ok(ticket) => return Ok(ticket),
+            Err(error) => error,
+        };
+        if attempted_soft || !matches!(first_error, MemoryError::Capacity(_)) {
+            return Err(first_error);
+        }
+
+        let hard_work = {
+            let core = self.lock()?;
+            let Some(reclaimer) = core.reclaimer.clone() else {
+                return Err(first_error);
+            };
+            let group = core.ledger.policy().owner_groups.get(&owner).cloned();
+            let request = Self::reclaim_request(
+                &core,
+                &class,
+                &owner,
+                group,
+                bytes,
+                ReclaimTrigger::CapacityDenial,
+            )?;
+            (reclaimer, request)
+        };
+        self.run_reclaim(hard_work.0, &hard_work.1);
+
+        // Final authority is the remeasured semantic state, never the callback's
+        // claimed byte count. One retry is the bounded exhaustion contract.
+        let mut core = self.lock()?;
+        if commit {
+            Self::reserve_committed_on(&mut core, class, owner, context, kind, bytes)
+        } else {
+            Self::reserve_on(&mut core, class, owner, context, kind, bytes)
+        }
+    }
+
     /// Release on an already-held lock guard (ledger release + group bookkeeping),
     /// fail-closed before any scheduler mutation.
     fn release_on(core: &mut BrokerCore, ticket: &ReservationTicket) -> MemoryResult<()> {
@@ -703,6 +924,50 @@ impl LiveProcessMemoryBroker {
         // weighted-fair scheduler (anti-starvation) before it can reserve.
         let group = core.ledger.policy().owner_groups.get(&owner).cloned();
         let mut next_scheduler = core.scheduler.clone();
+        if class != MemoryClass::Headroom {
+            let snapshot = core.ledger.snapshot();
+            snapshot.validate_exact()?;
+            let non_headroom_current = snapshot
+                .class_usage
+                .iter()
+                .filter(|(candidate, _)| **candidate != MemoryClass::Headroom)
+                .try_fold(0u64, |total, (_, usage)| {
+                    total
+                        .checked_add(usage.checked_total()?)
+                        .ok_or_else(|| MemoryError::capacity("non-headroom usage exceeds u64"))
+                })?;
+            let non_headroom_after = non_headroom_current
+                .checked_add(bytes)
+                .ok_or_else(|| MemoryError::capacity("non-headroom reserve total exceeds u64"))?;
+            let protected_for_peer_groups = core
+                .ledger
+                .policy()
+                .resource_groups
+                .iter()
+                .filter(|(candidate, _)| Some(candidate.as_str()) != group.as_deref())
+                .try_fold(0u64, |total, (name, budget)| {
+                    total
+                        .checked_add(
+                            budget
+                                .reserved_bytes
+                                .saturating_sub(core.scheduler.current_usage(name)),
+                        )
+                        .ok_or_else(|| MemoryError::capacity("group reserved floor exceeds u64"))
+                })?;
+            let group_ceiling = core
+                .ledger
+                .policy()
+                .global_hard_limit_bytes
+                .checked_sub(core.ledger.policy().headroom_bytes)
+                .and_then(|band| band.checked_sub(protected_for_peer_groups))
+                .ok_or_else(|| MemoryError::capacity("protected group floors exceed global"))?;
+            if non_headroom_after > group_ceiling {
+                return Err(MemoryError::capacity(format!(
+                    "resource-group protected ceiling {group_ceiling} exceeded by reserve to \
+                     {non_headroom_after}; {protected_for_peer_groups} bytes remain protected"
+                )));
+            }
+        }
         if let Some(ref group) = group {
             if !next_scheduler.admits(group, bytes) {
                 return Err(MemoryError::capacity(format!(
@@ -888,9 +1153,32 @@ impl LiveProcessMemoryBroker {
             )));
         }
 
-        // Fail-closed over the LIVE usage axes, not the new policy's keys: a class
-        // that currently holds bytes may neither be dropped from the policy (which
-        // would silently uncap it) nor be given a hard cap below its usage.
+        let unused_class_floor = new_policy.classes.iter().try_fold(
+            0u64,
+            |total, (class, budget)| -> MemoryResult<u64> {
+                if *class == MemoryClass::Headroom {
+                    return Ok(total);
+                }
+                let used = snapshot.class_usage.get(class).map_or(0, |usage| usage.total());
+                total.checked_add(budget.reserved_bytes.saturating_sub(used)).ok_or_else(|| {
+                    MemoryError::InvalidState("class reserved floor exceeds u64".into())
+                })
+            },
+        )?;
+        let class_protected_postimage =
+            non_headroom_used.checked_add(unused_class_floor).ok_or_else(|| {
+                MemoryError::InvalidState("class protected postimage exceeds u64".into())
+            })?;
+        if class_protected_postimage > new_non_headroom_ceiling {
+            return Err(MemoryError::InvalidState(format!(
+                "live reconfig denied: usage {non_headroom_used} plus unused class floors \
+                 {unused_class_floor} exceeds non-headroom ceiling {new_non_headroom_ceiling}"
+            )));
+        }
+
+        // Fail-closed over LIVE class usage, while preserving a legal shared-pool
+        // borrow. Reconfigure uses the same aggregate borrow predicate as reserve.
+        let mut total_class_borrow = 0u64;
         for (class, usage) in &snapshot.class_usage {
             let class_used = usage.total();
             if class_used == 0 {
@@ -898,9 +1186,17 @@ impl LiveProcessMemoryBroker {
             }
             match new_policy.classes.get(class) {
                 Some(budget) if budget.hard_cap_bytes >= class_used => {}
+                Some(budget) if budget.borrow_from_shared_pool => {
+                    total_class_borrow = total_class_borrow
+                        .checked_add(class_used - budget.hard_cap_bytes)
+                        .ok_or_else(|| {
+                            MemoryError::InvalidState("live class borrow exceeds u64".into())
+                        })?;
+                }
                 Some(budget) => {
                     return Err(MemoryError::InvalidState(format!(
-                        "live reconfig denied: class {class:?} new hard cap {} below current usage {class_used}",
+                        "live reconfig denied: non-borrowing class {class:?} new hard cap {} \
+                         below current usage {class_used}",
                         budget.hard_cap_bytes
                     )));
                 }
@@ -911,6 +1207,12 @@ impl LiveProcessMemoryBroker {
                     )));
                 }
             }
+        }
+        if total_class_borrow > new_policy.shared_burst_pool_bytes {
+            return Err(MemoryError::InvalidState(format!(
+                "live reconfig denied: class borrow {total_class_borrow} exceeds shared pool {}",
+                new_policy.shared_burst_pool_bytes
+            )));
         }
 
         // Any owner quota carried by the new policy must honor that owner's live
@@ -956,20 +1258,43 @@ impl LiveProcessMemoryBroker {
                 })?;
             }
         }
-        for (group, used) in live_group_usage {
-            if let Some(rg) = new_policy.resource_groups.get(group) {
-                if rg.hard_cap_bytes < used {
-                    return Err(MemoryError::InvalidState(format!(
-                        "live reconfig denied: resource group {group} new hard cap {} below current usage {used}",
-                        rg.hard_cap_bytes
-                    )));
-                }
+        use crate::application::scheduler::ResourceGroupScheduler;
+        let mut candidate_scheduler = WeightedResourceGroupScheduler::new(
+            new_policy.resource_groups.clone(),
+            new_policy.shared_burst_pool_bytes,
+        );
+        for (group, used) in &live_group_usage {
+            if !candidate_scheduler.admits(group, *used) {
+                return Err(MemoryError::InvalidState(format!(
+                    "live reconfig denied: resource group {group} current usage {used} violates \
+                     hard/burst policy"
+                )));
             }
+            candidate_scheduler.record_usage(group, *used)?;
+        }
+        let unused_group_floor = new_policy.resource_groups.iter().try_fold(
+            0u64,
+            |total, (group, budget)| -> MemoryResult<u64> {
+                let used = live_group_usage.get(group).copied().unwrap_or(0);
+                total.checked_add(budget.reserved_bytes.saturating_sub(used)).ok_or_else(|| {
+                    MemoryError::InvalidState("group reserved floor exceeds u64".into())
+                })
+            },
+        )?;
+        let group_protected_postimage =
+            non_headroom_used.checked_add(unused_group_floor).ok_or_else(|| {
+                MemoryError::InvalidState("group protected postimage exceeds u64".into())
+            })?;
+        if group_protected_postimage > new_non_headroom_ceiling {
+            return Err(MemoryError::InvalidState(format!(
+                "live reconfig denied: usage {non_headroom_used} plus unused group floors \
+                 {unused_group_floor} exceeds non-headroom ceiling {new_non_headroom_ceiling}"
+            )));
         }
 
         // Accepted: install the new policy by rebuilding the ledger's view while
         // preserving usage counters.
-        core.install_policy(validated)?;
+        core.install_policy(validated, OverrideSource::RuntimeReconfigure)?;
         Ok(())
     }
 
@@ -986,6 +1311,13 @@ impl LiveProcessMemoryBroker {
         let core = self.lock()?;
         Ok(core.report.clone())
     }
+
+    /// Bounded reclaim activity observed by this broker. Callback-reported
+    /// bytes are telemetry only; final admission always uses ledger remeasurement.
+    pub fn reclaim_runtime_stats(&self) -> MemoryResult<ReclaimRuntimeStats> {
+        let core = self.lock()?;
+        Ok(core.reclaim_stats.clone())
+    }
 }
 
 impl std::fmt::Debug for LiveProcessMemoryBroker {
@@ -1001,13 +1333,22 @@ impl BrokerCore {
     /// only swaps the active policy in place, so all accounting invariants hold
     /// across the reconfiguration. The scheduler and controller are rebuilt
     /// from the new policy.
-    fn install_policy(&mut self, validated: ValidatedResidencyPolicy) -> MemoryResult<()> {
+    fn install_policy(
+        &mut self,
+        validated: ValidatedResidencyPolicy,
+        source: OverrideSource,
+    ) -> MemoryResult<()> {
         // Snapshot live usage BEFORE the swap so the rebuilt scheduler can be
         // re-seeded from it (a fresh scheduler starts at zero usage, which would
         // otherwise make post-reconfigure admission see phantom-empty groups and
         // silently drop the anti-starvation guarantee).
         let snapshot = self.ledger.snapshot();
         snapshot.validate_exact()?;
+        let next_revision = self
+            .report
+            .policy_revision
+            .checked_add(1)
+            .ok_or_else(|| MemoryError::InvalidState("policy revision exhausted".into()))?;
         let new_policy = validated.as_policy().clone();
         let mut scheduler = WeightedResourceGroupScheduler::new(
             new_policy.resource_groups.clone(),
@@ -1034,6 +1375,13 @@ impl BrokerCore {
         self.controller = Arc::new(controller);
         // Keep the report's residency in sync with the active policy.
         self.report.residency = new_policy;
+        self.report.policy_revision = next_revision;
+        let source_label = source.label().to_string();
+        self.report.active_policy_source.clone_from(&source_label);
+        if !self.report.override_sources.contains(&source_label) {
+            self.report.override_sources.push(source_label);
+        }
+        self.report.override_provenance.push(OverrideRecord::new(source, "residency.active"));
         Ok(())
     }
 }
@@ -1094,6 +1442,8 @@ mod tests {
             residency,
             override_sources: vec!["test".to_string()],
             override_provenance: Vec::new(),
+            policy_revision: 1,
+            active_policy_source: "test".to_string(),
         }
     }
 
@@ -3448,5 +3798,368 @@ mod tests {
         assert_eq!(snap.total_owner_bytes(), 90_000, "baseline usage must survive unchanged");
         assert!(snap.class_owner_balanced(), "ledger invariants must survive concurrency");
         b.release(&baseline).expect("release baseline");
+    }
+
+    #[derive(Default)]
+    struct RecordingReclaimer {
+        requests: Mutex<Vec<ReclaimRequest>>,
+        charge_to_release: Mutex<Option<ManagedCharge>>,
+        broker_for_reentry: Mutex<Option<LiveProcessMemoryBroker>>,
+    }
+
+    impl MemoryReclaimer for RecordingReclaimer {
+        fn reclaim(
+            &self,
+            request: &ReclaimRequest,
+        ) -> MemoryResult<crate::ports::reclaim::ReclaimOutcome> {
+            self.requests.lock().expect("requests").push(request.clone());
+            if let Some(broker) = self.broker_for_reentry.lock().expect("broker").as_ref() {
+                broker.effective_report().expect("callback must run outside broker lock");
+            }
+            let mut reclaimed = 0;
+            if let Some(mut charge) = self.charge_to_release.lock().expect("charge").take() {
+                reclaimed = charge.bytes().expect("live charge");
+                charge.release().expect("callback release");
+            }
+            Ok(crate::ports::reclaim::ReclaimOutcome { reclaimed_bytes: reclaimed })
+        }
+    }
+
+    #[test]
+    fn soft_cap_crossing_triggers_reclaim_without_immediate_hard_deny() {
+        let reclaimer = Arc::new(RecordingReclaimer::default());
+        let policy = ResidencyPolicy::new(1_000)
+            .with_class_budget(MemoryClass::ArtifactCache, class_budget(0, 50, 100, false));
+        let broker = LiveProcessMemoryBroker::from_report_with_reclaimer(
+            report_with(policy),
+            Some(reclaimer.clone()),
+        )
+        .expect("broker");
+        *reclaimer.broker_for_reentry.lock().expect("broker") = Some(broker.clone());
+
+        let charge = broker
+            .reserve_managed_charge(
+                MemoryClass::ArtifactCache,
+                "soft-owner".into(),
+                MemoryContextKind::Request,
+                ChargeKind::RetainedPayload,
+                60,
+            )
+            .expect("soft crossing remains admissible below hard");
+        let requests = reclaimer.requests.lock().expect("requests");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].trigger, ReclaimTrigger::SoftThreshold);
+        assert_eq!(requests[0].max_attempts, 1);
+        drop(requests);
+        assert_eq!(broker.reclaim_runtime_stats().expect("stats").attempts, 1);
+        drop(charge);
+    }
+
+    #[test]
+    fn owner_and_group_soft_caps_each_trigger_the_same_reclaim_lane() {
+        let owner_reclaimer = Arc::new(RecordingReclaimer::default());
+        let owner_policy = ResidencyPolicy::new(1_000)
+            .with_class_budget(MemoryClass::ArtifactCache, class_budget(0, 100, 100, false))
+            .with_owner_quota("soft-owner", OwnerQuota { soft_cap_bytes: 10, hard_cap_bytes: 100 });
+        let owner_broker = LiveProcessMemoryBroker::from_report_with_reclaimer(
+            report_with(owner_policy),
+            Some(owner_reclaimer.clone()),
+        )
+        .expect("owner broker");
+        let owner_charge = owner_broker
+            .reserve_managed_charge(
+                MemoryClass::ArtifactCache,
+                "soft-owner".into(),
+                MemoryContextKind::Request,
+                ChargeKind::RetainedPayload,
+                11,
+            )
+            .expect("owner soft crossing");
+        assert_eq!(owner_reclaimer.requests.lock().expect("requests").len(), 1);
+
+        let group_reclaimer = Arc::new(RecordingReclaimer::default());
+        let group = ResourceGroup {
+            reserved_bytes: 0,
+            soft_cap_bytes: 10,
+            hard_cap_bytes: 100,
+            burst_percent: 0,
+            reclaim_priority: ReclaimPriority::Normal,
+            admission_weight: 1,
+        };
+        let group_policy = ResidencyPolicy::new(1_000)
+            .with_class_budget(MemoryClass::ArtifactCache, class_budget(0, 100, 100, false))
+            .with_resource_group("soft-group", group)
+            .with_owner_group("group-owner", "soft-group");
+        let group_broker = LiveProcessMemoryBroker::from_report_with_reclaimer(
+            report_with(group_policy),
+            Some(group_reclaimer.clone()),
+        )
+        .expect("group broker");
+        let group_charge = group_broker
+            .reserve_managed_charge(
+                MemoryClass::ArtifactCache,
+                "group-owner".into(),
+                MemoryContextKind::Request,
+                ChargeKind::RetainedPayload,
+                11,
+            )
+            .expect("group soft crossing");
+        let group_requests = group_reclaimer.requests.lock().expect("requests");
+        assert_eq!(group_requests.len(), 1);
+        assert_eq!(group_requests[0].resource_group.as_deref(), Some("soft-group"));
+        drop(group_requests);
+        drop(owner_charge);
+        drop(group_charge);
+    }
+
+    #[test]
+    fn hard_cap_denial_reclaims_outside_lock_remeasures_and_retries_once() {
+        let reclaimer = Arc::new(RecordingReclaimer::default());
+        let policy = ResidencyPolicy::new(1_000)
+            .with_class_budget(MemoryClass::ArtifactCache, class_budget(0, 50, 100, false));
+        let broker = LiveProcessMemoryBroker::from_report_with_reclaimer(
+            report_with(policy),
+            Some(reclaimer.clone()),
+        )
+        .expect("broker");
+        *reclaimer.broker_for_reentry.lock().expect("broker") = Some(broker.clone());
+
+        let baseline = broker
+            .reserve_managed_charge(
+                MemoryClass::ArtifactCache,
+                "hard-owner".into(),
+                MemoryContextKind::Request,
+                ChargeKind::RetainedPayload,
+                80,
+            )
+            .expect("baseline");
+        *reclaimer.charge_to_release.lock().expect("charge") = Some(baseline);
+        let replacement = broker
+            .reserve_managed_charge(
+                MemoryClass::ArtifactCache,
+                "hard-owner".into(),
+                MemoryContextKind::Request,
+                ChargeKind::RetainedPayload,
+                30,
+            )
+            .expect("retry sees callback release and admits");
+
+        let requests = reclaimer.requests.lock().expect("requests");
+        assert_eq!(requests.last().expect("hard request").trigger, ReclaimTrigger::CapacityDenial);
+        assert_eq!(requests.last().expect("hard request").max_attempts, 1);
+        drop(requests);
+        let stats = broker.reclaim_runtime_stats().expect("stats");
+        assert_eq!(stats.attempts, 2, "baseline soft signal plus one hard retry");
+        assert_eq!(stats.reported_reclaimed_bytes, 80);
+        assert_eq!(broker.ledger_snapshot().expect("snapshot").total_owner_bytes(), 30);
+        drop(replacement);
+    }
+
+    #[test]
+    fn group_reserved_floor_is_unavailable_to_peer_group() {
+        let protected = ResourceGroup {
+            reserved_bytes: 400,
+            soft_cap_bytes: 500,
+            hard_cap_bytes: 600,
+            burst_percent: 0,
+            reclaim_priority: ReclaimPriority::First,
+            admission_weight: 1,
+        };
+        let peer = ResourceGroup {
+            reserved_bytes: 0,
+            soft_cap_bytes: 700,
+            hard_cap_bytes: 1_000,
+            burst_percent: 0,
+            reclaim_priority: ReclaimPriority::Last,
+            admission_weight: 1,
+        };
+        let policy = ResidencyPolicy::new(1_000)
+            .with_class_budget(MemoryClass::ArtifactCache, class_budget(0, 1_000, 1_000, false))
+            .with_resource_group("protected", protected)
+            .with_resource_group("peer", peer)
+            .with_owner_group("protected-owner", "protected")
+            .with_owner_group("peer-owner", "peer");
+        let broker = LiveProcessMemoryBroker::from_report(report_with(policy)).expect("broker");
+
+        assert!(matches!(
+            broker.reserve(
+                MemoryClass::ArtifactCache,
+                "peer-owner".into(),
+                MemoryContextKind::Request,
+                ChargeKind::RetainedPayload,
+                601,
+            ),
+            Err(MemoryError::Capacity(_))
+        ));
+        let peer_ticket = broker
+            .reserve(
+                MemoryClass::ArtifactCache,
+                "peer-owner".into(),
+                MemoryContextKind::Request,
+                ChargeKind::RetainedPayload,
+                600,
+            )
+            .expect("peer may use unprotected band");
+        let protected_ticket = broker
+            .reserve(
+                MemoryClass::ArtifactCache,
+                "protected-owner".into(),
+                MemoryContextKind::Request,
+                ChargeKind::RetainedPayload,
+                400,
+            )
+            .expect("protected group consumes its floor");
+        broker.release(&peer_ticket).expect("release peer");
+        broker.release(&protected_ticket).expect("release protected");
+    }
+
+    #[test]
+    fn accepted_reconfigure_updates_revision_source_and_matches_headroom_predicate() {
+        let mut policy = ResidencyPolicy::new(1_000).with_headroom_bytes(200);
+        policy.classes.insert(MemoryClass::Headroom, class_budget(0, 200, 200, false));
+        policy.classes.insert(MemoryClass::ArtifactCache, class_budget(0, 800, 800, false));
+        let broker =
+            LiveProcessMemoryBroker::from_report(report_with(policy.clone())).expect("broker");
+        let headroom = broker
+            .reserve(
+                MemoryClass::Headroom,
+                "headroom".into(),
+                MemoryContextKind::Request,
+                ChargeKind::LiveScratch,
+                200,
+            )
+            .expect("headroom");
+        let work = broker
+            .reserve(
+                MemoryClass::ArtifactCache,
+                "work".into(),
+                MemoryContextKind::Request,
+                ChargeKind::RetainedPayload,
+                800,
+            )
+            .expect("separate non-headroom band");
+
+        broker.try_live_reconfigure(policy).expect("identity policy remains legal");
+        let report = broker.effective_report().expect("report");
+        assert_eq!(report.policy_revision, 2);
+        assert_eq!(report.active_policy_source, "runtime_reconfigure");
+        assert_eq!(
+            report.override_provenance.last(),
+            Some(&OverrideRecord::new(OverrideSource::RuntimeReconfigure, "residency.active"))
+        );
+        assert_eq!(report.residency.headroom_bytes, 200);
+        broker.release(&headroom).expect("release headroom");
+        broker.release(&work).expect("release work");
+    }
+
+    #[test]
+    fn identity_reconfigure_succeeds_during_legal_class_borrow() {
+        let policy = ResidencyPolicy::new(1_000)
+            .with_shared_burst_pool_bytes(100)
+            .with_class_budget(MemoryClass::ArtifactCache, class_budget(0, 50, 100, true));
+        let broker =
+            LiveProcessMemoryBroker::from_report(report_with(policy.clone())).expect("broker");
+        let ticket = broker
+            .reserve(
+                MemoryClass::ArtifactCache,
+                "borrower".into(),
+                MemoryContextKind::Request,
+                ChargeKind::RetainedPayload,
+                150,
+            )
+            .expect("legal 50-byte class borrow");
+        broker.try_live_reconfigure(policy).expect("identity reconfigure preserves legal borrow");
+        broker.release(&ticket).expect("release");
+    }
+
+    #[test]
+    fn identity_reconfigure_succeeds_during_legal_group_burst() {
+        let group = ResourceGroup {
+            reserved_bytes: 0,
+            soft_cap_bytes: 50,
+            hard_cap_bytes: 100,
+            burst_percent: 50,
+            reclaim_priority: ReclaimPriority::Normal,
+            admission_weight: 1,
+        };
+        let policy = ResidencyPolicy::new(1_000)
+            .with_shared_burst_pool_bytes(100)
+            .with_class_budget(MemoryClass::ArtifactCache, class_budget(0, 300, 500, false))
+            .with_resource_group("burstable", group)
+            .with_owner_group("group-owner", "burstable");
+        let broker =
+            LiveProcessMemoryBroker::from_report(report_with(policy.clone())).expect("broker");
+        let ticket = broker
+            .reserve(
+                MemoryClass::ArtifactCache,
+                "group-owner".into(),
+                MemoryContextKind::Request,
+                ChargeKind::RetainedPayload,
+                150,
+            )
+            .expect("legal 50-byte group burst");
+        broker.try_live_reconfigure(policy).expect("identity reconfigure preserves legal burst");
+        broker.release(&ticket).expect("release");
+    }
+
+    #[test]
+    fn reclaim_priority_orders_victims_deterministically() {
+        let reclaimer = Arc::new(RecordingReclaimer::default());
+        let mut last = class_budget(0, 10, 100, false);
+        last.reclaim_priority = ReclaimPriority::Last;
+        let mut normal = class_budget(0, 100, 100, false);
+        normal.reclaim_priority = ReclaimPriority::Normal;
+        let mut first = class_budget(0, 100, 100, false);
+        first.reclaim_priority = ReclaimPriority::First;
+        let group_with_priority = |priority| ResourceGroup {
+            reserved_bytes: 0,
+            soft_cap_bytes: 50,
+            hard_cap_bytes: 100,
+            burst_percent: 0,
+            reclaim_priority: priority,
+            admission_weight: 1,
+        };
+        let policy = ResidencyPolicy::new(1_000)
+            .with_class_budget(MemoryClass::ArtifactCache, last)
+            .with_class_budget(MemoryClass::EvidenceCache, normal)
+            .with_class_budget(MemoryClass::TraceIndex, first)
+            .with_resource_group("last-group", group_with_priority(ReclaimPriority::Last))
+            .with_resource_group("normal-group", group_with_priority(ReclaimPriority::Normal))
+            .with_resource_group("first-group", group_with_priority(ReclaimPriority::First));
+        let broker = LiveProcessMemoryBroker::from_report_with_reclaimer(
+            report_with(policy),
+            Some(reclaimer.clone()),
+        )
+        .expect("broker");
+        let charge = broker
+            .reserve_managed_charge(
+                MemoryClass::ArtifactCache,
+                "priority-owner".into(),
+                MemoryContextKind::Request,
+                ChargeKind::RetainedPayload,
+                11,
+            )
+            .expect("soft crossing");
+        let requests = reclaimer.requests.lock().expect("requests");
+        let candidates = &requests[0].candidates;
+        let last_pos = candidates
+            .iter()
+            .position(|candidate| candidate.class == MemoryClass::ArtifactCache)
+            .expect("last candidate");
+        let normal_pos = candidates
+            .iter()
+            .position(|candidate| candidate.class == MemoryClass::EvidenceCache)
+            .expect("normal candidate");
+        let first_pos = candidates
+            .iter()
+            .position(|candidate| candidate.class == MemoryClass::TraceIndex)
+            .expect("first candidate");
+        assert!(last_pos < normal_pos && normal_pos < first_pos);
+        let groups = &requests[0].group_candidates;
+        assert_eq!(groups[0].group, "last-group");
+        assert_eq!(groups[1].group, "normal-group");
+        assert_eq!(groups[2].group, "first-group");
+        drop(requests);
+        drop(charge);
     }
 }

@@ -61,6 +61,16 @@
 //! );
 //! # }
 //! ```
+//!
+//! Resource-group usage is derived only from owned ticket transitions; there is
+//! no public side channel that can mutate scheduler counters:
+//!
+//! ```compile_fail
+//! # use quanta_memory_platform_core::LiveProcessMemoryBroker;
+//! # fn side_channel(broker: &LiveProcessMemoryBroker) {
+//! broker.record_group_usage("group", 1);
+//! # }
+//! ```
 
 pub mod adapters;
 pub mod api;
@@ -99,9 +109,16 @@ pub use domain::policy::{
     ExecutionBudget, MemoryBudgetManifest, MemoryClass, MemoryClassBudget, MemoryPreset,
     OwnerQuota, ReclaimPriority, ResidencyPolicy, ResourceGroup,
 };
-pub use domain::stats::{AllocatorSnapshot, EffectiveMemoryBudgetReport, PressureState};
+pub use domain::stats::{
+    AllocatorSnapshot, EffectiveMemoryBudgetReport, PressureState, ReclaimRuntimeStats,
+};
 #[cfg(feature = "unbudgeted_pin")]
 pub use ports::pin::{InvalidationOutcome, PayloadPinLease, PinRegistry};
+#[cfg(feature = "live_control")]
+pub use ports::reclaim::{
+    MemoryReclaimer, ReclaimCandidate, ReclaimGroupCandidate, ReclaimOutcome, ReclaimRequest,
+    ReclaimTrigger,
+};
 pub use ports::scratch::{ScratchAllocator, ScratchRequest, ScratchReservation};
 pub use ports::store::{
     PublishedPayload, RetainedEnvelope, StagedHandle, StoreBindingHandle, StoreStats, SweepHint,

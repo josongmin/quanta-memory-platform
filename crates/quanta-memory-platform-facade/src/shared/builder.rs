@@ -100,6 +100,19 @@ impl MemoryPlatformBuilder {
         self
     }
 
+    /// Install the host-independent reclaim callback before constructing the
+    /// live platform. The broker invokes it outside its internal mutex and
+    /// remeasures ledger state before any retry decision.
+    #[cfg(feature = "core-live-accounting")]
+    #[must_use]
+    pub fn with_reclaimer(
+        mut self,
+        reclaimer: std::sync::Arc<dyn quanta_memory_platform_core::MemoryReclaimer>,
+    ) -> Self {
+        self.inner = self.inner.with_reclaimer(reclaimer);
+        self
+    }
+
     /// Build the enforced, accounting-backed default platform.
     #[cfg(feature = "core-live-accounting")]
     pub fn build(self) -> MemoryResult<LiveMemoryPlatform> {

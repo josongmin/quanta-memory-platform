@@ -104,6 +104,8 @@ fn builder_emits_effective_budget_report_with_override_provenance() {
     assert_eq!(report.preset, MemoryPreset::Ci);
     assert_eq!(report.execution.max_trace_edges, Some(10_000));
     assert_eq!(report.override_sources, vec!["preset".to_string()]);
+    assert_eq!(report.policy_revision, 1);
+    assert_eq!(report.active_policy_source, "preset");
     assert_eq!(report.residency.global_hard_limit_bytes, 512 * 1024 * 1024);
 }
 

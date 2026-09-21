@@ -136,7 +136,7 @@ impl UsageBreakdown {
     }
 
     #[cfg(feature = "live_control")]
-    fn checked_total(&self) -> MemoryResult<u64> {
+    pub(crate) fn checked_total(&self) -> MemoryResult<u64> {
         self.retained_payload_bytes
             .checked_add(self.retained_metadata_bytes)
             .and_then(|sum| sum.checked_add(self.live_scratch_bytes))
@@ -404,18 +404,57 @@ impl AccountingLedger {
         let global_total_after = LedgerSnapshot::checked_axis_total(&snapshot.owner_usage)?
             .checked_add(bytes)
             .ok_or_else(|| MemoryError::capacity("global reserve total exceeds u64"))?;
-        let global_ceiling = if class == MemoryClass::Headroom {
-            self.policy().global_hard_limit_bytes
-        } else {
-            self.policy().global_hard_limit_bytes.saturating_sub(self.policy().headroom_bytes)
-        };
-        if global_total_after > global_ceiling {
+        if global_total_after > self.policy().global_hard_limit_bytes {
             return Err(MemoryError::capacity(format!(
-                "global ceiling {global_ceiling} exceeded by reserve to {global_total_after} \
-                 (class {class:?}, global hard limit {}, headroom {})",
-                self.policy().global_hard_limit_bytes,
-                self.policy().headroom_bytes
+                "global hard limit {} exceeded by reserve to {global_total_after} (class {class:?})",
+                self.policy().global_hard_limit_bytes
             )));
+        }
+
+        // Non-headroom classes own a distinct distributable band. Protect the
+        // configured headroom once (not once plus its live usage), and protect
+        // every other class's still-unused reserved floor. The requested class
+        // may consume its own floor. Independent class/group axes can describe
+        // the same bytes, so group protection is enforced by the scheduler and
+        // is not added again here.
+        if class != MemoryClass::Headroom {
+            let non_headroom_current = snapshot
+                .class_usage
+                .iter()
+                .filter(|(candidate, _)| **candidate != MemoryClass::Headroom)
+                .try_fold(0u64, |total, (_, usage)| {
+                    total
+                        .checked_add(usage.checked_total()?)
+                        .ok_or_else(|| MemoryError::capacity("non-headroom usage exceeds u64"))
+                })?;
+            let non_headroom_after = non_headroom_current
+                .checked_add(bytes)
+                .ok_or_else(|| MemoryError::capacity("non-headroom reserve total exceeds u64"))?;
+            let protected_for_peers = self
+                .policy()
+                .classes
+                .iter()
+                .filter(|(candidate, _)| {
+                    **candidate != class && **candidate != MemoryClass::Headroom
+                })
+                .try_fold(0u64, |total, (candidate, budget)| {
+                    let used = self.class_usage(candidate).checked_total()?;
+                    total
+                        .checked_add(budget.reserved_bytes.saturating_sub(used))
+                        .ok_or_else(|| MemoryError::capacity("class reserved floor exceeds u64"))
+                })?;
+            let distributable = self
+                .policy()
+                .global_hard_limit_bytes
+                .checked_sub(self.policy().headroom_bytes)
+                .and_then(|bytes| bytes.checked_sub(protected_for_peers))
+                .ok_or_else(|| MemoryError::capacity("protected memory floors exceed global"))?;
+            if non_headroom_after > distributable {
+                return Err(MemoryError::capacity(format!(
+                    "non-headroom ceiling {distributable} exceeded by reserve to {non_headroom_after}; \
+                     {protected_for_peers} bytes remain protected for peer class floors"
+                )));
+            }
         }
 
         let owner_current = self.owner_usage(&owner).checked_total()?;
@@ -871,6 +910,63 @@ mod tests {
         reserve(&mut ledger, MemoryClass::Headroom, "o", 900)
             .expect("Headroom class may use the reserved band up to the global ceiling");
         assert_eq!(ledger.snapshot().total_owner_bytes(), 900);
+    }
+
+    #[test]
+    fn headroom_usage_does_not_consume_protected_non_headroom_band_twice() {
+        let mut policy = ResidencyPolicy::new(1_000).with_headroom_bytes(200);
+        policy.classes.insert(
+            MemoryClass::Headroom,
+            MemoryClassBudget {
+                reserved_bytes: 0,
+                soft_cap_bytes: 200,
+                hard_cap_bytes: 200,
+                borrow_from_shared_pool: false,
+                reclaim_priority: ReclaimPriority::Last,
+            },
+        );
+        let mut ledger = ledger_from_policy(policy);
+
+        reserve(&mut ledger, MemoryClass::Headroom, "headroom", 200).expect("headroom band");
+        reserve(&mut ledger, MemoryClass::ArtifactCache, "work", 800)
+            .expect("non-headroom owns its separate 800-byte band");
+        assert_eq!(ledger.snapshot().total_owner_bytes(), 1_000);
+    }
+
+    #[test]
+    fn reserved_floor_protects_class_from_peer_consumption() {
+        let mut policy = ResidencyPolicy::new(1_000);
+        policy.classes.insert(
+            MemoryClass::ArtifactCache,
+            MemoryClassBudget {
+                reserved_bytes: 400,
+                soft_cap_bytes: 700,
+                hard_cap_bytes: 1_000,
+                borrow_from_shared_pool: false,
+                reclaim_priority: ReclaimPriority::Normal,
+            },
+        );
+        policy.classes.insert(
+            MemoryClass::EvidenceCache,
+            MemoryClassBudget {
+                reserved_bytes: 0,
+                soft_cap_bytes: 1_000,
+                hard_cap_bytes: 1_000,
+                borrow_from_shared_pool: false,
+                reclaim_priority: ReclaimPriority::Normal,
+            },
+        );
+        let mut ledger = ledger_from_policy(policy);
+
+        assert!(matches!(
+            reserve(&mut ledger, MemoryClass::EvidenceCache, "peer", 601),
+            Err(MemoryError::Capacity(_))
+        ));
+        assert_eq!(ledger.snapshot().total_owner_bytes(), 0, "denial is fail-closed");
+        reserve(&mut ledger, MemoryClass::EvidenceCache, "peer", 600).expect("unprotected band");
+        reserve(&mut ledger, MemoryClass::ArtifactCache, "protected", 400)
+            .expect("reserved class can consume its floor");
+        assert_eq!(ledger.snapshot().total_owner_bytes(), 1_000);
     }
 
     // ---- #4: reservation tickets are idempotent (no double-release corruption) ----
