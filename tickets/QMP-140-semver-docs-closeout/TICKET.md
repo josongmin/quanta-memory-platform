@@ -84,16 +84,16 @@ Generated agent guidance를 수정해야 할 경우 `tools/pm/sources/**`만 수
 
 ## Acceptance
 
-- [ ] no public API claim contradicts visibility/runtime behavior.
-- [ ] all breaking changes have migration notes and version decision.
-- [ ] every feature name maps to reachable tested capability.
-- [ ] README example proves enforcement, not report generation only.
-- [ ] docs contain no nonexistent benchmark/gate/test claim.
+- [x] no public API claim contradicts visibility/runtime behavior.
+- [x] all breaking changes have migration notes and version decision.
+- [x] every feature name maps to reachable tested capability.
+- [x] README example proves enforcement, not report generation only.
+- [x] docs contain no nonexistent benchmark/gate/test claim.
 - [ ] workspace, extraction, host, performance receipts share declared exact revisions.
 - [ ] all P1/P2 crosswalk entries are closed.
-- [ ] final `tickets/README.md` lifecycle is internally consistent.
-- [ ] every documented named test selects at least one test; zero-test GREEN is rejected.
-- [ ] ticket/receipt schema enforces state, claim, identity, SHA and selected-count truth.
+- [x] final `tickets/README.md` lifecycle is internally consistent for the current local/external proof boundary.
+- [x] every documented named test selects at least one test; zero-test GREEN is rejected.
+- [x] ticket/receipt schema enforces state, claim, identity, SHA and selected-count truth.
 
 ## Verification
 
@@ -142,3 +142,24 @@ Add a docs/test-selector linter that resolves every command against `cargo test
 -- --list` or the host suite registry, a runtime bite test for every advertised
 leaf feature, and machine-readable receipt validation from QMP-000. Remove or
 quarantine features whose canonical builder path is not reachable.
+
+## Local closeout checkpoint (2026-09-21)
+
+Implemented at product source `aeeffe3588561398dcc1ad8c12332fe740f5f655`:
+
+- package version `0.2.0`, MSRV 1.95, internal-only `UNLICENSED`/`publish=false`
+  policy, `CHANGELOG.md`, and a breaking-change `MIGRATION.md`;
+- runtime bite tests for ten reachable feature compositions;
+- a docs selector validator resolving 166 named selectors and rejecting stale
+  commands;
+- corrected extraction/host documentation and explicit separation of local,
+  remote and host qualification;
+- current doctor (638 tests), focused Miri, performance smoke and actual
+  extraction evidence recorded in ticket receipts.
+
+The two unchecked acceptance rows are one external boundary: Semantica Cargo
+must resolve this exact QMP source and obtain a canonical same-source QBC
+receipt. The local focused host suites passed, but the host metadata currently
+resolves adjacent shared QMP `2cfccc6`; therefore QMP-130 and this ticket remain
+`BLOCKED`. Remote standalone CI for QMP-120 is also unobserved. Neither gap is
+papered over as local `QUALIFIED` or campaign `DONE`.

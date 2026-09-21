@@ -6,9 +6,55 @@ each ticket owns its implementation contract. Earlier evidence is preserved in
 [`AUDIT-BASELINE.md`](AUDIT-BASELINE.md) and
 [`AUDIT-DELTA-2026-09-21.md`](AUDIT-DELTA-2026-09-21.md).
 
-## 1. Verdict
+## Current closeout — authoritative status
 
-**FAIL — not production-ready and not host-qualified.**
+The `dfb58a6` findings below are the historical RED audit that drove the ticket
+campaign. They are not current defect claims. Current lifecycle authority is
+the inventory in [`README.md`](README.md) and each ticket's latest transition
+receipt.
+
+```text
+portable product source: aeeffe3588561398dcc1ad8c12332fe740f5f655
+qualification SSOT commit: f1d45c9bb28982f2c5ee3fcaac4a5d8ce4329be9
+current documentation HEAD: d242dde
+branch: codex/qmp-remaining-hardening
+local worktree: clean at closeout checkpoint
+```
+
+Current evidence:
+
+- `scripts/memory-platform-doctor`: PASS, 638 tests plus fmt, clippy
+  `-D warnings`, Semgrep, compile feature matrix, ten runtime feature-capability
+  lanes, examples, documented-selector resolution and `cargo deny`.
+- documented selector validator: PASS, 166 selectors resolve.
+- focused Miri: core reservation lifecycle 1/1 and facade spill ownership 1/1.
+- scaling: prior complete 160-sample/source-bound distribution remains
+  authoritative; current `0.2.0` source passes the 30-sample smoke with zero
+  semantic and allocator residual bytes.
+- actual extraction at `f1d45c9`: PASS; source tree `f44e74b6`, canonical
+  manifest `609f468f`, extracted commit `d07ebff5`, clean Git status, 638-test
+  doctor, ticket validator and PM lint.
+- local ticket admission, QMP-010 through QMP-110 behavior owners, conformance,
+  performance and operability are `QUALIFIED` where shown in the inventory.
+
+Remaining authority gaps, not local code defects:
+
+1. QMP-120 remains `IMPLEMENTED` because the remote standalone-extraction
+   workflow has not been observed on this revision.
+2. QMP-130 remains `BLOCKED`: the isolated Semantica implementation passes its
+   focused production-composition suite, but top-level and nested Cargo metadata
+   still resolve the adjacent shared QMP checkout, not `aeeffe3`. Repointing or
+   publishing that dependency is an external integration action.
+3. QMP-140 remains `BLOCKED` only on the same exact-revision host/remote proof;
+   its local SemVer, migration, feature-runtime and documentation work is done.
+
+Do not report the campaign as production/host `DONE` until those three proof
+boundaries are closed. Do not reopen the historical findings below without a
+new current-source reproduction.
+
+## Historical verdict at `dfb58a6` — superseded by current closeout
+
+**Historical result: FAIL — not production-ready and not host-qualified.**
 
 - P0: 0. No demonstrated immediate exploit or unavoidable total-system loss.
 - Newly confirmed in this audit: P1 5, P2 4.

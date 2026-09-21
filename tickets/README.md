@@ -77,8 +77,8 @@ override.
 | [QMP-100](QMP-100-scaling-benchmarks/TICKET.md) | P2 | QUALIFIED | full 160-sample qualification remains authoritative; current 0.2 source passes 30-sample smoke and doctor at `aeeffe3` | QMP-040, QMP-050, QMP-070 | payload/revocable containers, benches, CI scripts |
 | [QMP-110](QMP-110-operability-observation/TICKET.md) | P2 | QUALIFIED | typed one-lock observation, poison truth and bounded events remain green at `aeeffe3` | QMP-030, QMP-040, QMP-080 | stats traits, metrics adapters, broker/store emitters |
 | [QMP-120](QMP-120-standalone-extraction/TICKET.md) | P1 | IMPLEMENTED | local HEAD/tree/blob/mode-bound extraction, 638-test doctor and clean extracted commit pass at `f1d45c9`; remote workflow remains unobserved | QMP-000 | extraction manifest/scripts, lockfile, release CI |
-| [QMP-130](QMP-130-host-adoption/TICKET.md) | P1 | BLOCKED | Semantica currently resolves adjacent shared-main QMP, not the audited/qualified revision; exact-root qualification absent | QMP-030..QMP-120 | external host repo only; QMP repo read-only except receipts |
-| [QMP-140](QMP-140-semver-docs-closeout/TICKET.md) | P2 | BLOCKED | public API/SemVer, stale test selectors/docs, receipt schema and final closeout | QMP-010..QMP-130 | public exports, README/EXTRACTION/docs, Cargo metadata |
+| [QMP-130](QMP-130-host-adoption/TICKET.md) | P1 | BLOCKED | isolated host code and focused composition/execution-budget suites pass, but Cargo resolves adjacent shared QMP `2cfccc6`, not qualified `aeeffe3`; exact-root QBC absent | QMP-030..QMP-120 | external host repo only; QMP repo read-only except receipts |
+| [QMP-140](QMP-140-semver-docs-closeout/TICKET.md) | P2 | BLOCKED | local 0.2 SemVer/migration, feature runtime and 166-selector docs validation complete; exact host revision and remote extraction proof remain | QMP-010..QMP-130 | public exports, README/EXTRACTION/docs, Cargo metadata |
 
 상태를 바꿀 때 이 표와 ticket receipt를 같은 change에서 갱신한다.
 
