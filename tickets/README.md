@@ -47,7 +47,7 @@
 | --- | --- | --- | --- | --- | --- |
 | [QMP-000](QMP-000-campaign-admission/TICKET.md) | P1 | IMPLEMENTED | status/claim, receipt identity, committed-source digest, selected-count, and current-transition admission enforced; exact-head dynamic rerun deferred | — | `tickets/**`, `tools/tickets/**`, validator front door |
 | [QMP-010](QMP-010-policy-totality/TICKET.md) | P1 | IMPLEMENTED | mandatory class totality와 validated policy authority | QMP-000 | core `policy.rs`, `config.rs`, builder/policy tests |
-| [QMP-020](QMP-020-reservation-lifecycle/TICKET.md) | P1 | IMPLEMENTED | overflow-safe admission exists; public cloneable raw ticket leak and poisoned commit rollback loss remain | QMP-010 | core `ledger.rs`, recharge/control seams |
+| [QMP-020](QMP-020-reservation-lifecycle/TICKET.md) | P1 | IN_PROGRESS | remove discardable raw ticket authority and preserve rollback through poisoned commit failure | QMP-010 | core `ledger.rs`, recharge/control seams |
 | [QMP-030](QMP-030-enforced-builder-runtime-view/TICKET.md) | P1 | IMPLEMENTED | enforced default builder exists; root-exported raw ledger authority still bypasses guard lifecycle | QMP-010, QMP-020 | core/facade builders, broker/control/scratch API, examples |
 | [QMP-040](QMP-040-store-lifecycle/TICKET.md) | P1 | IMPLEMENTED | store construction typestate, close/drain, callback lock discipline | QMP-020, QMP-030 | facade shared builder/accounting + all store services |
 | [QMP-050](QMP-050-total-retained-cost/TICKET.md) | P1 | IMPLEMENTED | total retained-cost accounting; b18e47d clean doctor, downstream terminal proof open | QMP-040 | measure/accounting + store entry cost paths |

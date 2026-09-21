@@ -50,10 +50,7 @@ use quanta_memory_platform_core::{
     PublishError,
     // ports::store
     PublishedPayload,
-    RechargeError,
-    RechargeRecoveryV1,
     ReclaimPriority,
-    ReservationTicket,
     ResidencyPolicy,
     ResolvedBudget,
     ResourceGroup,
@@ -83,9 +80,9 @@ use quanta_memory_platform_core::{
 
 #[cfg(feature = "live_control")]
 use quanta_memory_platform_core::{
-    ChargeRechargeError, ChargeRechargeRecovery, ChargeReleaseError, CommittedCharge,
-    LadderPressureController, LiveProcessMemoryBroker, PendingReservation, PressureController,
-    PressureThresholds, ReclaimRung, ResourceGroupScheduler, WeightedResourceGroupScheduler,
+    LadderPressureController, LiveProcessMemoryBroker, ManagedCharge, PendingReservation,
+    PressureController, PressureThresholds, ReclaimRung, ResourceGroupScheduler,
+    WeightedResourceGroupScheduler,
 };
 
 /// Names EVERY public re-export from the crate root in type position. Never
@@ -127,16 +124,9 @@ fn names_every_public_reexport() {
         StoreDeleteError,
         StoreWriteError,
     );
-    type _Ledger = (ChargeKind, LedgerSnapshot, ReservationTicket, UsageBreakdown);
-    type _Recharge = (RechargeError, RechargeRecoveryV1);
+    type _Ledger = (ChargeKind, LedgerSnapshot, UsageBreakdown);
     #[cfg(feature = "live_control")]
-    type _OwnedAuthority = (
-        PendingReservation,
-        CommittedCharge,
-        ChargeReleaseError,
-        ChargeRechargeError,
-        ChargeRechargeRecovery,
-    );
+    type _OwnedAuthority = (PendingReservation, ManagedCharge);
     type _Policy = (
         ExecutionBudget,
         MemoryBudgetManifest,

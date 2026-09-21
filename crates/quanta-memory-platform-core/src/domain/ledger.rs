@@ -61,14 +61,11 @@ pub enum ChargeKind {
     LiveScratch,
 }
 
-/// Compatibility handle for the pre-typestate facade accounting bridge.
-///
-/// New consumers use `PendingReservation` and `CommittedCharge` from the live
-/// broker API. This cloneable handle remains temporarily while QMP-040 migrates
-/// every facade store; the ledger state map, not copies of this value, is the
-/// authority and rejects duplicate commit/release.
+/// Internal ledger capability. Public consumers receive broker-bound RAII
+/// authorities instead; exposing this cloneable identity would allow a caller
+/// to discard the only release path while the charge remains live.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ReservationTicket {
+pub(crate) struct ReservationTicket {
     /// Per-ledger id (unique within the issuing ledger only).
     id: u64,
     /// Instance tag of the issuing ledger (guards against cross-ledger misuse).
@@ -89,32 +86,27 @@ enum TicketState {
 
 impl ReservationTicket {
     #[must_use]
-    pub fn id(&self) -> u64 {
+    pub(crate) fn id(&self) -> u64 {
         self.id
     }
-    /// Instance tag of the ledger that issued this ticket.
     #[must_use]
-    pub fn ledger_id(&self) -> u64 {
-        self.ledger
-    }
-    #[must_use]
-    pub fn class(&self) -> &MemoryClass {
+    pub(crate) fn class(&self) -> &MemoryClass {
         &self.class
     }
     #[must_use]
-    pub fn owner(&self) -> &OwnerKey {
+    pub(crate) fn owner(&self) -> &OwnerKey {
         &self.owner
     }
     #[must_use]
-    pub fn bytes(&self) -> u64 {
+    pub(crate) fn bytes(&self) -> u64 {
         self.bytes
     }
     #[must_use]
-    pub fn kind(&self) -> ChargeKind {
+    pub(crate) fn kind(&self) -> ChargeKind {
         self.kind
     }
     #[must_use]
-    pub fn context(&self) -> MemoryContextKind {
+    pub(crate) fn context(&self) -> MemoryContextKind {
         self.context
     }
 }

@@ -6,7 +6,12 @@
 //! [`BrokerConformanceTarget`], so the SAME suite runs against the real contract
 //! and against (honest or deliberately broken) fakes.
 
-use quanta_memory_platform_core::{AllocatorAdvisory, AllocatorSnapshot, LiveProcessMemoryBroker};
+use std::cell::RefCell;
+
+use quanta_memory_platform_core::{
+    AllocatorAdvisory, AllocatorSnapshot, LiveProcessMemoryBroker, ManagedCharge,
+    PendingReservation,
+};
 
 use crate::fake::FakeProcessBroker;
 
@@ -120,6 +125,21 @@ pub enum ChargeAxis {
 /// these onto two distinct concrete classes.
 const CONFORMANCE_CLASS_AXES: &[&str] = &["artifact-cache", "evidence-cache"];
 
+/// Testkit-owned state machine around the production RAII authorities. The
+/// conformance suite retains reference-based replay probes, but the core crate
+/// no longer exposes cloneable raw ledger tickets to support them.
+#[derive(Debug)]
+pub struct LiveConformanceTicket {
+    state: RefCell<LiveConformanceTicketState>,
+}
+
+#[derive(Debug)]
+enum LiveConformanceTicketState {
+    Pending(PendingReservation),
+    Committed(ManagedCharge),
+    Released,
+}
+
 fn map_charge(axis: ChargeAxis) -> quanta_memory_platform_core::ChargeKind {
     use quanta_memory_platform_core::ChargeKind;
     match axis {
@@ -214,7 +234,7 @@ impl BrokerConformanceTarget for FakeProcessBroker {
 }
 
 impl BrokerConformanceTarget for LiveProcessMemoryBroker {
-    type Ticket = quanta_memory_platform_core::ReservationTicket;
+    type Ticket = LiveConformanceTicket;
 
     fn do_reserve(
         &mut self,
@@ -228,16 +248,57 @@ impl BrokerConformanceTarget for LiveProcessMemoryBroker {
         // The real broker takes a context kind; the conformance suite charges all
         // bytes against a single Request context (the context axis is checked by
         // the core's own owner-tests, not by the portable suite).
-        self.reserve(class, owner.to_string(), MemoryContextKind::Request, map_charge(kind), bytes)
-            .map_err(|e| e.to_string())
+        self.reserve_owned(
+            class,
+            owner.to_string(),
+            MemoryContextKind::Request,
+            map_charge(kind),
+            bytes,
+        )
+        .map(|pending| LiveConformanceTicket {
+            state: RefCell::new(LiveConformanceTicketState::Pending(pending)),
+        })
+        .map_err(|e| e.to_string())
     }
 
     fn do_commit(&mut self, ticket: &Self::Ticket) -> Result<(), String> {
-        LiveProcessMemoryBroker::commit(self, ticket).map(|_| ()).map_err(|e| e.to_string())
+        let current = ticket.state.replace(LiveConformanceTicketState::Released);
+        match current {
+            LiveConformanceTicketState::Pending(pending) => match pending.commit() {
+                Ok(charge) => {
+                    ticket.state.replace(LiveConformanceTicketState::Committed(charge));
+                    Ok(())
+                }
+                Err(error) => Err(error.to_string()),
+            },
+            LiveConformanceTicketState::Committed(charge) => {
+                ticket.state.replace(LiveConformanceTicketState::Committed(charge));
+                Err("reservation is already committed".to_string())
+            }
+            LiveConformanceTicketState::Released => {
+                Err("reservation is already released".to_string())
+            }
+        }
     }
 
     fn do_release(&mut self, ticket: &Self::Ticket) -> Result<(), String> {
-        LiveProcessMemoryBroker::release(self, ticket).map_err(|e| e.to_string())
+        let current = ticket.state.replace(LiveConformanceTicketState::Released);
+        match current {
+            LiveConformanceTicketState::Pending(pending) => {
+                drop(pending);
+                Ok(())
+            }
+            LiveConformanceTicketState::Committed(mut charge) => match charge.release() {
+                Ok(()) => Ok(()),
+                Err(error) => {
+                    ticket.state.replace(LiveConformanceTicketState::Committed(charge));
+                    Err(error.to_string())
+                }
+            },
+            LiveConformanceTicketState::Released => {
+                Err("reservation is already released".to_string())
+            }
+        }
     }
 
     fn do_begin_rebuild(&mut self) -> Result<(), String> {

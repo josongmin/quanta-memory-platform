@@ -100,8 +100,8 @@ Owner symbols:
 - [x] 테스트한 class/owner/context/kind/group admission/release/recharge/rollback에서 overflow는 mutation 전 거부되고 snapshot은 exact하다 (`59f0c4f` clean doctor PASS). 전체 transition의 모델 오라클은 QMP-090, 최종 extraction·host compatibility는 별도 게이트다.
 - [x] public store가 raw clone ticket에 의존하지 않도록 migration path가 문서화된다.
 - [x] existing recharge fail-closed semantics가 유지된다.
-- [ ] external safe API가 clone 가능한 raw `ReservationTicket`을 발급하지 않는다.
-- [ ] poisoned commit+rollback exceptional path도 pending authority를 잃지 않는다.
+- [x] external safe API가 clone 가능한 raw `ReservationTicket`을 발급하지 않는다.
+- [x] poisoned commit+rollback exceptional path도 pending authority를 잃지 않는다.
 
 ## Verification
 
@@ -173,3 +173,21 @@ Required repair:
 5. Hellgates: raw authority drop drains all axes/group to zero; poisoned commit
    followed by object drop drains the recovered inner state to zero; original
    commit and rollback errors remain distinguishable.
+
+Implementation checkpoint (runtime qualification deferred):
+
+- `ReservationTicket`, raw recharge types, and discardable `CommittedCharge`
+  are crate-private; raw broker mutations are no longer callable by an external
+  safe consumer.
+- `PendingReservation::commit` returns a broker-bound `ManagedCharge`, so both
+  the pending and committed success paths have exact Drop cleanup authority.
+- A failed commit keeps the ticket in `PendingReservation` until normal rollback
+  succeeds. On lock poison, the consuming method's Drop path recovers the mutex
+  and performs the exact pending rollback before returning the original commit
+  error.
+- The portable conformance adapter now owns an internal `Pending -> Committed ->
+  Released` state machine over public RAII types instead of depending on the raw
+  ticket escape hatch.
+- Static evidence: workspace all-target/all-feature `cargo check`, fmt, and
+  clippy `-D warnings` pass. The poison test and compile-fail doctests are present
+  but intentionally not executed in this checkpoint.

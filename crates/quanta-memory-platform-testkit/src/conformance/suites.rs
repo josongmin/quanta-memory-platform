@@ -2486,7 +2486,7 @@ mod tests {
             quanta_memory_platform_core::ChargeKind::RetainedPayload,
             7_000,
         );
-        let real_denied = real.reserve(
+        let real_denied = real.reserve_owned(
             MemoryClass::ArtifactCache,
             owner.to_string(),
             quanta_memory_platform_core::MemoryContextKind::Request,
@@ -2515,7 +2515,7 @@ mod tests {
             quanta_memory_platform_core::ChargeKind::RetainedPayload,
             5_000,
         );
-        let real_ok = real.reserve(
+        let real_ok = real.reserve_owned(
             MemoryClass::ArtifactCache,
             owner.to_string(),
             quanta_memory_platform_core::MemoryContextKind::Request,

@@ -123,8 +123,8 @@ mod live_control_contracts {
     // ============================================================================
     // Scenario group R: cross-cutting invariants promoted to the PUBLIC API
     // boundary. These tests drive the new global invariants (5, 6, 7) and preset
-    // class-cap isolation through the public `LiveProcessMemoryBroker` reserve /
-    // commit / release surface, using ONLY re-exports from
+    // class-cap isolation through the public `LiveProcessMemoryBroker` managed
+    // charge surface, using ONLY re-exports from
     // `quanta_memory_platform_core`. They are the integration-level counterpart of
     // the module-internal ledger tests: a regression that weakens these invariants
     // must be visible to an external consumer, not just to white-box unit tests.
@@ -167,8 +167,8 @@ mod live_control_contracts {
     #[test]
     fn global_hard_limit_denies_reserve_through_public_broker_and_is_fail_closed() {
         let b = broker_from_residency(permissive_policy(1_000));
-        let t = b
-            .reserve(
+        let _charge = b
+            .reserve_managed_charge(
                 MemoryClass::ArtifactCache,
                 "owner:a".to_string(),
                 MemoryContextKind::Request,
@@ -176,10 +176,9 @@ mod live_control_contracts {
                 600,
             )
             .expect("first reserve fits under the global ceiling");
-        b.commit(&t).expect("commit");
         let before = b.ledger_snapshot().expect("snapshot before denied reserve");
 
-        let denied = b.reserve(
+        let denied = b.reserve_managed_charge(
             MemoryClass::EvidenceCache,
             "owner:b".to_string(),
             MemoryContextKind::Request,
@@ -205,7 +204,7 @@ mod live_control_contracts {
     fn headroom_band_is_reserved_for_headroom_class_at_public_surface() {
         let b = broker_from_residency(permissive_policy(1_000).with_headroom_bytes(200));
 
-        let denied = b.reserve(
+        let denied = b.reserve_managed_charge(
             MemoryClass::ArtifactCache,
             "owner:a".to_string(),
             MemoryContextKind::Request,
@@ -222,8 +221,8 @@ mod live_control_contracts {
             "denial into the headroom band must not mutate"
         );
 
-        let t = b
-            .reserve(
+        let _charge = b
+            .reserve_managed_charge(
                 MemoryClass::Headroom,
                 "owner:a".to_string(),
                 MemoryContextKind::Request,
@@ -231,7 +230,6 @@ mod live_control_contracts {
                 900,
             )
             .expect("Headroom class may use the reserved band up to the global ceiling");
-        b.commit(&t).expect("commit");
         assert_eq!(b.ledger_snapshot().expect("snap").total_owner_bytes(), 900);
     }
 
@@ -243,8 +241,8 @@ mod live_control_contracts {
                 .with_class_budget(MemoryClass::ArtifactCache, class_budget(0, 400, 600, true)),
         );
 
-        let t0 = b
-            .reserve(
+        let _charge_at_cap = b
+            .reserve_managed_charge(
                 MemoryClass::ArtifactCache,
                 "owner:a".to_string(),
                 MemoryContextKind::Request,
@@ -252,9 +250,8 @@ mod live_control_contracts {
                 600,
             )
             .expect("up to the class hard cap");
-        b.commit(&t0).expect("commit");
-        let t1 = b
-            .reserve(
+        let _borrowed_charge = b
+            .reserve_managed_charge(
                 MemoryClass::ArtifactCache,
                 "owner:a".to_string(),
                 MemoryContextKind::Request,
@@ -262,10 +259,9 @@ mod live_control_contracts {
                 50,
             )
             .expect("borrow within the shared burst pool");
-        b.commit(&t1).expect("commit");
         let before = b.ledger_snapshot().expect("snap before overdraw");
 
-        let denied = b.reserve(
+        let denied = b.reserve_managed_charge(
             MemoryClass::ArtifactCache,
             "owner:a".to_string(),
             MemoryContextKind::Request,
@@ -288,7 +284,7 @@ mod live_control_contracts {
                 .with_shared_burst_pool_bytes(10_000)
                 .with_class_budget(MemoryClass::ArtifactCache, class_budget(0, 400, 600, false)),
         );
-        let denied = b.reserve(
+        let denied = b.reserve_managed_charge(
             MemoryClass::ArtifactCache,
             "owner:a".to_string(),
             MemoryContextKind::Request,
@@ -307,10 +303,10 @@ mod live_control_contracts {
     }
 
     #[test]
-    fn double_release_of_cloned_ticket_rejected_through_public_broker() {
+    fn managed_charge_double_release_is_rejected_without_counter_drift() {
         let b = broker_from_residency(permissive_policy(1_000_000));
-        let ticket = b
-            .reserve(
+        let mut charge = b
+            .reserve_managed_charge(
                 MemoryClass::ArtifactCache,
                 "owner:a".to_string(),
                 MemoryContextKind::Request,
@@ -318,14 +314,11 @@ mod live_control_contracts {
                 100_000,
             )
             .expect("reserve");
-        b.commit(&ticket).expect("commit");
-
-        b.release(&ticket).expect("first release succeeds");
+        charge.release().expect("first release succeeds");
         let after_first = b.ledger_snapshot().expect("snapshot after first release");
         assert_eq!(after_first.total_owner_bytes(), 0, "release returns the bytes exactly once");
 
-        let twin = ticket.clone();
-        let second = b.release(&twin);
+        let second = charge.release();
         assert!(
             matches!(second, Err(MemoryError::InvalidState(_))),
             "double release must be a typed invalid-state error, got {second:?}"
@@ -346,10 +339,10 @@ mod live_control_contracts {
     }
 
     #[test]
-    fn commit_after_release_rejected_through_public_broker() {
+    fn dropping_pending_public_authority_rolls_reservation_back() {
         let b = broker_from_residency(permissive_policy(1_000_000));
-        let ticket = b
-            .reserve(
+        let pending = b
+            .reserve_owned(
                 MemoryClass::ArtifactCache,
                 "owner:a".to_string(),
                 MemoryContextKind::Request,
@@ -357,16 +350,12 @@ mod live_control_contracts {
                 10_000,
             )
             .expect("reserve");
-        b.release(&ticket).expect("release the uncommitted reservation");
-
-        assert!(
-            matches!(b.commit(&ticket), Err(MemoryError::InvalidState(_))),
-            "committing a released ticket must be rejected at the public surface"
-        );
+        assert_eq!(b.ledger_snapshot().expect("reserved").total_owner_bytes(), 10_000);
+        drop(pending);
         assert_eq!(
             b.ledger_snapshot().expect("snap").total_owner_bytes(),
             0,
-            "the rejected commit must not resurrect the released charge"
+            "dropping the pending authority must refund the reservation"
         );
     }
 
@@ -389,7 +378,7 @@ mod live_control_contracts {
                 .build()
                 .expect("preset broker builds");
 
-            let denied = b.reserve(
+            let denied = b.reserve_managed_charge(
                 MemoryClass::ManifestResidency,
                 "owner:probe".to_string(),
                 MemoryContextKind::Request,
@@ -406,8 +395,8 @@ mod live_control_contracts {
                 "{preset:?}: the denied over-cap reserve must be fail-closed"
             );
 
-            let t = b
-                .reserve(
+            let _charge = b
+                .reserve_managed_charge(
                     MemoryClass::ManifestResidency,
                     "owner:probe".to_string(),
                     MemoryContextKind::Request,
@@ -415,7 +404,6 @@ mod live_control_contracts {
                     cap,
                 )
                 .unwrap_or_else(|e| panic!("{preset:?}: reserving exactly the cap must fit: {e}"));
-            b.commit(&t).expect("commit at the cap");
             assert_eq!(b.ledger_snapshot().expect("snap").total_owner_bytes(), cap);
         }
     }
@@ -432,7 +420,7 @@ mod live_control_contracts {
 
         let over_global = report.residency.global_hard_limit_bytes + 1;
         for class in MemoryClass::mandatory() {
-            let denied = b.reserve(
+            let denied = b.reserve_managed_charge(
                 class.clone(),
                 "owner:probe".to_string(),
                 MemoryContextKind::Request,

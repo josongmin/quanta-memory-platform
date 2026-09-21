@@ -37,6 +37,30 @@
 //! ```compile_fail
 //! use quanta_memory_platform_core::BasicPinRegistry;
 //! ```
+//!
+//! Raw ledger tickets and discardable committed authorities are not part of the
+//! external safe API:
+//!
+//! ```compile_fail
+//! use quanta_memory_platform_core::ReservationTicket;
+//! ```
+//!
+//! ```compile_fail
+//! use quanta_memory_platform_core::CommittedCharge;
+//! ```
+//!
+//! ```compile_fail
+//! # use quanta_memory_platform_core::{ChargeKind, LiveProcessMemoryBroker, MemoryClass, MemoryContextKind};
+//! # fn raw_reserve(broker: &LiveProcessMemoryBroker) {
+//! let ticket = broker.reserve(
+//!     MemoryClass::ArtifactCache,
+//!     "owner".to_string(),
+//!     MemoryContextKind::Request,
+//!     ChargeKind::RetainedPayload,
+//!     1,
+//! );
+//! # }
+//! ```
 
 pub mod adapters;
 pub mod api;
@@ -50,7 +74,6 @@ pub use api::broker::{ProcessMemoryBroker, RuntimeMemoryView};
 pub use api::builder::ProcessMemoryBrokerBuilder;
 #[cfg(feature = "live_control")]
 pub use api::control::{
-    ChargeRechargeError, ChargeRechargeRecovery, ChargeReleaseError, CommittedCharge,
     LiveProcessMemoryBroker, ManagedCharge, ManagedChargeRechargeError,
     ManagedChargeRechargeRecovery, PendingReservation,
 };
@@ -71,12 +94,11 @@ pub use domain::errors::{
     CapacityError, MemoryError, MemoryResult, PinError, PublishError, StoreDeleteError,
     StoreWriteError,
 };
-pub use domain::ledger::{ChargeKind, LedgerSnapshot, ReservationTicket, UsageBreakdown};
+pub use domain::ledger::{ChargeKind, LedgerSnapshot, UsageBreakdown};
 pub use domain::policy::{
     ExecutionBudget, MemoryBudgetManifest, MemoryClass, MemoryClassBudget, MemoryPreset,
     OwnerQuota, ReclaimPriority, ResidencyPolicy, ResourceGroup,
 };
-pub use domain::recharge::{RechargeError, RechargeRecoveryV1};
 pub use domain::stats::{AllocatorSnapshot, EffectiveMemoryBudgetReport, PressureState};
 #[cfg(feature = "unbudgeted_pin")]
 pub use ports::pin::{InvalidationOutcome, PayloadPinLease, PinRegistry};
