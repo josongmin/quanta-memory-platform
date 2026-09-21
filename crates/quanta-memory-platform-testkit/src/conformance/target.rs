@@ -18,6 +18,12 @@ pub struct AccountingView {
     pub total_class_bytes: u64,
     /// Sum of all per-owner usage totals.
     pub total_owner_bytes: u64,
+    /// Sum of the request context used by this conformance workload.
+    pub total_context_bytes: u64,
+    /// Exact totals for the two stable class axes.
+    pub class_axis_bytes: [u64; 2],
+    /// Exact totals for the two stable owners used by the suite.
+    pub owner_axis_bytes: [u64; 2],
     /// Owner retained-payload bytes.
     pub total_retained_payload_bytes: u64,
     /// Owner retained-metadata bytes.
@@ -93,7 +99,7 @@ pub trait BrokerConformanceTarget {
     }
 
     /// A neutral read of current accounting.
-    fn view(&self) -> AccountingView;
+    fn view(&self) -> Result<AccountingView, String>;
 
     /// Observe allocator telemetry without mutating semantic accounting.
     fn observe_allocator(
@@ -166,16 +172,31 @@ impl BrokerConformanceTarget for FakeProcessBroker {
 
     // class_axes: uses the trait's provided default (CONFORMANCE_CLASS_AXES).
 
-    fn view(&self) -> AccountingView {
+    fn view(&self) -> Result<AccountingView, String> {
         let snap = self.snapshot();
-        AccountingView {
+        let class_axis_bytes = [
+            snap.class_usage
+                .get(&quanta_memory_platform_core::MemoryClass::ArtifactCache)
+                .map_or(0, crate::fake::FakeUsage::total),
+            snap.class_usage
+                .get(&quanta_memory_platform_core::MemoryClass::EvidenceCache)
+                .map_or(0, crate::fake::FakeUsage::total),
+        ];
+        let owner_axis_bytes = [
+            snap.owner_usage.get("owner:conformance-a").map_or(0, crate::fake::FakeUsage::total),
+            snap.owner_usage.get("owner:conformance-b").map_or(0, crate::fake::FakeUsage::total),
+        ];
+        Ok(AccountingView {
             total_class_bytes: snap.total_class_bytes(),
             total_owner_bytes: snap.total_owner_bytes(),
+            total_context_bytes: snap.total_owner_bytes(),
+            class_axis_bytes,
+            owner_axis_bytes,
             total_retained_payload_bytes: snap.total_retained_payload_bytes(),
             total_retained_metadata_bytes: snap.total_retained_metadata_bytes(),
             total_live_scratch_bytes: snap.total_live_scratch_bytes(),
             rebuild_in_progress: snap.rebuild_in_progress,
-        }
+        })
     }
 
     fn observe_allocator(
@@ -229,20 +250,34 @@ impl BrokerConformanceTarget for LiveProcessMemoryBroker {
 
     // class_axes: uses the trait's provided default (CONFORMANCE_CLASS_AXES).
 
-    fn view(&self) -> AccountingView {
-        // A poisoned lock cannot fabricate usage; report an empty view, which the
-        // balance/partition invariants treat as a consistent zero state.
-        match self.ledger_snapshot() {
-            Ok(snap) => AccountingView {
+    fn view(&self) -> Result<AccountingView, String> {
+        self.ledger_snapshot()
+            .map(|snap| AccountingView {
                 total_class_bytes: snap.total_class_bytes(),
                 total_owner_bytes: snap.total_owner_bytes(),
+                total_context_bytes: snap.total_context_bytes(),
+                class_axis_bytes: [
+                    snap.class_usage
+                        .get(&quanta_memory_platform_core::MemoryClass::ArtifactCache)
+                        .map_or(0, quanta_memory_platform_core::UsageBreakdown::total),
+                    snap.class_usage
+                        .get(&quanta_memory_platform_core::MemoryClass::EvidenceCache)
+                        .map_or(0, quanta_memory_platform_core::UsageBreakdown::total),
+                ],
+                owner_axis_bytes: [
+                    snap.owner_usage
+                        .get("owner:conformance-a")
+                        .map_or(0, quanta_memory_platform_core::UsageBreakdown::total),
+                    snap.owner_usage
+                        .get("owner:conformance-b")
+                        .map_or(0, quanta_memory_platform_core::UsageBreakdown::total),
+                ],
                 total_retained_payload_bytes: snap.total_retained_payload_bytes(),
                 total_retained_metadata_bytes: snap.total_retained_metadata_bytes(),
                 total_live_scratch_bytes: snap.total_live_scratch_bytes(),
                 rebuild_in_progress: snap.rebuild_in_progress,
-            },
-            Err(_) => AccountingView::default(),
-        }
+            })
+            .map_err(|error| error.to_string())
     }
 
     fn observe_allocator(

@@ -173,11 +173,18 @@ pub struct FakeProcessBroker {
     group_owners: BTreeMap<String, Vec<OwnerKey>>,
     group_hard_caps: BTreeMap<String, u64>,
     next_id: u64,
+    ticket_states: BTreeMap<u64, FakeTicketState>,
     rebuild_in_progress: bool,
     pressure: PressureState,
     /// Bytes a single reclaim attempt will free. `0` models reclaim-returns-zero.
     reclaim_yield_bytes: u64,
     fidelity: AccountingFidelity,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FakeTicketState {
+    Pending,
+    Committed,
 }
 
 impl Default for FakeProcessBroker {
@@ -197,6 +204,7 @@ impl FakeProcessBroker {
             group_owners: BTreeMap::new(),
             group_hard_caps: BTreeMap::new(),
             next_id: 1,
+            ticket_states: BTreeMap::new(),
             rebuild_in_progress: false,
             pressure: PressureState::Normal,
             reclaim_yield_bytes: u64::MAX,
@@ -296,19 +304,31 @@ impl FakeProcessBroker {
         self.next_id = self.next_id.saturating_add(1);
         self.class_usage.entry(class.clone()).or_default().add(kind, bytes);
         self.owner_usage.entry(owner.clone()).or_default().add(kind, bytes);
+        self.ticket_states.insert(id, FakeTicketState::Pending);
 
         Ok(FakeReservation { id, class, owner, kind, bytes })
     }
 
     /// Commit a reservation. Mirrors the core ledger: reserve already moved the
     /// counters; commit only finalizes and is rejected during rebuild.
-    pub fn commit(&self, ticket: &FakeReservation) -> MemoryResult<u64> {
+    pub fn commit(&mut self, ticket: &FakeReservation) -> MemoryResult<u64> {
         if self.rebuild_in_progress {
             return Err(MemoryError::InvalidState(
                 "fake broker: rebuild in progress, live commit rejected".to_string(),
             ));
         }
-        Ok(ticket.bytes)
+        match self.ticket_states.get_mut(&ticket.id) {
+            Some(state @ FakeTicketState::Pending) => {
+                *state = FakeTicketState::Committed;
+                Ok(ticket.bytes)
+            }
+            Some(FakeTicketState::Committed) => {
+                Err(MemoryError::InvalidState("fake broker: reservation already committed".into()))
+            }
+            None => Err(MemoryError::InvalidState(
+                "fake broker: reservation is stale or already released".into(),
+            )),
+        }
     }
 
     /// Release a reservation/charge, subtracting from class and owner usage.
@@ -316,6 +336,11 @@ impl FakeProcessBroker {
         if self.rebuild_in_progress {
             return Err(MemoryError::InvalidState(
                 "fake broker: rebuild in progress, live release rejected".to_string(),
+            ));
+        }
+        if self.ticket_states.remove(&ticket.id).is_none() {
+            return Err(MemoryError::InvalidState(
+                "fake broker: reservation is stale or already released".into(),
             ));
         }
         if let Some(usage) = self.class_usage.get_mut(&ticket.class) {

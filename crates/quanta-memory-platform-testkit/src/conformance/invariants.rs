@@ -21,6 +21,8 @@ pub enum ContractFamily {
     OwnerPartition,
     /// Reserve fails closed: a denied reserve does not mutate accounting.
     ReserveFailClosed,
+    /// Reservation tickets have exactly one commit and one terminal release.
+    TicketLifecycle,
     /// Live writes are rejected while a rebuild window is open (invariant 4).
     RebuildWriteFence,
     /// Pin counts are metadata only; a pinned payload is never deleted (5.1/4.3).
@@ -41,6 +43,7 @@ impl ContractFamily {
             Self::ClassOwnerBalance => "class_owner_balance",
             Self::OwnerPartition => "owner_partition",
             Self::ReserveFailClosed => "reserve_fail_closed",
+            Self::TicketLifecycle => "ticket_lifecycle",
             Self::RebuildWriteFence => "rebuild_write_fence",
             Self::PinDiscipline => "pin_discipline",
             Self::ReclaimAccounting => "reclaim_accounting",
@@ -166,6 +169,7 @@ mod tests {
         ContractFamily::ClassOwnerBalance,
         ContractFamily::OwnerPartition,
         ContractFamily::ReserveFailClosed,
+        ContractFamily::TicketLifecycle,
         ContractFamily::RebuildWriteFence,
         ContractFamily::PinDiscipline,
         ContractFamily::ReclaimAccounting,
