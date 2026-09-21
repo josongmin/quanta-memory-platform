@@ -5,6 +5,9 @@ Lifecycle authority: `tickets/README.md`
 Depends on: QMP-050  
 Blocks: QMP-090, QMP-100, QMP-130
 
+Status: `QUALIFIED` locally at `f3b5a13d2f75a6a0010ce078a04ee8b1c3af5579`.
+See [`receipts/2026-09-21T061526Z-f3b5a13.md`](receipts/2026-09-21T061526Z-f3b5a13.md).
+
 ## Objective
 
 transcript의 replay/idempotency evidence가 process lifetime 동안 무제한 성장하지 않게 하고, 보존 한계에 도달했을 때 silent identity reuse가 아니라 명시적 fail-closed 또는 durable handoff를 수행한다. Evidence/session byte accounting은 QMP-050 소유이며, 여기서는 bound와 horizon을 소유한다.
@@ -94,12 +97,27 @@ Owner symbols:
 
 ## Acceptance
 
-- [ ] QMP-050의 active rows=0 evidence charge를 회귀시키지 않고 count/byte horizon과 일치시킨다.
-- [ ] unique append→truncate 반복이 configured bound를 넘지 않는다.
-- [ ] bound 도달 semantics가 typed result로 공개된다.
-- [ ] exact retry/conflict semantics가 eviction policy와 모순되지 않는다.
-- [ ] process restart claim은 durable implementation이 있을 때만 문서화된다.
-- [ ] transcript conformance suite가 honest/broken retention fake를 구분한다.
+- [x] QMP-050의 active rows=0 evidence charge를 회귀시키지 않고 count/byte horizon과 일치시킨다.
+- [x] unique append→truncate 반복이 configured bound를 넘지 않는다.
+- [x] bound 도달 semantics가 typed result로 공개된다.
+- [x] exact retry/conflict semantics가 eviction policy와 모순되지 않는다.
+- [x] process restart claim은 durable implementation이 있을 때만 문서화된다.
+- [x] transcript conformance suite가 honest/broken retention fake를 구분한다.
+
+## Qualified implementation checkpoint
+
+- Default policy is finite: 65,536 evidence entries and 64 MiB.
+- Store-global O(1) component counters own active/evidence/session-key totals;
+  checked reads reconcile them against retained maps.
+- Saturation is checked after exact replay/conflict lookup and before Clone,
+  accounting charge, or publication.
+- Runtime policy changes share the mutation lane; limits below live evidence
+  return `BelowLiveEvidence` without changing policy.
+- `TranscriptRetentionPolicyV1` and unreachable `ExpiredIdentity` were removed.
+  QMP-140 owns the pre-1.0 migration/semver note.
+- Exact source `f3b5a13` passed 601 workspace tests, the repo-local doctor,
+  feature matrix, Semgrep with zero findings, and fresh actual standalone
+  extraction. Extracted bootstrap commit: `10c0d5c1a319aa6e5c87c02f48a4a5b9a344e0b5`.
 
 ## Verification
 
