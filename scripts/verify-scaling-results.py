@@ -104,6 +104,7 @@ def validate(
         "payload_dedup_lookup",
         "revocable_fill_and_drain",
         "broker_release_owner_cardinality",
+        "scheduler_admission_group_cardinality",
     }
     observed_operations = {str(sample.get("operation")) for sample in samples}
     missing_operations = required_operations - observed_operations

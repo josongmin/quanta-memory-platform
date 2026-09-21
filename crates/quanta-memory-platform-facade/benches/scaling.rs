@@ -1,4 +1,5 @@
-use std::alloc::System;
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::collections::BTreeMap;
 use std::hint::black_box;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
@@ -6,17 +7,62 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use quanta_memory_platform_core::{
-    ChargeKind, MemoryClass, MemoryContextKind, MemoryError, RetainedEnvelope, StoreBindingHandle,
+    ChargeKind, MemoryClass, MemoryContextKind, MemoryError, ReclaimPriority, ResourceGroup,
+    ResourceGroupScheduler, RetainedEnvelope, StoreBindingHandle, WeightedResourceGroupScheduler,
 };
 use quanta_memory_platform_facade::{
     MemoryPlatformBuilder, PayloadStore, PortableMemoryPresets, RevocableStore,
 };
-use tracking_allocator::{AllocationGroupId, AllocationRegistry, AllocationTracker, Allocator};
-
 #[global_allocator]
-static GLOBAL: Allocator<System> = Allocator::system();
+static GLOBAL: BenchAllocator = BenchAllocator;
 
-#[derive(Debug, Default)]
+static ALLOCATION_TRACKING_ENABLED: AtomicBool = AtomicBool::new(false);
+static ALLOCATION_COUNTERS: AllocationCounters = AllocationCounters::new();
+
+struct BenchAllocator;
+
+// SAFETY: every operation delegates to `System` with the exact layout supplied
+// by the caller. Accounting is allocation-free atomic bookkeeping and does not
+// alter the returned pointer or allocation lifetime.
+unsafe impl GlobalAlloc for BenchAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        // SAFETY: delegated with the caller-provided valid layout.
+        let pointer = unsafe { System.alloc(layout) };
+        if !pointer.is_null() && ALLOCATION_TRACKING_ENABLED.load(Ordering::Relaxed) {
+            ALLOCATION_COUNTERS.record_allocation(layout.size());
+        }
+        pointer
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        // SAFETY: delegated with the caller-provided valid layout.
+        let pointer = unsafe { System.alloc_zeroed(layout) };
+        if !pointer.is_null() && ALLOCATION_TRACKING_ENABLED.load(Ordering::Relaxed) {
+            ALLOCATION_COUNTERS.record_allocation(layout.size());
+        }
+        pointer
+    }
+
+    unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
+        if ALLOCATION_TRACKING_ENABLED.load(Ordering::Relaxed) {
+            ALLOCATION_COUNTERS.record_deallocation(layout.size());
+        }
+        // SAFETY: delegated with the original pointer and layout from the caller.
+        unsafe { System.dealloc(pointer, layout) };
+    }
+
+    unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        // SAFETY: delegated with the original pointer/layout and requested size.
+        let replacement = unsafe { System.realloc(pointer, layout, new_size) };
+        if !replacement.is_null() && ALLOCATION_TRACKING_ENABLED.load(Ordering::Relaxed) {
+            ALLOCATION_COUNTERS.record_deallocation(layout.size());
+            ALLOCATION_COUNTERS.record_allocation(new_size);
+        }
+        replacement
+    }
+}
+
+#[derive(Debug)]
 struct AllocationCounters {
     allocated: AtomicU64,
     deallocated: AtomicU64,
@@ -25,40 +71,33 @@ struct AllocationCounters {
     underflowed: AtomicBool,
 }
 
-#[derive(Clone, Debug)]
-struct BenchAllocationTracker(Arc<AllocationCounters>);
-
-impl AllocationTracker for BenchAllocationTracker {
-    fn allocated(
-        &self,
-        _addr: usize,
-        object_size: usize,
-        _wrapped_size: usize,
-        _group_id: AllocationGroupId,
-    ) {
-        let bytes = object_size as u64;
-        self.0.allocated.fetch_add(bytes, Ordering::Relaxed);
-        let live = self.0.live.fetch_add(bytes, Ordering::Relaxed) + bytes;
-        self.0.high_water.fetch_max(live, Ordering::Relaxed);
+impl AllocationCounters {
+    const fn new() -> Self {
+        Self {
+            allocated: AtomicU64::new(0),
+            deallocated: AtomicU64::new(0),
+            live: AtomicU64::new(0),
+            high_water: AtomicU64::new(0),
+            underflowed: AtomicBool::new(false),
+        }
     }
 
-    fn deallocated(
-        &self,
-        _addr: usize,
-        object_size: usize,
-        _wrapped_size: usize,
-        _source_group_id: AllocationGroupId,
-        _current_group_id: AllocationGroupId,
-    ) {
+    fn record_allocation(&self, object_size: usize) {
         let bytes = object_size as u64;
-        self.0.deallocated.fetch_add(bytes, Ordering::Relaxed);
+        self.allocated.fetch_add(bytes, Ordering::Relaxed);
+        let live = self.live.fetch_add(bytes, Ordering::Relaxed) + bytes;
+        self.high_water.fetch_max(live, Ordering::Relaxed);
+    }
+
+    fn record_deallocation(&self, object_size: usize) {
+        let bytes = object_size as u64;
+        self.deallocated.fetch_add(bytes, Ordering::Relaxed);
         if self
-            .0
             .live
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |live| live.checked_sub(bytes))
             .is_err()
         {
-            self.0.underflowed.store(true, Ordering::Relaxed);
+            self.underflowed.store(true, Ordering::Relaxed);
         }
     }
 }
@@ -138,13 +177,6 @@ fn parse_usize_list(raw: &str, option: &str) -> Vec<usize> {
         .collect()
 }
 
-fn install_tracker() -> Arc<AllocationCounters> {
-    let counters = Arc::new(AllocationCounters::default());
-    AllocationRegistry::set_global_tracker(BenchAllocationTracker(counters.clone()))
-        .expect("benchmark installs the process tracker exactly once");
-    counters
-}
-
 fn begin_allocation_epoch(counters: &AllocationCounters) {
     assert_eq!(
         counters.live.load(Ordering::Relaxed),
@@ -155,11 +187,11 @@ fn begin_allocation_epoch(counters: &AllocationCounters) {
     counters.deallocated.store(0, Ordering::Relaxed);
     counters.high_water.store(0, Ordering::Relaxed);
     counters.underflowed.store(false, Ordering::Relaxed);
-    AllocationRegistry::enable_tracking();
+    ALLOCATION_TRACKING_ENABLED.store(true, Ordering::Release);
 }
 
 fn end_allocation_epoch(counters: &AllocationCounters) -> AllocationSample {
-    AllocationRegistry::disable_tracking();
+    ALLOCATION_TRACKING_ENABLED.store(false, Ordering::Release);
     AllocationSample {
         allocated: counters.allocated.load(Ordering::Relaxed),
         deallocated: counters.deallocated.load(Ordering::Relaxed),
@@ -238,23 +270,48 @@ fn emit(
 
 fn main() {
     let options = options();
-    let allocations = install_tracker();
+    warm_up_process_runtime();
+    let allocations = &ALLOCATION_COUNTERS;
     for entries in options.sizes {
         for repetition in 0..options.repetitions {
-            payload_unique_fill_and_lookup(entries, repetition, &allocations);
-            revocable_fill_and_drain(entries, repetition, &allocations);
-            broker_release_owner_cardinality(entries, repetition, &allocations);
+            payload_unique_fill_and_lookup(entries, repetition, allocations);
+            revocable_fill_and_drain(entries, repetition, allocations);
+            broker_release_owner_cardinality(entries, repetition, allocations);
+            scheduler_admission_group_cardinality(entries, repetition, allocations);
         }
         for threads in &options.threads {
             for mode in
                 [ContentionMode::ReadHeavy, ContentionMode::WriteHeavy, ContentionMode::Mixed]
             {
                 for repetition in 0..options.repetitions {
-                    payload_contention(entries, *threads, repetition, mode, &allocations);
+                    payload_contention(entries, *threads, repetition, mode, allocations);
                 }
             }
         }
     }
+}
+
+/// Force process-lifetime standard-library/runtime allocations to happen while
+/// tracking is disabled. The benchmark owns scenario allocations, not one-time
+/// main-thread hash seeding that intentionally survives the first store.
+fn warm_up_process_runtime() {
+    thread::spawn(|| {}).join().expect("warmup thread");
+    let platform = new_platform();
+    let store = platform
+        .payload_store_builder::<String, Vec<u8>>()
+        .bind(StoreBindingHandle::new(MemoryClass::ArtifactCache, "bench:warmup".into(), None))
+        .build()
+        .expect("warmup payload store");
+    store
+        .put_canonical(RetainedEnvelope::new(0u64.to_be_bytes().to_vec()))
+        .expect("warmup payload");
+    store.close().expect("close warmup payload store");
+    drop(store);
+    assert_eq!(
+        platform.broker().ledger_snapshot().expect("warmup ledger").total_owner_bytes(),
+        0,
+        "warmup must leave semantic accounting empty"
+    );
 }
 
 fn new_platform() -> quanta_memory_platform_facade::LiveMemoryPlatform {
@@ -269,8 +326,8 @@ fn payload_unique_fill_and_lookup(
     repetition: usize,
     allocations: &AllocationCounters,
 ) {
-    let platform = new_platform();
     begin_allocation_epoch(allocations);
+    let platform = new_platform();
     let store = platform
         .payload_store_builder::<String, Vec<u8>>()
         .bind(StoreBindingHandle::new(MemoryClass::ArtifactCache, "bench:payload".into(), None))
@@ -310,8 +367,8 @@ fn payload_unique_fill_and_lookup(
         0,
     );
 
-    let platform = new_platform();
     begin_allocation_epoch(allocations);
+    let platform = new_platform();
     let store = platform
         .payload_store_builder::<String, Vec<u8>>()
         .bind(StoreBindingHandle::new(MemoryClass::ArtifactCache, "bench:dedup".into(), None))
@@ -354,8 +411,8 @@ fn payload_unique_fill_and_lookup(
 }
 
 fn revocable_fill_and_drain(entries: usize, repetition: usize, allocations: &AllocationCounters) {
-    let platform = new_platform();
     begin_allocation_epoch(allocations);
+    let platform = new_platform();
     let store = platform
         .revocable_store_builder::<String, Vec<u8>>()
         .bind(StoreBindingHandle::new(MemoryClass::ArtifactCache, "bench:revocable".into(), None))
@@ -400,8 +457,8 @@ fn broker_release_owner_cardinality(
     repetition: usize,
     allocations: &AllocationCounters,
 ) {
-    let platform = new_platform();
     begin_allocation_epoch(allocations);
+    let platform = new_platform();
     let mut charges = Vec::with_capacity(entries);
     for owner in 0..entries {
         charges.push(
@@ -447,6 +504,58 @@ fn broker_release_owner_cardinality(
     );
 }
 
+fn scheduler_admission_group_cardinality(
+    entries: usize,
+    repetition: usize,
+    allocations: &AllocationCounters,
+) {
+    begin_allocation_epoch(allocations);
+    let mut groups = BTreeMap::new();
+    for index in 0..entries {
+        groups.insert(
+            format!("group-{index:08}"),
+            ResourceGroup {
+                reserved_bytes: 0,
+                soft_cap_bytes: 500,
+                hard_cap_bytes: 1_000,
+                burst_percent: 100,
+                reclaim_priority: ReclaimPriority::Normal,
+                admission_weight: 1,
+            },
+        );
+    }
+    let target = format!("group-{:08}", entries / 2);
+    let mut scheduler = WeightedResourceGroupScheduler::new(groups, entries as u64);
+    scheduler.record_usage(&target, 1_000).expect("record target hard-cap usage");
+
+    let mut latencies = Vec::with_capacity(entries);
+    let started = Instant::now();
+    for _ in 0..entries {
+        let operation = Instant::now();
+        assert!(scheduler.admits(&target, 1), "cached one-byte fair share must admit");
+        assert!(!scheduler.admits(&target, 2), "request beyond cached share must deny");
+        latencies.push(operation.elapsed().as_nanos() as u64);
+    }
+    let elapsed = started.elapsed();
+    drop(scheduler);
+    drop(target);
+    let latency = summarize_latencies(latencies);
+    let allocation = end_allocation_epoch(allocations);
+    emit(
+        "scheduler_admission_group_cardinality",
+        "single-thread",
+        entries,
+        1,
+        repetition,
+        elapsed,
+        latency,
+        0,
+        0,
+        allocation,
+        0,
+    );
+}
+
 fn payload_contention(
     entries: usize,
     threads: usize,
@@ -454,8 +563,8 @@ fn payload_contention(
     mode: ContentionMode,
     allocations: &AllocationCounters,
 ) {
-    let platform = new_platform();
     begin_allocation_epoch(allocations);
+    let platform = new_platform();
     let store = Arc::new(
         platform
             .payload_store_builder::<String, Vec<u8>>()

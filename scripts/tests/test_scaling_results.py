@@ -50,6 +50,7 @@ def valid_records() -> list[dict[str, object]]:
         "payload_dedup_lookup",
         "revocable_fill_and_drain",
         "broker_release_owner_cardinality",
+        "scheduler_admission_group_cardinality",
     ):
         for repetition in range(3):
             value = sample("single-thread", 1, repetition)
@@ -63,7 +64,7 @@ def valid_records() -> list[dict[str, object]]:
 
 class ScalingResultTests(unittest.TestCase):
     def test_valid_smoke_matrix_passes(self) -> None:
-        self.assertEqual(MODULE.validate(valid_records(), {1, 2}), 30)
+        self.assertEqual(MODULE.validate(valid_records(), {1, 2}), 33)
 
     def test_allocator_drift_is_rejected(self) -> None:
         records = valid_records()
@@ -88,6 +89,15 @@ class ScalingResultTests(unittest.TestCase):
             )
         ]
         with self.assertRaisesRegex(MODULE.ValidationError, "matrix is incomplete"):
+            MODULE.validate(records, {1, 2})
+
+    def test_missing_scheduler_cardinality_lane_is_rejected(self) -> None:
+        records = [
+            record
+            for record in valid_records()
+            if record.get("operation") != "scheduler_admission_group_cardinality"
+        ]
+        with self.assertRaisesRegex(MODULE.ValidationError, "missing operations"):
             MODULE.validate(records, {1, 2})
 
     def test_baseline_regression_is_rejected(self) -> None:
