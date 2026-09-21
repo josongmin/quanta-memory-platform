@@ -30,20 +30,20 @@
 ### Latest verified product checkpoint
 
 ```text
-verified product source: 557213b01ed93a20c1a45d3c69b2dae20ab90e70
+verified product source: cdbf94f8c409ecb60493eac5c222712f7010bbf9
 branch/worktree: codex/qmp-remaining-hardening / isolated clean worktree
 workspace tests: 639 passed
-doctor output SHA-256: b0dd21acd50ff4b44ce8d557c029fa3b3b5d07fc67ae50348441d291dece6fc7
-last actual extracted bootstrap: 6f744cac4e36d9dae5439c832d5a0a41f7809199 (source 557213b; clean)
-actual extraction output SHA-256: e6989be895ac09085b5c208273ec6b3c48f66b1ab0de19074506e817057afb75
+doctor output SHA-256: c7188fa1e0da4f8494802ef6df549ab6b28a14f2cec53cda847ea7363a32b71a
+last actual extracted bootstrap: 5bd3f7430b62d0882e8b50e4bba53f34373a6ec6 (source cdbf94f; clean)
+actual extraction output SHA-256: fb86a214ed538226d378c6d8860c7ac9e388d1e48bc935b13f9b9efba0edeeaa
 scaling smoke output SHA-256: 224480acfcb3e09c6a2adf6664c228db1b6ea3ae4a0678952172f764cff36945
 scaling full output SHA-256: 358d1970b4466dcf05e6b8415c012aa55b728c5a635f9f529fe462b73d53a0c0
 scaling baseline-gate output SHA-256: c8bcfdd32682fa20e46ef7d20b2f1b43927bdb3738d19801d5920e8a25fa4538
 ```
 
 This checkpoint qualifies only the ticket scopes whose latest receipts say
-`QUALIFIED`. It does not close remote QMP-120,
-external-host QMP-130, or final SemVer/docs QMP-140. Inventory state below is
+`QUALIFIED`. It does not close external-host QMP-130 or final SemVer/docs
+QMP-140. Inventory state below is
 the lifecycle authority; this block is exact proof metadata, not a status
 override.
 
@@ -77,9 +77,9 @@ override.
 | [QMP-090](QMP-090-conformance-model/TICKET.md) | P1 | QUALIFIED | independent model, negative-family mapping, five Loom models and clean standalone rails pass Rust 1.92 at `f2b7497`; focused Miri remains bound to `aeeffe3` | QMP-020, QMP-040, QMP-070 | testkit conformance/fakes/faults |
 | [QMP-100](QMP-100-scaling-benchmarks/TICKET.md) | P2 | QUALIFIED | cached weighted admission removes per-request group sorting; the fresh-build 33-sample rail directly rejects hot-loop allocations and passes zero-drift plus the 639-test doctor at `557213b` | QMP-040, QMP-050, QMP-070 | payload/revocable containers, scheduler, benches, CI scripts |
 | [QMP-110](QMP-110-operability-observation/TICKET.md) | P2 | QUALIFIED | typed one-lock observation, poison truth and bounded events pass the Rust 1.92 doctor at `2dfb7bc` | QMP-030, QMP-040, QMP-080 | stats traits, metrics adapters, broker/store emitters |
-| [QMP-120](QMP-120-standalone-extraction/TICKET.md) | P1 | IMPLEMENTED | local HEAD/tree/blob/mode-bound extraction, 639-test doctor and clean extracted commit pass at `557213b`; remote workflow remains unobserved | QMP-000 | extraction manifest/scripts, lockfile, release CI |
-| [QMP-130](QMP-130-host-adoption/TICKET.md) | P1 | BLOCKED | host `8e23e123` plus exact-QMP-`2dfb7bc` probe passed direct 129+46+86 and one QBC lane, but those receipts predate current `557213b`; committed Cargo still resolves adjacent QMP 0.1.0 and two QBC lanes are missing | QMP-030..QMP-120 | external host repo only; QMP repo read-only except receipts |
-| [QMP-140](QMP-140-semver-docs-closeout/TICKET.md) | P2 | BLOCKED | local 0.2 SemVer/MSRV, feature runtime and 166-selector docs validation complete; current-`557213b` host activation, two QBC receipts and remote extraction proof remain | QMP-010..QMP-130 | public exports, README/EXTRACTION/docs, Cargo metadata |
+| [QMP-120](QMP-120-standalone-extraction/TICKET.md) | P1 | QUALIFIED | workflow-free local HEAD/tree/blob/mode-bound extraction, 639-test doctor and clean extracted commit pass at `cdbf94f`; repo-local actual extraction is terminal authority | QMP-000 | extraction manifest/scripts, lockfile, release qualification |
+| [QMP-130](QMP-130-host-adoption/TICKET.md) | P1 | BLOCKED | host `8e23e123` plus exact-QMP-`2dfb7bc` probe passed direct 129+46+86 and one QBC lane, but those receipts predate current `cdbf94f`; committed Cargo still resolves adjacent QMP 0.1.0 and two QBC lanes are missing | QMP-030..QMP-120 | external host repo only; QMP repo read-only except receipts |
+| [QMP-140](QMP-140-semver-docs-closeout/TICKET.md) | P2 | BLOCKED | local 0.2 SemVer/MSRV, feature runtime, selectors, performance and workflow-free extraction are complete; current-`cdbf94f` host activation and two QBC receipts remain | QMP-010..QMP-130 | public exports, README/EXTRACTION/docs, Cargo metadata |
 
 상태를 바꿀 때 이 표와 ticket receipt를 같은 change에서 갱신한다.
 

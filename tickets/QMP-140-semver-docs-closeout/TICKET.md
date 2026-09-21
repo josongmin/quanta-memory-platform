@@ -134,9 +134,9 @@ scripts/verify-tickets.sh
 - `EXTRACTION.md` names host test targets absent from the current Semantica tree.
 - The feature matrix compiles and clippy-checks leaf features but does not execute runtime
   capability tests; this cannot qualify advertised moka/scc backings.
-- `README.md` describes historical extraction failure at the audit base but does
-  not clearly distinguish the later local extraction passes from unobserved
-  remote CI and the new HEAD-binding gap.
+- `README.md` historically described extraction failure at the audit base
+  without clearly distinguishing later local extraction passes. This is now
+  resolved by the exact workflow-free QMP-120 receipt and HEAD-binding gate.
 
 Add a docs/test-selector linter that resolves every command against `cargo test
 -- --list` or the host suite registry, a runtime bite test for every advertised
@@ -159,10 +159,10 @@ Implemented and reverified at product source
 - focused Miri evidence recorded in ticket receipts.
 
 The local product proof was refreshed at
-`557213b01ed93a20c1a45d3c69b2dae20ab90e70`: the Rust 1.92 doctor passes
+`cdbf94f8c409ecb60493eac5c222712f7010bbf9`: the Rust 1.92 doctor passes
 639 tests, the fresh-target performance smoke passes all 33 required samples,
-and actual standalone extraction produces canonical digest `da315e42`, clean
-bootstrap commit `6f744cac`, and the same complete standalone rails. Local
+and actual standalone extraction produces canonical digest `75355851`, clean
+bootstrap commit `5bd3f743`, and the same complete standalone rails. Local
 workspace/extraction/performance proof is therefore exact-current for that
 product source.
 
@@ -176,7 +176,7 @@ identity verifier tests 5/5 and registered production-composition QBC 2/2.
 QBC's one-new-lane-per-task admission prevented the same task from creating the
 host-full-wiring and execution-budget lanes, so those two canonical receipts
 remain absent. The committed host metadata still resolves adjacent QMP 0.1.0
-rather than current `557213b` 0.2.0, and the observed host proof predates that
+rather than current `cdbf94f` 0.2.0, and the observed host proof predates that
 source. Therefore QMP-130 and this ticket remain `BLOCKED`.
 QMP-120 uses repo-local actual extraction as its terminal authority; the
 removed GitHub Actions workflow is not a remaining gap. Host activation and

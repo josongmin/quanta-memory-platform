@@ -14,7 +14,7 @@ the inventory in [`README.md`](README.md) and each ticket's latest transition
 receipt.
 
 ```text
-portable product source: 557213b01ed93a20c1a45d3c69b2dae20ab90e70
+portable product source: cdbf94f8c409ecb60493eac5c222712f7010bbf9
 qualification SSOT base: a23bda308e57c7bcaab9f70bedfe9757fd399fb2
 session-hardening receipt: tickets/QMP-100-scaling-benchmarks/receipts/2026-09-21T131415Z-557213b.md
 branch: codex/qmp-remaining-hardening
@@ -33,17 +33,15 @@ Current evidence:
   smoke from a fresh Cargo target, including scheduler group cardinality and an
   allocation-free admission-loop oracle, with zero semantic and allocator
   residual bytes.
-- actual extraction at `557213b`: PASS; source tree `16d84b4c`, canonical
-  manifest `da315e42`, extracted commit `6f744cac`, extracted tree `559bffe0`,
+- actual extraction at `cdbf94f`: PASS; source tree `66eaac21`, canonical
+  manifest `75355851`, extracted commit `5bd3f743`, extracted tree `6a2f420e`,
   clean Git status, 639-test doctor, ticket validator and PM lint.
 - local ticket admission, QMP-010 through QMP-110 behavior owners, conformance,
   performance and operability are `QUALIFIED` where shown in the inventory.
 
 Remaining authority gaps, not local code defects:
 
-1. QMP-120 remains `IMPLEMENTED` because the remote standalone-extraction
-   workflow has not been observed on this revision.
-2. QMP-130 remains `BLOCKED`: host commit `8e23e123` implements the production
+1. QMP-130 remains `BLOCKED`: host commit `8e23e123` implements the production
    composition, host adapters, execution-budget enforcement, suite registration
    and fail-closed dependency-identity gate. A clean throwaway qualification
    commit changing only the two manifests and locks to exact QMP `2dfb7bc`
@@ -51,16 +49,16 @@ Remaining authority gaps, not local code defects:
    1.92. Its exact-root identity gate and registered production-composition QBC
    suite pass 5/5 + 2/2. The remaining two QBC suite lanes could not be created
    by the same Codex task because QBC admits only one new lane per task. Those
-   receipts predate the current `557213b` scheduler/performance hardening and
+   receipts predate the current `cdbf94f` portable source and
    therefore do not qualify the current portable source. The
    gate still correctly rejects the committed live
    resolution because Cargo points at adjacent shared QMP 0.1.0, not qualified
    QMP 0.2. Repointing/publishing and the two missing same-source QBC receipts
    are external integration actions.
-3. QMP-140 remains `BLOCKED` only on the same exact-revision host/remote proof;
+2. QMP-140 remains `BLOCKED` only on the same exact-revision host proof;
    its local SemVer, migration, feature-runtime and documentation work is done.
 
-Do not report the campaign as production/host `DONE` until those three proof
+Do not report the campaign as production/host `DONE` until these host proof
 boundaries are closed. Do not reopen the historical findings below without a
 new current-source reproduction.
 
@@ -330,7 +328,9 @@ Proof: `STATIC` + the zero-test execution above.
 `docs/verification-scenarios.md:56-63,179-181` still describes saturating ledger
 totals and names `saturating_add_near_u64_max_keeps_class_owner_balanced`, while
 the implementation moved to checked failure and that selector no longer exists.
-`EXTRACTION.md` uses present-tense workflow success without observed remote CI.
+Historical `EXTRACTION.md` used present-tense workflow success without observed
+remote CI. The unused workflow is now removed; exact repo-local actual
+extraction is the current QMP-120 terminal authority.
 This is proof drift: the product may be correct in a narrower scope, but the
 published evidence points at a different behavior or no test.
 
@@ -394,7 +394,7 @@ exist in the inventory.
 | QMP-090 | IMPLEMENTED | generative/shrinking model plus group/context/live-ticket, spill and concurrency axes |
 | QMP-100 | BLOCKED | remove measured O(N²) owners and set frozen workload thresholds |
 | QMP-110 | BLOCKED | fallible typed observation and bounded live telemetry after policy semantics freeze |
-| QMP-120 | IMPLEMENTED | bind extraction bytes and modes to exact commit; observe remote workflow |
+| QMP-120 | QUALIFIED | exact workflow-free repo-local extraction binds bytes and modes to the committed tree |
 | QMP-130 | BLOCKED | resolve host Cargo/gate identity, then exact-head host behavior qualification |
 | QMP-140 | BLOCKED | SemVer migration, executable docs, governance schema and final evidence reconciliation |
 
@@ -481,7 +481,8 @@ growth is insufficient.
 - Extract from exact commit blobs or fail dirty content/mode before copy.
 - Verify manifest equality, locked/frozen builds, clean extracted git, examples,
   deny and self-hosting from a fresh destination.
-- Run the actual remote workflow and attach its immutable artifact identity.
+- Run the actual repo-local extraction and attach its immutable manifest and
+  clean bootstrap identity.
 
 Exit hellgate: claimed commit, source manifest and extracted manifest are
 cryptographically identical including modes; dirty/mode fixtures fail.
@@ -537,7 +538,7 @@ These references define acceptance quality. They are not proof that QMP meets it
 - [ ] Hot paths meet frozen cardinality/contention thresholds.
 - [ ] Observation is fallible/typed; telemetry is bounded and non-authoritative.
 - [ ] Extraction bytes and modes equal the exact committed tree.
-- [ ] Remote extraction workflow is observed, not inferred.
+- [x] Workflow-free repo-local extraction is observed, not inferred.
 - [ ] Host Cargo, gate and receipt resolve the same QMP path and SHA.
 - [ ] All documented selectors exist and execute nonzero tests.
 - [ ] Public API removal has an explicit SemVer and migration record.

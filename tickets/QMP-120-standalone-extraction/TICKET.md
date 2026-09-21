@@ -5,14 +5,14 @@ Lifecycle authority: `tickets/README.md`
 Depends on: QMP-000  
 Blocks: QMP-130, QMP-140
 
-Status: `IMPLEMENTED`. The local isolated source at `4fdac520` freezes the exact
+Status: `QUALIFIED`. The local isolated source at `4fdac520` freezes the exact
 committed HEAD/tree, derives the copy manifest from Git tree objects, binds each
 path to mode/blob/content identity, rejects tracked/index/mode drift, and passed
 a fresh actual extraction with clean destination commit. See
 [`receipts/2026-09-21T055538Z-4fdac52.md`](receipts/2026-09-21T055538Z-4fdac52.md).
 The repository does not use GitHub Actions as extraction authority. A fresh
-repo-local actual extraction of the workflow-free canonical set is required
-before promotion to `QUALIFIED`.
+repo-local actual extraction of the workflow-free canonical set is the terminal
+qualification rail; the current receipt below passes it.
 
 ## Objective
 
@@ -112,6 +112,13 @@ was not an operational rail and is removed from the repository and canonical
 copy set. Historical receipts that recorded it as unobserved remain immutable
 history; they are not a current acceptance requirement. QMP-120 closes from an
 exact-source repo-local actual extraction receipt.
+
+Qualification: workflow-free source
+`cdbf94f8c409ecb60493eac5c222712f7010bbf9` passed the complete repo-local
+doctor and actual extraction. The canonical digest is `75355851`, extracted
+bootstrap commit is `5bd3f743`, `.github` is absent, and final Git status is
+clean. See
+[`receipts/2026-09-21T161832Z-cdbf94f.md`](receipts/2026-09-21T161832Z-cdbf94f.md).
 
 ## Verification
 
