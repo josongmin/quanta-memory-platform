@@ -53,8 +53,8 @@ Feature flags (the matrix runs clippy `-D warnings` on default, bare, each leaf,
 
 - **core:** `pressure`, `scheduler`, `live_control`, `unbudgeted_pin` (explicit experimental adapter),
   `telemetry` (= `metrics` + `hdrhistogram`), `full`
-- **facade:** `core-live-accounting`, `payload_store`, `retained_map`, `revocable_store` (moka + scc),
-  `transcript`, `publish_pipeline`, `spill` (redb), `full`
+- **facade:** `core-live-accounting`, `payload_store`, `retained_map`, `revocable_store`,
+  `transcript`, `publish_pipeline`, `spill` (`spill-redb` backing), `full`
 - **testkit:** `fixtures`, `doctor`, `conformance`, `faults`,
   `alloc_tracking` (tracking-allocator), `full`
 

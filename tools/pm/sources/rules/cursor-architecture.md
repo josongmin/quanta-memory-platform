@@ -26,7 +26,7 @@ quanta-memory-host (Semantica) -> quanta-memory-platform-{core,facade}   # OUTSI
 | Semantica nouns (`Semantica*`, `quanta_runtime`, `codegraph`) in public API | Library must stay host-independent |
 | Raw broker constructor in public code | Use the builder-first surface (`MemoryPlatformBuilder`, `ProcessMemoryBrokerBuilder`) |
 | A path dependency escaping `crates/` | Breaks standalone extraction |
-| Storage backing (redb/moka/scc) leaking outside its feature gate | Backings stay confined + feature-gated |
+| Storage backing (redb) leaking outside its feature gate | Backings stay confined + feature-gated |
 
 ### Where new code goes
 
@@ -39,7 +39,7 @@ quanta-memory-host (Semantica) -> quanta-memory-platform-{core,facade}   # OUTSI
 | Port implementation (infra) | `core/src/adapters/` | `domain`, `ports` |
 | Public broker surface / builder | `core/src/api/{broker,builder,control}.rs` | `domain` |
 | A portable store / pipeline (feature-sliced) | `facade/src/<feature>/service.rs` + builder in `shared/` | `core` |
-| A storage backing (redb/moka/scc) | `facade/src/<feature>/backings/<name>.rs` (feature-gated) | service code |
+| A storage backing (redb) | `facade/src/<feature>/backings/<name>.rs` (feature-gated) | service code |
 | Conformance / fault / fixture / doctor tooling | `testkit/src/{conformance,faults,fixtures,doctor}/` | `core`, `facade` |
 
 ### Core kernel rules (common mistakes)

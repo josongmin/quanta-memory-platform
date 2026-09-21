@@ -18,7 +18,7 @@ payload_store = ["core-live-accounting"]
 retained_map = ["core-live-accounting", "dep:hashlink"]
 # Base store/pipeline slices are pure-Rust in-memory and carry NO third-party
 # (copyleft) backing deps. Durable/concurrent backings are opt-in via the
-# `*-redb` / `*-moka` / `*-scc` features below, so a consumer that does not ask
+# `*-redb` features below, so a consumer that does not ask
 # for a heavy backing never links one (and `full` stays copyleft-free).
 revocable_store = ["core-live-accounting"]
 transcript = ["core-live-accounting", "dep:blake3"]
@@ -27,8 +27,6 @@ spill = []
 
 # Opt-in heavy backings (each pulls one third-party crate).
 spill-redb = ["spill", "dep:redb"]
-revocable-moka = ["revocable_store", "dep:moka"]
-revocable-scc = ["revocable_store", "dep:scc"]
 
 # `full` = every in-memory slice, deliberately WITHOUT any backing dep, so it is
 # free of copyleft transitive dependencies while still including the facade's
@@ -42,8 +40,10 @@ full = [
     "publish_pipeline",
     "spill",
 ]
-# `full-backings` = `full` plus every durable/concurrent backing (heavy deps).
-full-backings = ["full", "spill-redb", "revocable-moka", "revocable-scc"]
+# `full-backings` = `full` plus every production backing. Compile-only
+# moka/scc indexes were removed because they never implemented the canonical
+# revocable-store contract.
+full-backings = ["full", "spill-redb"]
 
 [[example]]
 name = "hello_world"
@@ -52,7 +52,5 @@ required-features = ["core-live-accounting"]
 [dependencies]
 blake3 = { workspace = true, optional = true }
 hashlink = { workspace = true, optional = true }
-moka = { workspace = true, optional = true }
 quanta-memory-platform-core = { path = "../quanta-memory-platform-core", default-features = false }
 redb = { workspace = true, optional = true }
-scc = { workspace = true, optional = true }

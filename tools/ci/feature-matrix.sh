@@ -47,8 +47,6 @@ FACADE_FEATURES=(
   publish_pipeline
   spill
   spill-redb
-  revocable-moka
-  revocable-scc
   full-backings
 )
 TESTKIT_FEATURES=(fixtures doctor conformance faults alloc_tracking)

@@ -192,3 +192,8 @@ Implementation checkpoint (runtime qualification deferred):
 - Static evidence: workspace all-target/all-feature `cargo check`, fmt, and
   clippy `-D warnings` pass. The poison test and compile-fail doctests are present
   but intentionally not executed in this checkpoint.
+- QMP-070's feature-matrix static sweep found the newly private ticket/recharge
+  types compiled but unused under core `--no-default-features`, causing
+  `-D warnings` failure. The owner types/module are now gated by `live_control`;
+  this is a feature-closure repair only and does not upgrade QMP-020 runtime
+  qualification.

@@ -1,5 +1,7 @@
+#[cfg(feature = "spill")]
+use std::collections::BTreeMap;
 use std::marker::PhantomData;
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use quanta_memory_platform_core::{
     ChargeKind, LiveProcessMemoryBroker, ManagedCharge, MemoryContextKind, MemoryError,
@@ -14,8 +16,9 @@ use crate::shared::lifecycle::{retire_client_value, BeginClose, StoreLifecycle};
 use crate::shared::measure::{semantic_cost_v1, ByteSized, RetainedCostV1};
 #[cfg(feature = "spill")]
 use crate::spill::{
-    DurableCommitFailure, DurableRestoreController, DurableRestoreOutcome, DurableSpillController,
-    InProcessSpillController, SpillFailure, SpillReceipt,
+    DurableCommitFailure, DurableRecordId, DurableRecordResolution, DurableRestoreController,
+    DurableRestoreOutcome, DurableWriteFailure, InProcessSpillController,
+    ReconciledDurableSpillController, SpillFailure, SpillReceipt,
 };
 
 #[derive(Debug)]
@@ -33,7 +36,9 @@ struct RevocableEntry<Key, Value> {
 #[cfg(feature = "spill")]
 #[derive(Debug)]
 pub struct RevocableSpillHandle<Key, Value> {
-    binding: StoreBindingHandle,
+    /// Shared store identity. Moving many entries into an in-process tier must
+    /// not deep-clone caller-controlled owner/runtime strings per handle.
+    binding: Arc<StoreBindingHandle>,
     entry: Option<RevocableEntry<Key, Value>>,
 }
 
@@ -98,6 +103,16 @@ fn revocable_entry_cost<Key: ByteSized, Value: ByteSized>(
 #[derive(Debug)]
 struct RevocableState<Key, Value> {
     entries: Vec<RevocableEntry<Key, Value>>,
+    /// Source entries fenced while a durable commit acknowledgement is unknown.
+    /// Their managed charges remain live until record reconciliation chooses the
+    /// durable or resident authority.
+    #[cfg(feature = "spill")]
+    pending_spills: BTreeMap<DurableRecordId, RevocableEntry<Key, Value>>,
+    /// Provisional resident entries fenced while a durable delete
+    /// acknowledgement is unknown. They are charged but not readable until
+    /// reconciliation proves that the durable record is absent.
+    #[cfg(feature = "spill")]
+    pending_restores: BTreeMap<DurableRecordId, RevocableEntry<Key, Value>>,
     committed_bytes: u64,
 }
 
@@ -123,7 +138,7 @@ struct RevocableState<Key, Value> {
 /// ```
 #[derive(Debug)]
 pub struct SimpleRevocableStore<Key, Value, Mode> {
-    binding: StoreBindingHandle,
+    binding: Arc<StoreBindingHandle>,
     accounting: StoreAccounting,
     lifecycle: StoreLifecycle,
     state: Mutex<RevocableState<Key, Value>>,
@@ -133,10 +148,17 @@ pub struct SimpleRevocableStore<Key, Value, Mode> {
 impl<Key, Value, Mode> SimpleRevocableStore<Key, Value, Mode> {
     fn with_accounting(binding: StoreBindingHandle, accounting: StoreAccounting) -> Self {
         Self {
-            binding,
+            binding: Arc::new(binding),
             accounting,
             lifecycle: StoreLifecycle::new("revocable store"),
-            state: Mutex::new(RevocableState { entries: Vec::new(), committed_bytes: 0 }),
+            state: Mutex::new(RevocableState {
+                entries: Vec::new(),
+                #[cfg(feature = "spill")]
+                pending_spills: BTreeMap::new(),
+                #[cfg(feature = "spill")]
+                pending_restores: BTreeMap::new(),
+                committed_bytes: 0,
+            }),
             _mode: PhantomData,
         }
     }
@@ -241,6 +263,12 @@ impl<Key, Value, Mode> SimpleRevocableStore<Key, Value, Mode> {
 
         let mut plan = {
             let mut state = self.lock_state()?;
+            #[cfg(feature = "spill")]
+            if !state.pending_spills.is_empty() || !state.pending_restores.is_empty() {
+                return Err(MemoryError::OperationInProgress(
+                    "cannot close revocable store with unresolved durable transfers".into(),
+                ));
+            }
             for entry in &state.entries {
                 self.require_charge_shape(entry, "close")?;
             }
@@ -323,65 +351,135 @@ impl<Key, Value> SimpleRevocableStore<Key, Value, Budgeted> {
         encode: Encode,
     ) -> MemoryResult<Option<SpillReceipt>>
     where
-        C: DurableSpillController<Vec<u8>>,
+        C: ReconciledDurableSpillController,
         Encode: FnOnce(&Key, &Value) -> MemoryResult<Vec<u8>>,
     {
         let _mutation = self.lifecycle.begin_mutation()?;
-        let (entry, next_committed) = {
-            let mut state = self.lock_state()?;
+        let bytes = {
+            let state = self.lock_state()?;
+            if !state.pending_spills.is_empty() {
+                return Err(MemoryError::OperationInProgress(
+                    "durable spill reconciliation is required before another spill".into(),
+                ));
+            }
             let Some(entry) = state.entries.first() else {
                 return Ok(None);
             };
             self.require_charge_shape(entry, "durable spill transfer")?;
-            let next_committed =
-                state.committed_bytes.checked_sub(entry.charged_bytes).ok_or_else(|| {
-                    MemoryError::InvalidState(
-                        "revocable committed bytes are smaller than transferred entry".into(),
-                    )
-                })?;
-            (state.entries.remove(0), next_committed)
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                encode(&entry.key, &entry.value)
+            })) {
+                Ok(result) => result?,
+                Err(panic) => std::panic::resume_unwind(panic),
+            }
         };
 
-        let encoded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            encode(&entry.key, &entry.value)
+        let record_id = controller.reserve_record_id()?;
+        let committed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            controller.commit_spill(record_id, &bytes)
         }));
-        let bytes = match encoded {
-            Ok(Ok(bytes)) => bytes,
-            Ok(Err(error)) => {
-                self.lock_state_for_commit().entries.insert(0, entry);
-                return Err(error);
-            }
-            Err(panic) => {
-                self.lock_state_for_commit().entries.insert(0, entry);
-                std::panic::resume_unwind(panic);
-            }
+        let result = match committed {
+            Ok(result) => result,
+            Err(panic) => std::panic::resume_unwind(panic),
         };
 
-        match controller.spill(bytes) {
-            Ok(receipt @ SpillReceipt::Durable { .. }) => {
-                self.lock_state_for_commit().committed_bytes = next_committed;
+        match result {
+            Ok(receipt @ SpillReceipt::Durable { sequence, .. }) if sequence == record_id.get() => {
+                let entry = {
+                    let mut state = self.lock_state_for_commit();
+                    let entry = state.entries.remove(0);
+                    state.committed_bytes = state
+                        .committed_bytes
+                        .checked_sub(entry.charged_bytes)
+                        .expect("validated committed bytes cover first entry");
+                    entry
+                };
                 retire_entry(entry);
                 Ok(Some(receipt))
             }
-            Ok(SpillReceipt::InProcess { .. }) => {
-                self.lock_state_for_commit().entries.insert(0, entry);
-                Err(MemoryError::InvalidState(
-                    "durable spill controller returned an in-process receipt".into(),
-                ))
+            Ok(receipt) => {
+                let mut state = self.lock_state_for_commit();
+                let entry = state.entries.remove(0);
+                state.pending_spills.insert(record_id, entry);
+                Err(MemoryError::OperationInProgress(format!(
+                    "durable spill returned mismatched receipt {receipt:?}; record {} requires reconciliation",
+                    record_id.get()
+                )))
             }
-            Err(failure) => {
-                let (error, _bytes) = failure.into_parts();
-                self.lock_state_for_commit().entries.insert(0, entry);
-                Err(error)
+            Err(DurableWriteFailure::NotCommitted(error)) => Err(*error),
+            Err(DurableWriteFailure::RecoveryRequired { record_id, commit_error, probe_error }) => {
+                let mut state = self.lock_state_for_commit();
+                let entry = state.entries.remove(0);
+                state.pending_spills.insert(record_id, entry);
+                Err(MemoryError::OperationInProgress(format!(
+                    "durable record {} requires reconciliation after commit error ({commit_error}) and probe error ({probe_error})",
+                    record_id.get()
+                )))
             }
         }
     }
 
+    /// IDs whose source entries are fenced after an unresolved durable commit.
+    pub fn pending_durable_spills(&self) -> MemoryResult<Vec<DurableRecordId>> {
+        Ok(self.lock_read()?.pending_spills.keys().copied().collect())
+    }
+
+    /// Resolve one fenced durable write. A present record becomes authoritative
+    /// and releases the source charge exactly once; an absent record restores
+    /// the original FIFO source entry without changing its charge.
+    pub fn reconcile_durable_spill<C>(
+        &self,
+        controller: &C,
+        record_id: DurableRecordId,
+    ) -> MemoryResult<DurableRecordResolution>
+    where
+        C: ReconciledDurableSpillController,
+    {
+        let _mutation = self.lifecycle.begin_mutation()?;
+        let resolution = controller.resolve_record(record_id)?;
+        let mut state = self.lock_state()?;
+        let entry_bytes = state
+            .pending_spills
+            .get(&record_id)
+            .ok_or_else(|| {
+                MemoryError::InvalidState(format!(
+                    "durable record {} has no fenced source authority",
+                    record_id.get()
+                ))
+            })?
+            .charged_bytes;
+        match resolution {
+            DurableRecordResolution::Present { .. } | DurableRecordResolution::Finalized => {
+                let next_committed =
+                    state.committed_bytes.checked_sub(entry_bytes).ok_or_else(|| {
+                        MemoryError::InvalidState(
+                            "revocable committed bytes are smaller than reconciled spill".into(),
+                        )
+                    })?;
+                let entry = state
+                    .pending_spills
+                    .remove(&record_id)
+                    .expect("pending spill was checked under the mutation permit");
+                state.committed_bytes = next_committed;
+                drop(state);
+                retire_entry(entry);
+            }
+            DurableRecordResolution::Absent => {
+                let entry = state
+                    .pending_spills
+                    .remove(&record_id)
+                    .expect("pending spill was checked under the mutation permit");
+                state.entries.insert(0, entry);
+            }
+        }
+        Ok(resolution)
+    }
+
     /// Restore the oldest durable record without a transient unowned window.
-    /// The destination is first read non-destructively; the source charge is
-    /// established before the exact durable sequence is deleted, then the entry
-    /// is published locally. Decode failure or admission denial leaves the
-    /// durable record authoritative and unchanged.
+    /// The destination is first claimed and read non-destructively; the source
+    /// charge is established before the exact durable sequence is deleted, then
+    /// the entry is published locally. Decode failure or admission denial aborts
+    /// the claim and leaves the durable record authoritative and unchanged.
     pub fn restore_one_durable<C, Decode>(
         &self,
         controller: &C,
@@ -394,48 +492,181 @@ impl<Key, Value> SimpleRevocableStore<Key, Value, Budgeted> {
         Value: ByteSized,
     {
         let _mutation = self.lifecycle.begin_mutation()?;
+        if !self.lock_state()?.pending_restores.is_empty() {
+            return Err(MemoryError::OperationInProgress(
+                "durable restore reconciliation is required before another restore".into(),
+            ));
+        }
         let Some(candidate) = controller.prepare_restore()? else {
             return Ok(DurableRestoreOutcome::Empty);
         };
         let decoded =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| decode(&candidate.bytes)));
         let (key, value) = match decoded {
-            Ok(result) => result?,
-            Err(panic) => std::panic::resume_unwind(panic),
+            Ok(Ok(decoded)) => decoded,
+            Ok(Err(error)) => {
+                return match controller.abort_restore(candidate.sequence) {
+                    Ok(()) => Err(error),
+                    Err(abort_error) => Err(MemoryError::OperationInProgress(format!(
+                        "decode failed ({error}) and durable restore {} claim abort failed ({abort_error})",
+                        candidate.sequence
+                    ))),
+                }
+            }
+            Err(panic) => {
+                let _ = controller.abort_restore(candidate.sequence);
+                std::panic::resume_unwind(panic)
+            }
         };
-        let charged_bytes = revocable_entry_cost(&key, &value)?;
-        let next_committed =
-            self.lock_state()?.committed_bytes.checked_add(charged_bytes).ok_or_else(|| {
-                MemoryError::capacity("revocable restore byte accounting overflow")
-            })?;
-        let charge = self.accounting.charge(
+        let charged_bytes = match revocable_entry_cost(&key, &value) {
+            Ok(charged_bytes) => charged_bytes,
+            Err(error) => {
+                retire_client_value(key);
+                retire_client_value(value);
+                return match controller.abort_restore(candidate.sequence) {
+                    Ok(()) => Err(error),
+                    Err(abort_error) => Err(MemoryError::OperationInProgress(format!(
+                        "restore sizing failed ({error}) and durable restore {} claim abort failed ({abort_error})",
+                        candidate.sequence
+                    ))),
+                };
+            }
+        };
+        let next_committed = match self.lock_state()?.committed_bytes.checked_add(charged_bytes) {
+            Some(next_committed) => next_committed,
+            None => {
+                retire_client_value(key);
+                retire_client_value(value);
+                let error = MemoryError::capacity("revocable restore byte accounting overflow");
+                return match controller.abort_restore(candidate.sequence) {
+                    Ok(()) => Err(error),
+                    Err(abort_error) => Err(MemoryError::OperationInProgress(format!(
+                        "restore accounting overflowed and durable restore {} claim abort failed ({abort_error})",
+                        candidate.sequence
+                    ))),
+                };
+            }
+        };
+        let charge = match self.accounting.charge(
             self.binding.class.clone(),
             self.binding.owner.clone(),
             MemoryContextKind::Runtime,
             ChargeKind::LiveScratch,
             charged_bytes,
-        )?;
+        ) {
+            Ok(charge) => charge,
+            Err(error) => {
+                retire_client_value(key);
+                retire_client_value(value);
+                return match controller.abort_restore(candidate.sequence) {
+                    Ok(()) => Err(error),
+                    Err(abort_error) => Err(MemoryError::OperationInProgress(format!(
+                        "restore admission failed ({error}) and durable restore {} claim abort failed ({abort_error})",
+                        candidate.sequence
+                    ))),
+                };
+            }
+        };
 
-        let outcome = match controller.commit_restore(candidate.sequence) {
-            Ok(()) => DurableRestoreOutcome::Restored { sequence: candidate.sequence },
+        match controller.commit_restore(candidate.sequence) {
+            Ok(()) => {
+                let mut state = self.lock_state_for_commit();
+                state.entries.push(RevocableEntry { key, value, charged_bytes, charge });
+                state.committed_bytes = next_committed;
+                Ok(DurableRestoreOutcome::Restored { sequence: candidate.sequence })
+            }
             Err(DurableCommitFailure::Retained(error)) => {
                 drop(charge);
                 retire_client_value(key);
                 retire_client_value(value);
-                return Err(*error);
-            }
-            Err(DurableCommitFailure::Ambiguous(commit_error)) => {
-                DurableRestoreOutcome::RecoveryRequired {
-                    sequence: candidate.sequence,
-                    commit_error,
+                match controller.abort_restore(candidate.sequence) {
+                    Ok(()) => Err(*error),
+                    Err(abort_error) => Err(MemoryError::OperationInProgress(format!(
+                        "durable delete retained record after error ({error}) but restore {} claim abort failed ({abort_error})",
+                        candidate.sequence
+                    ))),
                 }
             }
-        };
+            Err(DurableCommitFailure::Ambiguous(commit_error)) => {
+                let record_id = DurableRecordId::new(candidate.sequence);
+                let mut state = self.lock_state_for_commit();
+                state
+                    .pending_restores
+                    .insert(record_id, RevocableEntry { key, value, charged_bytes, charge });
+                state.committed_bytes = next_committed;
+                Ok(DurableRestoreOutcome::RecoveryRequired {
+                    sequence: candidate.sequence,
+                    commit_error,
+                })
+            }
+        }
+    }
 
+    /// IDs whose provisional resident copies are fenced after an unresolved
+    /// durable delete. Fenced copies remain charged but are not readable.
+    pub fn pending_durable_restores(&self) -> MemoryResult<Vec<DurableRecordId>> {
+        Ok(self.lock_read()?.pending_restores.keys().copied().collect())
+    }
+
+    /// Resolve one fenced durable restore. If the durable record is absent, the
+    /// charged resident copy becomes authoritative. If it is still present, the
+    /// provisional resident copy and its charge are retired exactly once.
+    pub fn reconcile_durable_restore<C>(
+        &self,
+        controller: &C,
+        record_id: DurableRecordId,
+    ) -> MemoryResult<DurableRecordResolution>
+    where
+        C: DurableRestoreController,
+    {
+        let _mutation = self.lifecycle.begin_mutation()?;
+        {
+            let state = self.lock_state()?;
+            if !state.pending_restores.contains_key(&record_id) {
+                return Err(MemoryError::InvalidState(format!(
+                    "durable record {} has no fenced restore authority",
+                    record_id.get()
+                )));
+            }
+        }
+        let resolution = controller.reconcile_restore(record_id.get())?;
         let mut state = self.lock_state_for_commit();
-        state.entries.push(RevocableEntry { key, value, charged_bytes, charge });
-        state.committed_bytes = next_committed;
-        Ok(outcome)
+        match resolution {
+            DurableRecordResolution::Present { .. } => {
+                let charged_bytes = state
+                    .pending_restores
+                    .get(&record_id)
+                    .expect("pending restore was checked under the mutation permit")
+                    .charged_bytes;
+                let next_committed =
+                    state.committed_bytes.checked_sub(charged_bytes).ok_or_else(|| {
+                        MemoryError::InvalidState(
+                            "revocable committed bytes are smaller than fenced restore".into(),
+                        )
+                    })?;
+                let entry = state
+                    .pending_restores
+                    .remove(&record_id)
+                    .expect("pending restore was checked under the mutation permit");
+                state.committed_bytes = next_committed;
+                drop(state);
+                retire_entry(entry);
+            }
+            DurableRecordResolution::Finalized => {
+                let entry = state
+                    .pending_restores
+                    .remove(&record_id)
+                    .expect("pending restore was checked under the mutation permit");
+                state.entries.push(entry);
+            }
+            DurableRecordResolution::Absent => {
+                return Err(MemoryError::InvalidState(format!(
+                    "durable restore {} resolved absent without a finalized claim",
+                    record_id.get()
+                )))
+            }
+        }
+        Ok(resolution)
     }
 
     /// Reattach an in-process tier handle to its original broker/binding. If
@@ -509,7 +740,7 @@ where
     Value: ByteSized,
 {
     fn binding(&self) -> &StoreBindingHandle {
-        &self.binding
+        self.binding.as_ref()
     }
 
     fn insert_checked(&self, key: Key, value: Value) -> Result<(), StoreWriteError> {
@@ -564,7 +795,10 @@ where
 
     fn stats(&self) -> MemoryResult<StoreStats> {
         let state = self.lock_read()?;
-        Ok(StoreStats { item_count: state.entries.len(), estimated_bytes: state.committed_bytes })
+        let item_count = state.entries.len();
+        #[cfg(feature = "spill")]
+        let item_count = item_count + state.pending_spills.len() + state.pending_restores.len();
+        Ok(StoreStats { item_count, estimated_bytes: state.committed_bytes })
     }
 
     fn close(&self) -> MemoryResult<()> {
@@ -577,8 +811,16 @@ impl<Key, Value, Mode> Drop for SimpleRevocableStore<Key, Value, Mode> {
         let _ = self.lifecycle.transition_to_closed_for_drop();
         let state = self.state.get_mut().unwrap_or_else(PoisonError::into_inner);
         let entries = std::mem::take(&mut state.entries);
+        #[cfg(feature = "spill")]
+        let pending = std::mem::take(&mut state.pending_spills).into_values().collect();
+        #[cfg(feature = "spill")]
+        let pending_restores = std::mem::take(&mut state.pending_restores).into_values().collect();
         state.committed_bytes = 0;
         retire_entries(entries);
+        #[cfg(feature = "spill")]
+        retire_entries(pending);
+        #[cfg(feature = "spill")]
+        retire_entries(pending_restores);
     }
 }
 
@@ -638,8 +880,10 @@ mod tests {
         ExecutionBudget, MemoryBudgetManifest, MemoryClass, MemoryClassBudget, MemoryPreset,
         ProcessMemoryBrokerBuilder, ReclaimPriority, ResidencyPolicy,
     };
+    #[cfg(feature = "spill")]
+    use std::sync::atomic::AtomicBool;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Arc, Barrier};
+    use std::sync::Barrier;
     use std::thread;
 
     type Store = SimpleRevocableStore<String, Vec<u8>, Budgeted>;
@@ -774,6 +1018,7 @@ mod tests {
     #[test]
     fn failed_destination_write_preserves_source_entry_and_charge() {
         struct RejectingTarget;
+        impl<Handle> crate::spill::service::sealed::InProcessSpillTarget<Handle> for RejectingTarget {}
         impl<Handle> SpillTarget<Handle> for RejectingTarget {
             fn is_available(&self) -> bool {
                 true
@@ -864,6 +1109,7 @@ mod tests {
             expected_live: u64,
             retained: Mutex<Vec<Vec<u8>>>,
         }
+        impl crate::spill::service::sealed::DurableSpillTarget<Vec<u8>> for ObservingDurableTarget {}
         impl SpillInventory for ObservingDurableTarget {
             fn retained_count(&self) -> MemoryResult<u64> {
                 Ok(self.retained.lock().expect("retained").len() as u64)
@@ -885,6 +1131,39 @@ mod tests {
             }
         }
         impl DurableSpillTarget<Vec<u8>> for ObservingDurableTarget {}
+        impl crate::spill::service::ReconciledDurableSpillTarget for ObservingDurableTarget {
+            fn reserve_record_id(&self) -> MemoryResult<DurableRecordId> {
+                Ok(DurableRecordId::new(7))
+            }
+
+            fn commit_spill(
+                &self,
+                record_id: DurableRecordId,
+                bytes: &[u8],
+            ) -> Result<SpillReceipt, DurableWriteFailure> {
+                assert_eq!(record_id.get(), 7);
+                assert_eq!(
+                    self.broker.ledger_snapshot().expect("pre-commit ledger").total_owner_bytes(),
+                    self.expected_live,
+                    "source charge must remain live until durable accept commits"
+                );
+                let mut retained = self.retained.lock().expect("retained");
+                retained.push(bytes.to_vec());
+                Ok(SpillReceipt::Durable {
+                    sequence: record_id.get(),
+                    inventory_after: retained.len() as u64,
+                })
+            }
+
+            fn resolve_record(
+                &self,
+                _record_id: DurableRecordId,
+            ) -> MemoryResult<DurableRecordResolution> {
+                Ok(DurableRecordResolution::Present {
+                    inventory_after: self.retained.lock().expect("retained").len() as u64,
+                })
+            }
+        }
 
         let broker = live_broker(1_000_000);
         let store = store_with_broker(&broker);
@@ -914,6 +1193,7 @@ mod tests {
     #[test]
     fn failed_durable_write_and_encoder_error_restore_source_fifo_and_charge() {
         struct RejectingDurableTarget;
+        impl crate::spill::service::sealed::DurableSpillTarget<Vec<u8>> for RejectingDurableTarget {}
         impl SpillInventory for RejectingDurableTarget {
             fn retained_count(&self) -> MemoryResult<u64> {
                 Ok(0)
@@ -928,6 +1208,28 @@ mod tests {
             }
         }
         impl DurableSpillTarget<Vec<u8>> for RejectingDurableTarget {}
+        impl crate::spill::service::ReconciledDurableSpillTarget for RejectingDurableTarget {
+            fn reserve_record_id(&self) -> MemoryResult<DurableRecordId> {
+                Ok(DurableRecordId::new(1))
+            }
+
+            fn commit_spill(
+                &self,
+                _record_id: DurableRecordId,
+                _bytes: &[u8],
+            ) -> Result<SpillReceipt, DurableWriteFailure> {
+                Err(DurableWriteFailure::NotCommitted(Box::new(MemoryError::capacity(
+                    "injected durable failure",
+                ))))
+            }
+
+            fn resolve_record(
+                &self,
+                _record_id: DurableRecordId,
+            ) -> MemoryResult<DurableRecordResolution> {
+                Ok(DurableRecordResolution::Absent)
+            }
+        }
 
         let broker = live_broker(1_000_000);
         let store = store_with_broker(&broker);
@@ -958,6 +1260,7 @@ mod tests {
     #[test]
     fn panicking_durable_encoder_restores_source_before_unwind() {
         struct DurableSink;
+        impl crate::spill::service::sealed::DurableSpillTarget<Vec<u8>> for DurableSink {}
         impl SpillInventory for DurableSink {
             fn retained_count(&self) -> MemoryResult<u64> {
                 Ok(0)
@@ -972,6 +1275,26 @@ mod tests {
             }
         }
         impl DurableSpillTarget<Vec<u8>> for DurableSink {}
+        impl crate::spill::service::ReconciledDurableSpillTarget for DurableSink {
+            fn reserve_record_id(&self) -> MemoryResult<DurableRecordId> {
+                Ok(DurableRecordId::new(0))
+            }
+
+            fn commit_spill(
+                &self,
+                record_id: DurableRecordId,
+                _bytes: &[u8],
+            ) -> Result<SpillReceipt, DurableWriteFailure> {
+                Ok(SpillReceipt::Durable { sequence: record_id.get(), inventory_after: 1 })
+            }
+
+            fn resolve_record(
+                &self,
+                _record_id: DurableRecordId,
+            ) -> MemoryResult<DurableRecordResolution> {
+                Ok(DurableRecordResolution::Present { inventory_after: 1 })
+            }
+        }
 
         let broker = live_broker(1_000_000);
         let store = store_with_broker(&broker);
@@ -1052,7 +1375,8 @@ mod tests {
         ));
         let _ = std::fs::remove_file(&path);
         let controller = RoutedSpillController::new(RedbSpillBacking::create(&path).expect("redb"));
-        let receipt = controller.spill(b"large\0payload".to_vec()).expect("seed durable");
+        let record_id = controller.reserve_record_id().expect("reserve durable record");
+        let receipt = controller.commit_spill(record_id, b"large\0payload").expect("seed durable");
         assert!(matches!(receipt, SpillReceipt::Durable { .. }));
         let tiny_broker = live_broker(5);
         let store = store_with_broker(&tiny_broker);
@@ -1072,6 +1396,7 @@ mod tests {
     #[test]
     fn failed_durable_delete_rolls_back_provisional_source_charge() {
         struct DeleteFailTarget;
+        impl crate::spill::service::sealed::DurableSpillTarget<Vec<u8>> for DeleteFailTarget {}
         impl SpillInventory for DeleteFailTarget {
             fn retained_count(&self) -> MemoryResult<u64> {
                 Ok(1)
@@ -1099,6 +1424,18 @@ mod tests {
                     "injected durable delete failure",
                 )))
             }
+
+            fn abort_restore(&self, _sequence: u64) -> MemoryResult<()> {
+                Ok(())
+            }
+
+            fn reconcile_restore(&self, _sequence: u64) -> MemoryResult<DurableRecordResolution> {
+                Ok(DurableRecordResolution::Present { inventory_after: 1 })
+            }
+
+            fn active_restore(&self) -> MemoryResult<Option<DurableRecordId>> {
+                Ok(Some(DurableRecordId::new(9)))
+            }
         }
 
         let broker = live_broker(1_000_000);
@@ -1117,11 +1454,14 @@ mod tests {
 
     #[cfg(feature = "spill")]
     #[test]
-    fn ambiguous_durable_delete_publishes_conservative_source_and_requires_reconciliation() {
-        struct AmbiguousDeleteTarget;
+    fn ambiguous_durable_delete_fences_source_until_absence_is_reconciled() {
+        struct AmbiguousDeleteTarget {
+            present: Arc<AtomicBool>,
+        }
+        impl crate::spill::service::sealed::DurableSpillTarget<Vec<u8>> for AmbiguousDeleteTarget {}
         impl SpillInventory for AmbiguousDeleteTarget {
             fn retained_count(&self) -> MemoryResult<u64> {
-                Ok(1)
+                Ok(u64::from(self.present.load(Ordering::SeqCst)))
             }
         }
         impl SpillTarget<Vec<u8>> for AmbiguousDeleteTarget {
@@ -1133,6 +1473,30 @@ mod tests {
             }
         }
         impl DurableSpillTarget<Vec<u8>> for AmbiguousDeleteTarget {}
+        impl crate::spill::service::ReconciledDurableSpillTarget for AmbiguousDeleteTarget {
+            fn reserve_record_id(&self) -> MemoryResult<DurableRecordId> {
+                unreachable!("restore test does not spill")
+            }
+
+            fn commit_spill(
+                &self,
+                _record_id: DurableRecordId,
+                _bytes: &[u8],
+            ) -> Result<SpillReceipt, DurableWriteFailure> {
+                unreachable!("restore test does not spill")
+            }
+
+            fn resolve_record(
+                &self,
+                _record_id: DurableRecordId,
+            ) -> MemoryResult<DurableRecordResolution> {
+                if self.present.load(Ordering::SeqCst) {
+                    Ok(DurableRecordResolution::Present { inventory_after: 1 })
+                } else {
+                    Ok(DurableRecordResolution::Absent)
+                }
+            }
+        }
         impl DurableRestoreTarget for AmbiguousDeleteTarget {
             fn prepare_restore(&self) -> MemoryResult<Option<DurableRestoreCandidate>> {
                 Ok(Some(DurableRestoreCandidate { sequence: 11, bytes: b"record".to_vec() }))
@@ -1145,18 +1509,51 @@ mod tests {
                     "commit acknowledgement lost",
                 )))
             }
+
+            fn abort_restore(&self, _sequence: u64) -> MemoryResult<()> {
+                Ok(())
+            }
+
+            fn reconcile_restore(&self, _sequence: u64) -> MemoryResult<DurableRecordResolution> {
+                if self.present.load(Ordering::SeqCst) {
+                    Ok(DurableRecordResolution::Present { inventory_after: 1 })
+                } else {
+                    Ok(DurableRecordResolution::Finalized)
+                }
+            }
+
+            fn active_restore(&self) -> MemoryResult<Option<DurableRecordId>> {
+                Ok(Some(DurableRecordId::new(11)))
+            }
         }
 
         let broker = live_broker(1_000_000);
         let store = store_with_broker(&broker);
-        let controller = RoutedSpillController::new(AmbiguousDeleteTarget);
+        let present = Arc::new(AtomicBool::new(true));
+        let controller =
+            RoutedSpillController::new(AmbiguousDeleteTarget { present: Arc::clone(&present) });
         let outcome = store
             .restore_one_durable(&controller, |_| Ok(("restored".to_string(), b"payload".to_vec())))
             .expect("ambiguity is a typed recovery outcome");
         assert!(matches!(outcome, DurableRestoreOutcome::RecoveryRequired { sequence: 11, .. }));
-        assert_eq!(store.stats().expect("conservative source").item_count, 1);
+        assert_eq!(
+            store.pending_durable_restores().expect("fenced IDs"),
+            vec![DurableRecordId::new(11)]
+        );
+        assert!(store.reclaim_one().expect("fenced source is not readable").is_none());
         assert!(broker.ledger_snapshot().expect("source charged").total_owner_bytes() > 0);
         assert_eq!(controller.spilled_count(), Ok(1), "target state is intentionally uncertain");
+
+        present.store(false, Ordering::SeqCst);
+        assert_eq!(
+            store
+                .reconcile_durable_restore(&controller, DurableRecordId::new(11))
+                .expect("absent durable record publishes resident source"),
+            DurableRecordResolution::Finalized
+        );
+        assert!(store.pending_durable_restores().expect("resolved IDs").is_empty());
+        assert_eq!(store.reclaim_one().expect("published source").expect("entry").0, "restored");
+        assert_eq!(broker.ledger_snapshot().expect("released source").total_owner_bytes(), 0);
     }
 
     #[test]

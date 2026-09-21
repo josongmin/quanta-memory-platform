@@ -1,4 +1,3 @@
-pub mod backings;
 pub mod service;
 
 use quanta_memory_platform_core::{MemoryResult, StoreBindingHandle, StoreStats, StoreWriteError};

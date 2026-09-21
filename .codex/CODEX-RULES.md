@@ -99,8 +99,8 @@ Boundary rules (hexagonal direction is inward-only):
 - **`application/`** orchestrates domain + ports; carries no host nouns.
 - **`api/`** is the public broker surface, builder-first. Low-level broker
   backdoors stay `pub(crate)` / unexported.
-- **`facade`** composes core behind builders; storage backings (redb, moka, scc)
-  are feature-gated and confined to their `*/backings/` modules.
+- **`facade`** composes core behind builders; production storage backings such
+  as redb are feature-gated and confined to their `*/backings/` modules.
 - **`testkit`** is NEVER a mandatory production dependency. `alloc_tracking` (the
   only `tracking-allocator` integration) is feature-gated so it can never enter a
   production graph.
@@ -177,8 +177,8 @@ Feature flags (the matrix runs clippy `-D warnings` on default, bare, each leaf,
 
 - **core:** `pressure`, `scheduler`, `live_control`, `unbudgeted_pin` (explicit experimental adapter),
   `telemetry` (= `metrics` + `hdrhistogram`), `full`
-- **facade:** `core-live-accounting`, `payload_store`, `retained_map`, `revocable_store` (moka + scc),
-  `transcript`, `publish_pipeline`, `spill` (redb), `full`
+- **facade:** `core-live-accounting`, `payload_store`, `retained_map`, `revocable_store`,
+  `transcript`, `publish_pipeline`, `spill` (`spill-redb` backing), `full`
 - **testkit:** `fixtures`, `doctor`, `conformance`, `faults`,
   `alloc_tracking` (tracking-allocator), `full`
 
@@ -208,7 +208,7 @@ Placement:
 | Public broker surface end-to-end (reserve→commit→snapshot→release→rebuild) | `core/src/api/control.rs` `#[cfg(test)]` |
 | Cross-cutting policy contracts | `core/tests/wave1_policy_contracts.rs` |
 | A facade store / pipeline behavior | that feature's `service.rs` `#[cfg(test)]` |
-| A storage backing (redb/moka/scc) round-trip | the backing module under its feature |
+| A storage backing (redb) round-trip | the backing module under its feature |
 | "the conformance suite actually bites" | `testkit` conformance + `self_tests` |
 | Deterministic fault/chaos scenarios | `testkit/src/faults/` |
 
@@ -309,7 +309,7 @@ Principles:
 - **Fail-closed before mutation.** An over-budget reserve, an invalid policy, or a
   write during rebuild returns the appropriate `MemoryError` BEFORE touching the
   ledger — never half-apply then error.
-- **Preserve the source.** When wrapping a backing error (redb/moka/scc), include
+- **Preserve the source.** When wrapping a backing error (redb), include
   it: `format!("spill write failed: {e}")`. Never `map_err(|_| …)`.
 - **Pick the right variant.** Over-budget → `Capacity`; bad manifest/policy →
   `Config`; builder misuse → `Build`; operation illegal in current state (e.g.
@@ -339,7 +339,6 @@ against `deny.toml`.
 
 **Shared versions** (pin in root `[workspace.dependencies]`, opt in per crate):
 
-- `moka`, `scc` — facade `revocable_store` backings
 - `redb` — facade `spill` backing
 - `hdrhistogram`, `metrics` — core `telemetry` adapters
 - `tracking-allocator` — testkit `alloc_tracking` ONLY

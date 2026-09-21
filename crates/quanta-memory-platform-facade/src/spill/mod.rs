@@ -25,14 +25,104 @@ pub trait SpillController<Handle> {
 /// Marker contract for controllers whose successful receipt keeps the exact
 /// handle resident in this process. It is the only controller class accepted
 /// by charge-preserving revocable-store transfer.
-pub trait InProcessSpillController<Handle>: SpillController<Handle> {}
+///
+/// External controllers cannot claim this accounting-bearing capability:
+///
+/// ```compile_fail
+/// use quanta_memory_platform_facade::{InProcessSpillController, SpillController};
+/// struct Foreign;
+/// impl SpillController<u8> for Foreign {
+///     fn spill(&self, handle: u8) -> Result<quanta_memory_platform_facade::SpillReceipt, quanta_memory_platform_facade::SpillFailure<u8>> {
+///         unimplemented!()
+///     }
+/// }
+/// impl InProcessSpillController<u8> for Foreign {}
+/// ```
+pub trait InProcessSpillController<Handle>:
+    SpillController<Handle> + service::sealed::InProcessSpillController<Handle>
+{
+}
 
 /// Marker contract for controllers that commit an encoded handle to a durable
 /// tier before returning [`SpillReceipt::Durable`].
-pub trait DurableSpillController<Handle>: SpillController<Handle> {}
+///
+/// ```compile_fail
+/// use quanta_memory_platform_facade::{DurableSpillController, SpillController};
+/// struct Foreign;
+/// impl SpillController<Vec<u8>> for Foreign {
+///     fn spill(&self, handle: Vec<u8>) -> Result<quanta_memory_platform_facade::SpillReceipt, quanta_memory_platform_facade::SpillFailure<Vec<u8>>> {
+///         unimplemented!()
+///     }
+/// }
+/// impl DurableSpillController<Vec<u8>> for Foreign {}
+/// ```
+pub trait DurableSpillController<Handle>:
+    SpillController<Handle> + service::sealed::DurableSpillController<Handle>
+{
+}
 
-/// Non-destructive durable restore candidate. The destination remains
-/// authoritative until [`DurableRestoreController::commit_restore`] succeeds.
+/// Persisted, never-reused identity for one durable write attempt.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct DurableRecordId(u64);
+
+impl DurableRecordId {
+    #[must_use]
+    pub fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    #[must_use]
+    pub fn get(self) -> u64 {
+        self.0
+    }
+}
+
+/// Read-side resolution of an ambiguous durable write.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DurableRecordResolution {
+    Present {
+        inventory_after: u64,
+    },
+    /// The record existed but was durably consumed. A stale write must not
+    /// recreate it; a restore owned by the matching claim may publish locally.
+    Finalized,
+    /// The reserved record never became durable.
+    Absent,
+}
+
+/// Durable write failure with an explicit authority disposition.
+#[derive(Debug)]
+pub enum DurableWriteFailure {
+    /// The record is known not to have committed; source authority remains live.
+    NotCommitted(Box<quanta_memory_platform_core::MemoryError>),
+    /// Commit acknowledgement and the follow-up probe both failed. The source
+    /// must be fenced until [`ReconciledDurableSpillController::resolve_record`]
+    /// determines the persisted postimage.
+    RecoveryRequired {
+        record_id: DurableRecordId,
+        commit_error: Box<quanta_memory_platform_core::MemoryError>,
+        probe_error: Box<quanta_memory_platform_core::MemoryError>,
+    },
+}
+
+/// Durable write protocol used by accounting-bearing stores. Bytes are borrowed,
+/// so a controller panic or precommit error cannot consume the source's only
+/// recovery copy.
+pub trait ReconciledDurableSpillController:
+    service::sealed::DurableSpillController<Vec<u8>>
+{
+    fn reserve_record_id(&self) -> MemoryResult<DurableRecordId>;
+    fn commit_spill(
+        &self,
+        record_id: DurableRecordId,
+        bytes: &[u8],
+    ) -> Result<SpillReceipt, DurableWriteFailure>;
+    fn resolve_record(&self, record_id: DurableRecordId) -> MemoryResult<DurableRecordResolution>;
+}
+
+/// Non-destructive durable restore candidate protected by a persisted claim.
+/// The destination remains authoritative until
+/// [`DurableRestoreController::commit_restore`] succeeds.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DurableRestoreCandidate {
     pub sequence: u64,
@@ -70,4 +160,10 @@ pub enum DurableRestoreOutcome {
 pub trait DurableRestoreController: DurableSpillController<Vec<u8>> {
     fn prepare_restore(&self) -> MemoryResult<Option<DurableRestoreCandidate>>;
     fn commit_restore(&self, sequence: u64) -> Result<(), DurableCommitFailure>;
+    /// Release a prepared claim when decode or destination admission fails.
+    fn abort_restore(&self, sequence: u64) -> MemoryResult<()>;
+    /// Resolve an ambiguous exact-delete outcome and release a retained claim.
+    fn reconcile_restore(&self, sequence: u64) -> MemoryResult<DurableRecordResolution>;
+    /// Persisted claim left by an interrupted or ambiguous restore.
+    fn active_restore(&self) -> MemoryResult<Option<DurableRecordId>>;
 }

@@ -5,9 +5,21 @@ use std::sync::Mutex;
 use quanta_memory_platform_core::{MemoryError, MemoryResult};
 
 use crate::spill::{
-    DurableCommitFailure, DurableRestoreCandidate, DurableRestoreController,
-    DurableSpillController, InProcessSpillController, SpillController,
+    DurableCommitFailure, DurableRecordId, DurableRecordResolution, DurableRestoreCandidate,
+    DurableRestoreController, DurableSpillController, DurableWriteFailure,
+    InProcessSpillController, ReconciledDurableSpillController, SpillController,
 };
+
+/// Capability seals for accounting-bearing transfer paths. Generic
+/// `SpillTarget` remains externally implementable for non-accounting use, but a
+/// foreign implementation cannot claim that consuming a charge-carrying handle
+/// is panic-safe or durably committed.
+pub(crate) mod sealed {
+    pub trait InProcessSpillTarget<Handle> {}
+    pub trait DurableSpillTarget<Handle> {}
+    pub trait InProcessSpillController<Handle> {}
+    pub trait DurableSpillController<Handle> {}
+}
 
 /// Destination authority established by a successful spill commit.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -105,21 +117,31 @@ pub trait SpillTarget<Handle>: SpillInventory {
 
 /// Marker for targets that retain the exact handle in process and therefore
 /// return [`SpillReceipt::InProcess`] on success.
-pub trait InProcessSpillTarget<Handle>: SpillTarget<Handle> {}
+pub trait InProcessSpillTarget<Handle>:
+    SpillTarget<Handle> + sealed::InProcessSpillTarget<Handle>
+{
+}
 
 /// Marker for targets that durably commit an encoded handle before returning
 /// [`SpillReceipt::Durable`].
-pub trait DurableSpillTarget<Handle>: SpillTarget<Handle> {}
+pub trait DurableSpillTarget<Handle>:
+    SpillTarget<Handle> + sealed::DurableSpillTarget<Handle>
+{
+}
 
 /// Durable byte targets expose a non-destructive prepare and exact commit so a
 /// source can establish charge authority before deleting the durable record.
 pub trait DurableRestoreTarget: DurableSpillTarget<Vec<u8>> {
-    /// Read the oldest record without removing or claiming it.
+    /// Claim and read the oldest record without removing it. Implementations
+    /// must persist the claim before returning the candidate.
     fn prepare_restore(&self) -> MemoryResult<Option<DurableRestoreCandidate>>;
 
     /// Remove exactly the prepared FIFO sequence and classify failure as known
     /// retained or commit-ambiguous.
     fn commit_restore(&self, sequence: u64) -> Result<(), DurableCommitFailure>;
+    fn abort_restore(&self, sequence: u64) -> MemoryResult<()>;
+    fn reconcile_restore(&self, sequence: u64) -> MemoryResult<DurableRecordResolution>;
+    fn active_restore(&self) -> MemoryResult<Option<DurableRecordId>>;
 }
 
 /// A missing spill tier: fail closed and return the original handle.
@@ -133,6 +155,7 @@ impl<Handle> SpillController<Handle> for NoopSpillController {
 }
 
 impl<Handle> InProcessSpillController<Handle> for NoopSpillController {}
+impl<Handle> sealed::InProcessSpillController<Handle> for NoopSpillController {}
 
 /// A spill controller that routes handles to a [`SpillTarget`], failing closed when
 /// the target is unavailable (negative path 4: spill target unavailable).
@@ -183,10 +206,53 @@ impl<Handle, T> InProcessSpillController<Handle> for RoutedSpillController<T> wh
     T: InProcessSpillTarget<Handle>
 {
 }
+impl<Handle, T> sealed::InProcessSpillController<Handle> for RoutedSpillController<T> where
+    T: InProcessSpillTarget<Handle>
+{
+}
 
 impl<Handle, T> DurableSpillController<Handle> for RoutedSpillController<T> where
     T: DurableSpillTarget<Handle>
 {
+}
+impl<Handle, T> sealed::DurableSpillController<Handle> for RoutedSpillController<T> where
+    T: DurableSpillTarget<Handle>
+{
+}
+
+impl<T> ReconciledDurableSpillController for RoutedSpillController<T>
+where
+    T: ReconciledDurableSpillTarget + DurableSpillTarget<Vec<u8>>,
+{
+    fn reserve_record_id(&self) -> MemoryResult<DurableRecordId> {
+        self.target.reserve_record_id()
+    }
+
+    fn commit_spill(
+        &self,
+        record_id: DurableRecordId,
+        bytes: &[u8],
+    ) -> Result<SpillReceipt, DurableWriteFailure> {
+        self.target.commit_spill(record_id, bytes)
+    }
+
+    fn resolve_record(&self, record_id: DurableRecordId) -> MemoryResult<DurableRecordResolution> {
+        self.target.resolve_record(record_id)
+    }
+}
+
+/// Target half of [`ReconciledDurableSpillController`]. Implementations are
+/// sealed because this trait carries accounting authority claims.
+pub trait ReconciledDurableSpillTarget:
+    SpillInventory + sealed::DurableSpillTarget<Vec<u8>>
+{
+    fn reserve_record_id(&self) -> MemoryResult<DurableRecordId>;
+    fn commit_spill(
+        &self,
+        record_id: DurableRecordId,
+        bytes: &[u8],
+    ) -> Result<SpillReceipt, DurableWriteFailure>;
+    fn resolve_record(&self, record_id: DurableRecordId) -> MemoryResult<DurableRecordResolution>;
 }
 
 impl<T> DurableRestoreController for RoutedSpillController<T>
@@ -199,6 +265,18 @@ where
 
     fn commit_restore(&self, sequence: u64) -> Result<(), DurableCommitFailure> {
         self.target.commit_restore(sequence)
+    }
+
+    fn abort_restore(&self, sequence: u64) -> MemoryResult<()> {
+        self.target.abort_restore(sequence)
+    }
+
+    fn reconcile_restore(&self, sequence: u64) -> MemoryResult<DurableRecordResolution> {
+        self.target.reconcile_restore(sequence)
+    }
+
+    fn active_restore(&self) -> MemoryResult<Option<DurableRecordId>> {
+        self.target.active_restore()
     }
 }
 
@@ -316,6 +394,7 @@ impl<Handle> SpillTarget<Handle> for InMemorySpillTarget<Handle> {
 }
 
 impl<Handle> InProcessSpillTarget<Handle> for InMemorySpillTarget<Handle> {}
+impl<Handle> sealed::InProcessSpillTarget<Handle> for InMemorySpillTarget<Handle> {}
 
 impl<Handle> SpillInventory for InMemorySpillTarget<Handle> {
     fn retained_count(&self) -> MemoryResult<u64> {
@@ -415,6 +494,7 @@ impl<Handle> SpillTarget<Handle> for RetainingSpillTarget<Handle> {
 }
 
 impl<Handle> InProcessSpillTarget<Handle> for RetainingSpillTarget<Handle> {}
+impl<Handle> sealed::InProcessSpillTarget<Handle> for RetainingSpillTarget<Handle> {}
 
 impl<Handle> SpillInventory for RetainingSpillTarget<Handle> {
     fn retained_count(&self) -> MemoryResult<u64> {

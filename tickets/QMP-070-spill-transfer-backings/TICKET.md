@@ -92,9 +92,9 @@ Owner symbols:
 
 - [x] process-resident bytes가 uncharged 상태로 tier 이동하지 않는다.
 - [x] spill success는 destination ownership level을 typed result로 표현한다.
-- [ ] destructive discard는 explicit API다.
+- [x] destructive discard는 persistence API에서 제거됐다. `NoopSpillController`는 원본 handle을 포함한 typed failure를 반환한다.
 - [x] restart 후 retained inventory와 controller telemetry가 일치한다.
-- [ ] advertised backing feature가 canonical builder에서 reachable하다.
+- [x] 유일한 advertised production backing인 redb가 canonical revocable durable transfer에서 reachable하다. 계약을 구현하지 않던 moka/scc feature와 dependency는 제거됐다.
 - [ ] 모든 backing이 동일 semantic conformance suite를 통과한다.
 
 ## Verification
@@ -164,3 +164,51 @@ Required repair:
 
 Use redb's transaction durability guarantee only for successful `commit` return;
 it does not turn an error return into proof that no durable postimage exists.
+
+## Static hardening checkpoint (2026-09-21; runtime qualification deferred)
+
+Current source adds the ownership protocol required by P1-F02 without claiming
+runtime qualification:
+
+- `DurableRecordId` is allocated from persisted monotonic metadata. Emptying the
+  queue or reopening the database does not reuse an ID.
+- `ReconciledDurableSpillController` borrows encoded bytes. Ordinary failure
+  cannot consume the source's only recovery copy; an unknown commit outcome is
+  fenced in `pending_spills` until an exact record probe resolves it.
+- redb successful/unknown writes are idempotent by stable ID and payload bytes.
+  A persisted finalized watermark rejects stale resurrection after restore.
+- durable restore preparation persists one exclusive active sequence before
+  returning bytes. Decode/admission/known-retained failures abort that claim.
+  Ambiguous delete keeps the provisional resident entry charged but unreadable
+  in `pending_restores`; persisted reconciliation either retires it while redb
+  remains authoritative or publishes it after finalization.
+- accounting-bearing controller/target marker traits are sealed to canonical
+  implementations. The in-process transfer handle shares binding identity via
+  `Arc`, avoiding an uncharged deep clone of caller-controlled strings per row.
+- generic redb `SpillTarget::{accept,restore}` now fail closed because that API
+  cannot express durable unknown outcomes. The reconciled write and claimed
+  two-phase restore paths are the only mutating redb paths.
+- `revocable-moka` and `revocable-scc` were removed from the manifest, feature
+  matrix, production source and dependency graph. They were standalone size
+  indexes, not implementations of the canonical revocable-store contract.
+
+Static proof on the dirty implementation tree: `cargo fmt --all --check`,
+`cargo check --workspace --all-targets --all-features`, and
+`cargo clippy --workspace --all-targets --all-features -- -D warnings` passed.
+The warning-denying per-feature `tools/ci/feature-matrix.sh` initially exposed
+and then verified repairs for core no-default and facade revocable-only feature
+closure; its final run passed every combination. This is not a runtime receipt
+and does not qualify the ticket.
+
+Remaining qualification/architecture gaps:
+
+1. Run the focused durable/spill tests, workspace tests, feature matrix, doctor,
+   deny, and actual extraction on one frozen source SHA. The user explicitly
+   deferred dynamic verification for this checkpoint.
+2. Add deterministic redb fault injection at commit acknowledgement boundaries;
+   current source models the outcomes but does not force real redb commit faults.
+3. A process crash after durable restore deletion but before the volatile
+   resident copy is published can still lose the payload. Closing that requires
+   a durable recovery-payload/ack phase, not another in-memory flag.
+4. QMP-090 still owns concurrency/model proof across spill, restore, reclaim,
+   restart and panic schedules. Static compilation is not that proof.

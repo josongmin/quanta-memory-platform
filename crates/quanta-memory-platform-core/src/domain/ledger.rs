@@ -65,6 +65,7 @@ pub enum ChargeKind {
 /// authorities instead; exposing this cloneable identity would allow a caller
 /// to discard the only release path while the charge remains live.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg(feature = "live_control")]
 pub(crate) struct ReservationTicket {
     /// Per-ledger id (unique within the issuing ledger only).
     id: u64,
@@ -84,6 +85,7 @@ enum TicketState {
     Committed,
 }
 
+#[cfg(feature = "live_control")]
 impl ReservationTicket {
     #[must_use]
     pub(crate) fn id(&self) -> u64 {
