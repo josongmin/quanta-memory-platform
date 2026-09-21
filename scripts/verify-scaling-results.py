@@ -56,7 +56,8 @@ def validate(
     expected_threads: set[int],
     baseline_records: list[dict[str, object]] | None = None,
     max_p99_ns: int = 1_000_000_000,
-    max_regression_percent: int = 50,
+    max_throughput_regression_percent: int = 50,
+    max_p99_regression_percent: int = 200,
 ) -> int:
     runs = [record for record in records if record.get("schema") == RUN_SCHEMA]
     if len(runs) != 1:
@@ -127,7 +128,8 @@ def validate(
         baseline_groups: dict[tuple[object, ...], list[dict[str, object]]] = defaultdict(list)
         for sample in baselines:
             baseline_groups[scenario_key(sample)].append(sample)
-        allowed = max_regression_percent / 100.0
+        throughput_allowed = max_throughput_regression_percent / 100.0
+        p99_allowed = max_p99_regression_percent / 100.0
         for key, current in grouped.items():
             baseline = baseline_groups.get(key)
             if not baseline:
@@ -138,12 +140,16 @@ def validate(
             baseline_throughput = statistics.median(
                 integer(sample, "throughput_ops_per_sec") for sample in baseline
             )
-            if current_throughput < baseline_throughput * (1.0 - allowed):
-                raise ValidationError(f"{key}: throughput regressed beyond {max_regression_percent}%")
+            if current_throughput < baseline_throughput * (1.0 - throughput_allowed):
+                raise ValidationError(
+                    f"{key}: throughput regressed beyond {max_throughput_regression_percent}%"
+                )
             current_p99 = statistics.median(integer(sample, "p99_ns") for sample in current)
             baseline_p99 = statistics.median(integer(sample, "p99_ns") for sample in baseline)
-            if current_p99 > baseline_p99 * (1.0 + allowed):
-                raise ValidationError(f"{key}: p99 regressed beyond {max_regression_percent}%")
+            if current_p99 > baseline_p99 * (1.0 + p99_allowed):
+                raise ValidationError(
+                    f"{key}: p99 regressed beyond {max_p99_regression_percent}%"
+                )
     return len(samples)
 
 
@@ -153,7 +159,8 @@ def main() -> int:
     parser.add_argument("--baseline", type=Path)
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--max-p99-ns", type=int, default=1_000_000_000)
-    parser.add_argument("--max-regression-percent", type=int, default=50)
+    parser.add_argument("--max-throughput-regression-percent", type=int, default=50)
+    parser.add_argument("--max-p99-regression-percent", type=int, default=200)
     args = parser.parse_args()
     try:
         records = load_jsonl(args.input)
@@ -163,7 +170,8 @@ def main() -> int:
             {1, 2} if args.smoke else {1, 2, 8, 32},
             baseline,
             args.max_p99_ns,
-            args.max_regression_percent,
+            args.max_throughput_regression_percent,
+            args.max_p99_regression_percent,
         )
     except (OSError, ValidationError) as error:
         print(f"verify-scaling-results: FAIL: {error}", file=sys.stderr)

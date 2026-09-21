@@ -96,7 +96,12 @@ class ScalingResultTests(unittest.TestCase):
             if record.get("schema") == MODULE.SAMPLE_SCHEMA:
                 record["throughput_ops_per_sec"] = 400
         with self.assertRaisesRegex(MODULE.ValidationError, "throughput regressed"):
-            MODULE.validate(current, {1, 2}, baseline, max_regression_percent=50)
+            MODULE.validate(
+                current,
+                {1, 2},
+                baseline,
+                max_throughput_regression_percent=50,
+            )
 
 
 if __name__ == "__main__":
