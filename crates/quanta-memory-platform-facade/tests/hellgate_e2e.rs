@@ -563,13 +563,14 @@ mod payload_e2e {
         let first = store
             .put_canonical(RetainedEnvelope::new(vec![7u8; 32]))
             .expect("first put charges the ledger");
-        // 32 body + retained reference "payload-0" (9) + digest 32 + state 16.
-        assert_eq!(ledger(&b), 89, "full payload retention flows through the broker ledger");
+        // 32 body + retained reference "payload-0" (9) + two 32-byte semantic
+        // index slots (canonical digest and reference lookup) + state 16.
+        assert_eq!(ledger(&b), 121, "full payload retention flows through the broker ledger");
 
         // Canonical dedup: the identical payload re-uses the entry, one live charge.
         let second = store.put_canonical(RetainedEnvelope::new(vec![7u8; 32])).expect("dedup put");
         assert_eq!(second.payload_ref(), first.payload_ref(), "dedup returns the same ref");
-        assert_eq!(ledger(&b), 89, "dedup does not double-charge the ledger");
+        assert_eq!(ledger(&b), 121, "dedup does not double-charge the ledger");
 
         // Pin discipline: a pinned payload cannot be deleted; the ledger is intact.
         store.pin(first.payload_ref()).expect("pin");
@@ -578,7 +579,7 @@ mod payload_e2e {
             matches!(pinned_delete, Err(MemoryError::InvalidState(_))),
             "deleting a pinned payload must be rejected, got {pinned_delete:?}"
         );
-        assert_eq!(ledger(&b), 89, "a refused pinned delete leaves the ledger charged");
+        assert_eq!(ledger(&b), 121, "a refused pinned delete leaves the ledger charged");
 
         // Unpin, then delete refunds the ledger to zero.
         store.unpin(first.payload_ref()).expect("unpin");

@@ -1,5 +1,6 @@
 #[cfg(feature = "spill")]
 use std::collections::BTreeMap;
+use std::collections::VecDeque;
 use std::marker::PhantomData;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
@@ -80,7 +81,7 @@ fn retire_entry<Key, Value>(entry: RevocableEntry<Key, Value>) {
     retire_client_value(value);
 }
 
-fn retire_entries<Key, Value>(entries: Vec<RevocableEntry<Key, Value>>) {
+fn retire_entries<Key, Value>(entries: VecDeque<RevocableEntry<Key, Value>>) {
     for entry in entries {
         retire_entry(entry);
     }
@@ -102,7 +103,7 @@ fn revocable_entry_cost<Key: ByteSized, Value: ByteSized>(
 
 #[derive(Debug)]
 struct RevocableState<Key, Value> {
-    entries: Vec<RevocableEntry<Key, Value>>,
+    entries: VecDeque<RevocableEntry<Key, Value>>,
     /// Source entries fenced while a durable commit acknowledgement is unknown.
     /// Their managed charges remain live until record reconciliation chooses the
     /// durable or resident authority.
@@ -152,7 +153,7 @@ impl<Key, Value, Mode> SimpleRevocableStore<Key, Value, Mode> {
             accounting,
             lifecycle: StoreLifecycle::new("revocable store"),
             state: Mutex::new(RevocableState {
-                entries: Vec::new(),
+                entries: VecDeque::new(),
                 #[cfg(feature = "spill")]
                 pending_spills: BTreeMap::new(),
                 #[cfg(feature = "spill")]
@@ -314,7 +315,7 @@ impl<Key, Value> SimpleRevocableStore<Key, Value, Budgeted> {
         let _mutation = self.lifecycle.begin_mutation()?;
         let (entry, next_committed) = {
             let mut state = self.lock_state()?;
-            let Some(entry) = state.entries.first() else {
+            let Some(entry) = state.entries.front() else {
                 return Ok(false);
             };
             self.require_charge_shape(entry, "spill transfer")?;
@@ -324,7 +325,7 @@ impl<Key, Value> SimpleRevocableStore<Key, Value, Budgeted> {
                         "revocable committed bytes are smaller than transferred entry".into(),
                     )
                 })?;
-            (state.entries.remove(0), next_committed)
+            (state.entries.pop_front().expect("front entry was checked"), next_committed)
         };
 
         let handle = RevocableSpillHandle { binding: self.binding.clone(), entry: Some(entry) };
@@ -335,7 +336,7 @@ impl<Key, Value> SimpleRevocableStore<Key, Value, Budgeted> {
             }
             Err(failure) => {
                 let (error, handle) = failure.into_parts();
-                self.lock_state_for_commit().entries.insert(0, handle.into_entry());
+                self.lock_state_for_commit().entries.push_front(handle.into_entry());
                 Err(error)
             }
         }
@@ -362,7 +363,7 @@ impl<Key, Value> SimpleRevocableStore<Key, Value, Budgeted> {
                     "durable spill reconciliation is required before another spill".into(),
                 ));
             }
-            let Some(entry) = state.entries.first() else {
+            let Some(entry) = state.entries.front() else {
                 return Ok(None);
             };
             self.require_charge_shape(entry, "durable spill transfer")?;
@@ -389,7 +390,7 @@ impl<Key, Value> SimpleRevocableStore<Key, Value, Budgeted> {
             Ok(receipt @ SpillReceipt::Durable { sequence, .. }) if sequence == record_id.get() => {
                 let entry = {
                     let mut state = self.lock_state_for_commit();
-                    let entry = state.entries.remove(0);
+                    let entry = state.entries.pop_front().expect("front entry was checked");
                     state.committed_bytes = state
                         .committed_bytes
                         .checked_sub(entry.charged_bytes)
@@ -401,7 +402,7 @@ impl<Key, Value> SimpleRevocableStore<Key, Value, Budgeted> {
             }
             Ok(receipt) => {
                 let mut state = self.lock_state_for_commit();
-                let entry = state.entries.remove(0);
+                let entry = state.entries.pop_front().expect("front entry was checked");
                 state.pending_spills.insert(record_id, entry);
                 Err(MemoryError::OperationInProgress(format!(
                     "durable spill returned mismatched receipt {receipt:?}; record {} requires reconciliation",
@@ -411,7 +412,7 @@ impl<Key, Value> SimpleRevocableStore<Key, Value, Budgeted> {
             Err(DurableWriteFailure::NotCommitted(error)) => Err(*error),
             Err(DurableWriteFailure::RecoveryRequired { record_id, commit_error, probe_error }) => {
                 let mut state = self.lock_state_for_commit();
-                let entry = state.entries.remove(0);
+                let entry = state.entries.pop_front().expect("front entry was checked");
                 state.pending_spills.insert(record_id, entry);
                 Err(MemoryError::OperationInProgress(format!(
                     "durable record {} requires reconciliation after commit error ({commit_error}) and probe error ({probe_error})",
@@ -471,7 +472,7 @@ impl<Key, Value> SimpleRevocableStore<Key, Value, Budgeted> {
                     .pending_spills
                     .remove(&record_id)
                     .expect("pending spill was checked under the mutation permit");
-                state.entries.insert(0, entry);
+                state.entries.push_front(entry);
             }
         }
         Ok(resolution)
@@ -626,7 +627,7 @@ impl<Key, Value> SimpleRevocableStore<Key, Value, Budgeted> {
         // crash window.
         {
             let mut state = self.lock_state_for_commit();
-            state.entries.push(RevocableEntry { key, value, charged_bytes, charge });
+            state.entries.push_back(RevocableEntry { key, value, charged_bytes, charge });
             state.committed_bytes = next_committed;
         }
         let finalized = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -687,7 +688,8 @@ impl<Key, Value> SimpleRevocableStore<Key, Value, Budgeted> {
 
     fn fence_published_restore(&self, sequence: u64) {
         let mut state = self.lock_state_for_commit();
-        let entry = state.entries.pop().expect("restore entry was published before finalization");
+        let entry =
+            state.entries.pop_back().expect("restore entry was published before finalization");
         let replaced = state.pending_restores.insert(DurableRecordId::new(sequence), entry);
         debug_assert!(replaced.is_none(), "mutation permit prevents duplicate restore fencing");
     }
@@ -747,7 +749,7 @@ impl<Key, Value> SimpleRevocableStore<Key, Value, Budgeted> {
                     .pending_restores
                     .remove(&record_id)
                     .expect("pending restore was checked under the mutation permit");
-                state.entries.push(entry);
+                state.entries.push_back(entry);
                 drop(state);
                 let finalized = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     controller.finalize_restore(record_id.get())
@@ -826,7 +828,7 @@ impl<Key, Value> SimpleRevocableStore<Key, Value, Budgeted> {
                 ));
             }
         };
-        state.entries.push(handle.into_entry());
+        state.entries.push_back(handle.into_entry());
         state.committed_bytes = next_committed;
         Ok(())
     }
@@ -865,7 +867,7 @@ where
         )?;
 
         let mut state = self.lock_state()?;
-        state.entries.push(RevocableEntry { key, value, charged_bytes, charge });
+        state.entries.push_back(RevocableEntry { key, value, charged_bytes, charge });
         state.committed_bytes = next_committed;
         Ok(())
     }
@@ -874,7 +876,7 @@ where
         let _mutation = self.lifecycle.begin_mutation()?;
         let (mut entry, next_committed) = {
             let mut state = self.lock_state()?;
-            let Some(entry) = state.entries.first() else {
+            let Some(entry) = state.entries.front() else {
                 return Ok(None);
             };
             self.require_charge_shape(entry, "single reclaim")?;
@@ -884,13 +886,13 @@ where
                         "revocable committed bytes are smaller than reclaimed entry".to_string(),
                     )
                 })?;
-            (state.entries.remove(0), next_committed)
+            (state.entries.pop_front().expect("front entry was checked"), next_committed)
         };
 
         let mut charges = entry.charge.take().into_iter().collect::<Vec<_>>();
         if let Err(error) = self.accounting.release_many(&mut charges) {
             entry.charge = charges.pop();
-            self.lock_state_for_commit().entries.insert(0, entry);
+            self.lock_state_for_commit().entries.push_front(entry);
             return Err(error);
         }
 
@@ -930,17 +932,22 @@ impl<Key, Value, Mode> Drop for SimpleRevocableStore<Key, Value, Mode> {
 }
 
 fn extract_entries<Key, Value>(
-    entries: &mut Vec<RevocableEntry<Key, Value>>,
+    entries: &mut VecDeque<RevocableEntry<Key, Value>>,
     indices: &[usize],
 ) -> Vec<(usize, RevocableEntry<Key, Value>)> {
-    let mut plan =
-        indices.iter().rev().map(|index| (*index, entries.remove(*index))).collect::<Vec<_>>();
+    let mut plan = indices
+        .iter()
+        .rev()
+        .map(|index| {
+            (*index, entries.remove(*index).expect("selected revocable index must remain present"))
+        })
+        .collect::<Vec<_>>();
     plan.reverse();
     plan
 }
 
 fn restore_entries<Key, Value>(
-    entries: &mut Vec<RevocableEntry<Key, Value>>,
+    entries: &mut VecDeque<RevocableEntry<Key, Value>>,
     plan: Vec<(usize, RevocableEntry<Key, Value>)>,
 ) {
     for (index, entry) in plan {
@@ -1081,6 +1088,20 @@ mod tests {
         assert_eq!(
             broker.ledger_snapshot().expect("ledger").total_owner_bytes(),
             expected_entry_cost("second", 6)
+        );
+    }
+
+    #[test]
+    fn revocable_full_drain_uses_fifo_deque_without_front_shifts() {
+        let source = include_str!("service.rs");
+        assert!(
+            source.contains("entries: VecDeque<RevocableEntry"),
+            "the canonical queue must provide O(1) amortized front removal"
+        );
+        let forbidden_front_shift = ["entries", ".remove(0)"].concat();
+        assert!(
+            !source.contains(&forbidden_front_shift),
+            "front-shifting Vec removal reintroduces quadratic full drain"
         );
     }
 

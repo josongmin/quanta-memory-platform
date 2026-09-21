@@ -49,6 +49,11 @@ full-backings = ["full", "spill-redb"]
 name = "hello_world"
 required-features = ["core-live-accounting"]
 
+[[bench]]
+name = "scaling"
+harness = false
+required-features = ["payload_store", "revocable_store"]
+
 [dependencies]
 blake3 = { workspace = true, optional = true }
 hashlink = { workspace = true, optional = true }

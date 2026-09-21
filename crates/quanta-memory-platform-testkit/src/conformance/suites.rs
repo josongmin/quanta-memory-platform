@@ -968,9 +968,10 @@ fn run_all_store_lifecycle_suites(kit: &MemoryTestKit) -> Vec<AssertionVerdict> 
 
 #[cfg(feature = "fixtures")]
 fn run_payload_store_slice(kit: &MemoryTestKit) -> Vec<AssertionVerdict> {
-    // 32 body + the retained "payload-0" reference (9) + digest (32) +
-    // entry state (16). This is independent of the store's calculator.
-    let expected_entry_bytes = 32 + 9 + 32 + 16;
+    // 32 body + the retained "payload-0" reference (9) + two semantic index
+    // slots (canonical digest and reference lookup, 32 each) + entry state
+    // (16). This is independent of the store's calculator.
+    let expected_entry_bytes = 32 + 9 + 64 + 16;
     let accounting =
         InvariantAssertion::new(ContractFamily::ReclaimAccounting, "payload_dedup_refund");
     let pin_discipline = InvariantAssertion::new(ContractFamily::PinDiscipline, "pin_safe_delete");

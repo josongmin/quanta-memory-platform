@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
 use std::sync::{Mutex, PoisonError};
 
@@ -15,9 +17,14 @@ use crate::shared::lifecycle::{retire_client_value, BeginClose, DropTransition, 
 use crate::shared::measure::{semantic_cost_v1, ByteSized, CanonicalKey, RetainedCostV1};
 
 fn canonical_digest(key: &[u8]) -> u64 {
-    use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     key.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn reference_digest<PayloadRef: Hash>(payload_ref: &PayloadRef) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    payload_ref.hash(&mut hasher);
     hasher.finish()
 }
 
@@ -38,15 +45,22 @@ fn retire_entry<PayloadRef, Bytes>(entry: PayloadEntry<PayloadRef, Bytes>) {
     retire_client_value(bytes);
 }
 
-fn retire_entries<PayloadRef, Bytes>(entries: Vec<PayloadEntry<PayloadRef, Bytes>>) {
-    for entry in entries {
+fn retire_entries<PayloadRef, Bytes>(entries: Vec<Option<PayloadEntry<PayloadRef, Bytes>>>) {
+    for entry in entries.into_iter().flatten() {
         retire_entry(entry);
     }
 }
 
 #[derive(Debug)]
 struct PayloadState<PayloadRef, Bytes> {
-    entries: Vec<PayloadEntry<PayloadRef, Bytes>>,
+    /// Stable slots avoid shifting every index on delete. A slot is reusable
+    /// only after both internal indices have removed it; no slot identity is
+    /// exposed outside the store.
+    entries: Vec<Option<PayloadEntry<PayloadRef, Bytes>>>,
+    free_slots: Vec<usize>,
+    canonical_index: HashMap<u64, Vec<usize>>,
+    reference_index: HashMap<u64, Vec<usize>>,
+    live_entries: usize,
     next_ref: u64,
     charged_total: u64,
 }
@@ -111,7 +125,15 @@ impl<PayloadRef, Bytes, Mode> SimplePayloadStore<PayloadRef, Bytes, Mode> {
             context,
             accounting,
             lifecycle: StoreLifecycle::new("payload store"),
-            state: Mutex::new(PayloadState { entries: Vec::new(), next_ref: 0, charged_total: 0 }),
+            state: Mutex::new(PayloadState {
+                entries: Vec::new(),
+                free_slots: Vec::new(),
+                canonical_index: HashMap::new(),
+                reference_index: HashMap::new(),
+                live_entries: 0,
+                next_ref: 0,
+                charged_total: 0,
+            }),
             _mode: PhantomData,
         }
     }
@@ -154,6 +176,9 @@ impl<PayloadRef, Bytes, Mode> SimplePayloadStore<PayloadRef, Bytes, Mode> {
             let mut indices = Vec::new();
             let mut charges = Vec::new();
             for (index, entry) in state.entries.iter_mut().enumerate() {
+                let Some(entry) = entry.as_mut() else {
+                    continue;
+                };
                 if let Some(charge) = entry.charge.take() {
                     indices.push(index);
                     charges.push(charge);
@@ -165,7 +190,8 @@ impl<PayloadRef, Bytes, Mode> SimplePayloadStore<PayloadRef, Bytes, Mode> {
         if let Err(error) = self.accounting.release_many(&mut charges) {
             let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
             for (index, charge) in indices.into_iter().zip(charges) {
-                state.entries[index].charge = Some(charge);
+                state.entries[index].as_mut().expect("close slot remains live").charge =
+                    Some(charge);
             }
             close.rollback();
             return Err(error);
@@ -174,6 +200,10 @@ impl<PayloadRef, Bytes, Mode> SimplePayloadStore<PayloadRef, Bytes, Mode> {
         let entries = {
             let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
             state.charged_total = 0;
+            state.live_entries = 0;
+            state.free_slots.clear();
+            state.canonical_index.clear();
+            state.reference_index.clear();
             std::mem::take(&mut state.entries)
         };
         close.commit();
@@ -186,17 +216,25 @@ impl<PayloadRef, Bytes, Mode> SimplePayloadStore<PayloadRef, Bytes, Mode> {
 
 impl<PayloadRef, Bytes, Mode> SimplePayloadStore<PayloadRef, Bytes, Mode>
 where
-    PayloadRef: Clone + From<String> + PartialEq + ByteSized,
+    PayloadRef: Clone + From<String> + Eq + Hash + ByteSized,
     Bytes: Clone + ByteSized + CanonicalKey,
 {
     pub fn pin(&self, payload_ref: &PayloadRef) -> MemoryResult<()> {
         let _permit = self.lifecycle.begin_mutation()?;
+        let digest = reference_digest(payload_ref);
         let mut state = self.lock()?;
-        let entry = state
-            .entries
-            .iter_mut()
-            .find(|entry| &entry.payload_ref == payload_ref)
+        let index = state
+            .reference_index
+            .get(&digest)
+            .and_then(|slots| {
+                slots.iter().copied().find(|slot| {
+                    state.entries[*slot]
+                        .as_ref()
+                        .is_some_and(|entry| &entry.payload_ref == payload_ref)
+                })
+            })
             .ok_or_else(|| MemoryError::InvalidState("pin: payload not found".to_string()))?;
+        let entry = state.entries[index].as_mut().expect("reference index points to live slot");
         entry.pin_count = entry
             .pin_count
             .checked_add(1)
@@ -206,12 +244,20 @@ where
 
     pub fn unpin(&self, payload_ref: &PayloadRef) -> MemoryResult<()> {
         let _permit = self.lifecycle.begin_mutation()?;
+        let digest = reference_digest(payload_ref);
         let mut state = self.lock()?;
-        let entry = state
-            .entries
-            .iter_mut()
-            .find(|entry| &entry.payload_ref == payload_ref)
+        let index = state
+            .reference_index
+            .get(&digest)
+            .and_then(|slots| {
+                slots.iter().copied().find(|slot| {
+                    state.entries[*slot]
+                        .as_ref()
+                        .is_some_and(|entry| &entry.payload_ref == payload_ref)
+                })
+            })
             .ok_or_else(|| MemoryError::InvalidState("unpin: payload not found".to_string()))?;
+        let entry = state.entries[index].as_mut().expect("reference index points to live slot");
         entry.pin_count = entry
             .pin_count
             .checked_sub(1)
@@ -220,19 +266,22 @@ where
     }
 
     pub fn pin_count(&self, payload_ref: &PayloadRef) -> MemoryResult<u64> {
-        Ok(self
-            .lock_read()?
-            .entries
-            .iter()
-            .find(|entry| &entry.payload_ref == payload_ref)
-            .map_or(0, |entry| entry.pin_count))
+        let digest = reference_digest(payload_ref);
+        let state = self.lock_read()?;
+        Ok(state.reference_index.get(&digest).map_or(0, |slots| {
+            slots
+                .iter()
+                .filter_map(|slot| state.entries[*slot].as_ref())
+                .find(|entry| &entry.payload_ref == payload_ref)
+                .map_or(0, |entry| entry.pin_count)
+        }))
     }
 }
 
 impl<PayloadRef, Bytes, Mode> PayloadStore<PayloadRef, Bytes>
     for SimplePayloadStore<PayloadRef, Bytes, Mode>
 where
-    PayloadRef: Clone + From<String> + PartialEq + ByteSized,
+    PayloadRef: Clone + From<String> + Eq + Hash + ByteSized,
     Bytes: Clone + ByteSized + CanonicalKey,
 {
     fn binding(&self) -> &StoreBindingHandle {
@@ -250,8 +299,10 @@ where
 
         let (payload_ref_text, next_ref) = {
             let state = self.lock()?;
-            if let Some(existing) = state.entries.iter().find(|entry| {
-                entry.canonical_digest == digest && entry.bytes.canonical_key() == canonical_key
+            if let Some(existing) = state.canonical_index.get(&digest).and_then(|slots| {
+                slots.iter().filter_map(|slot| state.entries[*slot].as_ref()).find(|entry| {
+                    entry.canonical_digest == digest && entry.bytes.canonical_key() == canonical_key
+                })
             }) {
                 return Ok(PublishedPayload::new(existing.payload_ref.clone()));
             }
@@ -265,10 +316,14 @@ where
         // panic or reentry cannot poison the authoritative state or charge the
         // broker before the complete semantic cost is known.
         let payload_ref = PayloadRef::from(payload_ref_text);
+        let payload_ref_digest = reference_digest(&payload_ref);
+        let index_bytes = semantic_cost_v1::DIGEST_BYTES
+            .checked_mul(2)
+            .ok_or_else(|| MemoryError::capacity("payload index cost exceeds u64"))?;
         let charged_bytes = RetainedCostV1 {
             payload_bytes: value.bytes.byte_size(),
             key_identity_bytes: payload_ref.byte_size(),
-            index_bytes: semantic_cost_v1::DIGEST_BYTES,
+            index_bytes,
             fixed_overhead_bytes: semantic_cost_v1::ENTRY_STATE_BYTES,
             ..RetainedCostV1::default()
         }
@@ -296,14 +351,29 @@ where
                 ));
             }
         };
-        state.entries.push(PayloadEntry {
+        let entry = PayloadEntry {
             payload_ref: payload_ref.clone(),
             canonical_digest: digest,
             charged_bytes,
             pin_count: 0,
             charge,
             bytes: value.bytes,
-        });
+        };
+        let slot = if let Some(slot) = state.free_slots.pop() {
+            debug_assert!(state.entries[slot].is_none(), "free slot must be vacant");
+            state.entries[slot] = Some(entry);
+            slot
+        } else {
+            let slot = state.entries.len();
+            state.entries.push(Some(entry));
+            slot
+        };
+        state.canonical_index.entry(digest).or_default().push(slot);
+        state.reference_index.entry(payload_ref_digest).or_default().push(slot);
+        state.live_entries = state
+            .live_entries
+            .checked_add(1)
+            .expect("live entry count cannot exceed allocated slots");
         state.next_ref = next_ref;
         state.charged_total = next_total;
         Ok(PublishedPayload::new(payload_ref))
@@ -311,39 +381,56 @@ where
 
     fn delete_if_unpinned(&self, payload_ref: &PayloadRef) -> Result<(), StoreDeleteError> {
         let _permit = self.lifecycle.begin_mutation()?;
-        let (index, next_total, mut charge) = {
+        let reference_digest = reference_digest(payload_ref);
+        let (index, canonical_digest, next_total, mut charge) = {
             let mut state = self.lock()?;
             let index = state
-                .entries
-                .iter()
-                .position(|entry| &entry.payload_ref == payload_ref)
+                .reference_index
+                .get(&reference_digest)
+                .and_then(|slots| {
+                    slots.iter().copied().find(|slot| {
+                        state.entries[*slot]
+                            .as_ref()
+                            .is_some_and(|entry| &entry.payload_ref == payload_ref)
+                    })
+                })
                 .ok_or_else(|| {
                     MemoryError::InvalidState("delete: payload not found".to_string())
                 })?;
-            if state.entries[index].pin_count > 0 {
+            let entry = state.entries[index].as_mut().expect("reference index points to live slot");
+            if entry.pin_count > 0 {
                 return Err(MemoryError::InvalidState(format!(
                     "delete rejected: payload still pinned ({} dependents)",
-                    state.entries[index].pin_count
+                    entry.pin_count
                 )));
             }
-            let next_total =
-                state.charged_total.checked_sub(state.entries[index].charged_bytes).ok_or_else(
-                    || MemoryError::InvalidState("payload byte counter underflow".to_string()),
-                )?;
-            (index, next_total, state.entries[index].charge.take())
+            let canonical_digest = entry.canonical_digest;
+            let charged_bytes = entry.charged_bytes;
+            let charge = entry.charge.take();
+            let next_total = state.charged_total.checked_sub(charged_bytes).ok_or_else(|| {
+                MemoryError::InvalidState("payload byte counter underflow".to_string())
+            })?;
+            (index, canonical_digest, next_total, charge)
         };
 
         if let Some(active) = charge.as_mut() {
             if let Err(error) = self.accounting.release_many(std::slice::from_mut(active)) {
                 let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-                state.entries[index].charge = charge;
+                state.entries[index].as_mut().expect("delete slot remains live").charge = charge;
                 return Err(error);
             }
         }
 
         let removed = {
             let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-            let removed = state.entries.remove(index);
+            let removed = state.entries[index].take().expect("delete slot remains live");
+            remove_index_slot(&mut state.canonical_index, canonical_digest, index);
+            remove_index_slot(&mut state.reference_index, reference_digest, index);
+            state.free_slots.push(index);
+            state.live_entries = state
+                .live_entries
+                .checked_sub(1)
+                .expect("removing a live slot requires a positive live count");
             state.charged_total = next_total;
             removed
         };
@@ -356,7 +443,7 @@ where
 
     fn stats(&self) -> MemoryResult<StoreStats> {
         let state = self.lock_read()?;
-        Ok(StoreStats { item_count: state.entries.len(), estimated_bytes: state.charged_total })
+        Ok(StoreStats { item_count: state.live_entries, estimated_bytes: state.charged_total })
     }
 
     fn close(&self) -> MemoryResult<()> {
@@ -371,8 +458,24 @@ impl<PayloadRef, Bytes, Mode> Drop for SimplePayloadStore<PayloadRef, Bytes, Mod
         }
         let state = self.state.get_mut().unwrap_or_else(PoisonError::into_inner);
         let entries = std::mem::take(&mut state.entries);
+        state.free_slots.clear();
+        state.canonical_index.clear();
+        state.reference_index.clear();
+        state.live_entries = 0;
         state.charged_total = 0;
         retire_entries(entries);
+    }
+}
+
+fn remove_index_slot(index: &mut HashMap<u64, Vec<usize>>, digest: u64, slot: usize) {
+    let bucket = index.get_mut(&digest).expect("live payload has an index bucket");
+    let position = bucket
+        .iter()
+        .position(|candidate| *candidate == slot)
+        .expect("live payload index bucket contains its stable slot");
+    bucket.swap_remove(position);
+    if bucket.is_empty() {
+        index.remove(&digest);
     }
 }
 
@@ -431,7 +534,7 @@ mod tests {
 
     fn retained_cost(payload_bytes: u64, sequence: u64) -> u64 {
         // Independent oracle: do not call the production formula or constants.
-        payload_bytes + format!("payload-{sequence}").len() as u64 + 32 + 16
+        payload_bytes + format!("payload-{sequence}").len() as u64 + 64 + 16
     }
 
     #[derive(Clone)]
@@ -541,6 +644,14 @@ mod tests {
         }
     }
 
+    impl Eq for ReentrantPayloadRef {}
+
+    impl Hash for ReentrantPayloadRef {
+        fn hash<H: Hasher>(&self, state: &mut H) {
+            self.0.hash(state);
+        }
+    }
+
     #[derive(Clone)]
     struct ReentrantCanonicalBytes {
         bytes: Vec<u8>,
@@ -588,6 +699,96 @@ mod tests {
             broker.ledger_snapshot().expect("ledger").total_owner_bytes(),
             retained_cost(4, 0)
         );
+    }
+
+    #[test]
+    fn payload_lookup_probe_count_is_n_independent() {
+        #[derive(Clone)]
+        struct ProbeBytes {
+            bytes: Vec<u8>,
+            probes: Arc<AtomicUsize>,
+        }
+
+        impl ByteSized for ProbeBytes {
+            fn byte_size(&self) -> u64 {
+                self.bytes.len() as u64
+            }
+        }
+
+        impl CanonicalKey for ProbeBytes {
+            fn canonical_key(&self) -> Vec<u8> {
+                self.probes.fetch_add(1, Ordering::SeqCst);
+                self.bytes.clone()
+            }
+        }
+
+        let broker = live_broker(1_000_000, 600_000);
+        let store = SimplePayloadStore::<String, ProbeBytes, Budgeted>::new_budgeted(
+            binding(),
+            None,
+            broker,
+        );
+        let probes = Arc::new(AtomicUsize::new(0));
+        for value in 0u32..2_048 {
+            store
+                .put_canonical(RetainedEnvelope::new(ProbeBytes {
+                    bytes: value.to_be_bytes().to_vec(),
+                    probes: Arc::clone(&probes),
+                }))
+                .expect("unique payload insert");
+        }
+
+        probes.store(0, Ordering::SeqCst);
+        let duplicate = store
+            .put_canonical(RetainedEnvelope::new(ProbeBytes {
+                bytes: 1_024u32.to_be_bytes().to_vec(),
+                probes: Arc::clone(&probes),
+            }))
+            .expect("indexed duplicate lookup");
+        assert_eq!(duplicate.payload_ref(), "payload-1024");
+        assert_eq!(
+            probes.load(Ordering::SeqCst),
+            2,
+            "lookup evaluates only the query and its digest-bucket candidate, independent of N"
+        );
+        assert_eq!(store.stats().expect("stats").item_count, 2_048);
+    }
+
+    #[test]
+    fn payload_delete_reuses_vacant_slots_without_stale_index_alias() {
+        let (broker, store) = store();
+        let mut first_generation = Vec::new();
+        for value in 0u32..128 {
+            first_generation.push(
+                store
+                    .put_canonical(RetainedEnvelope::new(value.to_be_bytes().to_vec()))
+                    .expect("first generation")
+                    .payload_ref()
+                    .clone(),
+            );
+        }
+        for payload_ref in &first_generation {
+            store.delete_if_unpinned(payload_ref).expect("delete first generation");
+        }
+        {
+            let state = store.state.lock().expect("state");
+            assert_eq!(state.entries.len(), 128);
+            assert_eq!(state.free_slots.len(), 128);
+            assert!(state.canonical_index.is_empty() && state.reference_index.is_empty());
+        }
+
+        for value in 128u32..256 {
+            store
+                .put_canonical(RetainedEnvelope::new(value.to_be_bytes().to_vec()))
+                .expect("second generation");
+        }
+        let state = store.state.lock().expect("state");
+        assert_eq!(state.entries.len(), 128, "churn must reuse stable vacant slots");
+        assert!(state.free_slots.is_empty());
+        assert_eq!(state.live_entries, 128);
+        drop(state);
+        drop(store);
+        assert_eq!(broker.ledger_snapshot().expect("ledger").total_owner_bytes(), 0);
     }
 
     #[test]
@@ -777,7 +978,7 @@ mod tests {
 
     #[test]
     fn over_cap_put_is_fail_closed_and_does_not_consume_ref() {
-        let broker = live_broker(1_000, 110);
+        let broker = live_broker(1_000, 140);
         let store = store_with(&broker);
         assert!(matches!(store.put_canonical(envelope(&[0; 100])), Err(MemoryError::Capacity(_))));
         assert_eq!(store.stats().expect("stats").item_count, 0);
@@ -1062,6 +1263,12 @@ mod tests {
         }
 
         impl Eq for Ref {}
+
+        impl Hash for Ref {
+            fn hash<H: Hasher>(&self, state: &mut H) {
+                self.0.hash(state);
+            }
+        }
 
         impl ByteSized for Ref {
             fn byte_size(&self) -> u64 {
