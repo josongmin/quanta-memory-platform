@@ -341,11 +341,7 @@ impl<Handle> InMemorySpillTarget<Handle> {
 
     /// Number of spilled handles currently retained (restorable).
     pub fn retained_count(&self) -> MemoryResult<u64> {
-        let len = self
-            .store
-            .lock()
-            .map_err(|_| MemoryError::InvalidState("spill target store poisoned".to_string()))?
-            .len();
+        let len = self.store.lock().map_err(|_| MemoryError::poisoned("spill target store"))?.len();
         u64::try_from(len).map_err(|_| MemoryError::capacity("spill inventory exceeds u64"))
     }
 }
@@ -368,10 +364,7 @@ impl<Handle> SpillTarget<Handle> for InMemorySpillTarget<Handle> {
         let mut store = match self.store.lock() {
             Ok(store) => store,
             Err(_) => {
-                return Err(SpillFailure::new(
-                    MemoryError::InvalidState("spill target store poisoned".to_string()),
-                    handle,
-                ));
+                return Err(SpillFailure::new(MemoryError::poisoned("spill target store"), handle));
             }
         };
         let inventory_after = match u64::try_from(store.len()).ok().and_then(|n| n.checked_add(1)) {
@@ -395,11 +388,7 @@ impl<Handle> SpillTarget<Handle> for InMemorySpillTarget<Handle> {
         if !self.available.load(Ordering::SeqCst) {
             return Err(MemoryError::capacity("spill target unavailable at restore time"));
         }
-        Ok(self
-            .store
-            .lock()
-            .map_err(|_| MemoryError::InvalidState("spill target store poisoned".to_string()))?
-            .pop_front())
+        Ok(self.store.lock().map_err(|_| MemoryError::poisoned("spill target store"))?.pop_front())
     }
 }
 
@@ -445,11 +434,7 @@ impl<Handle> RetainingSpillTarget<Handle> {
 
     /// Number of spilled handles currently retained (restorable).
     pub fn retained_count(&self) -> MemoryResult<u64> {
-        let len = self
-            .store
-            .lock()
-            .map_err(|_| MemoryError::InvalidState("spill target store poisoned".to_string()))?
-            .len();
+        let len = self.store.lock().map_err(|_| MemoryError::poisoned("spill target store"))?.len();
         u64::try_from(len).map_err(|_| MemoryError::capacity("spill inventory exceeds u64"))
     }
 }
@@ -469,10 +454,7 @@ impl<Handle> SpillTarget<Handle> for RetainingSpillTarget<Handle> {
         let mut store = match self.store.lock() {
             Ok(store) => store,
             Err(_) => {
-                return Err(SpillFailure::new(
-                    MemoryError::InvalidState("spill target store poisoned".to_string()),
-                    handle,
-                ));
+                return Err(SpillFailure::new(MemoryError::poisoned("spill target store"), handle));
             }
         };
         let inventory_after = match u64::try_from(store.len()).ok().and_then(|n| n.checked_add(1)) {
@@ -495,11 +477,7 @@ impl<Handle> SpillTarget<Handle> for RetainingSpillTarget<Handle> {
         if !self.available.load(Ordering::SeqCst) {
             return Err(MemoryError::capacity("spill target unavailable at restore time"));
         }
-        Ok(self
-            .store
-            .lock()
-            .map_err(|_| MemoryError::InvalidState("spill target store poisoned".to_string()))?
-            .pop_front())
+        Ok(self.store.lock().map_err(|_| MemoryError::poisoned("spill target store"))?.pop_front())
     }
 }
 
@@ -515,6 +493,21 @@ impl<Handle> SpillInventory for RetainingSpillTarget<Handle> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn poisoned_spill_inventory_returns_error_not_zero() {
+        let target = std::sync::Arc::new(InMemorySpillTarget::<u32>::available());
+        let _receipt = SpillTarget::accept(target.as_ref(), 7).expect("seed retained inventory");
+        let poisoner = std::sync::Arc::clone(&target);
+        assert!(std::thread::spawn(move || {
+            let _guard = poisoner.store.lock().expect("spill inventory lock");
+            panic!("poison spill inventory");
+        })
+        .join()
+        .is_err());
+
+        assert!(matches!(target.retained_count(), Err(MemoryError::Poisoned(_))));
+    }
 
     #[test]
     fn unavailable_spill_returns_the_only_handle_without_dropping_it() {

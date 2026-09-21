@@ -81,7 +81,7 @@ impl StoreLifecycle {
             Ok(guard) => Ok(guard),
             Err(TryLockError::WouldBlock) => Err(MemoryError::operation_in_progress(self.resource)),
             Err(TryLockError::Poisoned(_)) => {
-                Err(MemoryError::InvalidState(format!("{} lock poisoned", self.resource)))
+                Err(MemoryError::poisoned(format!("{} lock", self.resource)))
             }
         }
     }

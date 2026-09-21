@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use quanta_memory_platform_core::{
     ChargeKind, LiveProcessMemoryBroker, ManagedCharge, MemoryContextKind, MemoryError,
-    MemoryResult, StoreBindingHandle, StoreStats, StoreWriteError, SweepStats,
+    MemoryOperation, MemoryResult, StoreBindingHandle, StoreStats, StoreWriteError, SweepStats,
 };
 
 use crate::revocable_store::RevocableStore;
@@ -257,6 +257,12 @@ impl<Key, Value, Mode> SimpleRevocableStore<Key, Value, Mode> {
 
     /// Atomically release every entry and enter the terminal closed state.
     pub fn close(&self) -> MemoryResult<()> {
+        let result = self.close_inner();
+        self.accounting.emit_result(MemoryOperation::Close, None, &result);
+        result
+    }
+
+    fn close_inner(&self) -> MemoryResult<()> {
         let close = match self.lifecycle.begin_close()? {
             BeginClose::AlreadyClosed => return Ok(()),
             BeginClose::Acquired(close) => close,
@@ -312,6 +318,15 @@ impl<Key, Value> SimpleRevocableStore<Key, Value, Budgeted> {
     where
         C: InProcessSpillController<RevocableSpillHandle<Key, Value>>,
     {
+        let result = self.spill_one_into_inner(controller);
+        self.accounting.emit_result(MemoryOperation::SpillInProcess, None, &result);
+        result
+    }
+
+    fn spill_one_into_inner<C>(&self, controller: &C) -> MemoryResult<bool>
+    where
+        C: InProcessSpillController<RevocableSpillHandle<Key, Value>>,
+    {
         let _mutation = self.lifecycle.begin_mutation()?;
         let (entry, next_committed) = {
             let mut state = self.lock_state()?;
@@ -347,6 +362,20 @@ impl<Key, Value> SimpleRevocableStore<Key, Value, Budgeted> {
     /// durable commit receipt. Encoder errors, encoder panics, and ordinary
     /// destination errors restore the original FIFO entry before propagating.
     pub fn spill_one_durable<C, Encode>(
+        &self,
+        controller: &C,
+        encode: Encode,
+    ) -> MemoryResult<Option<SpillReceipt>>
+    where
+        C: ReconciledDurableSpillController,
+        Encode: FnOnce(&Key, &Value) -> MemoryResult<Vec<u8>>,
+    {
+        let result = self.spill_one_durable_inner(controller, encode);
+        self.accounting.emit_result(MemoryOperation::SpillDurable, None, &result);
+        result
+    }
+
+    fn spill_one_durable_inner<C, Encode>(
         &self,
         controller: &C,
         encode: Encode,
@@ -494,6 +523,22 @@ impl<Key, Value> SimpleRevocableStore<Key, Value, Budgeted> {
         Key: ByteSized,
         Value: ByteSized,
     {
+        let result = self.restore_one_durable_inner(controller, decode);
+        self.accounting.emit_result(MemoryOperation::RestoreDurable, None, &result);
+        result
+    }
+
+    fn restore_one_durable_inner<C, Decode>(
+        &self,
+        controller: &C,
+        decode: Decode,
+    ) -> MemoryResult<DurableRestoreOutcome>
+    where
+        C: DurableRestoreController,
+        Decode: FnOnce(&[u8]) -> MemoryResult<(Key, Value)>,
+        Key: ByteSized,
+        Value: ByteSized,
+    {
         let _mutation = self.lifecycle.begin_mutation()?;
         if !self.lock_state()?.pending_restores.is_empty() {
             return Err(MemoryError::OperationInProgress(
@@ -511,6 +556,22 @@ impl<Key, Value> SimpleRevocableStore<Key, Value, Budgeted> {
     /// only after the previous volatile owner is gone. The redb file lock and
     /// exclusive persisted claim prevent another ordinary restore from passing.
     pub fn recover_active_durable_restore<C, Decode>(
+        &self,
+        controller: &C,
+        decode: Decode,
+    ) -> MemoryResult<DurableRestoreOutcome>
+    where
+        C: DurableRestoreController,
+        Decode: FnOnce(&[u8]) -> MemoryResult<(Key, Value)>,
+        Key: ByteSized,
+        Value: ByteSized,
+    {
+        let result = self.recover_active_durable_restore_inner(controller, decode);
+        self.accounting.emit_result(MemoryOperation::RestoreDurable, None, &result);
+        result
+    }
+
+    fn recover_active_durable_restore_inner<C, Decode>(
         &self,
         controller: &C,
         decode: Decode,
@@ -988,9 +1049,12 @@ mod tests {
         InProcessSpillTarget, NoopSpillController, RoutedSpillController, SpillController,
         SpillInventory, SpillReceipt, SpillTarget,
     };
+    #[cfg(feature = "spill")]
+    use quanta_memory_platform_core::MemoryOutcome;
     use quanta_memory_platform_core::{
-        ExecutionBudget, MemoryBudgetManifest, MemoryClass, MemoryClassBudget, MemoryPreset,
-        ProcessMemoryBrokerBuilder, ReclaimPriority, ResidencyPolicy,
+        ExecutionBudget, MemoryBudgetManifest, MemoryClass, MemoryClassBudget, MemoryEvent,
+        MemoryEventSink, MemoryPreset, ProcessMemoryBrokerBuilder, ReclaimPriority,
+        ResidencyPolicy,
     };
     #[cfg(feature = "spill")]
     use std::sync::atomic::AtomicBool;
@@ -999,6 +1063,15 @@ mod tests {
     use std::thread;
 
     type Store = SimpleRevocableStore<String, Vec<u8>, Budgeted>;
+
+    #[derive(Default)]
+    struct RecordingEvents(Mutex<Vec<MemoryEvent>>);
+
+    impl MemoryEventSink for RecordingEvents {
+        fn emit(&self, event: MemoryEvent) {
+            self.0.lock().expect("event recorder").push(event);
+        }
+    }
 
     fn expected_entry_cost(key: &str, payload_bytes: u64) -> u64 {
         u64::try_from(key.len()).expect("test key fits") + payload_bytes + 16 + 16
@@ -1013,6 +1086,13 @@ mod tests {
     }
 
     fn live_broker(class_hard: u64) -> LiveProcessMemoryBroker {
+        live_broker_with_events(class_hard, Arc::new(RecordingEvents::default()))
+    }
+
+    fn live_broker_with_events(
+        class_hard: u64,
+        events: Arc<dyn MemoryEventSink>,
+    ) -> LiveProcessMemoryBroker {
         let residency = ResidencyPolicy::new(10_000_000).with_class_budget(
             MemoryClass::ExecutionScratchRevocable,
             MemoryClassBudget {
@@ -1029,6 +1109,7 @@ mod tests {
                 ExecutionBudget::default(),
                 residency,
             ))
+            .with_event_sink(events)
             .build()
             .expect("valid broker")
     }
@@ -1138,6 +1219,31 @@ mod tests {
         assert_eq!(store.reclaim_one().expect("remaining FIFO").expect("entry").0, "second");
         assert_eq!(store.reclaim_one().expect("restored entry").expect("entry").0, "first");
         assert_eq!(broker.ledger_snapshot().expect("drained ledger").total_owner_bytes(), 0);
+    }
+
+    #[cfg(feature = "spill")]
+    #[test]
+    fn spill_and_close_emit_bounded_facade_events() {
+        let events = Arc::new(RecordingEvents::default());
+        let broker = live_broker_with_events(1_000_000, events.clone());
+        let store = store_with_broker(&broker);
+        store.insert_checked("first".into(), vec![1; 4]).expect("insert");
+        let controller = RoutedSpillController::new(InMemorySpillTarget::available());
+
+        assert!(store.spill_one_into(&controller).expect("spill"));
+        store.close().expect("close empty source");
+
+        let recorded = events.0.lock().expect("events").clone();
+        assert!(recorded.contains(&MemoryEvent::new(
+            MemoryOperation::SpillInProcess,
+            MemoryOutcome::Succeeded,
+            None,
+        )));
+        assert!(recorded.contains(&MemoryEvent::new(
+            MemoryOperation::Close,
+            MemoryOutcome::Succeeded,
+            None,
+        )));
     }
 
     #[cfg(feature = "spill")]
@@ -2273,7 +2379,7 @@ mod tests {
         .join()
         .is_err());
 
-        assert!(matches!(store.stats(), Err(MemoryError::InvalidState(_))));
+        assert!(matches!(store.stats(), Err(MemoryError::Poisoned(_))));
         drop(store);
         assert_eq!(broker.ledger_snapshot().expect("ledger").total_owner_bytes(), 0);
     }

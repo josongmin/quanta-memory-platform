@@ -99,7 +99,7 @@ impl<Stage, Commit, Published, T> SimplePublishPipeline<Stage, Commit, Published
         self.published_count
             .lock()
             .map(|guard| *guard)
-            .map_err(|_| MemoryError::InvalidState("publish pipeline lock poisoned".to_string()))
+            .map_err(|_| MemoryError::poisoned("publish pipeline lock"))
     }
 }
 
@@ -142,7 +142,7 @@ where
         let mut count = self
             .published_count
             .lock()
-            .map_err(|_| MemoryError::InvalidState("publish pipeline lock poisoned".to_string()))?;
+            .map_err(|_| MemoryError::poisoned("publish pipeline lock"))?;
         *count = count.saturating_add(1);
         Ok(published)
     }

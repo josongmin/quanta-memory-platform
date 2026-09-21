@@ -27,9 +27,7 @@ impl UnbudgetedPinRegistry {
     /// abort cleanly without taking the process down. Mirrors the broker
     /// poisoned-lock handling in `api/control.rs`.
     fn locked(&self) -> MemoryResult<MutexGuard<'_, HashMap<String, Vec<String>>>> {
-        self.state
-            .lock()
-            .map_err(|e| MemoryError::InvalidState(format!("pin registry lock poisoned: {e}")))
+        self.state.lock().map_err(|e| MemoryError::poisoned(format!("pin registry lock: {e}")))
     }
 
     /// Acquire the state lock for read-only accounting, recovering the guard if
@@ -178,7 +176,7 @@ mod tests {
     }
 
     // scenario M: a poisoned lock is fail-closed for mutating ops (typed
-    // InvalidState, no panic) and recovers a safe count for the read path,
+    // Poisoned, no panic) and recovers a safe count for the read path,
     // never taking the process down.
     #[test]
     fn poisoned_lock_is_fail_closed_not_panicking() {
@@ -205,13 +203,13 @@ mod tests {
         // Mutating path is fail-closed with a typed error, no panic.
         let pin_result = reg.pin("p".to_string(), "d2".to_string());
         assert!(
-            matches!(pin_result, Err(MemoryError::InvalidState(_))),
-            "pin on a poisoned lock returns typed InvalidState, got {pin_result:?}"
+            matches!(pin_result, Err(MemoryError::Poisoned(_))),
+            "pin on a poisoned lock returns typed Poisoned, got {pin_result:?}"
         );
         let inv_result = reg.invalidate_dependents_atomically(&"p".to_string());
         assert!(
-            matches!(inv_result, Err(MemoryError::InvalidState(_))),
-            "invalidate on a poisoned lock returns typed InvalidState, got {inv_result:?}"
+            matches!(inv_result, Err(MemoryError::Poisoned(_))),
+            "invalidate on a poisoned lock returns typed Poisoned, got {inv_result:?}"
         );
     }
 }

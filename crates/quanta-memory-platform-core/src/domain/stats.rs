@@ -1,4 +1,5 @@
 use crate::domain::config::{OverrideRecord, ResolvedBudget};
+use crate::domain::ledger::LedgerSnapshot;
 use crate::domain::policy::{ExecutionBudget, MemoryBudgetManifest, MemoryPreset, ResidencyPolicy};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -74,6 +75,18 @@ pub struct ReclaimRuntimeStats {
     pub successes: u128,
     pub failures: u128,
     pub reported_reclaimed_bytes: u128,
+}
+
+/// One lock-consistent broker observation. Consumers no longer need to join a
+/// ledger snapshot, policy report, pressure value and reclaim counters sampled
+/// at different revisions.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BrokerObservation {
+    pub ledger: LedgerSnapshot,
+    pub report: EffectiveMemoryBudgetReport,
+    pub pressure: PressureState,
+    pub reclaim: ReclaimRuntimeStats,
+    pub semantic_bytes: u64,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

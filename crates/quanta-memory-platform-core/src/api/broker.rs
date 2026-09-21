@@ -3,7 +3,7 @@ use std::sync::Arc;
 use crate::domain::context::{
     MemoryContextHandle, MemoryContextKind, OwnerKey, RuntimeId, RuntimeKind,
 };
-use crate::domain::stats::EffectiveMemoryBudgetReport;
+use crate::domain::stats::{BrokerObservation, EffectiveMemoryBudgetReport};
 use crate::ports::scratch::ScratchAllocator;
 use crate::ports::store::StoreBindingHandle;
 use crate::{MemoryClass, MemoryResult};
@@ -24,4 +24,8 @@ pub trait ProcessMemoryBroker: Send + Sync {
     ) -> MemoryResult<Arc<dyn RuntimeMemoryView>>;
 
     fn effective_report(&self) -> EffectiveMemoryBudgetReport;
+
+    /// Fallible, lock-consistent operational observation. Poison/corruption is
+    /// never translated into an empty or zero snapshot.
+    fn observe(&self) -> MemoryResult<BrokerObservation>;
 }

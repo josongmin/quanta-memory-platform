@@ -346,9 +346,7 @@ where
             Ok(state) => state,
             Err(_) => {
                 drop(charge);
-                return Err(MemoryError::InvalidState(
-                    "payload store lock poisoned after accounting".to_string(),
-                ));
+                return Err(MemoryError::poisoned("payload store lock after accounting"));
             }
         };
         let entry = PayloadEntry {
@@ -1216,7 +1214,7 @@ mod tests {
         })
         .join()
         .is_err());
-        assert!(matches!(store.stats(), Err(MemoryError::InvalidState(_))));
+        assert!(matches!(store.stats(), Err(MemoryError::Poisoned(_))));
     }
 
     #[test]

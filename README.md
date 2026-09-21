@@ -107,6 +107,29 @@ public:
     applies the same headroom/floor postimage rules, increments
     `policy_revision`, and records `RuntimeReconfigure` provenance atomically.
 
+## Observation and operational events
+
+- `LiveProcessMemoryBroker::observe()` is the authoritative observation API. It
+  returns a typed `Result<BrokerObservation, MemoryError>` containing one-lock
+  ledger, effective-policy revision/provenance, pressure, reclaim counters and
+  semantic bytes. Poison or an invalid snapshot is never converted to zero.
+- `ProcessMemoryBroker::effective_report()` remains an infallible compatibility
+  view of the last effective policy. It is not an accounting/control oracle;
+  callers that need availability and ledger truth must use `observe()`.
+- Public `LedgerSnapshot::checked_total_*` methods are the fallible surface for
+  externally constructed snapshots. The legacy `total_*` convenience methods
+  require an exact/representable snapshot and may panic when that precondition
+  is violated.
+- `MemoryError::Capacity` is caller-actionable by reducing demand or changing a
+  validated policy. `OperationInProgress` is retryable after the current
+  lifecycle transition. `Poisoned`, `InvalidState`, and `Report` require
+  operator/recovery handling and are never equivalent to empty state.
+- Install `MemoryEventSink` with `MemoryPlatformBuilder::with_event_sink`.
+  Operations and outcomes are closed enums; owner, runtime, key, session and
+  error strings cannot become metric labels. Events are advisory, emitted
+  outside broker/store data locks, and sink panics are contained. They never
+  mutate semantic ledger counters.
+
 Examples (compile against the real public APIs):
 
 ```bash

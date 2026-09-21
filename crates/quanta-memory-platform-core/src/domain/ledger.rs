@@ -35,7 +35,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(feature = "live_control")]
 use crate::domain::config::ValidatedResidencyPolicy;
 use crate::domain::context::{MemoryContextKind, OwnerKey};
-#[cfg(feature = "live_control")]
 use crate::domain::errors::{MemoryError, MemoryResult};
 use crate::domain::policy::MemoryClass;
 #[cfg(feature = "live_control")]
@@ -135,8 +134,7 @@ impl UsageBreakdown {
             .expect("ledger usage breakdown exceeds u64")
     }
 
-    #[cfg(feature = "live_control")]
-    pub(crate) fn checked_total(&self) -> MemoryResult<u64> {
+    pub fn checked_total(&self) -> MemoryResult<u64> {
         self.retained_payload_bytes
             .checked_add(self.retained_metadata_bytes)
             .and_then(|sum| sum.checked_add(self.live_scratch_bytes))
@@ -187,14 +185,44 @@ pub struct LedgerSnapshot {
 }
 
 impl LedgerSnapshot {
-    // Public total getters remain infallible for API compatibility. They never
-    // truncate: a caller-constructed, unrepresentable snapshot panics, while
-    // broker observations validate first and return a typed InvalidState.
-    #[cfg(feature = "live_control")]
     fn checked_axis_total<K: Ord>(axis: &BTreeMap<K, UsageBreakdown>) -> MemoryResult<u64> {
         axis.values().try_fold(0u64, |sum, usage| {
             sum.checked_add(usage.checked_total()?)
                 .ok_or_else(|| MemoryError::InvalidState("ledger axis total exceeds u64".into()))
+        })
+    }
+
+    pub fn checked_total_class_bytes(&self) -> MemoryResult<u64> {
+        Self::checked_axis_total(&self.class_usage)
+    }
+
+    pub fn checked_total_owner_bytes(&self) -> MemoryResult<u64> {
+        Self::checked_axis_total(&self.owner_usage)
+    }
+
+    pub fn checked_total_context_bytes(&self) -> MemoryResult<u64> {
+        Self::checked_axis_total(&self.context_usage)
+    }
+
+    pub fn checked_total_retained_payload_bytes(&self) -> MemoryResult<u64> {
+        self.owner_usage.values().try_fold(0u64, |sum, usage| {
+            sum.checked_add(usage.retained_payload_bytes)
+                .ok_or_else(|| MemoryError::InvalidState("ledger payload total exceeds u64".into()))
+        })
+    }
+
+    pub fn checked_total_retained_metadata_bytes(&self) -> MemoryResult<u64> {
+        self.owner_usage.values().try_fold(0u64, |sum, usage| {
+            sum.checked_add(usage.retained_metadata_bytes).ok_or_else(|| {
+                MemoryError::InvalidState("ledger metadata total exceeds u64".into())
+            })
+        })
+    }
+
+    pub fn checked_total_live_scratch_bytes(&self) -> MemoryResult<u64> {
+        self.owner_usage.values().try_fold(0u64, |sum, usage| {
+            sum.checked_add(usage.live_scratch_bytes)
+                .ok_or_else(|| MemoryError::InvalidState("ledger scratch total exceeds u64".into()))
         })
     }
 
@@ -222,18 +250,12 @@ impl LedgerSnapshot {
 
     #[must_use]
     pub fn total_class_bytes(&self) -> u64 {
-        self.class_usage
-            .values()
-            .map(UsageBreakdown::total)
-            .fold(0u64, |a, b| a.checked_add(b).expect("ledger class total exceeds u64"))
+        self.checked_total_class_bytes().expect("ledger class total exceeds u64")
     }
 
     #[must_use]
     pub fn total_owner_bytes(&self) -> u64 {
-        self.owner_usage
-            .values()
-            .map(UsageBreakdown::total)
-            .fold(0u64, |a, b| a.checked_add(b).expect("ledger owner total exceeds u64"))
+        self.checked_total_owner_bytes().expect("ledger owner total exceeds u64")
     }
 
     /// Total bytes on the context axis. The context axis is the third accounting
@@ -241,10 +263,7 @@ impl LedgerSnapshot {
     /// three, so this total must equal the owner total at every point.
     #[must_use]
     pub fn total_context_bytes(&self) -> u64 {
-        self.context_usage
-            .values()
-            .map(UsageBreakdown::total)
-            .fold(0u64, |a, b| a.checked_add(b).expect("ledger context total exceeds u64"))
+        self.checked_total_context_bytes().expect("ledger context total exceeds u64")
     }
 
     /// Context axis balances against the owner axis (the third-axis analogue of
@@ -256,26 +275,17 @@ impl LedgerSnapshot {
 
     #[must_use]
     pub fn total_retained_payload_bytes(&self) -> u64 {
-        self.owner_usage
-            .values()
-            .map(|u| u.retained_payload_bytes)
-            .fold(0u64, |a, b| a.checked_add(b).expect("ledger payload total exceeds u64"))
+        self.checked_total_retained_payload_bytes().expect("ledger payload total exceeds u64")
     }
 
     #[must_use]
     pub fn total_retained_metadata_bytes(&self) -> u64 {
-        self.owner_usage
-            .values()
-            .map(|u| u.retained_metadata_bytes)
-            .fold(0u64, |a, b| a.checked_add(b).expect("ledger metadata total exceeds u64"))
+        self.checked_total_retained_metadata_bytes().expect("ledger metadata total exceeds u64")
     }
 
     #[must_use]
     pub fn total_live_scratch_bytes(&self) -> u64 {
-        self.owner_usage
-            .values()
-            .map(|u| u.live_scratch_bytes)
-            .fold(0u64, |a, b| a.checked_add(b).expect("ledger scratch total exceeds u64"))
+        self.checked_total_live_scratch_bytes().expect("ledger scratch total exceeds u64")
     }
 
     /// Invariant 1: class totals equal owner totals.

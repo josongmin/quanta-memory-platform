@@ -5,7 +5,7 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use quanta_memory_platform_core::{
     ChargeKind, LiveProcessMemoryBroker, ManagedCharge, MemoryContextKind, MemoryError,
-    MemoryResult, StoreBindingHandle, StoreStats,
+    MemoryEvent, MemoryOperation, MemoryOutcome, MemoryResult, StoreBindingHandle, StoreStats,
 };
 
 #[cfg(feature = "unbudgeted-stores")]
@@ -756,13 +756,20 @@ where
             if next_evidence_count > state.retention.max_evidence_count()
                 || next_evidence_bytes > state.retention.max_evidence_bytes()
             {
-                return Err(TranscriptAppendErrorV1::RetentionSaturated {
+                let error = TranscriptAppendErrorV1::RetentionSaturated {
                     evidence_count: state.evidence_count,
                     max_evidence_count: state.retention.max_evidence_count(),
                     evidence_bytes: state.evidence_bytes,
                     requested_evidence_bytes: evidence_bytes,
                     max_evidence_bytes: state.retention.max_evidence_bytes(),
-                });
+                };
+                drop(state);
+                self.accounting.emit(MemoryEvent::new(
+                    MemoryOperation::TombstoneSaturation,
+                    MemoryOutcome::CapacityDenied,
+                    None,
+                ));
+                return Err(error);
             }
 
             let new_session = existing.is_none();
@@ -1755,8 +1762,8 @@ mod tests {
             panic!("deterministic poison");
         })
         .join();
-        assert!(matches!(store.load(&"s".to_string()), Err(MemoryError::InvalidState(_))));
-        assert!(matches!(store.stats(), Err(MemoryError::InvalidState(_))));
+        assert!(matches!(store.load(&"s".to_string()), Err(MemoryError::Poisoned(_))));
+        assert!(matches!(store.stats(), Err(MemoryError::Poisoned(_))));
     }
 
     #[test]
@@ -1773,7 +1780,7 @@ mod tests {
         use super::*;
         use quanta_memory_platform_core::{
             ExecutionBudget, LiveProcessMemoryBroker, MemoryBudgetManifest, MemoryClassBudget,
-            MemoryPreset, ReclaimPriority, ResidencyPolicy,
+            MemoryEventSink, MemoryPreset, NoopMemoryEventSink, ReclaimPriority, ResidencyPolicy,
         };
         use std::cmp::Ordering;
         use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
@@ -2308,6 +2315,13 @@ mod tests {
         }
 
         fn broker(class_hard: u64) -> LiveProcessMemoryBroker {
+            broker_with_events(class_hard, Arc::new(NoopMemoryEventSink))
+        }
+
+        fn broker_with_events(
+            class_hard: u64,
+            events: Arc<dyn MemoryEventSink>,
+        ) -> LiveProcessMemoryBroker {
             let residency = ResidencyPolicy::new(1_000_000).with_class_budget(
                 MemoryClass::SessionTranscript,
                 MemoryClassBudget {
@@ -2324,6 +2338,7 @@ mod tests {
                     ExecutionBudget::default(),
                     residency,
                 ))
+                .with_event_sink(events)
                 .build()
                 .expect("valid broker")
         }
@@ -2686,6 +2701,44 @@ mod tests {
         }
 
         #[test]
+        fn retention_saturation_emits_one_bounded_tombstone_event() {
+            #[derive(Default)]
+            struct Events(std::sync::Mutex<Vec<MemoryEvent>>);
+            impl MemoryEventSink for Events {
+                fn emit(&self, event: MemoryEvent) {
+                    self.0.lock().expect("events").push(event);
+                }
+            }
+
+            let events = Arc::new(Events::default());
+            let broker = broker_with_events(1_000_000, events.clone());
+            let store =
+                charged_with_policy(&broker, TranscriptRetentionPolicyV2::fail_closed(1, u64::MAX));
+            store.append(request("s", 0, "m0", "one")).expect("seed");
+
+            assert!(matches!(
+                store.append(request("s", 1, "m1", "two")),
+                Err(TranscriptAppendErrorV1::RetentionSaturated { .. })
+            ));
+            let tombstones = events
+                .0
+                .lock()
+                .expect("events")
+                .iter()
+                .filter(|event| event.operation == MemoryOperation::TombstoneSaturation)
+                .copied()
+                .collect::<Vec<_>>();
+            assert_eq!(
+                tombstones,
+                vec![MemoryEvent::new(
+                    MemoryOperation::TombstoneSaturation,
+                    MemoryOutcome::CapacityDenied,
+                    None,
+                )]
+            );
+        }
+
+        #[test]
         fn every_conflict_axis_preserves_rows_indexes_and_accounting() {
             let broker = broker(1_000_000);
             let store = charged(&broker);
@@ -2824,8 +2877,8 @@ mod tests {
                 panic!("poison store after committed charge");
             })
             .join();
-            assert!(matches!(store.close(), Err(MemoryError::InvalidState(_))));
-            assert!(matches!(store.stats(), Err(MemoryError::InvalidState(_))));
+            assert!(matches!(store.close(), Err(MemoryError::Poisoned(_))));
+            assert!(matches!(store.stats(), Err(MemoryError::Poisoned(_))));
             assert_eq!(
                 broker.ledger_snapshot().expect("charged").total_owner_bytes(),
                 cost("a", &[("m0", "one", true)]) + cost("b", &[("m1", "four", true)])

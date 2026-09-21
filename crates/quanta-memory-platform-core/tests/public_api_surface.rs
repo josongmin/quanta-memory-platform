@@ -173,21 +173,23 @@ fn names_every_public_reexport() {
 
 /// All eight `MemoryError` variants remain constructible. The single error type is
 /// a public contract
-/// (Build|Config|Capacity|Closed|OperationInProgress|InvalidState|Report|Unsupported);
+/// (Build|Config|Capacity|Closed|OperationInProgress|Poisoned|InvalidState|Report|Unsupported);
 /// removing or renaming a variant breaks this exhaustive match.
 #[test]
-fn memory_error_has_exactly_the_eight_documented_variants() {
+fn memory_error_has_exactly_the_nine_documented_variants() {
     let variants = [
         MemoryError::Build("b".to_string()),
         MemoryError::Config("c".to_string()),
         MemoryError::Capacity("cap".to_string()),
         MemoryError::Closed("closed-store".to_string()),
         MemoryError::OperationInProgress("busy-store".to_string()),
+        MemoryError::Poisoned("poisoned-store".to_string()),
         MemoryError::InvalidState("s".to_string()),
         MemoryError::Report("r".to_string()),
         MemoryError::Unsupported("u".to_string()),
     ];
-    // Exhaustive match: a 7th variant added without updating the snapshot fails
+    assert_eq!(variants.len(), 9);
+    // Exhaustive match: a variant added without updating the snapshot fails
     // to compile here; a removed variant fails to construct above.
     for v in &variants {
         let _classified = match v {
@@ -196,6 +198,7 @@ fn memory_error_has_exactly_the_eight_documented_variants() {
             MemoryError::Capacity(_) => "capacity",
             MemoryError::Closed(_) => "closed",
             MemoryError::OperationInProgress(_) => "operation_in_progress",
+            MemoryError::Poisoned(_) => "poisoned",
             MemoryError::InvalidState(_) => "invalid_state",
             MemoryError::Report(_) => "report",
             MemoryError::Unsupported(_) => "unsupported",

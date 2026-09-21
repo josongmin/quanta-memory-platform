@@ -1190,7 +1190,7 @@ mod tests {
     }
 
     #[test]
-    fn checked_reads_report_typed_invalid_state_after_owner_mutex_poison_v1() {
+    fn checked_reads_report_typed_poison_after_owner_mutex_poison_v1() {
         let binding =
             StoreBindingHandle::new(MemoryClass::MemoResidency, "owner-poison".to_string(), None);
         let store: UnbudgetedTestStore<String, ClonePanicsWhenArmed> =
@@ -1211,19 +1211,19 @@ mod tests {
         assert!(panic.is_err(), "clone panic must poison the canonical owner mutex");
 
         assert!(
-            matches!(store.get_checked(&key), Err(MemoryError::InvalidState(message)) if message == "retained map lock poisoned"),
+            matches!(store.get_checked(&key), Err(MemoryError::Poisoned(message)) if message == "retained map lock"),
             "checked point read must preserve the typed poison failure"
         );
         assert!(
-            matches!(store.stats_checked(), Err(MemoryError::InvalidState(message)) if message == "retained map lock poisoned"),
+            matches!(store.stats_checked(), Err(MemoryError::Poisoned(message)) if message == "retained map lock"),
             "checked stats must preserve the typed poison failure"
         );
         assert!(
-            matches!(store.keys_checked(), Err(MemoryError::InvalidState(message)) if message == "retained map lock poisoned"),
+            matches!(store.keys_checked(), Err(MemoryError::Poisoned(message)) if message == "retained map lock"),
             "checked key enumeration must preserve the typed poison failure"
         );
         assert!(
-            matches!(store.entries_checked(), Err(MemoryError::InvalidState(message)) if message == "retained map lock poisoned"),
+            matches!(store.entries_checked(), Err(MemoryError::Poisoned(message)) if message == "retained map lock"),
             "checked entry enumeration must preserve the typed poison failure"
         );
         let trait_source = include_str!("mod.rs");

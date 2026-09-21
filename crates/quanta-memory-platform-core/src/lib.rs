@@ -110,7 +110,8 @@ pub use domain::policy::{
     OwnerQuota, ReclaimPriority, ResidencyPolicy, ResourceGroup,
 };
 pub use domain::stats::{
-    AllocatorSnapshot, EffectiveMemoryBudgetReport, PressureState, ReclaimRuntimeStats,
+    AllocatorSnapshot, BrokerObservation, EffectiveMemoryBudgetReport, PressureState,
+    ReclaimRuntimeStats,
 };
 #[cfg(feature = "unbudgeted_pin")]
 pub use ports::pin::{InvalidationOutcome, PayloadPinLease, PinRegistry};
@@ -124,4 +125,7 @@ pub use ports::store::{
     PublishedPayload, RetainedEnvelope, StagedHandle, StoreBindingHandle, StoreStats, SweepHint,
     SweepStats,
 };
-pub use ports::telemetry::{AllocatorAdvisory, AllocatorTelemetry, StaticAllocatorTelemetry};
+pub use ports::telemetry::{
+    AllocatorAdvisory, AllocatorTelemetry, MemoryEvent, MemoryEventSink, MemoryOperation,
+    MemoryOutcome, NoopMemoryEventSink, StaticAllocatorTelemetry,
+};

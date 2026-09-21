@@ -113,6 +113,18 @@ impl MemoryPlatformBuilder {
         self
     }
 
+    /// Install the bounded-cardinality event sink used by both the broker and
+    /// facade stores constructed from the resulting platform.
+    #[cfg(feature = "core-live-accounting")]
+    #[must_use]
+    pub fn with_event_sink(
+        mut self,
+        event_sink: std::sync::Arc<dyn quanta_memory_platform_core::MemoryEventSink>,
+    ) -> Self {
+        self.inner = self.inner.with_event_sink(event_sink);
+        self
+    }
+
     /// Build the enforced, accounting-backed default platform.
     #[cfg(feature = "core-live-accounting")]
     pub fn build(self) -> MemoryResult<LiveMemoryPlatform> {
@@ -223,6 +235,10 @@ impl quanta_memory_platform_core::ProcessMemoryBroker for LiveMemoryPlatform {
 
     fn effective_report(&self) -> EffectiveMemoryBudgetReport {
         quanta_memory_platform_core::ProcessMemoryBroker::effective_report(&self.broker)
+    }
+
+    fn observe(&self) -> MemoryResult<quanta_memory_platform_core::BrokerObservation> {
+        quanta_memory_platform_core::ProcessMemoryBroker::observe(&self.broker)
     }
 }
 
