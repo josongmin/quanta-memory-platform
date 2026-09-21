@@ -128,11 +128,34 @@ pub struct UsageBreakdown {
 }
 
 impl UsageBreakdown {
+    /// Exact total for a representable breakdown.
+    ///
+    /// # Panics
+    /// Panics if a caller-constructed breakdown exceeds `u64::MAX`. Ledger
+    /// mutations reject such a postimage before publishing it.
     #[must_use]
     pub fn total(&self) -> u64 {
         self.retained_payload_bytes
-            .saturating_add(self.retained_metadata_bytes)
-            .saturating_add(self.live_scratch_bytes)
+            .checked_add(self.retained_metadata_bytes)
+            .and_then(|sum| sum.checked_add(self.live_scratch_bytes))
+            .expect("ledger usage breakdown exceeds u64")
+    }
+
+    #[cfg(feature = "live_control")]
+    fn checked_total(&self) -> MemoryResult<u64> {
+        self.retained_payload_bytes
+            .checked_add(self.retained_metadata_bytes)
+            .and_then(|sum| sum.checked_add(self.live_scratch_bytes))
+            .ok_or_else(|| MemoryError::InvalidState("ledger usage breakdown exceeds u64".into()))
+    }
+
+    #[cfg(feature = "live_control")]
+    fn slot(&self, kind: ChargeKind) -> u64 {
+        match kind {
+            ChargeKind::RetainedPayload => self.retained_payload_bytes,
+            ChargeKind::RetainedMetadata => self.retained_metadata_bytes,
+            ChargeKind::LiveScratch => self.live_scratch_bytes,
+        }
     }
 
     #[cfg(feature = "live_control")]
@@ -144,27 +167,18 @@ impl UsageBreakdown {
         }
     }
 
-    /// Add `bytes` to the given kind's slot, saturating at `u64::MAX`.
-    ///
-    /// Uses a `u64` magnitude directly: a charge of `bytes > i64::MAX` must NOT
-    /// be routed through an `i64` delta (the old `bytes as i64` cast wrapped such
-    /// a value to a negative number and silently *subtracted*, corrupting the
-    /// counters and breaking invariant 1). The reserve path's cap checks already
-    /// reject anything that would overflow the (much smaller) global limit, so
-    /// saturation here is a defence-in-depth guard, never the normal path.
+    /// Exact axis mutation after admission has checked the full postimage.
     #[cfg(feature = "live_control")]
     fn add(&mut self, kind: ChargeKind, bytes: u64) {
         let slot = self.slot_mut(kind);
-        *slot = slot.saturating_add(bytes);
+        *slot = slot.checked_add(bytes).expect("ledger reserve preflight checked axis slot");
     }
 
-    /// Subtract `bytes` from the given kind's slot, saturating at `0`. A live
-    /// ticket can never over-subtract (its bytes were added when reserved), so
-    /// the saturation floor is defence-in-depth and never the normal path.
+    /// Exact axis mutation after release has checked all three axes.
     #[cfg(feature = "live_control")]
     fn sub(&mut self, kind: ChargeKind, bytes: u64) {
         let slot = self.slot_mut(kind);
-        *slot = slot.saturating_sub(bytes);
+        *slot = slot.checked_sub(bytes).expect("ledger release preflight checked axis slot");
     }
 }
 
@@ -179,14 +193,53 @@ pub struct LedgerSnapshot {
 }
 
 impl LedgerSnapshot {
+    // Public total getters remain infallible for API compatibility. They never
+    // truncate: a caller-constructed, unrepresentable snapshot panics, while
+    // broker observations validate first and return a typed InvalidState.
+    #[cfg(feature = "live_control")]
+    fn checked_axis_total<K: Ord>(axis: &BTreeMap<K, UsageBreakdown>) -> MemoryResult<u64> {
+        axis.values().try_fold(0u64, |sum, usage| {
+            sum.checked_add(usage.checked_total()?)
+                .ok_or_else(|| MemoryError::InvalidState("ledger axis total exceeds u64".into()))
+        })
+    }
+
+    #[cfg(feature = "live_control")]
+    pub(crate) fn validate_exact(&self) -> MemoryResult<()> {
+        let class = Self::checked_axis_total(&self.class_usage)?;
+        let owner = Self::checked_axis_total(&self.owner_usage)?;
+        let context = Self::checked_axis_total(&self.context_usage)?;
+        if class != owner || owner != context {
+            return Err(MemoryError::InvalidState("ledger accounting axes are unbalanced".into()));
+        }
+        let kinds = self.owner_usage.values().try_fold(0u64, |sum, usage| {
+            sum.checked_add(usage.retained_payload_bytes)
+                .and_then(|sum| sum.checked_add(usage.retained_metadata_bytes))
+                .and_then(|sum| sum.checked_add(usage.live_scratch_bytes))
+                .ok_or_else(|| {
+                    MemoryError::InvalidState("ledger kind partition exceeds u64".into())
+                })
+        })?;
+        if kinds != owner {
+            return Err(MemoryError::InvalidState("ledger kind partition is unbalanced".into()));
+        }
+        Ok(())
+    }
+
     #[must_use]
     pub fn total_class_bytes(&self) -> u64 {
-        self.class_usage.values().map(UsageBreakdown::total).fold(0u64, u64::saturating_add)
+        self.class_usage
+            .values()
+            .map(UsageBreakdown::total)
+            .fold(0u64, |a, b| a.checked_add(b).expect("ledger class total exceeds u64"))
     }
 
     #[must_use]
     pub fn total_owner_bytes(&self) -> u64 {
-        self.owner_usage.values().map(UsageBreakdown::total).fold(0u64, u64::saturating_add)
+        self.owner_usage
+            .values()
+            .map(UsageBreakdown::total)
+            .fold(0u64, |a, b| a.checked_add(b).expect("ledger owner total exceeds u64"))
     }
 
     /// Total bytes on the context axis. The context axis is the third accounting
@@ -194,7 +247,10 @@ impl LedgerSnapshot {
     /// three, so this total must equal the owner total at every point.
     #[must_use]
     pub fn total_context_bytes(&self) -> u64 {
-        self.context_usage.values().map(UsageBreakdown::total).fold(0u64, u64::saturating_add)
+        self.context_usage
+            .values()
+            .map(UsageBreakdown::total)
+            .fold(0u64, |a, b| a.checked_add(b).expect("ledger context total exceeds u64"))
     }
 
     /// Context axis balances against the owner axis (the third-axis analogue of
@@ -206,17 +262,26 @@ impl LedgerSnapshot {
 
     #[must_use]
     pub fn total_retained_payload_bytes(&self) -> u64 {
-        self.owner_usage.values().map(|u| u.retained_payload_bytes).fold(0u64, u64::saturating_add)
+        self.owner_usage
+            .values()
+            .map(|u| u.retained_payload_bytes)
+            .fold(0u64, |a, b| a.checked_add(b).expect("ledger payload total exceeds u64"))
     }
 
     #[must_use]
     pub fn total_retained_metadata_bytes(&self) -> u64 {
-        self.owner_usage.values().map(|u| u.retained_metadata_bytes).fold(0u64, u64::saturating_add)
+        self.owner_usage
+            .values()
+            .map(|u| u.retained_metadata_bytes)
+            .fold(0u64, |a, b| a.checked_add(b).expect("ledger metadata total exceeds u64"))
     }
 
     #[must_use]
     pub fn total_live_scratch_bytes(&self) -> u64 {
-        self.owner_usage.values().map(|u| u.live_scratch_bytes).fold(0u64, u64::saturating_add)
+        self.owner_usage
+            .values()
+            .map(|u| u.live_scratch_bytes)
+            .fold(0u64, |a, b| a.checked_add(b).expect("ledger scratch total exceeds u64"))
     }
 
     /// Invariant 1: class totals equal owner totals.
@@ -229,11 +294,10 @@ impl LedgerSnapshot {
     /// live scratch.
     #[must_use]
     pub fn owner_partition_balanced(&self) -> bool {
-        self.total_owner_bytes()
-            == self
-                .total_retained_payload_bytes()
-                .saturating_add(self.total_retained_metadata_bytes())
-                .saturating_add(self.total_live_scratch_bytes())
+        self.total_retained_payload_bytes()
+            .checked_add(self.total_retained_metadata_bytes())
+            .and_then(|sum| sum.checked_add(self.total_live_scratch_bytes()))
+            .is_some_and(|sum| sum == self.total_owner_bytes())
     }
 }
 
@@ -341,7 +405,11 @@ impl AccountingLedger {
         // Invariant 5: the global hard limit is the absolute ceiling on total
         // owner bytes. Non-`Headroom` charges leave the reserved headroom band
         // free; only the `Headroom` class may draw into it.
-        let global_total_after = self.snapshot().total_owner_bytes().saturating_add(bytes);
+        let snapshot = self.snapshot();
+        snapshot.validate_exact()?;
+        let global_total_after = LedgerSnapshot::checked_axis_total(&snapshot.owner_usage)?
+            .checked_add(bytes)
+            .ok_or_else(|| MemoryError::capacity("global reserve total exceeds u64"))?;
         let global_ceiling = if class == MemoryClass::Headroom {
             self.policy().global_hard_limit_bytes
         } else {
@@ -356,8 +424,10 @@ impl AccountingLedger {
             )));
         }
 
-        let owner_current = self.owner_usage(&owner).total();
-        let owner_after = owner_current.saturating_add(bytes);
+        let owner_current = self.owner_usage(&owner).checked_total()?;
+        let owner_after = owner_current
+            .checked_add(bytes)
+            .ok_or_else(|| MemoryError::capacity("owner reserve total exceeds u64"))?;
         if let Some(quota) = self.policy().owner_quotas.get(&owner) {
             if owner_after > quota.hard_cap_bytes {
                 return Err(MemoryError::capacity(format!(
@@ -367,8 +437,26 @@ impl AccountingLedger {
             }
         }
 
-        let class_current = self.class_usage(&class).total();
-        let class_after = class_current.saturating_add(bytes);
+        let class_current = self.class_usage(&class).checked_total()?;
+        let class_after = class_current
+            .checked_add(bytes)
+            .ok_or_else(|| MemoryError::capacity("class reserve total exceeds u64"))?;
+        self.context_usage
+            .get(&context)
+            .copied()
+            .unwrap_or_default()
+            .checked_total()?
+            .checked_add(bytes)
+            .ok_or_else(|| MemoryError::capacity("context reserve total exceeds u64"))?;
+        for usage in [
+            self.class_usage.get(&class),
+            self.owner_usage.get(&owner),
+            self.context_usage.get(&context),
+        ] {
+            if usage.map_or(0, |u| u.slot(kind)).checked_add(bytes).is_none() {
+                return Err(MemoryError::capacity("ledger charge-kind slot exceeds u64"));
+            }
+        }
         let Some(budget) = self.policy().classes.get(&class) else {
             return Err(MemoryError::capacity(format!(
                 "class {class:?} is not configured in the active residency policy"
@@ -385,7 +473,7 @@ impl AccountingLedger {
             // burst pool, which is finite and shared across all borrowing
             // classes. Recompute total borrow with this class's prospective
             // usage and reject if it would overdraw the pool.
-            let total_borrow_after = self.total_borrow_with(&class, class_after);
+            let total_borrow_after = self.total_borrow_with(&class, class_after)?;
             if total_borrow_after > self.policy().shared_burst_pool_bytes {
                 return Err(MemoryError::capacity(format!(
                     "class {class:?} borrow would draw total {total_borrow_after} from shared \
@@ -420,17 +508,22 @@ impl AccountingLedger {
     /// (its prospective post-reserve usage) and every other borrowing class at
     /// its current usage. A class borrows the amount by which its usage exceeds
     /// its own hard cap.
-    fn total_borrow_with(&self, probe_class: &MemoryClass, probe_usage: u64) -> u64 {
+    fn total_borrow_with(&self, probe_class: &MemoryClass, probe_usage: u64) -> MemoryResult<u64> {
         let mut total: u64 = 0;
         for (class, budget) in &self.policy().classes {
             if !budget.borrow_from_shared_pool {
                 continue;
             }
-            let usage =
-                if class == probe_class { probe_usage } else { self.class_usage(class).total() };
-            total = total.saturating_add(usage.saturating_sub(budget.hard_cap_bytes));
+            let usage = if class == probe_class {
+                probe_usage
+            } else {
+                self.class_usage(class).checked_total()?
+            };
+            total = total
+                .checked_add(usage.saturating_sub(budget.hard_cap_bytes))
+                .ok_or_else(|| MemoryError::capacity("shared borrow total exceeds u64"))?;
         }
-        total
+        Ok(total)
     }
 
     /// Commit a reservation. In this model a committed reservation keeps its
@@ -475,6 +568,7 @@ impl AccountingLedger {
         self.validate_ledger_identity(ticket, "pending rollback")?;
         match self.ticket_states.get(&ticket.id) {
             Some(TicketState::Pending) => {
+                self.preflight_release_batch(std::slice::from_ref(ticket))?;
                 self.apply_release(ticket);
                 Ok(())
             }
@@ -494,6 +588,7 @@ impl AccountingLedger {
     /// that are later deleted/evicted.
     pub fn release(&mut self, ticket: &ReservationTicket) -> MemoryResult<()> {
         self.validate_release_ticket(ticket)?;
+        self.preflight_release_batch(std::slice::from_ref(ticket))?;
         self.apply_release(ticket);
         Ok(())
     }
@@ -514,6 +609,7 @@ impl AccountingLedger {
         bytes: u64,
     ) -> MemoryResult<ReservationTicket> {
         self.validate_committed_ticket(old)?;
+        self.preflight_release_batch(std::slice::from_ref(old))?;
         self.apply_release(old);
 
         let replacement = match self.reserve(class, owner, context, kind, bytes) {
@@ -557,10 +653,35 @@ impl AccountingLedger {
                 )));
             }
         }
+        self.preflight_release_batch(tickets)?;
         for ticket in tickets {
             self.apply_release(ticket);
         }
         Ok(())
+    }
+
+    fn preflight_release_batch(&self, tickets: &[ReservationTicket]) -> MemoryResult<()> {
+        let mut snapshot = self.snapshot();
+        snapshot.validate_exact()?;
+        for ticket in tickets {
+            if ticket.bytes == 0 {
+                continue;
+            }
+            for usage in [
+                snapshot.class_usage.get_mut(&ticket.class),
+                snapshot.owner_usage.get_mut(&ticket.owner),
+                snapshot.context_usage.get_mut(&ticket.context),
+            ] {
+                let Some(usage) = usage else {
+                    return Err(MemoryError::InvalidState("release axis is missing".into()));
+                };
+                let slot = usage.slot_mut(ticket.kind);
+                *slot = slot.checked_sub(ticket.bytes).ok_or_else(|| {
+                    MemoryError::InvalidState("release exceeds charged axis slot".into())
+                })?;
+            }
+        }
+        snapshot.validate_exact()
     }
 
     fn validate_release_ticket(&self, ticket: &ReservationTicket) -> MemoryResult<()> {
@@ -995,23 +1116,89 @@ mod tests {
     // ---- scenario A: saturating_add near u64::MAX preserves invariant 1 ----
 
     #[test]
-    fn saturating_add_near_u64_max_keeps_class_owner_balanced() {
-        // scenario A: with a global limit at u64::MAX, two large reserves whose
-        // sum saturates must saturate class AND owner identically, so invariant
-        // 1 (class==owner) survives saturation rather than skewing one axis.
+    fn overflow_denial_preserves_exact_live_ticket_accounting() {
         let mut ledger = ledger_from_policy(ResidencyPolicy::new(u64::MAX));
+        let first = reserve(&mut ledger, MemoryClass::ArtifactCache, "o", u64::MAX - 10)
+            .expect("first fits within validated global policy");
+        ledger.commit(&first).expect("first commits");
+        let before = ledger.snapshot();
+        let second = reserve(&mut ledger, MemoryClass::EvidenceCache, "o", 100);
+        assert!(
+            matches!(second, Err(MemoryError::Capacity(_))),
+            "overflow must deny, got {second:?}"
+        );
+        assert_eq!(ledger.snapshot(), before, "denial must leave all axes unchanged");
+    }
 
-        reserve(&mut ledger, MemoryClass::ArtifactCache, "o", u64::MAX - 10)
+    #[test]
+    fn exact_boundary_ticket_survives_first_release() {
+        let mut ledger = ledger_from_policy(ResidencyPolicy::new(u64::MAX));
+        let first = reserve(&mut ledger, MemoryClass::ArtifactCache, "o", u64::MAX - 10)
+            .expect("first reserve");
+        ledger.commit(&first).expect("first commit");
+        let second = reserve(&mut ledger, MemoryClass::EvidenceCache, "o", 10)
+            .expect("sum equals u64::MAX exactly");
+        ledger.commit(&second).expect("second commit");
+        ledger.release(&first).expect("release first");
+        assert_eq!(
+            ledger.snapshot().total_owner_bytes(),
+            10,
+            "second live ticket must remain exactly charged"
+        );
+        ledger.release(&second).expect("release second");
+        assert_eq!(ledger.snapshot().total_owner_bytes(), 0);
+    }
+
+    #[test]
+    fn unrepresentable_sum_is_denied_without_mutating_any_axis() {
+        let mut ledger = ledger_from_policy(ResidencyPolicy::new(u64::MAX));
+        let first = reserve(&mut ledger, MemoryClass::ArtifactCache, "o", u64::MAX - 10)
             .expect("first huge reserve fits under u64::MAX global");
-        // This second reserve passes the (saturating) ceiling check and then the
-        // counters saturate at u64::MAX on every axis in lockstep.
-        reserve(&mut ledger, MemoryClass::EvidenceCache, "o", 100)
-            .expect("second reserve admitted; counters saturate");
+        let before = ledger.snapshot();
+        assert!(matches!(
+            reserve(&mut ledger, MemoryClass::EvidenceCache, "other", 100),
+            Err(MemoryError::Capacity(_))
+        ));
+        assert_eq!(ledger.snapshot(), before);
+        ledger.release(&first).expect("original ticket remains live and releasable");
+        assert_eq!(ledger.snapshot().total_owner_bytes(), 0);
+    }
 
-        let snap = ledger.snapshot();
-        assert_eq!(snap.total_owner_bytes(), u64::MAX, "owner total saturated at u64::MAX");
-        // The whole point: saturation did not desync the axes.
-        assert_axes_balanced(&snap);
+    #[test]
+    fn batch_release_preflights_every_charge_kind_before_first_ticket_mutates() {
+        let mut ledger = ledger_from_policy(ResidencyPolicy::new(1_000));
+        let first =
+            reserve(&mut ledger, MemoryClass::ArtifactCache, "first", 100).expect("first reserve");
+        let second = reserve(&mut ledger, MemoryClass::EvidenceCache, "second", 100)
+            .expect("second reserve");
+        // Keep the class total unchanged while corrupting the second ticket's
+        // exact kind slot. A totals-only preflight would miss this mismatch.
+        let usage = ledger.class_usage.get_mut(&MemoryClass::EvidenceCache).expect("second class");
+        usage.retained_payload_bytes = 0;
+        usage.retained_metadata_bytes = 100;
+        let before = ledger.snapshot();
+        assert!(matches!(
+            ledger.release_batch(&[first.clone(), second.clone()]),
+            Err(MemoryError::InvalidState(_))
+        ));
+        assert_eq!(ledger.snapshot(), before, "preflight failure must not release first ticket");
+        assert!(ledger.ticket_states.contains_key(&first.id()));
+        assert!(ledger.ticket_states.contains_key(&second.id()));
+    }
+
+    #[test]
+    fn snapshot_validation_rejects_unrepresentable_axis_instead_of_saturating_it() {
+        let mut snapshot = LedgerSnapshot::default();
+        snapshot.owner_usage.insert(
+            "owner".into(),
+            UsageBreakdown {
+                retained_payload_bytes: u64::MAX,
+                retained_metadata_bytes: 1,
+                live_scratch_bytes: 0,
+            },
+        );
+        assert!(matches!(snapshot.validate_exact(), Err(MemoryError::InvalidState(_))));
+        assert!(std::panic::catch_unwind(|| snapshot.total_owner_bytes()).is_err());
     }
 
     // ---- scenario A: bytes > i64::MAX must not wrap to a negative delta ----

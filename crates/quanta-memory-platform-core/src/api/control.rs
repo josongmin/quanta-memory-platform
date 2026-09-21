@@ -533,7 +533,10 @@ impl LiveProcessMemoryBroker {
         let new_group = core.ledger.policy().owner_groups.get(&owner).cloned();
         let mut next_scheduler = core.scheduler.clone();
         if let Some(group) = &old_group {
-            next_scheduler.record_release(group, old.bytes());
+            next_scheduler.record_release(group, old.bytes()).map_err(|error| RechargeError {
+                error,
+                recovery: RechargeRecoveryV1::OldChargePreserved,
+            })?;
         }
         if let Some(group) = &new_group {
             if !next_scheduler.admits(group, bytes) {
@@ -544,6 +547,10 @@ impl LiveProcessMemoryBroker {
                     recovery: RechargeRecoveryV1::OldChargePreserved,
                 });
             }
+            next_scheduler.record_usage(group, bytes).map_err(|error| RechargeError {
+                error,
+                recovery: RechargeRecoveryV1::OldChargePreserved,
+            })?;
         }
 
         // The execution scratch ceiling is a broker-owned admission axis, not a
@@ -553,12 +560,20 @@ impl LiveProcessMemoryBroker {
             let max = u64::try_from(max).unwrap_or(u64::MAX);
             let current = core.ledger.snapshot().total_live_scratch_bytes();
             let without_old = if old.kind() == ChargeKind::LiveScratch {
-                current.saturating_sub(old.bytes())
+                current.checked_sub(old.bytes()).ok_or_else(|| RechargeError {
+                    error: MemoryError::InvalidState(
+                        "scratch recharge old charge exceeds live usage".into(),
+                    ),
+                    recovery: RechargeRecoveryV1::OldChargePreserved,
+                })?
             } else {
                 current
             };
             let live_after = if kind == ChargeKind::LiveScratch {
-                without_old.saturating_add(bytes)
+                without_old.checked_add(bytes).ok_or_else(|| RechargeError {
+                    error: MemoryError::capacity("execution scratch recharge total exceeds u64"),
+                    recovery: RechargeRecoveryV1::OldChargePreserved,
+                })?
             } else {
                 without_old
             };
@@ -576,9 +591,6 @@ impl LiveProcessMemoryBroker {
             core.ledger.replace_committed(old, class, owner, context, kind, bytes).map_err(
                 |error| RechargeError { error, recovery: RechargeRecoveryV1::OldChargePreserved },
             )?;
-        if let Some(group) = &new_group {
-            next_scheduler.record_usage(group, bytes);
-        }
         core.scheduler = next_scheduler;
         core.ticket_groups.remove(&old.id());
         if let Some(group) = new_group {
@@ -611,18 +623,24 @@ impl LiveProcessMemoryBroker {
     /// Release on an already-held lock guard (ledger release + group bookkeeping),
     /// fail-closed before any scheduler mutation.
     fn release_on(core: &mut BrokerCore, ticket: &ReservationTicket) -> MemoryResult<()> {
-        core.ledger.release(ticket)?;
-        if let Some(group) = core.ticket_groups.remove(&ticket.id()) {
-            core.scheduler.record_release(&group, ticket.bytes());
+        let mut next_scheduler = core.scheduler.clone();
+        if let Some(group) = core.ticket_groups.get(&ticket.id()) {
+            next_scheduler.record_release(group, ticket.bytes())?;
         }
+        core.ledger.release(ticket)?;
+        core.scheduler = next_scheduler;
+        core.ticket_groups.remove(&ticket.id());
         Ok(())
     }
 
     fn rollback_pending_on(core: &mut BrokerCore, ticket: &ReservationTicket) -> MemoryResult<()> {
-        core.ledger.rollback_pending(ticket)?;
-        if let Some(group) = core.ticket_groups.remove(&ticket.id()) {
-            core.scheduler.record_release(&group, ticket.bytes());
+        let mut next_scheduler = core.scheduler.clone();
+        if let Some(group) = core.ticket_groups.get(&ticket.id()) {
+            next_scheduler.record_release(group, ticket.bytes())?;
         }
+        core.ledger.rollback_pending(ticket)?;
+        core.scheduler = next_scheduler;
+        core.ticket_groups.remove(&ticket.id());
         Ok(())
     }
 
@@ -669,11 +687,16 @@ impl LiveProcessMemoryBroker {
     }
 
     fn release_many_on(core: &mut BrokerCore, tickets: &[ReservationTicket]) -> MemoryResult<()> {
-        core.ledger.release_batch(tickets)?;
+        let mut next_scheduler = core.scheduler.clone();
         for ticket in tickets {
-            if let Some(group) = core.ticket_groups.remove(&ticket.id()) {
-                core.scheduler.record_release(&group, ticket.bytes());
+            if let Some(group) = core.ticket_groups.get(&ticket.id()) {
+                next_scheduler.record_release(group, ticket.bytes())?;
             }
+        }
+        core.ledger.release_batch(tickets)?;
+        core.scheduler = next_scheduler;
+        for ticket in tickets {
+            core.ticket_groups.remove(&ticket.id());
         }
         Ok(())
     }
@@ -695,12 +718,14 @@ impl LiveProcessMemoryBroker {
         // D: resource-group admission. An owner mapped to a group must pass the
         // weighted-fair scheduler (anti-starvation) before it can reserve.
         let group = core.ledger.policy().owner_groups.get(&owner).cloned();
+        let mut next_scheduler = core.scheduler.clone();
         if let Some(ref group) = group {
-            if !core.scheduler.admits(group, bytes) {
+            if !next_scheduler.admits(group, bytes) {
                 return Err(MemoryError::capacity(format!(
                     "resource group {group} admission denied for owner {owner} reserve of {bytes} bytes"
                 )));
             }
+            next_scheduler.record_usage(group, bytes)?;
         }
 
         // ExecutionBudget: the memory-relevant cap is `max_execution_scratch_bytes`,
@@ -710,8 +735,14 @@ impl LiveProcessMemoryBroker {
         if kind == ChargeKind::LiveScratch {
             if let Some(max) = core.report.execution.max_execution_scratch_bytes {
                 let max = u64::try_from(max).unwrap_or(u64::MAX);
-                let live_after =
-                    core.ledger.snapshot().total_live_scratch_bytes().saturating_add(bytes);
+                let live_after = core
+                    .ledger
+                    .snapshot()
+                    .total_live_scratch_bytes()
+                    .checked_add(bytes)
+                    .ok_or_else(|| {
+                        MemoryError::capacity("execution scratch reserve total exceeds u64")
+                    })?;
                 if live_after > max {
                     return Err(MemoryError::capacity(format!(
                         "execution scratch budget {max} exceeded by reserve to {live_after}"
@@ -721,10 +752,10 @@ impl LiveProcessMemoryBroker {
         }
 
         let ticket = core.ledger.reserve(class, owner, context, kind, bytes)?;
+        core.scheduler = next_scheduler;
         // Keep scheduler usage in sync so admission reflects live group usage, and
         // remember the issuing group so release is symmetric across reconfigure.
         if let Some(group) = group {
-            core.scheduler.record_usage(&group, bytes);
             core.ticket_groups.insert(ticket.id(), group);
         }
         Ok(ticket)
@@ -818,7 +849,9 @@ impl LiveProcessMemoryBroker {
     /// telemetry).
     pub fn classify_pressure(&self) -> MemoryResult<PressureState> {
         let core = self.lock()?;
-        let used = core.ledger.snapshot().total_owner_bytes();
+        let snapshot = core.ledger.snapshot();
+        snapshot.validate_exact()?;
+        let used = snapshot.total_owner_bytes();
         Ok(core.controller.update_from_semantic(used))
     }
 
@@ -830,7 +863,9 @@ impl LiveProcessMemoryBroker {
         snapshot: &AllocatorSnapshot,
     ) -> MemoryResult<AllocatorAdvisory> {
         let core = self.lock()?;
-        let semantic = core.ledger.snapshot().total_owner_bytes();
+        let semantic_snapshot = core.ledger.snapshot();
+        semantic_snapshot.validate_exact()?;
+        let semantic = semantic_snapshot.total_owner_bytes();
         Ok(AllocatorAdvisory::compare(snapshot, semantic))
     }
 
@@ -851,6 +886,7 @@ impl LiveProcessMemoryBroker {
         let mut core = self.lock()?;
 
         let snapshot = core.ledger.snapshot();
+        snapshot.validate_exact()?;
         let current_total = snapshot.total_owner_bytes();
         if new_policy.global_hard_limit_bytes < current_total {
             return Err(MemoryError::InvalidState(format!(
@@ -940,7 +976,9 @@ impl LiveProcessMemoryBroker {
         for (owner, usage) in &snapshot.owner_usage {
             if let Some(group) = new_policy.owner_groups.get(owner) {
                 let slot = live_group_usage.entry(group).or_insert(0);
-                *slot = slot.saturating_add(usage.total());
+                *slot = slot.checked_add(usage.total()).ok_or_else(|| {
+                    MemoryError::InvalidState("live resource-group usage exceeds u64".into())
+                })?;
             }
         }
         for (group, used) in live_group_usage {
@@ -956,14 +994,16 @@ impl LiveProcessMemoryBroker {
 
         // Accepted: install the new policy by rebuilding the ledger's view while
         // preserving usage counters.
-        core.install_policy(validated);
+        core.install_policy(validated)?;
         Ok(())
     }
 
     /// Immutable ledger snapshot for invariant assertions and reporting.
     pub fn ledger_snapshot(&self) -> MemoryResult<LedgerSnapshot> {
         let core = self.lock()?;
-        Ok(core.ledger.snapshot())
+        let snapshot = core.ledger.snapshot();
+        snapshot.validate_exact()?;
+        Ok(snapshot)
     }
 
     /// The effective budget report this broker was built from.
@@ -986,14 +1026,14 @@ impl BrokerCore {
     /// only swaps the active policy in place, so all accounting invariants hold
     /// across the reconfiguration. The scheduler and controller are rebuilt
     /// from the new policy.
-    fn install_policy(&mut self, validated: ValidatedResidencyPolicy) {
+    fn install_policy(&mut self, validated: ValidatedResidencyPolicy) -> MemoryResult<()> {
         // Snapshot live usage BEFORE the swap so the rebuilt scheduler can be
         // re-seeded from it (a fresh scheduler starts at zero usage, which would
         // otherwise make post-reconfigure admission see phantom-empty groups and
         // silently drop the anti-starvation guarantee).
         let snapshot = self.ledger.snapshot();
+        snapshot.validate_exact()?;
         let new_policy = validated.as_policy().clone();
-        self.ledger.swap_policy(validated);
         let mut scheduler = WeightedResourceGroupScheduler::new(
             new_policy.resource_groups.clone(),
             new_policy.shared_burst_pool_bytes,
@@ -1001,9 +1041,10 @@ impl BrokerCore {
         for (owner, group) in &new_policy.owner_groups {
             let used = snapshot.owner_usage.get(owner).map_or(0, |u| u.total());
             if used > 0 {
-                scheduler.record_usage(group, used);
+                scheduler.record_usage(group, used)?;
             }
         }
+        self.ledger.swap_policy(validated);
         self.scheduler = scheduler;
         let controller = LadderPressureController::new(
             new_policy.global_hard_limit_bytes,
@@ -1018,6 +1059,7 @@ impl BrokerCore {
         self.controller = Arc::new(controller);
         // Keep the report's residency in sync with the active policy.
         self.report.residency = new_policy;
+        Ok(())
     }
 }
 
@@ -1103,6 +1145,82 @@ mod tests {
     fn broker() -> LiveProcessMemoryBroker {
         LiveProcessMemoryBroker::from_report(report_with(base_residency()))
             .expect("base residency is valid")
+    }
+
+    #[test]
+    fn scratch_reserve_cap_overflow_is_denied_without_mutation() {
+        let mut report = report_with(ResidencyPolicy::new(u64::MAX));
+        report.execution.max_execution_scratch_bytes = Some(usize::MAX);
+        let b = LiveProcessMemoryBroker::from_report(report).expect("validated policy");
+        let first = b
+            .reserve(
+                MemoryClass::ArtifactCache,
+                "o".into(),
+                MemoryContextKind::Request,
+                ChargeKind::LiveScratch,
+                u64::MAX - 10,
+            )
+            .expect("first reserve");
+        b.commit(&first).expect("commit first");
+        let before = b.ledger_snapshot().expect("before");
+        let second = b.reserve(
+            MemoryClass::EvidenceCache,
+            "o".into(),
+            MemoryContextKind::Request,
+            ChargeKind::LiveScratch,
+            100,
+        );
+        assert!(
+            matches!(second, Err(MemoryError::Capacity(_))),
+            "scratch cap overflow must deny: {second:?}"
+        );
+        assert_eq!(b.ledger_snapshot().expect("after denial"), before);
+        b.release(&first).expect("first ticket remains live");
+        assert_eq!(b.ledger_snapshot().expect("drained").total_owner_bytes(), 0);
+    }
+
+    #[test]
+    fn scratch_recharge_cap_overflow_preserves_original_ticket() {
+        let mut report = report_with(ResidencyPolicy::new(u64::MAX));
+        report.execution.max_execution_scratch_bytes = Some(usize::MAX);
+        let b = LiveProcessMemoryBroker::from_report(report).expect("validated policy");
+        let first = b
+            .reserve(
+                MemoryClass::ArtifactCache,
+                "o".into(),
+                MemoryContextKind::Request,
+                ChargeKind::LiveScratch,
+                u64::MAX - 11,
+            )
+            .expect("first reserve");
+        b.commit(&first).expect("commit first");
+        let old = b
+            .reserve(
+                MemoryClass::EvidenceCache,
+                "o".into(),
+                MemoryContextKind::Request,
+                ChargeKind::LiveScratch,
+                1,
+            )
+            .expect("old reserve");
+        b.commit(&old).expect("commit old");
+        let before = b.ledger_snapshot().expect("before");
+        let replacement = b.recharge(
+            &old,
+            MemoryClass::EvidenceCache,
+            "o".into(),
+            MemoryContextKind::Request,
+            ChargeKind::LiveScratch,
+            100,
+        );
+        assert!(
+            matches!(replacement, Err(RechargeError { error: MemoryError::Capacity(_), .. })),
+            "scratch recharge overflow must deny: {replacement:?}"
+        );
+        assert_eq!(b.ledger_snapshot().expect("after denial"), before);
+        b.release(&old).expect("old ticket remains live");
+        b.release(&first).expect("first ticket remains live");
+        assert_eq!(b.ledger_snapshot().expect("drained").total_owner_bytes(), 0);
     }
 
     #[test]

@@ -8,6 +8,7 @@
 
 use std::collections::BTreeMap;
 
+use crate::domain::errors::{MemoryError, MemoryResult};
 use crate::domain::policy::ResourceGroup;
 
 /// Admission authority for resource groups.
@@ -44,17 +45,22 @@ impl WeightedResourceGroupScheduler {
 
     /// Record committed growth for a group so subsequent admission decisions see
     /// live usage. Returns the new usage total for that group.
-    pub fn record_usage(&mut self, group_name: &str, delta: u64) -> u64 {
-        let entry = self.usage.entry(group_name.to_string()).or_insert(0);
-        *entry = entry.saturating_add(delta);
-        *entry
+    pub fn record_usage(&mut self, group_name: &str, delta: u64) -> MemoryResult<u64> {
+        let after = self
+            .current_usage(group_name)
+            .checked_add(delta)
+            .ok_or_else(|| MemoryError::capacity("resource-group usage exceeds u64"))?;
+        self.usage.insert(group_name.to_string(), after);
+        Ok(after)
     }
 
     /// Record a release for a group.
-    pub fn record_release(&mut self, group_name: &str, delta: u64) -> u64 {
-        let entry = self.usage.entry(group_name.to_string()).or_insert(0);
-        *entry = entry.saturating_sub(delta);
-        *entry
+    pub fn record_release(&mut self, group_name: &str, delta: u64) -> MemoryResult<u64> {
+        let after = self.current_usage(group_name).checked_sub(delta).ok_or_else(|| {
+            MemoryError::InvalidState("resource-group release exceeds usage".into())
+        })?;
+        self.usage.insert(group_name.to_string(), after);
+        Ok(after)
     }
 
     #[must_use]
@@ -83,7 +89,9 @@ impl ResourceGroupScheduler for WeightedResourceGroupScheduler {
             return false;
         };
         let current = self.current_usage(group_name);
-        let after = current.saturating_add(requested_bytes);
+        let Some(after) = current.checked_add(requested_bytes) else {
+            return false;
+        };
 
         if after <= group.hard_cap_bytes {
             return true;
@@ -141,7 +149,7 @@ mod tests {
         // bg weight 1 => burst share = (400/4)*1 = 100.
 
         // fg fills its hard cap, then keeps trying to grow (noisy owner).
-        assert_eq!(s.record_usage("fg", 1_000), 1_000);
+        assert_eq!(s.record_usage("fg", 1_000).expect("record"), 1_000);
         // borrow up to 300 over hard cap is allowed.
         assert!(s.admits("fg", 300), "fg may borrow up to its 300 fair share");
         // but 301 over hard cap exceeds fg's share -> denied (no starvation of bg).
@@ -149,8 +157,8 @@ mod tests {
 
         // Even after fg already borrowed its full share, bg still gets its own
         // share -> bg is not starved by fg's noise.
-        assert_eq!(s.record_usage("fg", 300), 1_300); // fg consumed its share
-        assert_eq!(s.record_usage("bg", 1_000), 1_000); // bg at its hard cap
+        assert_eq!(s.record_usage("fg", 300).expect("record"), 1_300); // fg consumed its share
+        assert_eq!(s.record_usage("bg", 1_000).expect("record"), 1_000); // bg at its hard cap
         assert!(s.admits("bg", 100), "bg keeps its own 100 fair share despite fg noise");
         assert!(!s.admits("bg", 101), "bg still bounded by its own share");
     }
@@ -158,9 +166,9 @@ mod tests {
     #[test]
     fn release_returns_burst_capacity() {
         let mut s = two_group_scheduler();
-        s.record_usage("fg", 1_300); // hard cap + full share
+        s.record_usage("fg", 1_300).expect("record"); // hard cap + full share
         assert!(!s.admits("fg", 1), "no more burst available");
-        s.record_release("fg", 300); // give back the borrowed share
+        s.record_release("fg", 300).expect("release"); // give back the borrowed share
         assert!(s.admits("fg", 200), "released capacity becomes admissible again");
     }
 
@@ -220,16 +228,16 @@ mod tests {
         let mut s = two_group_scheduler(); // fg share 300 over hard cap 1_000
         assert_eq!(s.current_usage("fg"), 0);
         // Consume hard cap + full burst share.
-        assert_eq!(s.record_usage("fg", 1_300), 1_300);
+        assert_eq!(s.record_usage("fg", 1_300).expect("record"), 1_300);
         assert!(!s.admits("fg", 1), "fully bursted: no further admission");
         // Release the full burst; usage returns to exactly the hard cap.
-        assert_eq!(s.record_release("fg", 300), 1_000);
+        assert_eq!(s.record_release("fg", 300).expect("release"), 1_000);
         assert_eq!(s.current_usage("fg"), 1_000, "round-trip restores exact prior usage");
         // The freed burst is admissible again.
         assert!(s.admits("fg", 300), "released burst capacity is re-admitted");
-        // Saturating release never underflows below zero.
-        assert_eq!(s.record_release("fg", u64::MAX), 0, "over-release saturates at zero");
-        assert_eq!(s.current_usage("fg"), 0);
+        let before = s.current_usage("fg");
+        assert!(matches!(s.record_release("fg", u64::MAX), Err(MemoryError::InvalidState(_))));
+        assert_eq!(s.current_usage("fg"), before, "over-release must not mutate usage");
     }
 
     #[test]
@@ -250,12 +258,15 @@ mod tests {
     }
 
     #[test]
-    fn repeated_saturating_usage_release_round_trip_never_wraps() {
+    fn repeated_exact_usage_release_round_trip_never_wraps() {
         let mut s = two_group_scheduler();
         for _ in 0..8 {
-            assert_eq!(s.record_usage("fg", u64::MAX), u64::MAX);
+            assert_eq!(s.record_usage("fg", u64::MAX).expect("first charge"), u64::MAX);
             assert_eq!(s.current_usage("fg"), u64::MAX);
-            assert_eq!(s.record_release("fg", u64::MAX), 0);
+            assert!(matches!(s.record_usage("fg", 1), Err(MemoryError::Capacity(_))));
+            assert_eq!(s.current_usage("fg"), u64::MAX, "overflow must not alter usage");
+            assert!(!s.admits("fg", 1), "admission must deny unrepresentable sum");
+            assert_eq!(s.record_release("fg", u64::MAX).expect("release"), 0);
             assert_eq!(s.current_usage("fg"), 0);
         }
     }
