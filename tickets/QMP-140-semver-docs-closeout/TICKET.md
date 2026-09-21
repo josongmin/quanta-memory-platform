@@ -156,10 +156,15 @@ Implemented and reverified at product source
   commands;
 - corrected extraction/host documentation and explicit separation of local,
   remote and host qualification;
-- current Rust 1.92 doctor (638 tests), focused Miri and performance smoke
-  evidence recorded in ticket receipts. The most recent actual extraction is
-  source `f3d01c9`; it predates the MSRV-only `2dfb7bc` change and is not
-  upgraded to exact-current-source proof.
+- focused Miri evidence recorded in ticket receipts.
+
+The local product proof was refreshed at
+`557213b01ed93a20c1a45d3c69b2dae20ab90e70`: the Rust 1.92 doctor passes
+639 tests, the fresh-target performance smoke passes all 33 required samples,
+and actual standalone extraction produces canonical digest `da315e42`, clean
+bootstrap commit `6f744cac`, and the same complete standalone rails. Local
+workspace/extraction/performance proof is therefore exact-current for that
+product source.
 
 The two unchecked acceptance rows are one external boundary: Semantica Cargo
 must resolve this exact QMP source and obtain a canonical same-source QBC
@@ -171,6 +176,7 @@ identity verifier tests 5/5 and registered production-composition QBC 2/2.
 QBC's one-new-lane-per-task admission prevented the same task from creating the
 host-full-wiring and execution-budget lanes, so those two canonical receipts
 remain absent. The committed host metadata still resolves adjacent QMP 0.1.0
-rather than qualified `2dfb7bc` 0.2.0. Therefore QMP-130 and this ticket remain `BLOCKED`.
+rather than current `557213b` 0.2.0, and the observed host proof predates that
+source. Therefore QMP-130 and this ticket remain `BLOCKED`.
 Remote standalone CI for QMP-120 is also unobserved. Neither gap is papered over
 as local `QUALIFIED` or campaign `DONE`.
