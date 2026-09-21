@@ -365,6 +365,76 @@ class TicketValidatorTests(unittest.TestCase):
             with self.assertRaisesRegex(ValidationError, "latest transition.*QUALIFIED"):
                 validate_tree(root)
 
+    def test_historical_terminal_receipt_may_be_stale_when_latest_is_current(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            init_git_repo(root)
+            ticket_dir = write_ticket_tree(root, status="QUALIFIED")
+            (root / "tools/tickets").mkdir(parents=True)
+            owner = root / "tools/tickets/owner.py"
+            owner.write_text("VERSION = 1\n")
+            subprocess.run(["git", "-C", str(root), "add", "."], check=True)
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(root),
+                    "-c",
+                    "user.name=tests",
+                    "-c",
+                    "user.email=tests@example.invalid",
+                    "commit",
+                    "-qm",
+                    "old proof source",
+                ],
+                check=True,
+            )
+            old_head = subprocess.check_output(
+                ["git", "-C", str(root), "rev-parse", "HEAD"], text=True
+            ).strip()
+            owner.write_text("VERSION = 2\n")
+            subprocess.run(["git", "-C", str(root), "add", str(owner)], check=True)
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(root),
+                    "-c",
+                    "user.name=tests",
+                    "-c",
+                    "user.email=tests@example.invalid",
+                    "commit",
+                    "-qm",
+                    "current proof source",
+                ],
+                check=True,
+            )
+            current_head = subprocess.check_output(
+                ["git", "-C", str(root), "rev-parse", "HEAD"], text=True
+            ).strip()
+            receipts = ticket_dir / "receipts"
+            receipts.mkdir()
+            old = receipt_text(
+                head=old_head,
+                base=old_head,
+                timestamp="2026-09-20T00:00:00Z",
+                from_status="READY",
+                to_status="IMPLEMENTED",
+                schema=False,
+            )
+            current = receipt_text(
+                head=current_head,
+                base=old_head,
+                timestamp="2026-09-20T00:00:01Z",
+                from_status="IMPLEMENTED",
+                to_status="QUALIFIED",
+                schema=False,
+            )
+            (receipts / f"2026-09-20T000000Z-{old_head[:7]}.md").write_text(old)
+            (receipts / f"2026-09-20T000001Z-{current_head[:7]}.md").write_text(current)
+
+            validate_tree(root)
+
     def test_v1_source_tree_digest_is_recomputed_from_git(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

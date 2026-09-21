@@ -483,9 +483,18 @@ def validate_tree(root: Path) -> None:
             raise ValidationError(
                 f"{ticket.ticket_id} status {ticket.status} requires a receipt"
             )
+        receipt_records = [(receipt, receipt.read_text()) for receipt in receipts]
         transitions: list[tuple[str, str]] = []
-        for receipt in receipts:
-            text = receipt.read_text()
+        for receipt, text in receipt_records:
+            transition_to = _optional_field(text, "to")
+            if transition_to is not None:
+                if transition_to not in VALID_STATUSES:
+                    raise ValidationError(
+                        f"receipt {receipt.name} has invalid transition status: {transition_to}"
+                    )
+                transitions.append((receipt.name, transition_to))
+        latest_transition_name = transitions[-1][0] if transitions else None
+        for receipt, text in receipt_records:
             receipt_head = _field(text, "HEAD")
             changed_paths: tuple[str, ...] = ()
             if current_sha and SHA.fullmatch(receipt_head):
@@ -503,7 +512,7 @@ def validate_tree(root: Path) -> None:
             receipt_timestamp, _, _ = _receipt_filename_parts(receipt.name)
             validate_receipt(
                 text,
-                ticket.status,
+                ticket.status if receipt.name == latest_transition_name else "READY",
                 current_sha,
                 changed_paths,
                 ticket_id=ticket.ticket_id,
@@ -511,13 +520,6 @@ def validate_tree(root: Path) -> None:
                 repo=root if current_sha else None,
                 strict_required=receipt_timestamp >= RECEIPT_SCHEMA_CUTOVER,
             )
-            transition_to = _optional_field(text, "to")
-            if transition_to is not None:
-                if transition_to not in VALID_STATUSES:
-                    raise ValidationError(
-                        f"receipt {receipt.name} has invalid transition status: {transition_to}"
-                    )
-                transitions.append((receipt.name, transition_to))
         if ticket.status in RECEIPT_REQUIRED:
             if not transitions:
                 raise ValidationError(
