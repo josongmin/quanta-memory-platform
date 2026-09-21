@@ -6,7 +6,7 @@
 
 ### Linux cgroup v2 memory controller
 
-Source: https://cdn.kernel.org/doc/html/latest/admin-guide/cgroup-v2.html
+Source: https://docs.kernel.org/admin-guide/cgroup-v2.html
 
 Required implications:
 
