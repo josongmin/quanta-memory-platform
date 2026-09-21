@@ -90,6 +90,7 @@ python3 tools/pm/pm.py lint
 
 - Validator implementation commits: `fd4fdf08c362131193856898a4d7aeb539f59d53`, `dc2e7d0373911ec4fa943a5c0129ebf680ca0817`, `b91044e4972a550a8d56c781df1e5721c6429172`
 - Receipt: [`receipts/2026-09-20T183609Z-b91044e.md`](receipts/2026-09-20T183609Z-b91044e.md)
+- Proof-integrity hardening receipt: [`receipts/2026-09-21T035450Z-6f01f67.md`](receipts/2026-09-21T035450Z-6f01f67.md)
 
 ## Reopened proof-integrity gap — a GREEN command may execute zero tests
 
@@ -128,5 +129,7 @@ all Cargo test-result lines, sums actually executed pass/fail counts across
 targets, emits `qmp-cargo-test-evidence-v1` JSON with an output digest, and exits
 3 when Cargo itself exits 0 but selected count is zero.
 
-Until this is implemented, `scripts/verify-tickets.sh` GREEN proves structural
-consistency only. It is not qualification evidence by itself.
+Implemented at `6f01f673972a01553500e5f27b9809e235e581ed`. A validator GREEN is
+admission evidence for receipt structure and committed source identity; it does
+not replace product behavior evidence. Exact-head workspace and extraction
+reruns remain required before `QUALIFIED`.

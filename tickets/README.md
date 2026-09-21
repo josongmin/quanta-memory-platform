@@ -45,7 +45,7 @@
 
 | ID | 우선순위 | 상태 | 목적 | depends_on | 주요 write set |
 | --- | --- | --- | --- | --- | --- |
-| [QMP-000](QMP-000-campaign-admission/TICKET.md) | P1 | IN_PROGRESS | hardening status/claim, receipt identity, source and selected-count admission | — | `tickets/**`, `tools/tickets/**`, validator front door |
+| [QMP-000](QMP-000-campaign-admission/TICKET.md) | P1 | IMPLEMENTED | status/claim, receipt identity, committed-source digest, selected-count, and current-transition admission enforced; exact-head dynamic rerun deferred | — | `tickets/**`, `tools/tickets/**`, validator front door |
 | [QMP-010](QMP-010-policy-totality/TICKET.md) | P1 | IMPLEMENTED | mandatory class totality와 validated policy authority | QMP-000 | core `policy.rs`, `config.rs`, builder/policy tests |
 | [QMP-020](QMP-020-reservation-lifecycle/TICKET.md) | P1 | IMPLEMENTED | overflow-safe admission exists; public cloneable raw ticket leak and poisoned commit rollback loss remain | QMP-010 | core `ledger.rs`, recharge/control seams |
 | [QMP-030](QMP-030-enforced-builder-runtime-view/TICKET.md) | P1 | IMPLEMENTED | enforced default builder exists; root-exported raw ledger authority still bypasses guard lifecycle | QMP-010, QMP-020 | core/facade builders, broker/control/scratch API, examples |
