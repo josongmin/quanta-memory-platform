@@ -104,9 +104,9 @@ Miri rail:
 - [x] listed broken fakes가 모두 rejected다.
 - [x] honest fake와 real broker가 같은 exact model suite를 통과한다.
 - [x] observation failure가 PASS로 변환되지 않는다.
-- [ ] arbitrary sequence가 model equality와 final drain을 증명한다.
-- [ ] Loom/Miri scope와 한계가 receipt에 명시된다.
-- [ ] conformance family mapping이 failure cause를 숨기지 않는다.
+- [x] arbitrary sequence가 model equality와 final drain을 증명한다.
+- [x] Loom/Miri scope와 한계가 receipt에 명시된다.
+- [x] conformance family mapping이 failure cause를 숨기지 않는다.
 
 ## Verification
 
@@ -150,6 +150,30 @@ and an executed Miri subset before `QUALIFIED`.
 Current-source evidence is refreshed at
 `0c126a25aeab11f457e20c4a209fc7bb631ea859` in
 [`receipts/2026-09-21T072928Z-0c126a2.md`](receipts/2026-09-21T072928Z-0c126a2.md).
-QMP-090 remains `IMPLEMENTED`; the receipt does not substitute deterministic
-traces for proptest shrinking, Loom, Miri, or independent group/context/live-
-ticket state.
+At `0c126a2`, QMP-090 remained `IMPLEMENTED`; that historical receipt does not
+substitute deterministic traces for proptest shrinking, Loom, Miri, or
+independent group/context/live-ticket state. The later qualification checkpoint
+below supersedes that gap statement.
+
+## Qualification checkpoint (2026-09-21)
+
+Product source `0d80cf9c285e94379b90f3c5d045c371513f3563` closes the
+remaining oracle gaps:
+
+- `LedgerSnapshot.live_ticket_count` observes zero-byte and non-zero live
+  authority independently of byte totals; `BrokerObservation` samples
+  scheduler resource-group usage under the same broker lock as the ledger.
+- the honest fake owns separate class, owner, context and resource-group state;
+  the oracle no longer derives context/group truth from owner totals.
+- proptest executes 128 shrinkable traces over reserve, commit, release,
+  rebuild, denial, allocator observation and final drain against both the fake
+  and real grouped broker. Default source-parallel failure persistence records a
+  minimized regression seed if a case fails.
+- broken targets assert the exact expected violated-family set, including
+  documented cascade families for black-hole, observation-error and
+  double-owner targets.
+- five Loom small-state models cover reserve/reconfigure, single/batch release,
+  close/mutation, spill/restore/offline and versioned callback compensation.
+  They prove authority algorithms, not production mutex instrumentation.
+- Miri executes one core ticket-lifecycle test and one facade spill round-trip;
+  it is a focused alias/UB rail, not whole-workspace exhaustive interpretation.

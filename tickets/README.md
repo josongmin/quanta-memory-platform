@@ -30,17 +30,17 @@
 ### Latest verified product checkpoint
 
 ```text
-product source: 163d28fd30c781e37f5be4e8018ebb12083abc9d
+product source: 0d80cf9c285e94379b90f3c5d045c371513f3563
 branch/worktree: codex/qmp-remaining-hardening / isolated clean worktree
-workspace tests: 627 passed
-doctor output SHA-256: c1de8ca79caa3a4878706a561b007217548cf1eff7be74875cae11895575ff3a
-extraction output SHA-256: 5348397f2397fbde8bfec2ce5a89d88e6bf64f6136868ed18476633ed81d9042
-extracted bootstrap: 373d1d6bd4e45a9a591781aba9491fe1cea166ab (clean)
+workspace tests: 634 passed
+doctor output SHA-256: d4c4079c14d40c2efdf5137fe83a75c5dd3b4fcaf701d6e00618acea5ab499d3
+extraction dry-run output SHA-256: 214c36042bfc395dcf44bf0a4feb888a5667fe9140e0152bfc2cef1b8f991efe
+last actual extracted bootstrap: 373d1d6bd4e45a9a591781aba9491fe1cea166ab (product source 163d28f; clean)
 scaling smoke output SHA-256: 87da472630e14467ecc0a5236058f63e9de94585db464b999d4c382dbc0e1a44
 ```
 
 This checkpoint qualifies only the ticket scopes whose latest receipts say
-`QUALIFIED`. It does not close QMP-050, QMP-090, QMP-100, remote QMP-120,
+`QUALIFIED`. It does not close QMP-050, QMP-100, remote QMP-120,
 external-host QMP-130, or final SemVer/docs QMP-140. Inventory state below is
 the lifecycle authority; this block is exact proof metadata, not a status
 override.
@@ -72,7 +72,7 @@ override.
 | [QMP-060](QMP-060-transcript-tombstones/TICKET.md) | P1 | QUALIFIED | bounded fail-closed evidence horizon, typed stats/reconfigure, 620-test doctor and real extraction refreshed at `0c126a2` | QMP-050 | transcript types/service/builder |
 | [QMP-070](QMP-070-spill-transfer-backings/TICKET.md) | P1 | QUALIFIED | recovery-payload/ack protocol preserved by VecDeque rewrite; 620-test doctor and extraction refreshed at `0c126a2` | QMP-020, QMP-040, QMP-050 | revocable/spill/backings/builders |
 | [QMP-080](QMP-080-policy-runtime-semantics/TICKET.md) | P2 | QUALIFIED | canonical reserve/recharge/reconfigure postimages, protected floors, bounded out-of-lock reclaim, weighted burst and provenance pass at `f9f6d15` | QMP-010, QMP-020, QMP-030 | scheduler/controller/control/config |
-| [QMP-090](QMP-090-conformance-model/TICKET.md) | P1 | IN_PROGRESS | independent oracle extension to generative traces, context/group/live-ticket axes and Loom ownership models is actively claimed | QMP-020, QMP-040, QMP-070 | testkit conformance/fakes/faults |
+| [QMP-090](QMP-090-conformance-model/TICKET.md) | P1 | QUALIFIED | independent context/group/live-ticket oracle, 128-case shrinkable traces, exact negative-family mapping, five Loom models and focused Miri pass at `0d80cf9` | QMP-020, QMP-040, QMP-070 | testkit conformance/fakes/faults |
 | [QMP-100](QMP-100-scaling-benchmarks/TICKET.md) | P2 | IMPLEMENTED | payload indexed buckets/slot reuse and revocable VecDeque remove confirmed O(N²) paths; source-bound smoke exists, contention/memory/core threshold proof open | QMP-040, QMP-050, QMP-070 | payload/revocable containers, benches, CI scripts |
 | [QMP-110](QMP-110-operability-observation/TICKET.md) | P2 | QUALIFIED | typed one-lock broker observation, poison truth, bounded broker/store/spill events and callback-outside-lock emission pass at `163d28f` | QMP-030, QMP-040, QMP-080 | stats traits, metrics adapters, broker/store emitters |
 | [QMP-120](QMP-120-standalone-extraction/TICKET.md) | P1 | IMPLEMENTED | local HEAD/tree/blob/mode-bound extraction and negative fixtures pass at `4fdac520`; remote workflow remains unobserved | QMP-000 | extraction manifest/scripts, lockfile, release CI |
