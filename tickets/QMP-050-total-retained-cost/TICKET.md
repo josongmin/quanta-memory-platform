@@ -112,7 +112,7 @@ Property tests:
 - [x] tested transcript/prepared tombstone/index byte가 stats와 ledger에서 사라지지 않는다.
 - [x] QMP-050 semantic component/lease arithmetic은 checked이며 saturation으로 cost drift를 숨기지 않는다. **Core ledger 전축 exactness는 별도 QMP-020**의 통합 proof를 요구한다.
 - [ ] formula V1은 명명됐으나 public compatibility/migration policy는 QMP-140에서 확정해야 한다.
-- [ ] prepared/transcript에 independent literal oracle과 underbilling fake RED가 있다. 전체 facade store state-machine oracle은 QMP-090에서 확장한다.
+- [x] prepared/transcript에 independent literal oracle과 underbilling fake RED가 있다. 전체 facade store state-machine oracle은 QMP-090에서 확장한다.
 
 ## Verification
 
@@ -223,3 +223,18 @@ QMP-050 owns the cost decision and QMP-070 owns the transfer implementation:
 Hellgate: many entries with large owner/runtime identifiers move to the in-
 process tier and `ledger == source retained cost + destination-only delta`
 after every move, restore, source close and tier drop.
+
+## Current-source refresh (2026-09-21)
+
+The indexed payload store retains a canonical-digest index and a reference-
+digest index. `PayloadRef` therefore requires `Eq + Hash`, and the portable
+semantic cost charges two retained digest slots. For the existing 32-byte
+fixture the independent literal changes from 89 to 121 bytes. This is a real
+public bound/cost-model migration and must be recorded by QMP-140 rather than
+hidden behind compatibility prose.
+
+The independent transcript/prepared underbilling fakes and all workspace rails
+pass at `0c126a25aeab11f457e20c4a209fc7bb631ea859`; see
+[`receipts/2026-09-21T072928Z-0c126a2.md`](receipts/2026-09-21T072928Z-0c126a2.md).
+QMP-050 remains `IMPLEMENTED`: public version/migration policy and the
+in-process spill identity-cost decision remain open.

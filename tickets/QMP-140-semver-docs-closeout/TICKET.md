@@ -111,6 +111,16 @@ scripts/verify-tickets.sh
 
 그리고 QMP-120 actual extraction, QMP-130 host, QMP-100 perf receipts가 필수다.
 
+### Current migration items from QMP-100
+
+- `SimplePayloadStore` and `PayloadStoreBuilder` now require
+  `PayloadRef: Eq + Hash` so canonical/reference digest buckets can validate
+  collisions without a whole-store scan. This is a public generic-bound change.
+- `RetainedCostV1` for payload entries now charges two retained digest-index
+  slots. The 32-byte conformance fixture changes from 89 to 121 semantic bytes.
+- document these as a pre-1.0 breaking change (or choose and enforce another
+  version policy); do not present the cost change as allocator/RSS truth.
+
 ## Non-goals
 
 - 새로운 product feature 추가

@@ -101,9 +101,9 @@ Miri rail:
 
 ## Acceptance
 
-- [ ] listed broken fakes가 모두 rejected다.
-- [ ] honest fake와 real broker가 같은 exact model suite를 통과한다.
-- [ ] observation failure가 PASS로 변환되지 않는다.
+- [x] listed broken fakes가 모두 rejected다.
+- [x] honest fake와 real broker가 같은 exact model suite를 통과한다.
+- [x] observation failure가 PASS로 변환되지 않는다.
 - [ ] arbitrary sequence가 model equality와 final drain을 증명한다.
 - [ ] Loom/Miri scope와 한계가 receipt에 명시된다.
 - [ ] conformance family mapping이 failure cause를 숨기지 않는다.
@@ -146,3 +146,10 @@ also do not prove an empty live-ticket set. Add independent context/group/live-
 ticket axes, checked view arithmetic, a no-context broken fake, exact causal
 family assertions, proptest shrinking/persisted seeds, registered Loom models,
 and an executed Miri subset before `QUALIFIED`.
+
+Current-source evidence is refreshed at
+`0c126a25aeab11f457e20c4a209fc7bb631ea859` in
+[`receipts/2026-09-21T072928Z-0c126a2.md`](receipts/2026-09-21T072928Z-0c126a2.md).
+QMP-090 remains `IMPLEMENTED`; the receipt does not substitute deterministic
+traces for proptest shrinking, Loom, Miri, or independent group/context/live-
+ticket state.

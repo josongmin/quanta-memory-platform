@@ -72,6 +72,12 @@ public:
   same-store reentry from client `Hash`/`Clone`/`CanonicalKey` callbacks;
   callers may retry after the in-flight operation. A successful `close()` is
   terminal and repeated close is idempotent; later writes return `Closed`.
+- Payload entries use collision-safe canonical/reference digest indexes and
+  stable reusable slots. `PayloadRef` must implement `Eq + Hash`; exact value
+  equality is still checked inside a digest bucket. `RetainedCostV1` charges
+  both retained digest-index slots, so this semantic cost is not allocator RSS.
+  Revocable entries use FIFO `VecDeque` ownership; rollback restores the front
+  and reclaim drains the front without repeatedly shifting all survivors.
 - Transcript idempotency evidence is finite by default. Configure
   `TranscriptRetentionPolicyV2::fail_closed(count, bytes)` on the transcript
   builder when the default 65,536-entry/64-MiB horizon is unsuitable. Exact
@@ -130,7 +136,15 @@ cargo deny --all-features check
 scripts/check-workspace.sh
 # repo-local doctor rail:
 scripts/memory-platform-doctor
+
+# source-bound single-thread structural smoke; not a production perf gate
+scripts/run-scaling-bench.sh --smoke
 ```
+
+The scaling smoke exercises public budgeted builder paths and records source
+SHA/tree, toolchain, machine, entry count and ns/op. It does not qualify
+contention, allocator/RSS drift, core-ledger cardinality, or portable regression
+thresholds; QMP-100 remains the authority for those open gates.
 
 ## Extraction into a standalone repo
 

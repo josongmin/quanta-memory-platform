@@ -108,7 +108,7 @@ Owner structs/hot paths:
 ## RED/perf tests
 
 - source/behavior test: `payload_lookup_probe_count_is_n_independent`
-- `revocable_full_drain_has_linear_total_work`
+- `revocable_full_drain_uses_fifo_deque_without_front_shifts`
 - `feature_matrix_is_warning_free`
 - `ledger_release_work_is_bounded_by_affected_slots`, 10K/100K live owners; core overflow negative fixtures preserve exact denial before/after optimization
 - benchmark smoke가 실제 public builder/store path를 사용
@@ -116,21 +116,42 @@ Owner structs/hot paths:
 
 ## Acceptance
 
-- [ ] payload unique-fill이 O(N²) scan을 하지 않는다.
-- [ ] revocable full drain이 O(N²) shift를 하지 않는다.
-- [ ] public semantics/accounting invariants가 기존 conformance를 통과한다.
-- [ ] benchmark results가 source SHA/toolchain/hardware와 묶인다.
+- [x] payload unique-fill이 O(N²) scan을 하지 않는다.
+- [x] revocable full drain이 O(N²) shift를 하지 않는다.
+- [x] public semantics/accounting invariants가 기존 conformance를 통과한다.
+- [x] benchmark results가 source SHA/toolchain/hardware와 묶인다.
 - [ ] contention 및 memory drift scenario가 존재한다.
-- [ ] bare/single-feature matrix가 `-D warnings`로 clean하다.
-- [ ] docs의 performance claim이 실제 executable target과 일치한다.
+- [x] bare/single-feature matrix가 `-D warnings`로 clean하다.
+- [x] docs의 performance claim이 실제 executable target과 일치한다.
 
 ## Verification
 
 ```bash
 cargo test -p quanta-memory-platform-facade --all-features
-cargo bench -p quanta-memory-platform-facade --all-features
+scripts/run-scaling-bench.sh --smoke
 tools/ci/feature-matrix.sh
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 ```
 
 PERF receipt가 없으면 코드가 빨라 보여도 ticket은 `QUALIFIED`가 아니다.
+
+## Implementation checkpoint (2026-09-21)
+
+At `0c126a25aeab11f457e20c4a209fc7bb631ea859`:
+
+- payload entries use stable `Vec<Option<Entry>>` slots plus collision-safe
+  canonical/reference digest buckets. Deleted slots are reused. Duplicate,
+  pin/count and delete operations inspect only the digest bucket and still
+  compare exact client values before acting.
+- revocable FIFO ownership uses `VecDeque`; normal append, rollback and drain
+  are `push_back`, `push_front` and `pop_front` respectively.
+- `benches/scaling.rs` exercises public budgeted builders for payload unique/
+  dedup and revocable fill/drain. `scripts/run-scaling-bench.sh --smoke` rejects
+  a dirty source and emits source SHA/tree, toolchain and machine metadata.
+- the executable smoke is part of the canonical standalone extraction file set.
+
+The local 1K/10K single-thread samples are recorded in
+[`receipts/2026-09-21T072928Z-0c126a2.md`](receipts/2026-09-21T072928Z-0c126a2.md).
+They are observation, not a portable threshold. QMP-100 is `IMPLEMENTED`, not
+`QUALIFIED`: 2/8/32-thread distributions, allocator/RSS drift, enforced
+regression thresholds, and the core ledger full-map hot path remain open.

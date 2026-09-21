@@ -49,13 +49,13 @@
 | [QMP-010](QMP-010-policy-totality/TICKET.md) | P1 | IMPLEMENTED | mandatory class totality와 validated policy authority | QMP-000 | core `policy.rs`, `config.rs`, builder/policy tests |
 | [QMP-020](QMP-020-reservation-lifecycle/TICKET.md) | P1 | IMPLEMENTED | raw/discardable authority sealed behind managed RAII; poisoned commit retains rollback authority; runtime qualification deferred | QMP-010 | core `ledger.rs`, recharge/control seams |
 | [QMP-030](QMP-030-enforced-builder-runtime-view/TICKET.md) | P1 | QUALIFIED | enforced builder/runtime scratch and managed RAII authority; current builder/control/public surface refreshed at `f9f6d15` | QMP-010, QMP-020 | core/facade builders, broker/control/scratch API, examples |
-| [QMP-040](QMP-040-store-lifecycle/TICKET.md) | P1 | IMPLEMENTED | store construction typestate, close/drain, callback lock discipline | QMP-020, QMP-030 | facade shared builder/accounting + all store services |
-| [QMP-050](QMP-050-total-retained-cost/TICKET.md) | P1 | IMPLEMENTED | total retained-cost accounting; b18e47d clean doctor, downstream terminal proof open | QMP-040 | measure/accounting + store entry cost paths |
-| [QMP-060](QMP-060-transcript-tombstones/TICKET.md) | P1 | QUALIFIED | bounded fail-closed evidence horizon, typed stats/reconfigure, 616-test doctor and real extraction refreshed at `f9f6d15` | QMP-050 | transcript types/service/builder |
-| [QMP-070](QMP-070-spill-transfer-backings/TICKET.md) | P1 | QUALIFIED | recovery-payload/ack, panic fencing, fault injection, 594-test doctor and HEAD-bound extraction passed through `4fdac520` | QMP-020, QMP-040, QMP-050 | revocable/spill/backings/builders |
+| [QMP-040](QMP-040-store-lifecycle/TICKET.md) | P1 | QUALIFIED | five-store lifecycle oracle, exact close/drop authority and hostile panic-payload containment pass at `0c126a2` | QMP-020, QMP-030 | facade shared lifecycle + all store services |
+| [QMP-050](QMP-050-total-retained-cost/TICKET.md) | P1 | IMPLEMENTED | total retained-cost and independent underbilling oracles pass at `0c126a2`; public migration/spill-identity cost open | QMP-040 | measure/accounting + store entry cost paths |
+| [QMP-060](QMP-060-transcript-tombstones/TICKET.md) | P1 | QUALIFIED | bounded fail-closed evidence horizon, typed stats/reconfigure, 620-test doctor and real extraction refreshed at `0c126a2` | QMP-050 | transcript types/service/builder |
+| [QMP-070](QMP-070-spill-transfer-backings/TICKET.md) | P1 | QUALIFIED | recovery-payload/ack protocol preserved by VecDeque rewrite; 620-test doctor and extraction refreshed at `0c126a2` | QMP-020, QMP-040, QMP-050 | revocable/spill/backings/builders |
 | [QMP-080](QMP-080-policy-runtime-semantics/TICKET.md) | P2 | QUALIFIED | canonical reserve/recharge/reconfigure postimages, protected floors, bounded out-of-lock reclaim, weighted burst and provenance pass at `f9f6d15` | QMP-010, QMP-020, QMP-030 | scheduler/controller/control/config |
-| [QMP-090](QMP-090-conformance-model/TICKET.md) | P1 | IMPLEMENTED | independent literal oracle와 broken-fake/model trace implemented; proptest/Loom/Miri 및 독립 context/group/live-ticket 축 open | QMP-020, QMP-040, QMP-070 | testkit conformance/fakes/faults |
-| [QMP-100](QMP-100-scaling-benchmarks/TICKET.md) | P2 | IN_PROGRESS | payload/revocable confirmed O(N²) paths under active structural remediation; PERF authority remains open | QMP-040, QMP-050, QMP-070 | payload/revocable containers, benches, CI scripts |
+| [QMP-090](QMP-090-conformance-model/TICKET.md) | P1 | IMPLEMENTED | 33 current broken/honest oracle tests pass at `0c126a2`; proptest/Loom/Miri 및 독립 context/group/live-ticket 축 open | QMP-020, QMP-040, QMP-070 | testkit conformance/fakes/faults |
+| [QMP-100](QMP-100-scaling-benchmarks/TICKET.md) | P2 | IMPLEMENTED | payload indexed buckets/slot reuse and revocable VecDeque remove confirmed O(N²) paths; source-bound smoke exists, contention/memory/core threshold proof open | QMP-040, QMP-050, QMP-070 | payload/revocable containers, benches, CI scripts |
 | [QMP-110](QMP-110-operability-observation/TICKET.md) | P2 | BLOCKED | typed observation, poison truth, bounded telemetry | QMP-030, QMP-040, QMP-080 | stats traits, metrics adapters, broker/store emitters |
 | [QMP-120](QMP-120-standalone-extraction/TICKET.md) | P1 | IMPLEMENTED | local HEAD/tree/blob/mode-bound extraction and negative fixtures pass at `4fdac520`; remote workflow remains unobserved | QMP-000 | extraction manifest/scripts, lockfile, release CI |
 | [QMP-130](QMP-130-host-adoption/TICKET.md) | P1 | BLOCKED | Semantica currently resolves adjacent shared-main QMP, not the audited/qualified revision; exact-root qualification absent | QMP-030..QMP-120 | external host repo only; QMP repo read-only except receipts |
@@ -78,7 +78,7 @@
 | P1-09 reclaim→in-memory spill loses ownership | QMP-070 | source/destination receipt transfer E2E |
 | P1-10 actual extraction fails | QMP-120 | fresh actual extraction + clean git + locked build |
 | P1-D01 saturated admission issues an unaccounted live ticket (2026-09-21 delta) | QMP-020 | `u64::MAX-10` 뒤 `100` 거부 + exact post-release accounting |
-| P1-D02 generic store delete/remove can abort on panicking destructors (2026-09-21 delta) | QMP-040 | two-field/outer-unwind subprocess + exact refund, repeatable readable postimage |
+| P1-D02 generic store delete/remove can abort on panicking destructors (2026-09-21 delta; locally closed at `0c126a2`) | QMP-040 | two-field/outer-unwind/hostile-payload subprocess + exact refund, repeatable readable postimage |
 | P1-F01 public cloneable raw ticket can be dropped while charge remains live | QMP-020, QMP-030, QMP-140 | raw ticket/root exports removed or made owned RAII; compile-fail bypass probe + drop/refund E2E |
 | P1-F02 durable spill has ambiguous commit/retry outcomes, sequence ABA and panic ownership loss | QMP-070, QMP-090 | persisted intent/idempotency fence, monotonic identity, fault-injected reconcile/retry/panic tests |
 | P1-F03 extraction is not bound to committed HEAD bytes or executable modes | QMP-120, QMP-140 | dirty tracked-byte/mode negative fixtures + HEAD/tree digest equality |
@@ -95,7 +95,7 @@
 | P2-09 poison reported as zero | QMP-110 | typed observation failure tests |
 | P2-10 moka/scc compile-only backings | QMP-070 | canonical backing port parity suite or feature removal |
 | P2-11 spill count wrong after restart | QMP-070 | reopened redb controller reconciliation |
-| P2-12 payload/revocable/core release O(N²), global mutex (59f0c4f static delta) | QMP-100 | affected-slot exact preflight, asymptotic source cut + benchmark thresholds |
+| P2-12 payload/revocable/core release O(N²), global mutex (facade paths closed; core/threshold work open) | QMP-100 | indexed payload + VecDeque receipt; affected-slot core preflight, contention and thresholds remain |
 | P2-13 saturating counter hides live bytes | QMP-040, QMP-050 | checked overflow fail-closed tests |
 | P2-14 noop spill discards and succeeds | QMP-070 | typed unsupported or explicit discard API test |
 | P2-15 public bumpalo bypass | QMP-030, QMP-140 | budgeted wrapper or public removal compile test |
@@ -105,7 +105,7 @@
 | P2-F03 docs and ticket commands name stale semantics/nonexistent selectors | QMP-000, QMP-140 | doc-command execution audit with selected-count checks and generated current-source claims |
 | P2-F04 in-process spill deep-clones uncharged binding strings per entry | QMP-050, QMP-070 | shared/bounded binding identity or exact charged cost; adversarial long-identity accounting test |
 | Proof: telemetry unwired | QMP-110 | event emission/cardinality tests |
-| Proof: no benchmark/fuzz/loom | QMP-090, QMP-100 | executable rails and receipts |
+| Proof: no contention threshold/proptest/loom | QMP-090, QMP-100 | current smoke exists; generative/concurrency rails and enforced thresholds remain |
 | Proof: feature warnings allowed | QMP-100, QMP-120 | `-D warnings` matrix |
 | Proof: docs claim no limitations | QMP-140 | docs generated from current ticket state |
 | Proof: host non-memory ExecutionBudget helpers unused | QMP-130 | host call-site census + behavior tests |
