@@ -1,4 +1,8 @@
-//! Lock-free concurrent index backing over `scc` (opt-in `revocable-scc` feature).
+//! Experimental concurrent size index over `scc` (opt-in
+//! `experimental-revocable-scc-index` feature).
+//!
+//! This is not a canonical revocable-store backing: it owns neither payloads
+//! nor accounting transfer authority.
 //!
 //! A concurrent `id -> charged_bytes` index for revocable entries. Unlike the
 //! previous stub, `insert` no longer silently swallows its result: a duplicate

@@ -71,6 +71,16 @@ public:
   same-store reentry from client `Hash`/`Clone`/`CanonicalKey` callbacks;
   callers may retry after the in-flight operation. A successful `close()` is
   terminal and repeated close is idempotent; later writes return `Closed`.
+- Transcript replay evidence uses `TranscriptRetentionPolicyV2` with explicit
+  count and byte limits. Saturation rejects only new identities; exact retries
+  and conflicts are resolved from retained evidence before admission. Closing
+  the store ends that in-memory replay horizon.
+- Revocable transfer uses `prepare_reclaim_one()` to return a `ReclaimedEntry`
+  that still owns its accounting lease. `discard_one()` is the separate
+  destructive path. Spill failures return the original handle, while success
+  receipts distinguish discard, in-process retention, and durable commit.
+  The redb target deliberately rejects raw restore until reverse transfer can
+  charge the host destination before removing durable authority.
 - Runtime scratch obtained through `LiveMemoryPlatform::attach_runtime` is
   charged against the same broker ledger, execution-scratch cap, class cap,
   owner/group admission, and release lifecycle as direct broker charges.

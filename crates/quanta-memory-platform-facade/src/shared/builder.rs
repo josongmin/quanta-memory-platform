@@ -66,7 +66,7 @@ use crate::shared::accounting::{AccountingUnset, Budgeted};
 ))]
 use crate::shared::measure::ByteSized;
 #[cfg(feature = "transcript")]
-use crate::transcript_store::{service::SimpleSessionTranscriptStore, TranscriptRetentionPolicyV1};
+use crate::transcript_store::{service::SimpleSessionTranscriptStore, TranscriptRetentionPolicyV2};
 #[cfg(feature = "payload_store")]
 use quanta_memory_platform_core::MemoryContextHandle;
 
@@ -605,7 +605,7 @@ impl<Payload, Mode> PreparedPublicationServiceBuilder<Payload, Mode> {
 pub struct SessionTranscriptStoreBuilder<SessionId, MessageId, Message, Mode> {
     binding: Option<StoreBindingHandle>,
     accounting: Mode,
-    retention: TranscriptRetentionPolicyV1,
+    retention: TranscriptRetentionPolicyV2,
     _marker: PhantomData<fn() -> (SessionId, MessageId, Message)>,
 }
 
@@ -617,7 +617,7 @@ impl<SessionId, MessageId, Message> Default
         Self {
             binding: None,
             accounting: AccountingUnset::default(),
-            retention: TranscriptRetentionPolicyV1::process_lifetime(),
+            retention: TranscriptRetentionPolicyV2::default(),
             _marker: PhantomData,
         }
     }
@@ -652,7 +652,7 @@ impl<SessionId, MessageId, Message>
         Self {
             binding: None,
             accounting: Budgeted::new(broker),
-            retention: TranscriptRetentionPolicyV1::process_lifetime(),
+            retention: TranscriptRetentionPolicyV2::default(),
             _marker: PhantomData,
         }
     }
@@ -699,7 +699,7 @@ impl<SessionId, MessageId, Message, Mode>
     }
 
     #[must_use]
-    pub fn with_retention_policy(mut self, retention: TranscriptRetentionPolicyV1) -> Self {
+    pub fn with_retention_policy(mut self, retention: TranscriptRetentionPolicyV2) -> Self {
         self.retention = retention;
         self
     }

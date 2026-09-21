@@ -4,7 +4,7 @@ use std::sync::Mutex;
 
 use quanta_memory_platform_core::{MemoryError, MemoryResult};
 
-use crate::spill::SpillController;
+use crate::spill::{SpillController, SpillOwnership, SpillReceiptV1, SpillTransferError};
 
 /// A destination a spillable handle can be flushed to — and restored from.
 ///
@@ -17,11 +17,18 @@ use crate::spill::SpillController;
 /// merely offloads-and-forgets (eviction) keeps the default `Ok(None)`, while a
 /// retaining target ([`RetainingSpillTarget`]) returns spilled handles in order.
 pub trait SpillTarget<Handle> {
+    /// Ownership level established by a successful commit.
+    fn ownership(&self) -> SpillOwnership;
+
     /// Whether the target can currently accept a spill.
     fn is_available(&self) -> bool;
 
     /// Accept the spilled handle. Only called when [`Self::is_available`] is true.
-    fn accept(&self, handle: Handle) -> MemoryResult<()>;
+    fn accept(&self, handle: Handle) -> Result<SpillReceiptV1, SpillTransferError<Handle>>;
+
+    /// Current committed destination inventory. Controllers delegate telemetry
+    /// to the destination so reopen cannot reset it to zero.
+    fn inventory_count(&self) -> MemoryResult<u64>;
 
     /// Restore the next previously spilled handle (oldest first).
     ///
@@ -40,14 +47,60 @@ pub trait SpillTarget<Handle> {
     }
 }
 
-/// A spill controller that does nothing and always succeeds. Useful where the host
-/// has not configured a spill target and spilling is a no-op.
-#[derive(Clone, Debug, Default)]
-pub struct NoopSpillController;
+pub(crate) mod sealed {
+    pub trait DurableSpillTargetSealed {}
+}
 
-impl<Handle> SpillController<Handle> for NoopSpillController {
-    fn spill(&self, _handle: Handle) -> MemoryResult<()> {
-        Ok(())
+/// Sealed marker for targets whose successful receipt means the handle survived
+/// a durable commit. In-process and downstream targets cannot opt into source
+/// release without repository-owned conformance.
+pub trait DurableSpillTarget<Handle>:
+    SpillTarget<Handle> + sealed::DurableSpillTargetSealed
+{
+}
+
+#[cfg(feature = "revocable_store")]
+#[derive(Debug)]
+pub struct DurableSpillTransferError<Key, Value> {
+    error: MemoryError,
+    entry: Box<crate::revocable_store::ReclaimedEntry<Key, Value>>,
+}
+
+#[cfg(feature = "revocable_store")]
+impl<Key, Value> DurableSpillTransferError<Key, Value> {
+    #[must_use]
+    pub fn error(&self) -> &MemoryError {
+        &self.error
+    }
+
+    #[must_use]
+    pub fn into_parts(self) -> (MemoryError, crate::revocable_store::ReclaimedEntry<Key, Value>) {
+        (self.error, *self.entry)
+    }
+}
+
+/// Explicitly unavailable spill controller. It never reports successful
+/// persistence and always returns the original handle.
+#[derive(Clone, Debug, Default)]
+pub struct UnavailableSpillController;
+
+impl<Handle> SpillController<Handle> for UnavailableSpillController {
+    fn spill(&self, handle: Handle) -> Result<SpillReceiptV1, SpillTransferError<Handle>> {
+        Err(SpillTransferError::new(
+            MemoryError::capacity("spill target is not configured"),
+            handle,
+        ))
+    }
+}
+
+/// Explicit destructive eviction. Success is typed as `Discarded` and makes no
+/// restore or persistence claim.
+#[derive(Clone, Debug, Default)]
+pub struct DiscardSpillController;
+
+impl<Handle> SpillController<Handle> for DiscardSpillController {
+    fn spill(&self, _handle: Handle) -> Result<SpillReceiptV1, SpillTransferError<Handle>> {
+        Ok(SpillReceiptV1::new(SpillOwnership::Discarded))
     }
 }
 
@@ -60,17 +113,64 @@ impl<Handle> SpillController<Handle> for NoopSpillController {
 #[derive(Clone, Debug, Default)]
 pub struct RoutedSpillController<T> {
     target: T,
-    spilled_count: std::sync::Arc<AtomicU64>,
 }
 
 impl<T> RoutedSpillController<T> {
     pub fn new(target: T) -> Self {
-        Self { target, spilled_count: std::sync::Arc::new(AtomicU64::new(0)) }
+        Self { target }
     }
 
-    /// Number of handles successfully spilled. Never counts a failed spill.
-    pub fn spilled_count(&self) -> u64 {
-        self.spilled_count.load(Ordering::SeqCst)
+    /// Current destination inventory, including durable rows recovered after a
+    /// process restart.
+    pub fn spilled_count<Handle>(&self) -> MemoryResult<u64>
+    where
+        T: SpillTarget<Handle>,
+    {
+        self.target.inventory_count()
+    }
+}
+
+#[cfg(feature = "revocable_store")]
+impl<T> RoutedSpillController<T> {
+    /// Commit a serialized copy to a durable tier while the source entry still
+    /// owns its live accounting lease. Only after the durable receipt exists is
+    /// the source authority dropped and released. Encoding or destination
+    /// failure returns the complete source entry unchanged.
+    pub fn spill_reclaimed_durable<Key, Value, Encode>(
+        &self,
+        entry: crate::revocable_store::ReclaimedEntry<Key, Value>,
+        encode: Encode,
+    ) -> Result<SpillReceiptV1, DurableSpillTransferError<Key, Value>>
+    where
+        T: DurableSpillTarget<Vec<u8>>,
+        Encode: FnOnce(&Key, &Value) -> MemoryResult<Vec<u8>>,
+    {
+        let payload = match encode(entry.key(), entry.value()) {
+            Ok(payload) => payload,
+            Err(error) => return Err(DurableSpillTransferError { error, entry: Box::new(entry) }),
+        };
+        match self.spill(payload) {
+            Ok(receipt) => {
+                if receipt.ownership() != SpillOwnership::DurableCommitted {
+                    return Err(DurableSpillTransferError {
+                        error: MemoryError::InvalidState(
+                            "durable spill target returned a non-durable receipt".to_string(),
+                        ),
+                        entry: Box::new(entry),
+                    });
+                }
+                // ManagedCharge::drop releases immediately or defers exact
+                // release through its issuing broker. It can never create an
+                // uncharged source-resident interval before destination commit.
+                drop(entry);
+                Ok(receipt)
+            }
+            Err(failure) => {
+                let (error, payload) = failure.into_parts();
+                drop(payload);
+                Err(DurableSpillTransferError { error, entry: Box::new(entry) })
+            }
+        }
     }
 }
 
@@ -78,35 +178,18 @@ impl<Handle, T> SpillController<Handle> for RoutedSpillController<T>
 where
     T: SpillTarget<Handle>,
 {
-    fn spill(&self, handle: Handle) -> MemoryResult<()> {
+    fn spill(&self, handle: Handle) -> Result<SpillReceiptV1, SpillTransferError<Handle>> {
         if !self.target.is_available() {
-            return Err(MemoryError::capacity("spill target unavailable"));
+            return Err(SpillTransferError::new(
+                MemoryError::capacity("spill target unavailable"),
+                handle,
+            ));
         }
-        // Reserve the count slot BEFORE accept so a concurrent restore can never
-        // decrement past a not-yet-counted spill and permanently drift the count
-        // (the saturating_sub floor would otherwise lose that decrement). Roll the
-        // increment back if accept fails, so a failed spill still counts nothing.
-        self.spilled_count.fetch_add(1, Ordering::SeqCst);
-        if let Err(err) = self.target.accept(handle) {
-            // Roll back the reservation with a SATURATING decrement, symmetric with
-            // the restore path: a plain fetch_sub could wrap to u64::MAX if a
-            // concurrent restore already drove the count to 0.
-            let _ = self
-                .spilled_count
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |c| Some(c.saturating_sub(1)));
-            return Err(err);
-        }
-        Ok(())
+        self.target.accept(handle)
     }
 
     fn restore(&self) -> MemoryResult<Option<Handle>> {
         let restored = self.target.restore()?;
-        if restored.is_some() {
-            // A restored handle is no longer spilled; never underflow the count.
-            let _ = self
-                .spilled_count
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |c| Some(c.saturating_sub(1)));
-        }
         Ok(restored)
     }
 }
@@ -167,23 +250,45 @@ impl<Handle> InMemorySpillTarget<Handle> {
 }
 
 impl<Handle> SpillTarget<Handle> for InMemorySpillTarget<Handle> {
+    fn ownership(&self) -> SpillOwnership {
+        SpillOwnership::InProcessRetained
+    }
+
     fn is_available(&self) -> bool {
         self.available.load(Ordering::SeqCst)
     }
 
-    fn accept(&self, handle: Handle) -> MemoryResult<()> {
+    fn accept(&self, handle: Handle) -> Result<SpillReceiptV1, SpillTransferError<Handle>> {
         if !self.available.load(Ordering::SeqCst) {
-            return Err(MemoryError::capacity("spill target unavailable at accept time"));
+            return Err(SpillTransferError::new(
+                MemoryError::capacity("spill target unavailable at accept time"),
+                handle,
+            ));
         }
         // Retain the handle so it can be restored later (two-way tier). Pushed
         // BEFORE bumping the accepted counter so a poisoned-lock failure leaves the
         // counter untouched (fail-closed: a rejected accept counts nothing).
-        self.store
+        let mut store = match self.store.lock() {
+            Ok(store) => store,
+            Err(_) => {
+                return Err(SpillTransferError::new(
+                    MemoryError::InvalidState("spill target store poisoned".to_string()),
+                    handle,
+                ));
+            }
+        };
+        store.push_back(handle);
+        self.accepted.fetch_add(1, Ordering::SeqCst);
+        Ok(SpillReceiptV1::new(self.ownership()))
+    }
+
+    fn inventory_count(&self) -> MemoryResult<u64> {
+        let len = self
+            .store
             .lock()
             .map_err(|_| MemoryError::InvalidState("spill target store poisoned".to_string()))?
-            .push_back(handle);
-        self.accepted.fetch_add(1, Ordering::SeqCst);
-        Ok(())
+            .len();
+        u64::try_from(len).map_err(|_| MemoryError::capacity("spill inventory count overflow"))
     }
 
     fn restore(&self) -> MemoryResult<Option<Handle>> {
@@ -240,19 +345,41 @@ impl<Handle> RetainingSpillTarget<Handle> {
 }
 
 impl<Handle> SpillTarget<Handle> for RetainingSpillTarget<Handle> {
+    fn ownership(&self) -> SpillOwnership {
+        SpillOwnership::InProcessRetained
+    }
+
     fn is_available(&self) -> bool {
         self.available.load(Ordering::SeqCst)
     }
 
-    fn accept(&self, handle: Handle) -> MemoryResult<()> {
+    fn accept(&self, handle: Handle) -> Result<SpillReceiptV1, SpillTransferError<Handle>> {
         if !self.available.load(Ordering::SeqCst) {
-            return Err(MemoryError::capacity("spill target unavailable at accept time"));
+            return Err(SpillTransferError::new(
+                MemoryError::capacity("spill target unavailable at accept time"),
+                handle,
+            ));
         }
-        self.store
+        let mut store = match self.store.lock() {
+            Ok(store) => store,
+            Err(_) => {
+                return Err(SpillTransferError::new(
+                    MemoryError::InvalidState("spill target store poisoned".to_string()),
+                    handle,
+                ));
+            }
+        };
+        store.push_back(handle);
+        Ok(SpillReceiptV1::new(self.ownership()))
+    }
+
+    fn inventory_count(&self) -> MemoryResult<u64> {
+        let len = self
+            .store
             .lock()
             .map_err(|_| MemoryError::InvalidState("spill target store poisoned".to_string()))?
-            .push_back(handle);
-        Ok(())
+            .len();
+        u64::try_from(len).map_err(|_| MemoryError::capacity("spill inventory count overflow"))
     }
 
     fn restore(&self) -> MemoryResult<Option<Handle>> {
@@ -279,7 +406,7 @@ mod tests {
         let controller = RoutedSpillController::new(InMemorySpillTarget::available());
         controller.spill("handle-1".to_string()).expect("spill to available");
         controller.spill("handle-2".to_string()).expect("spill again");
-        assert_eq!(controller.spilled_count(), 2);
+        assert_eq!(controller.spilled_count::<String>().expect("count"), 2);
     }
 
     /// A target that reports available but whose `accept` always fails — drives the
@@ -289,11 +416,20 @@ mod tests {
     struct AcceptFailingTarget;
 
     impl<Handle> SpillTarget<Handle> for AcceptFailingTarget {
+        fn ownership(&self) -> SpillOwnership {
+            SpillOwnership::InProcessRetained
+        }
+
         fn is_available(&self) -> bool {
             true // passes the controller's guard...
         }
-        fn accept(&self, _handle: Handle) -> MemoryResult<()> {
-            Err(MemoryError::capacity("accept always fails")) // ...but accept fails.
+
+        fn accept(&self, handle: Handle) -> Result<SpillReceiptV1, SpillTransferError<Handle>> {
+            Err(SpillTransferError::new(MemoryError::capacity("accept always fails"), handle))
+        }
+
+        fn inventory_count(&self) -> MemoryResult<u64> {
+            Ok(0)
         }
     }
 
@@ -303,11 +439,20 @@ mod tests {
         // is_available() is true, so we pass the guard and increment the count;
         // accept then fails and the increment is rolled back (saturating): 0.
         let r = controller.spill("h".to_string());
-        assert!(matches!(r, Err(MemoryError::Capacity(_))), "accept failure surfaces, got {r:?}");
-        assert_eq!(controller.spilled_count(), 0, "a failed spill counts nothing (rollback)");
+        assert!(
+            matches!(&r, Err(failure) if matches!(failure.error(), MemoryError::Capacity(_))),
+            "accept failure surfaces, got {r:?}"
+        );
+        let (_, recovered) = r.expect_err("failure").into_parts();
+        assert_eq!(recovered, "h", "a failed spill returns source recovery authority");
+        assert_eq!(
+            controller.spilled_count::<String>().expect("count"),
+            0,
+            "a failed spill counts nothing"
+        );
         // Repeated failures never drift the count or wrap it negative.
         let _ = controller.spill("h2".to_string());
-        assert_eq!(controller.spilled_count(), 0, "rollback is saturating and stable");
+        assert_eq!(controller.spilled_count::<String>().expect("count"), 0);
     }
 
     #[test]
@@ -316,11 +461,11 @@ mod tests {
         let controller = RoutedSpillController::new(InMemorySpillTarget::unavailable());
         let err = controller.spill("handle".to_string()).expect_err("must fail when unavailable");
         assert!(
-            matches!(err, MemoryError::Capacity(_)),
+            matches!(err.error(), MemoryError::Capacity(_)),
             "unavailable spill must be a Capacity error, got {err:?}"
         );
         assert_eq!(
-            controller.spilled_count(),
+            controller.spilled_count::<String>().expect("count"),
             0,
             "a failed spill must not increment the spilled count"
         );
@@ -332,18 +477,30 @@ mod tests {
         // target availability (the one core condition).
         let online = RoutedSpillController::new(InMemorySpillTarget::available());
         online.spill(1u32).expect("online spill ok");
-        assert_eq!(online.spilled_count(), 1);
+        assert_eq!(online.spilled_count::<u32>().expect("count"), 1);
 
         let offline = RoutedSpillController::new(InMemorySpillTarget::unavailable());
         let err = offline.spill(2u32).expect_err("offline rejects");
-        assert!(matches!(err, MemoryError::Capacity(_)), "got {err:?}");
-        assert_eq!(offline.spilled_count(), 0);
+        assert!(matches!(err.error(), MemoryError::Capacity(_)), "got {err:?}");
+        assert_eq!(offline.spilled_count::<u32>().expect("count"), 0);
     }
 
     #[test]
-    fn noop_controller_always_succeeds_without_a_target() {
-        let controller = NoopSpillController;
-        SpillController::spill(&controller, "anything".to_string()).expect("noop spill");
+    fn unavailable_controller_fails_and_returns_the_handle() {
+        let controller = UnavailableSpillController;
+        let failure = SpillController::spill(&controller, "anything".to_string())
+            .expect_err("unconfigured spill must fail");
+        let (error, handle) = failure.into_parts();
+        assert!(matches!(error, MemoryError::Capacity(_)));
+        assert_eq!(handle, "anything");
+    }
+
+    #[test]
+    fn discard_controller_has_explicit_discard_receipt() {
+        let controller = DiscardSpillController;
+        let receipt =
+            SpillController::spill(&controller, "anything".to_string()).expect("explicit discard");
+        assert_eq!(receipt.ownership(), SpillOwnership::Discarded);
     }
 
     #[test]
@@ -354,18 +511,21 @@ mod tests {
         // unchanged. Capture counts BEFORE the denied op, assert identical AFTER.
         let controller = RoutedSpillController::new(InMemorySpillTarget::available());
         controller.spill("first".to_string()).expect("first spill ok");
-        assert_eq!(controller.spilled_count(), 1);
+        assert_eq!(controller.spilled_count::<String>().expect("count"), 1);
 
         // The controller owns the target by value; take availability offline by
         // building a fresh offline controller representing the same transition path.
         // (RoutedSpillController moves the target, so we model the offline state on a
         // separate controller and assert the denied op is inert.)
         let offline = RoutedSpillController::new(InMemorySpillTarget::unavailable());
-        let count_before = offline.spilled_count();
+        let count_before = offline.spilled_count::<String>().expect("count");
         let denied = offline.spill("blocked".to_string());
-        assert!(matches!(denied, Err(MemoryError::Capacity(_))), "got {denied:?}");
+        assert!(
+            matches!(&denied, Err(failure) if matches!(failure.error(), MemoryError::Capacity(_))),
+            "got {denied:?}"
+        );
         assert_eq!(
-            offline.spilled_count(),
+            offline.spilled_count::<String>().expect("count"),
             count_before,
             "a denied spill must not advance the spilled counter"
         );
@@ -378,7 +538,7 @@ mod tests {
         assert_eq!(target.accepted_count(), 1);
         target.set_available(false);
         let err = SpillTarget::accept(&target, 2u32).expect_err("accept while offline must fail");
-        assert!(matches!(err, MemoryError::Capacity(_)), "got {err:?}");
+        assert!(matches!(err.error(), MemoryError::Capacity(_)), "got {err:?}");
         assert_eq!(target.accepted_count(), 1, "rejected accept must not increment count");
     }
 
@@ -468,7 +628,7 @@ mod tests {
     fn retaining_target_offline_rejects_accept_but_state_unchanged() {
         let target = RetainingSpillTarget::<u32>::unavailable();
         let err = SpillTarget::accept(&target, 1u32).expect_err("offline accept rejected");
-        assert!(matches!(err, MemoryError::Capacity(_)), "got {err:?}");
+        assert!(matches!(err.error(), MemoryError::Capacity(_)), "got {err:?}");
         assert_eq!(target.retained_count(), 0, "rejected accept retains nothing");
     }
 
@@ -519,16 +679,16 @@ mod tests {
         let controller = RoutedSpillController::new(RetainingSpillTarget::available());
         controller.spill("h1".to_string()).expect("spill 1");
         controller.spill("h2".to_string()).expect("spill 2");
-        assert_eq!(controller.spilled_count(), 2);
+        assert_eq!(controller.spilled_count::<String>().expect("count"), 2);
 
         // Each restore pulls a handle back and decrements the live spilled count.
         assert_eq!(controller.restore().expect("restore 1"), Some("h1".to_string()));
-        assert_eq!(controller.spilled_count(), 1);
+        assert_eq!(controller.spilled_count::<String>().expect("count"), 1);
         assert_eq!(controller.restore().expect("restore 2"), Some("h2".to_string()));
-        assert_eq!(controller.spilled_count(), 0);
+        assert_eq!(controller.spilled_count::<String>().expect("count"), 0);
         // Draining past empty is inert and never underflows the count.
         assert_eq!(controller.restore().expect("restore empty"), None);
-        assert_eq!(controller.spilled_count(), 0);
+        assert_eq!(controller.spilled_count::<String>().expect("count"), 0);
     }
 
     #[test]
@@ -553,19 +713,27 @@ mod tests {
             h.join().expect("thread panicked");
         }
         let total = u64::from(threads * per_thread);
-        assert_eq!(controller.spilled_count(), total, "every concurrent spill counted once");
+        assert_eq!(
+            controller.spilled_count::<String>().expect("count"),
+            total,
+            "every concurrent spill counted once"
+        );
 
         let mut drained = 0u64;
         while controller.restore().expect("restore").is_some() {
             drained += 1;
         }
         assert_eq!(drained, total, "all spilled handles restored");
-        assert_eq!(controller.spilled_count(), 0, "count balances to 0 after a full drain");
+        assert_eq!(
+            controller.spilled_count::<String>().expect("count"),
+            0,
+            "count balances to 0 after a full drain"
+        );
     }
 
     #[test]
-    fn noop_controller_restore_is_none() {
-        let controller = NoopSpillController;
-        assert_eq!(SpillController::<u32>::restore(&controller).expect("noop restore"), None);
+    fn unavailable_controller_restore_is_none() {
+        let controller = UnavailableSpillController;
+        assert_eq!(SpillController::<u32>::restore(&controller).expect("empty restore"), None);
     }
 }

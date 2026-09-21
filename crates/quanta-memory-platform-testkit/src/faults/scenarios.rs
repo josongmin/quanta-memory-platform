@@ -156,17 +156,34 @@ pub fn drive_rebuild_race_accepts_write_too_early() -> FaultOutcome {
 #[must_use]
 pub fn drive_spill_failure_after_reservation() -> FaultOutcome {
     let controller = RoutedSpillController::new(InMemorySpillTarget::unavailable());
-    let before = controller.spilled_count();
-    let result = controller.spill("spillable-handle".to_string());
-    let after = controller.spilled_count();
-    match result {
-        Err(e) if before == after => FaultOutcome::Contained {
-            evidence: format!("spill failed closed ({e}); spilled_count stayed at {after}"),
+    let handle = "spillable-handle".to_string();
+    let before = controller.spilled_count::<String>();
+    let result = controller.spill(handle.clone());
+    let after = controller.spilled_count::<String>();
+    match (result, before, after) {
+        (Err(failure), Ok(before), Ok(after)) => {
+            let (error, recovered) = failure.into_parts();
+            if before == after && recovered == handle {
+                FaultOutcome::Contained {
+                    evidence: format!(
+                        "spill failed closed ({error}); source authority recovered; spilled_count stayed at {after}"
+                    ),
+                }
+            } else {
+                FaultOutcome::Escaped {
+                    evidence: format!(
+                        "spill failed ({error}) but source/counter drifted: recovered={recovered:?} expected={handle:?} count={before}->{after}"
+                    ),
+                }
+            }
+        }
+        (Err(failure), before, after) => FaultOutcome::Escaped {
+            evidence: format!(
+                "spill failed ({}) but spilled_count observation failed: before={before:?} after={after:?}",
+                failure.error()
+            ),
         },
-        Err(e) => FaultOutcome::Escaped {
-            evidence: format!("spill failed ({e}) but spilled_count moved {before}->{after}"),
-        },
-        Ok(()) => FaultOutcome::Escaped {
+        (Ok(_), _, _) => FaultOutcome::Escaped {
             evidence: "spill to an unavailable target reported success".to_string(),
         },
     }
@@ -175,6 +192,7 @@ pub fn drive_spill_failure_after_reservation() -> FaultOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use quanta_memory_platform_facade::{SpillOwnership, SpillReceiptV1, SpillTransferError};
 
     #[test]
     fn reclaim_returns_zero_is_contained() {
@@ -211,15 +229,13 @@ mod tests {
     // the honest fail-closed controller as the `Contained` positive pole.
     #[test]
     fn spill_fault_classification_reports_escaped_for_a_lying_controller() {
-        use quanta_memory_platform_core::MemoryResult;
-
         // Shared classification shape: Err => Contained, Ok => Escaped.
         fn classify<C: SpillController<String>>(controller: &C) -> FaultOutcome {
             match controller.spill("spillable-handle".to_string()) {
                 Err(e) => {
                     FaultOutcome::Contained { evidence: format!("spill failed closed ({e})") }
                 }
-                Ok(()) => FaultOutcome::Escaped {
+                Ok(_) => FaultOutcome::Escaped {
                     evidence: "spill to an unavailable target reported success".to_string(),
                 },
             }
@@ -229,8 +245,8 @@ mod tests {
         #[derive(Debug, Default)]
         struct LyingSpillController;
         impl SpillController<String> for LyingSpillController {
-            fn spill(&self, _handle: String) -> MemoryResult<()> {
-                Ok(()) // contract violation: an unavailable spill must fail closed.
+            fn spill(&self, _handle: String) -> Result<SpillReceiptV1, SpillTransferError<String>> {
+                Ok(SpillReceiptV1::new(SpillOwnership::InProcessRetained))
             }
         }
 

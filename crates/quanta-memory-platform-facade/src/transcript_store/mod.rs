@@ -69,10 +69,22 @@ pub enum TranscriptAppendDispositionV1 {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TranscriptAppendErrorV1 {
-    PayloadConflict { sequence: u64 },
-    SequenceConflict { sequence: u64 },
+    PayloadConflict {
+        sequence: u64,
+    },
+    SequenceConflict {
+        sequence: u64,
+    },
     MessageIdConflict,
-    ExpiredIdentity { sequence: u64 },
+    ExpiredIdentity {
+        sequence: u64,
+    },
+    EvidenceSaturated {
+        retained_count: usize,
+        retained_bytes: u64,
+        max_count: usize,
+        max_bytes: u64,
+    },
     Accounting(MemoryError),
     Storage(MemoryError),
 }
@@ -90,6 +102,15 @@ impl Display for TranscriptAppendErrorV1 {
             Self::ExpiredIdentity { sequence } => {
                 write!(f, "transcript identity evidence expired at sequence {sequence}")
             }
+            Self::EvidenceSaturated {
+                retained_count,
+                retained_bytes,
+                max_count,
+                max_bytes,
+            } => write!(
+                f,
+                "transcript identity evidence saturated: count {retained_count}/{max_count}, bytes {retained_bytes}/{max_bytes}"
+            ),
             Self::Accounting(error) => write!(f, "transcript accounting error: {error}"),
             Self::Storage(error) => write!(f, "transcript storage error: {error}"),
         }
@@ -168,29 +189,60 @@ impl<MessageId, Message> TranscriptRecordV1<MessageId, Message> {
     }
 }
 
-/// Dedupe evidence policy for the in-memory backing.
+/// Bounded process-lifetime dedupe-evidence policy for the in-memory backing.
 ///
-/// Active message bodies may be truncated, but the sequence/message-id/body
-/// digest tombstone remains for the process lifetime. This proves only
-/// process-lifetime idempotency, never restart durability.
+/// Active bodies may be truncated, but identity evidence remains until the
+/// store closes. Once either limit would be exceeded, a new identity is
+/// rejected without mutation. Existing exact retries and conflicts remain
+/// observable at saturation. This policy makes no restart-durability claim.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct TranscriptRetentionPolicyV1;
+pub struct TranscriptRetentionPolicyV2 {
+    max_tombstone_count: usize,
+    max_tombstone_bytes: u64,
+}
 
-impl TranscriptRetentionPolicyV1 {
-    #[must_use]
-    pub fn process_lifetime() -> Self {
-        Self
+impl TranscriptRetentionPolicyV2 {
+    pub fn fail_closed(max_tombstone_count: usize, max_tombstone_bytes: u64) -> MemoryResult<Self> {
+        if max_tombstone_count == 0 {
+            return Err(MemoryError::capacity(
+                "transcript tombstone count limit must be greater than zero",
+            ));
+        }
+        if max_tombstone_bytes == 0 {
+            return Err(MemoryError::capacity(
+                "transcript tombstone byte limit must be greater than zero",
+            ));
+        }
+        Ok(Self { max_tombstone_count, max_tombstone_bytes })
     }
 
     #[must_use]
-    pub fn retains_process_lifetime_tombstones(self) -> bool {
-        true
+    pub fn max_tombstone_count(self) -> usize {
+        self.max_tombstone_count
+    }
+
+    #[must_use]
+    pub fn max_tombstone_bytes(self) -> u64 {
+        self.max_tombstone_bytes
+    }
+
+    pub(crate) fn admits(self, next_count: usize, next_bytes: u64) -> bool {
+        next_count <= self.max_tombstone_count && next_bytes <= self.max_tombstone_bytes
     }
 }
 
-impl Default for TranscriptRetentionPolicyV1 {
+/// Split observability for active payload and retained idempotency evidence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TranscriptEvidenceStatsV1 {
+    pub tombstone_count: usize,
+    pub tombstone_bytes: u64,
+    pub active_row_count: usize,
+    pub active_row_bytes: u64,
+}
+
+impl Default for TranscriptRetentionPolicyV2 {
     fn default() -> Self {
-        Self::process_lifetime()
+        Self { max_tombstone_count: 65_536, max_tombstone_bytes: 64 * 1024 * 1024 }
     }
 }
 

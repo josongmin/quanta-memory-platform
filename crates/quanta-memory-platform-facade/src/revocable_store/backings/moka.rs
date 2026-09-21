@@ -1,4 +1,8 @@
-//! Concurrent cache backing over `moka` (opt-in `revocable-moka` feature).
+//! Experimental size index over `moka` (opt-in
+//! `experimental-revocable-moka-index` feature).
+//!
+//! This is not a canonical revocable-store backing: it owns neither payloads
+//! nor accounting transfer authority, and autonomous eviction has no receipt.
 //!
 //! A size-bounded concurrent index keyed by entry id, holding each entry's
 //! charged byte size. Eviction is `moka`'s own capacity policy, so callers must

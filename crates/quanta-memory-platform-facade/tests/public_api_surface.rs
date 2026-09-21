@@ -184,7 +184,7 @@ fn names_revocable_store_reexports() {
 use quanta_memory_platform_facade::{
     SessionTranscriptStore, SessionTranscriptStoreBuilder, SimpleSessionTranscriptStore,
     TranscriptAppendDispositionV1, TranscriptAppendErrorV1, TranscriptAppendIdentityV1,
-    TranscriptAppendRequestV1, TranscriptRecordV1, TranscriptRetentionPolicyV1,
+    TranscriptAppendRequestV1, TranscriptRecordV1, TranscriptRetentionPolicyV2,
 };
 
 /// Pins the `transcript` slice's public exports.
@@ -199,7 +199,7 @@ fn names_transcript_reexports() {
     type _Record = TranscriptRecordV1<String, String>;
     type _Error = TranscriptAppendErrorV1;
     type _Disposition = TranscriptAppendDispositionV1;
-    type _Retention = TranscriptRetentionPolicyV1;
+    type _Retention = TranscriptRetentionPolicyV2;
 }
 
 #[cfg(feature = "publish_pipeline")]
@@ -266,8 +266,8 @@ fn prepared_publication_builder_exposes_root_bound_resolution_contract() {
 use quanta_memory_platform_core::MemoryResult;
 #[cfg(feature = "spill")]
 use quanta_memory_platform_facade::{
-    InMemorySpillTarget, NoopSpillController, RetainingSpillTarget, RoutedSpillController,
-    SpillController, SpillTarget,
+    DiscardSpillController, InMemorySpillTarget, RetainingSpillTarget, RoutedSpillController,
+    SpillController, SpillOwnership, SpillTarget, UnavailableSpillController,
 };
 
 /// Pins the `spill` slice's public exports, including the controller and target
@@ -277,7 +277,8 @@ use quanta_memory_platform_facade::{
 fn names_spill_reexports() {
     type _Controllers = (
         Box<dyn SpillController<u64>>,
-        NoopSpillController,
+        UnavailableSpillController,
+        DiscardSpillController,
         RoutedSpillController<InMemorySpillTarget<u64>>,
     );
     type _Targets =
@@ -576,7 +577,7 @@ fn transcript_builder_exposes_public_charged_path() {
     let store: SimpleSessionTranscriptStore<String, String, String, Budgeted> = platform
         .transcript_store_builder::<String, String, String>()
         .bind(binding)
-        .with_retention_policy(TranscriptRetentionPolicyV1::process_lifetime())
+        .with_retention_policy(TranscriptRetentionPolicyV2::default())
         .build()
         .expect("budgeted transcript builder must build");
 
@@ -600,9 +601,9 @@ fn transcript_builder_exposes_public_charged_path() {
 fn spill_controller_round_trips_a_handle_via_restore() {
     let controller = RoutedSpillController::new(InMemorySpillTarget::<u64>::available());
 
-    let spilled: MemoryResult<()> = controller.spill(42);
-    assert!(spilled.is_ok(), "an available target must accept the spill: {spilled:?}");
-    assert_eq!(controller.spilled_count(), 1, "a successful spill increments the count");
+    let spilled = controller.spill(42).expect("an available target must accept the spill");
+    assert_eq!(spilled.ownership(), SpillOwnership::InProcessRetained);
+    assert_eq!(controller.spilled_count::<u64>().expect("count"), 1);
 
     let restored: MemoryResult<Option<u64>> = controller.restore();
     assert_eq!(
@@ -610,7 +611,7 @@ fn spill_controller_round_trips_a_handle_via_restore() {
         Some(42),
         "a retaining target restores the spilled handle"
     );
-    assert_eq!(controller.spilled_count(), 0, "restoring a handle decrements the spilled count");
+    assert_eq!(controller.spilled_count::<u64>().expect("count"), 0);
 }
 
 /// A routed controller over an UNAVAILABLE target fails closed on spill (it never
@@ -619,21 +620,23 @@ fn spill_controller_round_trips_a_handle_via_restore() {
 #[test]
 fn spill_controller_fails_closed_when_target_unavailable() {
     let controller = RoutedSpillController::new(InMemorySpillTarget::<u64>::unavailable());
-    let result: MemoryResult<()> = controller.spill(7);
-    assert!(result.is_err(), "an unavailable spill target must fail closed, got Ok");
-    assert_eq!(controller.spilled_count(), 0, "a failed spill must not increment the count");
+    let result = controller.spill(7);
+    let (_, recovered) =
+        result.expect_err("an unavailable spill target must fail closed").into_parts();
+    assert_eq!(recovered, 7);
+    assert_eq!(controller.spilled_count::<u64>().expect("count"), 0);
 }
 
-/// The `NoopSpillController` always succeeds and never retains — the documented
-/// no-op contract for hosts without a configured spill backend.
+/// An unconfigured controller fails and returns the original handle.
 #[cfg(feature = "spill")]
 #[test]
-fn noop_spill_controller_succeeds_and_restores_nothing() {
-    let controller = NoopSpillController;
-    assert!(SpillController::<u64>::spill(&controller, 1).is_ok(), "noop spill always succeeds");
+fn unavailable_spill_controller_returns_source_authority() {
+    let controller = UnavailableSpillController;
+    let failure = SpillController::<u64>::spill(&controller, 1).expect_err("unavailable");
+    assert_eq!(failure.into_parts().1, 1);
     assert_eq!(
-        SpillController::<u64>::restore(&controller).expect("noop restore succeeds"),
+        SpillController::<u64>::restore(&controller).expect("empty restore succeeds"),
         None,
-        "the noop controller retains nothing to restore"
+        "the unavailable controller retains nothing"
     );
 }
