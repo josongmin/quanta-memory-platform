@@ -14,6 +14,7 @@ corrupted/unavailable state를 empty/zero로 위장하지 않고, memory admissi
 - payload/revocable/transcript store `stats`는 QMP-040 이후 `MemoryResult<StoreStats>`로 변경됐다 (`payload_store/mod.rs:18`, `revocable_store/mod.rs:15`, `transcript_store/mod.rs:231`). 이 세 zero-on-poison 결함은 **historical baseline**이며, 아래 테스트는 regression guards다.
 - 두 public in-memory/Noop spill target의 retained count는 아직 poison을 zero로 바꾼다: `spill/service.rs:164-165,237-238`. redb observation은 이미 fallible이다.
 - core의 `effective_report()` trait는 infallible (`core/src/api/broker.rs:26`); live 구현은 poisoned guard의 실제 report를 복구하지만 poison 상태 자체를 드러내지 않는다 (`api/control.rs:1033-1045`). 이를 fabricated zero로 서술하지 말고 typed observation 계약을 결정한다.
+- QMP-020 후 공개 `LedgerSnapshot`의 `total_*` getters는 수동 구성한 unrepresentable snapshot에서 `checked_add(...).expect(...)`로 panic한다 (`core/src/domain/ledger.rs:229-268`). Broker snapshot은 먼저 `validate_exact()`로 typed error를 반환한다. 이 둘의 public contract/compatibility를 QMP-140과 함께 결정한다.
 - metrics/hdr adapters는 존재하지만 broker/store production call site가 없다.
 - reconfigure report provenance는 active value와 stale해질 수 있다.
 
@@ -75,6 +76,7 @@ bounded enum labels로 최소 다음을 집계한다.
 - `poisoned_transcript_stats_returns_error_not_zero` (기존 QMP-040 동작의 regression guard)
 - `poisoned_spill_inventory_returns_error_not_zero`
 - `poisoned_broker_report_exposes_status_without_losing_actual_policy_values` (infallible API의 migration/compatibility 판정 포함)
+- `forged_unrepresentable_public_snapshot_has_documented_fallible_observation` (panic precondition 또는 새 checked public API를 명시하고 외부 테스트로 고정)
 - `denial_reason_emits_one_bounded_metric`
 - `allocator_observation_never_mutates_semantic_usage`
 - `metrics_do_not_use_owner_or_runtime_as_labels`

@@ -98,6 +98,7 @@ Required implications:
 
 - A client callback panic under a store mutex can poison subsequent access. Poison is advisory, not a transactional rollback mechanism; ignoring it alone does not prove a sound postimage.
 - `catch_unwind` catches unwinding panics, not aborting panics. Do not present it as containment of every client destructor or a double panic during cleanup.
+- The returned `Err` owns a panic payload whose `Drop` may itself panic. Treat disposal of that payload as another exceptional ownership transition; ordinary string-payload tests do not cover it.
 - Retire independently owned generic fields in separate unwind boundaries after publishing the exact charge/state postimage. Test destructive leaves in a child process so an abort is observable instead of killing the whole suite.
 - Decide whether arbitrary client callback panics are a supported recoverable case; otherwise make the public contract and residual availability risk explicit.
 
