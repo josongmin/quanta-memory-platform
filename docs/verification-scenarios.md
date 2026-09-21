@@ -64,7 +64,7 @@ cloning all live owner/context maps.
 - ✅ Inv 5 global limit + headroom band — `reserve_denied_when_global_hard_limit_would_be_exceeded`, `global_ceiling_reserves_headroom_for_non_headroom_classes`.
 - ✅ Inv 6 shared burst pool — `borrow_over_class_cap_is_bounded_by_shared_burst_pool`, `shared_burst_pool_is_shared_across_borrowing_classes`, `borrow_false_still_denies_over_cap_regardless_of_pool`.
 - ✅ Inv 7 idempotency — `double_release_of_a_cloned_ticket_is_rejected_and_does_not_corrupt`, `commit_after_release_is_rejected`.
-- ✅🔢 Zero-byte / u64 boundary / i64 cast — `zero_byte_reserve_commits_and_releases_coherently`, `saturating_add_near_u64_max_keeps_class_owner_balanced`, `reserve_above_i64_max_does_not_wrap_to_negative_delta`.
+- ✅🔢 Zero-byte / u64 boundary / i64 cast — `zero_byte_reserve_commits_and_releases_coherently`, `snapshot_validation_rejects_unrepresentable_axis_instead_of_saturating_it`, `reserve_above_i64_max_does_not_wrap_to_negative_delta`.
 - ✅ Cross-ledger ticket — `ticket_from_one_ledger_cannot_release_on_another`; id uniqueness — `ticket_ids_are_monotonic_and_unique_across_many_reserves`.
 - ✅ Context axis balance — `context_axis_balances_with_owner_after_mixed_sequence`; wrong-kind release — `mixed_kind_release_preserves_charge_kind_partition`.
 - ✅🔬 Deterministic fuzz — `deterministic_fuzz_preserves_invariants_and_returns_to_zero` (400-step sequence, invariants 1/2/5/6 at every step, drains to 0).
@@ -76,7 +76,7 @@ Impl: `validate_residency` now also validates `resource_groups`, per-axis
 check helpers that the control plane enforces (see group C/D).
 
 - ✅ validate hardening — `validate_rejects_class_hard_cap_above_global`, `validate_rejects_owner_hard_cap_above_global`, `validate_rejects_constructed_headroom_above_global`, `validate_accepts_headroom_equal_to_global`.
-- ✅ resource_groups — `validate_accepts_well_formed_resource_group`, `validate_rejects_resource_group_{reserved_above_soft,soft_above_hard,hard_above_global,burst_percent_over_100}`, `validate_accepts_resource_group_burst_percent_boundaries`, `resource_group_reserved_does_not_count_against_global_floor`.
+- ✅ resource_groups — `validate_accepts_well_formed_resource_group`, `validate_rejects_resource_group_reserved_above_soft`, `validate_rejects_resource_group_soft_above_hard`, `validate_rejects_resource_group_hard_above_global`, `validate_rejects_resource_group_burst_percent_over_100`, `validate_accepts_resource_group_burst_percent_boundaries`, `resource_group_reserved_has_an_independent_global_floor`.
 - ✅ owner→group mapping validated — `validate_rejects_owner_group_mapping_to_unknown_group` (`core/src/domain/config.rs`).
 - ✅ presets — `for_preset_{populates_every_mandatory_class,is_structurally_valid,class_caps_isolate_below_global,scales_caps_with_global_limit,weighted_split_never_over_allocates_distributable,headroom_class_owns_exactly_the_reserved_band,no_single_class_cap_plus_headroom_exceeds_global}`.
 - ✅🔢 edges — `default_residency_global_one_does_not_underflow_and_validates`, `default_residency_small_globals_all_validate`, `borrow_flag_with_zero_shared_pool_is_valid_but_grants_no_burst`.
@@ -114,7 +114,7 @@ check helpers that the control plane enforces (see group C/D).
 
 ## D. Scheduler — ✅ (`core/src/application/scheduler.rs`)
 
-- ✅ edges — `empty_scheduler_has_zero_share_and_denies_all`, `unknown_group_denied_even_with_pool_available`, `floor_division_pool_remainder_is_left_unallocated`, `usage_release_round_trip_readmits_burst` (+ existing starvation/admission tests).
+- ✅ edges — `empty_scheduler_has_zero_share_and_denies_all`, `unknown_group_denied_even_with_pool_available`, `weighted_share_distributes_remainder_work_conservingly`, `usage_release_round_trip_readmits_burst` (+ existing starvation/admission tests).
 - ✅ **wired into reserve** — owner→group mapping gates a `reserve` at the broker surface; admission denial blocks the reserve fail-closed. Evidence: `reserve_gated_by_resource_group_admission_fail_closed`, `owner_without_group_mapping_is_not_gated_by_admission` (`core/src/api/control.rs`); mapping validation `validate_rejects_owner_group_mapping_to_unknown_group` (`core/src/domain/config.rs`).
 
 ## E. Pressure controller — ✅ (`core/src/application/controller.rs`)
@@ -126,18 +126,18 @@ check helpers that the control plane enforces (see group C/D).
 
 ## F. Facade stores — ✅ (`facade/src/*`)
 
-- ✅ payload_store round-trip/dedup/pin/delete — `put_canonical_charges_payload_bytes_exactly_once`, `dedup_hit_returns_existing_ref_without_storing_a_second_entry`, `delete_unpinned_releases_bytes_once`, `delete_while_pinned_is_rejected_with_invalid_state`, `pin_is_metadata_only_and_does_not_recharge_bytes`.
-- ✅ **F#3 for payload_store** — `charged_store_routes_bytes_through_the_ledger`, `charged_store_put_over_cap_is_denied_and_fails_closed`, `uncharged_store_is_explicit_non_budgeted_mode` (a "charged store" mode routes bytes through the broker ledger).
-- ✅ retained_map hash-indexed point operations + accounting/order preservation — `put_get_remove_get_none_round_trip_corrects_bytes`, `equal_hash_key_duplicate_overwrites_and_does_not_double_count`, `exact_key_lookup_uses_keyed_admission_instead_of_scanning_live_entries`, `overwrite_preserves_original_insertion_position_for_newest_first_sweep`, `arbitrary_remove_preserves_remaining_newest_first_sweep_order`, `charged_sweep_during_rebuild_is_fail_closed`, and `keys_lists_inserted_keys_in_deterministic_sorted_order`. The public key identity law is `Eq + Hash`; exact lookup/overwrite/remove use the canonical linked hash container while enumeration remains deterministically key-sorted.
-- ✅ **F#3 for retained_map** — retained_map is ledger-wired only through the typestate builder: binding produces `BoundRetainedMapStoreBuilder`, only the bound state exposes infallible `build()`, and `SimpleRetainedMapStore` has no public late-attach transition. Evidence: the two compile-fail docs plus `retained_map_builder_charged_against_routes_bytes_through_the_ledger`, `charged_insert_routes_bytes_through_the_ledger`, `charged_insert_over_cap_is_denied_and_fails_closed`, `charged_overwrite_denial_leaves_existing_entry_unchanged`, and `charged_sweep_refunds_reclaimed_bytes_to_the_ledger`. Internal ticket corruption is also fail-closed before refund or container mutation (`charged_remove_rejects_a_ticketless_entry_without_mutating_state`, `charged_sweep_rejects_a_ticketless_candidate_without_partial_refund_or_eviction`). The uncharged `new` path remains distinct via `uncharged_retained_map_bytes_are_not_reflected_in_a_broker_ledger_snapshot`.
+- ✅ payload_store round-trip/dedup/pin/delete — `canonical_put_deduplicates_and_charges_once`, `dedup_hit_preserves_first_context_and_stores_no_second_entry`, `delete_unpinned_releases_bytes_exactly_once`, `pin_is_metadata_only_and_pinned_delete_is_rejected`.
+- ✅ **F#3 for payload_store** — `charged_store_bytes_flow_through_the_ledger_and_drain_to_zero`, `charged_payload_over_cap_put_is_fail_closed`, `uncharged_store_is_explicit_non_budgeted_mode` (a "charged store" mode routes bytes through the broker ledger).
+- ✅ retained_map hash-indexed point operations + accounting/order preservation — `put_get_remove_get_none_round_trip_corrects_bytes`, `equal_hash_key_duplicate_overwrites_and_does_not_double_count`, `first_and_last_key_point_operations_share_one_n_independent_probe_bound_v1`, `overwrite_preserves_original_insertion_position_for_newest_first_sweep`, `arbitrary_remove_preserves_remaining_newest_first_sweep_order`, `charged_sweep_during_rebuild_is_fail_closed`, and `keys_lists_inserted_keys_in_deterministic_sorted_order`. The public key identity law is `Eq + Hash`; exact lookup/overwrite/remove use the canonical linked hash container while enumeration remains deterministically key-sorted.
+- ✅ **F#3 for retained_map** — retained_map is ledger-wired only through the typestate builder: binding produces `BoundRetainedMapStoreBuilder`, only the bound state exposes infallible `build()`, and `SimpleRetainedMapStore` has no public late-attach transition. Evidence: the two compile-fail docs plus `retained_map_platform_builder_routes_bytes_through_the_ledger`, `charged_insert_routes_bytes_through_the_ledger`, `charged_insert_over_cap_is_denied_and_fails_closed`, `charged_overwrite_denial_leaves_existing_entry_unchanged`, and `charged_sweep_refunds_reclaimed_bytes_to_the_ledger`. Internal ticket corruption is also fail-closed before refund or container mutation (`charged_remove_rejects_a_ticketless_entry_without_mutating_state`, `charged_sweep_rejects_a_ticketless_candidate_without_partial_refund_or_eviction`). The uncharged `new` path remains distinct via `uncharged_retained_map_bytes_are_not_reflected_in_a_broker_ledger_snapshot`.
 - ✅ revocable FIFO/revoke/eviction — `reclaim_one_is_fifo_and_releases_its_bytes`, `revoke_makes_entry_unretrievable_and_decrements_accounting`, `reclaim_eviction_order_is_deterministic_fifo_at_capacity_boundary`.
 - ✅ publish_pipeline commit transition — `default_pipeline_runs_stage_then_commit_each_exactly_once_no_rollback`, `failed_commit_never_publishes_and_never_increments_count`.
 - ✅ CanonicalKey/MeasuredValue — `cloning_measured_arc_shares_the_allocation_not_a_deep_copy`, `measured_value_charges_caller_supplied_size_not_inner_len`, `cloning_measured_value_preserves_size_and_value_context`.
-- ✅ spill routing fail-closed — `routed_spill_to_available_target_succeeds_and_counts`, `spill_to_unavailable_target_fails_closed_and_does_not_count`, `routed_spill_after_target_goes_offline_fails_closed_leaving_counters_unchanged`.
+- ✅ spill routing fail-closed — `routed_spill_to_available_target_succeeds_and_counts`, `spill_to_unavailable_target_fails_closed_and_does_not_count`, `routed_spill_after_target_goes_offline_fails_closed_leaving_inventory_unchanged`.
 - ✅ **spill write → restore (inverse) round-trips** — the restore inverse landed: `in_memory_target_write_then_restore_round_trips_the_payload`, `in_memory_target_restore_of_missing_handle_is_none_not_an_error`, `in_memory_target_restore_after_offline_fails_closed_leaving_retained_state_unchanged` (`facade/src/spill/service.rs`).
-- ✅ transcript per-session isolation + charged mode — `truncate_one_session_does_not_touch_other_session_bytes`, `append_to_one_session_does_not_change_another_sessions_result_or_cost`, and (charged) `append_and_truncate_track_the_ledger`, `append_over_cap_is_denied_and_fails_closed` (`facade/src/transcript_store/service.rs`).
-- ✅ charged facade mutators are fail-closed before store mutation — `charged_remove_during_rebuild_is_fail_closed`, `charged_sweep_during_rebuild_is_fail_closed`, `reclaim_one_during_rebuild_is_fail_closed`, `reclaim_until_during_rebuild_is_fail_closed`, `truncate_during_rebuild_is_fail_closed`.
-- ✅ transcript charged breadth now matches the closeout bar — `charged_append_isolates_other_sessions` proves session-local charging, and `truncate_during_rebuild_is_fail_closed` proves refund denial leaves both ledger and store untouched.
+- ✅ transcript per-session isolation + charged mode — `append_identity_is_partitioned_by_session`, `retention_stats_separate_active_evidence_and_session_costs`, and (charged) `exact_retry_charges_once_and_truncate_refunds_only_active_body`, `quota_denial_leaves_row_indexes_and_charge_unchanged` (`facade/src/transcript_store/service.rs`).
+- ✅ charged facade mutators are fail-closed before store mutation — `charged_remove_during_rebuild_is_fail_closed`, `charged_sweep_during_rebuild_is_fail_closed`, `reclaim_one_during_rebuild_is_fail_closed`, `reclaim_until_during_rebuild_is_fail_closed`, `truncate_refund_failure_preserves_rows_indexes_and_accounting`.
+- ✅ transcript charged breadth now matches the closeout bar — `append_identity_is_partitioned_by_session` proves session-local identity partitioning, and `truncate_refund_failure_preserves_rows_indexes_and_accounting` proves refund denial leaves both ledger and store untouched.
 
 **publish_pipeline is intentionally not charged.** It is a non-retaining
 *transition* stage (zero bytes held): it transforms a staged value into a
@@ -180,9 +180,9 @@ choice documented in `facade/src/publish_pipeline/service.rs`, not a gap.
 
 ## K. Numeric / safety 🔢 — ✅
 
-- ✅ ledger numeric edges — see group A (saturating folds, u64 add/sub, i64-cast regression guard).
+- ✅ ledger numeric edges — see group A (checked aggregate folds, u64 add/sub, i64-cast regression guard).
 - ✅ controller numeric coverage — `tiny_non_zero_limit_saturates_percent_without_wrapping` and the existing zero-limit / ladder tests cover tiny-limit and `u64::MAX` semantic usage edges without wrap.
-- ✅ scheduler numeric coverage — `huge_pool_and_weights_compute_a_non_wrapping_fair_share` and `repeated_saturating_usage_release_round_trip_never_wraps` cover huge-pool/huge-weight share math and repeated saturating usage/release round-trips.
+- ✅ scheduler numeric coverage — `huge_pool_and_weights_compute_a_non_wrapping_fair_share` and `repeated_exact_usage_release_round_trip_never_wraps` cover huge-pool/huge-weight share math and repeated exact usage/release round-trips.
 
 ## L. Telemetry adapters — ✅ (`core/src/adapters/*`, `core/src/ports/telemetry.rs`)
 
@@ -212,8 +212,8 @@ New invariants promoted to the public API boundary:
 - ✅ `headroom_band_is_reserved_for_headroom_class_at_public_surface`
 - ✅ `shared_burst_pool_bounds_borrowing_through_public_broker`
 - ✅ `non_borrowing_class_cannot_use_burst_pool_at_public_surface`
-- ✅ `double_release_of_cloned_ticket_rejected_through_public_broker`
-- ✅ `commit_after_release_rejected_through_public_broker`
+- ✅ `double_release_of_a_cloned_ticket_is_rejected_and_does_not_corrupt`
+- ✅ `commit_after_release_is_rejected`
 - ✅ `preset_class_caps_bite_at_public_reserve_surface`
 - ✅ `preset_broker_global_limit_is_consistent_with_enforcement`
 
@@ -221,12 +221,15 @@ New invariants promoted to the public API boundary:
 
 ## Current campaign status — 🚧
 
-- QMP-030 implementation is locally covered by default/bare/leaf/full/all
-  warning-free feature slices, runtime scratch owner tests, public surface
-  compile-fail tests, examples, and extraction dry-run.
-- Terminal standalone extraction, host-adapter adoption, facade authority
-  migration, and SemVer/feature policy remain separately owned by QMP-120,
-  QMP-130, QMP-040, and QMP-140. Do not infer those closures from this file.
+- Standalone implementation is locally covered by default/bare/leaf/full/all
+  warning-free feature slices, non-zero runtime capability tests for every
+  advertised facade feature path, runtime scratch owner tests, public surface
+  compile-fail tests, examples, performance gates, and actual extraction.
+- `scripts/verify-doc-test-selectors.py` resolves the selectors named by this
+  document against `cargo test --workspace --all-features -- --list`; stale or
+  zero-test documentation is a release-gate failure.
+- External Semantica host adoption and remote workflow observation remain
+  separate authorities. Do not infer those closures from this file.
 - Charged facade mutations are now uniformly fail-closed: charge via `reserve_committed`,
   overwrite via `recharge`, and refund-bearing delete/reclaim/truncate paths via
   fallible refund-before-mutate APIs.
@@ -244,6 +247,8 @@ cargo fmt --all --check
 cargo deny --all-features check
 scripts/check-workspace.sh            # includes warning-free feature matrix + feature-leak guard
 scripts/memory-platform-doctor        # repo-local fmt/clippy/feature-matrix/check/test/examples/deny rail
+scripts/verify-feature-capabilities.sh # isolated runtime bite for advertised features
+scripts/verify-doc-test-selectors.py   # reject stale named test selectors
 # list the evidence test names per file:
 grep -rA1 '#\[test\]' crates --include='*.rs' | grep -oE 'fn [a-z0-9_]+'
 ```

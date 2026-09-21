@@ -404,7 +404,7 @@ dependencies = [
 
 [[package]]
 name = "quanta-memory-platform-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "hdrhistogram",
  "metrics",
@@ -412,7 +412,7 @@ dependencies = [
 
 [[package]]
 name = "quanta-memory-platform-facade"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "blake3",
  "hashlink",
@@ -423,7 +423,7 @@ dependencies = [
 
 [[package]]
 name = "quanta-memory-platform-testkit"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "loom",
  "proptest",

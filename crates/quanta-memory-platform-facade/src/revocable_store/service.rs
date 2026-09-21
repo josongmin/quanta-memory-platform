@@ -1223,6 +1223,77 @@ mod tests {
 
     #[cfg(feature = "spill")]
     #[test]
+    fn many_spills_share_large_binding_identity_without_unbilled_clones() {
+        const ENTRY_COUNT: usize = 128;
+        let broker = live_broker(10_000_000);
+        let large_owner = "owner-".to_string() + &"o".repeat(64 * 1024);
+        let large_runtime = "runtime-".to_string() + &"r".repeat(64 * 1024);
+        let store = SimpleRevocableStore::new_budgeted(
+            StoreBindingHandle::new(
+                MemoryClass::ExecutionScratchRevocable,
+                large_owner,
+                Some(large_runtime),
+            ),
+            broker.clone(),
+        );
+        let controller = RoutedSpillController::new(InMemorySpillTarget::available());
+
+        let mut expected_total = 0u64;
+        for index in 0..ENTRY_COUNT {
+            let key = format!("key-{index}");
+            expected_total += expected_entry_cost(&key, 1);
+            store.insert_checked(key, vec![index as u8]).expect("insert");
+        }
+        assert_eq!(
+            broker.ledger_snapshot().expect("initial ledger").total_owner_bytes(),
+            expected_total
+        );
+
+        for spilled in 1..=ENTRY_COUNT {
+            assert!(store.spill_one_into(&controller).expect("spill"));
+            assert_eq!(controller.spilled_count(), Ok(spilled as u64));
+            assert_eq!(
+                broker.ledger_snapshot().expect("spill ledger").total_owner_bytes(),
+                expected_total,
+                "in-process transfer must preserve the exact semantic charge"
+            );
+        }
+        assert_eq!(store.committed_bytes(), Ok(0));
+
+        let mut handles = Vec::with_capacity(ENTRY_COUNT);
+        while let Some(handle) = controller.restore().expect("restore from tier") {
+            assert!(
+                Arc::ptr_eq(&handle.binding, &store.binding),
+                "every spill handle must share the store identity allocation"
+            );
+            handles.push(handle);
+        }
+        assert_eq!(handles.len(), ENTRY_COUNT);
+        assert_eq!(Arc::strong_count(&store.binding), ENTRY_COUNT + 1);
+        assert_eq!(
+            broker.ledger_snapshot().expect("restored handles ledger").total_owner_bytes(),
+            expected_total
+        );
+
+        for handle in handles {
+            store.accept_restored(handle).expect("reattach shared binding handle");
+            assert_eq!(
+                broker.ledger_snapshot().expect("reattach ledger").total_owner_bytes(),
+                expected_total
+            );
+        }
+        assert_eq!(Arc::strong_count(&store.binding), 1);
+        drop(controller);
+        assert_eq!(
+            broker.ledger_snapshot().expect("empty tier drop ledger").total_owner_bytes(),
+            expected_total
+        );
+        store.close().expect("close restored source");
+        assert_eq!(broker.ledger_snapshot().expect("closed ledger").total_owner_bytes(), 0);
+    }
+
+    #[cfg(feature = "spill")]
+    #[test]
     fn spill_and_close_emit_bounded_facade_events() {
         let events = Arc::new(RecordingEvents::default());
         let broker = live_broker_with_events(1_000_000, events.clone());

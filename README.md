@@ -7,8 +7,9 @@ designed to be extracted into its own repository without rewrites.
 > **Current qualification status (2026-09-21): NOT production-ready.** Local
 > standalone extraction, including committed HEAD/tree/blob/mode binding, has
 > passed; remote workflow execution and external host adoption remain
-> unobserved. The final audit still has open authority, performance, and
-> observability tickets. The authoritative
+> unobserved on the current release candidate. Standalone performance,
+> observability, extraction, and conformance rails are locally qualified; they
+> do not substitute for host-product GREEN. The authoritative
 > remediation inventory, status, dependencies, acceptance criteria, and receipts
 > live in [`tickets/README.md`](./tickets/README.md). Passing a focused test or
 > dry-run does not supersede that status.
@@ -35,6 +36,18 @@ quanta-memory-host (Semantica monorepo)  ->  quanta-memory-platform-{core,facade
 The host adapter never appears as a dependency of this repo; that would invert
 the direction. The portable library carries no Semantica nouns
 (`Semantica*`, `quanta_runtime`, `codegraph`) in its public API.
+
+## Version, compatibility, and distribution
+
+- `0.2.0` is a deliberate pre-1.0 breaking release. There is no deprecated
+  compatibility window for an alias that would reopen unbounded or unbudgeted
+  authority; internal consumers migrate atomically.
+- Rust 1.95 is the declared MSRV and pinned toolchain.
+- The workspace is internal-only (`UNLICENSED`, `publish = false`). It is not a
+  crates.io release candidate.
+- Exact breaking changes and consumer actions are in
+  [MIGRATION.md](./MIGRATION.md); the release inventory is in
+  [CHANGELOG.md](./CHANGELOG.md).
 
 ## Builder-first usage (recommended public surface)
 
@@ -168,6 +181,12 @@ scripts/run-scaling-bench.sh
 
 # optional same-host baseline comparison
 QMP_SCALING_BASELINE=/path/to/baseline.jsonl scripts/run-scaling-bench.sh
+
+# non-zero runtime bite for every advertised facade feature path
+scripts/verify-feature-capabilities.sh
+
+# every test selector named by public verification docs must exist
+scripts/verify-doc-test-selectors.py
 ```
 
 The scaling rail exercises public budgeted store and broker paths and records
@@ -198,10 +217,11 @@ copying, so a cyclic / mis-directed split is rejected up front.
 This repo now carries its own verification front doors:
 
 - `scripts/check-workspace.sh` — fmt + clippy `-D warnings` + workspace check +
-  example builds + per-feature matrix + `cargo deny`.
+  example builds + per-feature compile matrix + advertised feature runtime
+  tests + documented-selector validation + `cargo deny`.
 - `scripts/memory-platform-doctor` — repo-local doctor: fmt + clippy `-D warnings`
-  + per-feature matrix + workspace check + workspace tests + example builds +
-  `cargo deny` when available.
+  + per-feature compile/runtime matrix + workspace check/tests + documented
+  selector validation + example builds + `cargo deny` when available.
 - `scripts/memory-platform-{fix,report}` — mechanical fix/report helpers.
 - `scripts/scaffold-external-repo.sh` — asserts the extracted self-hosting file
   set is present in-source and that the copy plan excludes `tools/ci/gates`.

@@ -10,7 +10,8 @@ resolver = "2"
 edition = "2021"
 license = "UNLICENSED"
 publish = false
-version = "0.1.0"
+rust-version = "1.95"
+version = "0.2.0"
 
 [workspace.dependencies]
 blake3 = "=1.5.3"

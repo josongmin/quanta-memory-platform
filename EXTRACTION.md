@@ -81,6 +81,8 @@ dependency direction. Not prose: every step is a command or a verifiable gate.
    scripts/tests/extraction-contracts.sh # negative release-rail contracts
    python3 -m unittest -v scripts/tests/test_extraction_metadata.py scripts/tests/test_extraction_manifest.py # dependency/tree negative fixtures
    python3 -m unittest -v scripts/tests/test_scaling_results.py # performance-gate negative fixtures
+   scripts/verify-feature-capabilities.sh # every advertised feature executes a non-zero runtime test
+   scripts/verify-doc-test-selectors.py # documented selectors resolve against cargo --list
    scripts/run-scaling-bench.sh --smoke # public store/broker + allocator drift smoke
    cargo metadata --locked --format-version 1 # no re-resolution
    ```
@@ -98,22 +100,18 @@ dependency direction. Not prose: every step is a command or a verifiable gate.
    to the extracted location (path, git, or registry). Do NOT add a dependency
    from the extracted repo back to Semantica — that would invert the direction.
 
-5. If you need host-integration proof, run the Semantica boundary gates from the
-   Semantica monorepo root after the rewire:
+5. Host integration proof is separate from extraction. After the rewire, first
+   prove that both Semantica workspace roots resolve the same QMP root/tree and
+   that the gate target matches Cargo resolution. Then run the registered
+   QMP-130 suite bundle from the Semantica root:
 
    ```bash
-   MEMORY_PLATFORM_REPO=/path/to/new/quanta-memory-platform \
-     tools/ci/gates/gate-memory-platform-doctor.sh
-   MEMORY_PLATFORM_REPO=/path/to/new/quanta-memory-platform \
-     tools/ci/gates/gate-memory-platform-lint.sh
+   just gate-qmp130-host-adoption
    ```
 
-6. Run the Semantica static guards (the boundary fences):
-
-   ```bash
-   cargo test -p quanta-runtime    --test runtime_structure_static_guard
-   cargo test -p quanta-memory-host --features full --test host_boundary_static_guard
-   ```
+   Resolve the suite IDs from the host's current suite registry. Do not replace
+   the registered QBC receipts with raw Cargo commands or names copied from an
+   older Semantica snapshot.
 
 ## Standalone extraction gate (QMP-120)
 
