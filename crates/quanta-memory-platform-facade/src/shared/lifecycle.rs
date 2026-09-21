@@ -19,7 +19,14 @@ const CLOSED: u8 = 3;
 /// a whole collection is insufficient: two field panics during collection
 /// unwinding would abort the process before the second could be contained.
 pub(crate) fn retire_client_value<T>(value: T) {
-    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(value)));
+    if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(value))) {
+        // Dropping a caught panic payload is user-controlled too: `panic_any`
+        // can carry a value whose destructor panics. During an outer unwind that
+        // second panic aborts the process. This exceptional path intentionally
+        // leaks only the panic payload so store cleanup can continue retiring
+        // the remaining fields and release every accounting authority.
+        std::mem::forget(payload);
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -212,6 +219,53 @@ impl Drop for ClosePermit<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct PanicOnPayloadDrop;
+
+    impl Drop for PanicOnPayloadDrop {
+        fn drop(&mut self) {
+            panic!("panic payload destructor");
+        }
+    }
+
+    struct PanicWithHostilePayload;
+
+    impl Drop for PanicWithHostilePayload {
+        fn drop(&mut self) {
+            std::panic::panic_any(PanicOnPayloadDrop);
+        }
+    }
+
+    struct RetireDuringOuterUnwind;
+
+    impl Drop for RetireDuringOuterUnwind {
+        fn drop(&mut self) {
+            retire_client_value(PanicWithHostilePayload);
+        }
+    }
+
+    #[test]
+    fn hostile_panic_payload_drop_cannot_abort_outer_unwind() {
+        const CHILD: &str = "QMP_HOSTILE_PANIC_PAYLOAD_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let outer = std::panic::catch_unwind(|| {
+                let _retire = RetireDuringOuterUnwind;
+                panic!("outer unwind");
+            })
+            .expect_err("outer panic propagates after client retirement");
+            assert_eq!(outer.downcast_ref::<&str>(), Some(&"outer unwind"));
+            return;
+        }
+
+        let status = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .arg("--exact")
+            .arg("shared::lifecycle::tests::hostile_panic_payload_drop_cannot_abort_outer_unwind")
+            .arg("--nocapture")
+            .env(CHILD, "1")
+            .status()
+            .expect("run isolated destructor-panic child");
+        assert!(status.success(), "hostile panic payload must not abort the child: {status}");
+    }
 
     #[test]
     fn client_callback_reentry_on_held_container_lock_is_typed_busy() {
