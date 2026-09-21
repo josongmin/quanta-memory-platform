@@ -120,7 +120,7 @@ Owner structs/hot paths:
 - [x] revocable full drain이 O(N²) shift를 하지 않는다.
 - [x] public semantics/accounting invariants가 기존 conformance를 통과한다.
 - [x] benchmark results가 source SHA/toolchain/hardware와 묶인다.
-- [ ] contention 및 memory drift scenario가 존재한다.
+- [x] contention 및 memory drift scenario가 존재한다.
 - [x] bare/single-feature matrix가 `-D warnings`로 clean하다.
 - [x] docs의 performance claim이 실제 executable target과 일치한다.
 
@@ -152,6 +152,24 @@ At `0c126a25aeab11f457e20c4a209fc7bb631ea859`:
 
 The local 1K/10K single-thread samples are recorded in
 [`receipts/2026-09-21T072928Z-0c126a2.md`](receipts/2026-09-21T072928Z-0c126a2.md).
-They are observation, not a portable threshold. QMP-100 is `IMPLEMENTED`, not
-`QUALIFIED`: 2/8/32-thread distributions, allocator/RSS drift, enforced
-regression thresholds, and the core ledger full-map hot path remain open.
+They are observation, not a portable threshold.
+
+At `6d082ee71226b687b2fb500e1cba767d48457f48`, QMP-100 is `QUALIFIED`:
+
+- ledger reserve/release uses exact aggregates and affected-slot preflight;
+  `single_release_preflight_is_bounded_by_affected_slots_at_10k_owners` pins
+  one class/owner/context probe each regardless of owner cardinality;
+- scheduler floor accounting is incremental and reserve/release/rollback/batch
+  no longer clone the complete scheduler state;
+- the v2 benchmark runs 1/2/8/32-thread read-heavy, write-heavy and mixed
+  distributions with five repetitions at 1K/10K, plus the public broker
+  owner-cardinality release lane;
+- each sample records p50/p95/p99, throughput, busy retries, semantic peak and
+  post-close bytes, allocator high-water, exact allocated/deallocated bytes,
+  residual live bytes and underflow state;
+- `scripts/verify-scaling-results.py` rejects incomplete matrices, fewer than
+  three repetitions, semantic/allocator drift, absolute p99 regressions and
+  supplied-baseline regressions. Negative fixtures prove every gate bites.
+
+The exact-source qualification receipt is
+[`receipts/2026-09-21T095245Z-6d082ee.md`](receipts/2026-09-21T095245Z-6d082ee.md).

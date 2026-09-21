@@ -43,18 +43,22 @@ Correctness is managed as **tests**; benchmarks answer a different question
   fail-closed, validation. Fast, localizing.
 - **~25% e2e / conformance** (broker surface, testkit conformance, cross-crate) —
   emergent gaps only visible end-to-end (e.g. F#3 facade↔ledger).
-- **~5% benchmarks** — one e2e scenario via criterion (tracking), iai-callgrind
-  (deterministic CI gate), and an allocation-budget assertion (the only
-  perf-flavored check that lives as a test). `testkit::alloc_tracking` provides
-  the allocation probe (`AllocationProbe`) for that budget assertion.
+- **~5% benchmarks** — `scripts/run-scaling-bench.sh` executes public
+  store/broker paths with repeated latency/throughput distributions and a real
+  tracking allocator. `scripts/verify-scaling-results.py` owns the executable
+  absolute and optional same-host baseline thresholds; its negative fixtures
+  prove drift and regressed results are rejected. Correctness remains in the
+  owning unit/conformance suites.
 
 ---
 
 ## A. Ledger accounting invariants — ✅ (`core/src/domain/ledger.rs`)
 
 Impl hardening landed: per-ledger **epoch** (`LEDGER_INSTANCE`) binds tickets to
-their issuing ledger; `total_*_bytes()` use **saturating** folds; reserve/release
-use `u64` add/sub (the unsound `bytes as i64` cast is gone).
+their issuing ledger; snapshot totals and mutation preflights use checked
+arithmetic; reserve/release use `u64` add/sub (the unsound `bytes as i64` cast
+is gone). Hot admission uses exact aggregates and affected slots rather than
+cloning all live owner/context maps.
 
 - ✅ Inv 1/2 + fail-closed — covered here and at the broker surface (group C/R).
 - ✅ Inv 5 global limit + headroom band — `reserve_denied_when_global_hard_limit_would_be_exceeded`, `global_ceiling_reserves_headroom_for_non_headroom_classes`.

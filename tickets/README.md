@@ -30,17 +30,18 @@
 ### Latest verified product checkpoint
 
 ```text
-product source: 0d80cf9c285e94379b90f3c5d045c371513f3563
+product source: 6d082ee71226b687b2fb500e1cba767d48457f48
 branch/worktree: codex/qmp-remaining-hardening / isolated clean worktree
-workspace tests: 634 passed
-doctor output SHA-256: d4c4079c14d40c2efdf5137fe83a75c5dd3b4fcaf701d6e00618acea5ab499d3
+workspace tests: 637 passed
+doctor output SHA-256: 75b343dc25dd4b8c1a15d505544477b667c0d4d329a14c6fb7ec00f3f4ce863c
 extraction dry-run output SHA-256: 214c36042bfc395dcf44bf0a4feb888a5667fe9140e0152bfc2cef1b8f991efe
 last actual extracted bootstrap: 373d1d6bd4e45a9a591781aba9491fe1cea166ab (product source 163d28f; clean)
-scaling smoke output SHA-256: 87da472630e14467ecc0a5236058f63e9de94585db464b999d4c382dbc0e1a44
+scaling full output SHA-256: 358d1970b4466dcf05e6b8415c012aa55b728c5a635f9f529fe462b73d53a0c0
+scaling baseline-gate output SHA-256: c8bcfdd32682fa20e46ef7d20b2f1b43927bdb3738d19801d5920e8a25fa4538
 ```
 
 This checkpoint qualifies only the ticket scopes whose latest receipts say
-`QUALIFIED`. It does not close QMP-050, QMP-100, remote QMP-120,
+`QUALIFIED`. It does not close QMP-050, remote QMP-120,
 external-host QMP-130, or final SemVer/docs QMP-140. Inventory state below is
 the lifecycle authority; this block is exact proof metadata, not a status
 override.
@@ -73,7 +74,7 @@ override.
 | [QMP-070](QMP-070-spill-transfer-backings/TICKET.md) | P1 | QUALIFIED | recovery-payload/ack protocol preserved by VecDeque rewrite; 620-test doctor and extraction refreshed at `0c126a2` | QMP-020, QMP-040, QMP-050 | revocable/spill/backings/builders |
 | [QMP-080](QMP-080-policy-runtime-semantics/TICKET.md) | P2 | QUALIFIED | canonical reserve/recharge/reconfigure postimages, protected floors, bounded out-of-lock reclaim, weighted burst and provenance pass at `f9f6d15` | QMP-010, QMP-020, QMP-030 | scheduler/controller/control/config |
 | [QMP-090](QMP-090-conformance-model/TICKET.md) | P1 | QUALIFIED | independent context/group/live-ticket oracle, 128-case shrinkable traces, exact negative-family mapping, five Loom models and focused Miri pass at `0d80cf9` | QMP-020, QMP-040, QMP-070 | testkit conformance/fakes/faults |
-| [QMP-100](QMP-100-scaling-benchmarks/TICKET.md) | P2 | IN_PROGRESS | contention/memory distributions, threshold rejection and affected-slot ledger preflight are actively claimed | QMP-040, QMP-050, QMP-070 | payload/revocable containers, benches, CI scripts |
+| [QMP-100](QMP-100-scaling-benchmarks/TICKET.md) | P2 | QUALIFIED | affected-slot ledger and aggregate scheduler hot paths; 1/2/8/32-thread distributions, exact allocator drift and rejecting thresholds pass at `6d082ee` | QMP-040, QMP-050, QMP-070 | payload/revocable containers, benches, CI scripts |
 | [QMP-110](QMP-110-operability-observation/TICKET.md) | P2 | QUALIFIED | typed one-lock broker observation, poison truth, bounded broker/store/spill events and callback-outside-lock emission pass at `163d28f` | QMP-030, QMP-040, QMP-080 | stats traits, metrics adapters, broker/store emitters |
 | [QMP-120](QMP-120-standalone-extraction/TICKET.md) | P1 | IMPLEMENTED | local HEAD/tree/blob/mode-bound extraction and negative fixtures pass at `4fdac520`; remote workflow remains unobserved | QMP-000 | extraction manifest/scripts, lockfile, release CI |
 | [QMP-130](QMP-130-host-adoption/TICKET.md) | P1 | BLOCKED | Semantica currently resolves adjacent shared-main QMP, not the audited/qualified revision; exact-root qualification absent | QMP-030..QMP-120 | external host repo only; QMP repo read-only except receipts |
@@ -113,7 +114,7 @@ override.
 | P2-09 poison reported as zero | QMP-110 | typed observation failure tests |
 | P2-10 moka/scc compile-only backings | QMP-070 | canonical backing port parity suite or feature removal |
 | P2-11 spill count wrong after restart | QMP-070 | reopened redb controller reconciliation |
-| P2-12 payload/revocable/core release O(N²), global mutex (facade paths closed; core/threshold work open) | QMP-100 | indexed payload + VecDeque receipt; affected-slot core preflight, contention and thresholds remain |
+| P2-12 payload/revocable/core release O(N²), global mutex | QMP-100 | indexed payload + VecDeque; affected-slot ledger, aggregate scheduler, contention distributions and zero-drift threshold receipt |
 | P2-13 saturating counter hides live bytes | QMP-040, QMP-050 | checked overflow fail-closed tests |
 | P2-14 noop spill discards and succeeds | QMP-070 | typed unsupported or explicit discard API test |
 | P2-15 public bumpalo bypass | QMP-030, QMP-140 | budgeted wrapper or public removal compile test |

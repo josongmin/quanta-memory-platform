@@ -160,14 +160,23 @@ scripts/check-workspace.sh
 # repo-local doctor rail:
 scripts/memory-platform-doctor
 
-# source-bound single-thread structural smoke; not a production perf gate
+# source-bound smoke: repeated 1/2-thread distributions + allocator drift gate
 scripts/run-scaling-bench.sh --smoke
+
+# full 1/2/8/32-thread read/write/mixed matrix (five repetitions)
+scripts/run-scaling-bench.sh
+
+# optional same-host baseline comparison
+QMP_SCALING_BASELINE=/path/to/baseline.jsonl scripts/run-scaling-bench.sh
 ```
 
-The scaling smoke exercises public budgeted builder paths and records source
-SHA/tree, toolchain, machine, entry count and ns/op. It does not qualify
-contention, allocator/RSS drift, core-ledger cardinality, or portable regression
-thresholds; QMP-100 remains the authority for those open gates.
+The scaling rail exercises public budgeted store and broker paths and records
+source SHA/tree, toolchain, machine, repeated p50/p95/p99, throughput, lifecycle
+busy retries, semantic bytes, allocator high-water and exact final drift. The
+verifier rejects missing matrix cells, insufficient repetitions, semantic or
+allocator drift, counter underflow and absolute latency regressions. A supplied
+same-host baseline also gates stable-lane throughput and p99 regressions. These
+wall-clock thresholds are host-local; they are not portable performance claims.
 
 ## Extraction into a standalone repo
 

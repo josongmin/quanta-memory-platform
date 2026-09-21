@@ -80,6 +80,8 @@ dependency direction. Not prose: every step is a command or a verifiable gate.
    scripts/check-workspace-offline.sh  # separate frozen/cache-only recheck
    scripts/tests/extraction-contracts.sh # negative release-rail contracts
    python3 -m unittest -v scripts/tests/test_extraction_metadata.py scripts/tests/test_extraction_manifest.py # dependency/tree negative fixtures
+   python3 -m unittest -v scripts/tests/test_scaling_results.py # performance-gate negative fixtures
+   scripts/run-scaling-bench.sh --smoke # public store/broker + allocator drift smoke
    cargo metadata --locked --format-version 1 # no re-resolution
    ```
 
