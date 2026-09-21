@@ -49,7 +49,7 @@
 | [QMP-040](QMP-040-store-lifecycle/TICKET.md) | P1 | IMPLEMENTED | store construction typestate, close/drain, callback lock discipline | QMP-020, QMP-030 | facade shared builder/accounting + all store services |
 | [QMP-050](QMP-050-total-retained-cost/TICKET.md) | P1 | IMPLEMENTED | total retained-cost accounting; b18e47d clean doctor, downstream terminal proof open | QMP-040 | measure/accounting + store entry cost paths |
 | [QMP-060](QMP-060-transcript-tombstones/TICKET.md) | P1 | READY | bounded transcript tombstone/idempotency lifecycle; QMP-050 formula frozen at b18e47d | QMP-050 | transcript types/service/builder |
-| [QMP-070](QMP-070-spill-transfer-backings/TICKET.md) | P1 | READY | reclaim→spill receipt transfer, safe spill semantics, real backings; coordinate revocable owner with QMP-040 | QMP-020, QMP-040, QMP-050 | revocable/spill/backings/builders |
+| [QMP-070](QMP-070-spill-transfer-backings/TICKET.md) | P1 | IN_PROGRESS | reclaim→spill receipt transfer, safe spill semantics, real backings; isolated owner claim active | QMP-020, QMP-040, QMP-050 | revocable/spill/backings/builders |
 | [QMP-080](QMP-080-policy-runtime-semantics/TICKET.md) | P2 | READY | reserved/soft/hard/burst/reclaim runtime semantics; QMP-020 clean doctor and scoped receipt available | QMP-010, QMP-020, QMP-030 | scheduler/controller/control/config |
 | [QMP-090](QMP-090-conformance-model/TICKET.md) | P1 | BLOCKED | independent conformance oracle와 model/concurrency tests | QMP-020, QMP-040, QMP-070 | testkit conformance/fakes/faults |
 | [QMP-100](QMP-100-scaling-benchmarks/TICKET.md) | P2 | BLOCKED | O(N²) 제거와 workload benchmark authority | QMP-040, QMP-050, QMP-070 | payload/revocable containers, benches, CI scripts |
