@@ -372,6 +372,126 @@ impl AccountingLedger {
         self.owner_usage.get(owner).copied().unwrap_or_default()
     }
 
+    /// Canonical legal-state predicate shared by reserve and live reconfigure.
+    /// `delta` describes one prospective reservation; `None` validates the
+    /// current snapshot against a replacement policy.
+    pub(crate) fn validate_policy_postimage(
+        policy: &ResidencyPolicy,
+        snapshot: &LedgerSnapshot,
+        delta: Option<(&MemoryClass, &OwnerKey, u64)>,
+    ) -> MemoryResult<()> {
+        snapshot.validate_exact()?;
+        let delta_bytes = delta.map_or(0, |(_, _, bytes)| bytes);
+        let global_after = snapshot
+            .total_owner_bytes()
+            .checked_add(delta_bytes)
+            .ok_or_else(|| MemoryError::capacity("global postimage exceeds u64"))?;
+        if global_after > policy.global_hard_limit_bytes {
+            return Err(MemoryError::capacity(format!(
+                "global hard limit {} below postimage {global_after}",
+                policy.global_hard_limit_bytes
+            )));
+        }
+
+        let class_after = |class: &MemoryClass| -> MemoryResult<u64> {
+            let current = match snapshot.class_usage.get(class) {
+                Some(usage) => usage.checked_total()?,
+                None => 0,
+            };
+            if delta.is_some_and(|(candidate, _, _)| candidate == class) {
+                current
+                    .checked_add(delta_bytes)
+                    .ok_or_else(|| MemoryError::capacity("class postimage exceeds u64"))
+            } else {
+                Ok(current)
+            }
+        };
+        let owner_after = |owner: &OwnerKey| -> MemoryResult<u64> {
+            let current = match snapshot.owner_usage.get(owner) {
+                Some(usage) => usage.checked_total()?,
+                None => 0,
+            };
+            if delta.is_some_and(|(_, candidate, _)| candidate == owner) {
+                current
+                    .checked_add(delta_bytes)
+                    .ok_or_else(|| MemoryError::capacity("owner postimage exceeds u64"))
+            } else {
+                Ok(current)
+            }
+        };
+
+        let mut non_headroom_after = 0u64;
+        let mut unused_class_floor = 0u64;
+        let mut total_borrow = 0u64;
+        for (class, budget) in &policy.classes {
+            let used = class_after(class)?;
+            if *class != MemoryClass::Headroom {
+                non_headroom_after = non_headroom_after
+                    .checked_add(used)
+                    .ok_or_else(|| MemoryError::capacity("non-headroom postimage exceeds u64"))?;
+                unused_class_floor = unused_class_floor
+                    .checked_add(budget.reserved_bytes.saturating_sub(used))
+                    .ok_or_else(|| MemoryError::capacity("class reserved floor exceeds u64"))?;
+            }
+            if used > budget.hard_cap_bytes {
+                if !budget.borrow_from_shared_pool {
+                    return Err(MemoryError::capacity(format!(
+                        "non-borrowing class {class:?} hard cap {} below postimage {used}",
+                        budget.hard_cap_bytes
+                    )));
+                }
+                total_borrow = total_borrow
+                    .checked_add(used - budget.hard_cap_bytes)
+                    .ok_or_else(|| MemoryError::capacity("class borrow exceeds u64"))?;
+            }
+        }
+        if let Some((class, _, _)) = delta {
+            if !policy.classes.contains_key(class) {
+                return Err(MemoryError::capacity(format!(
+                    "class {class:?} is not configured in the active residency policy"
+                )));
+            }
+        }
+        for (class, usage) in &snapshot.class_usage {
+            if usage.checked_total()? > 0 && !policy.classes.contains_key(class) {
+                return Err(MemoryError::capacity(format!(
+                    "live class {class:?} is absent from policy"
+                )));
+            }
+        }
+        if total_borrow > policy.shared_burst_pool_bytes {
+            return Err(MemoryError::capacity(format!(
+                "class borrow {total_borrow} exceeds shared pool {}",
+                policy.shared_burst_pool_bytes
+            )));
+        }
+        let non_headroom_band =
+            policy
+                .global_hard_limit_bytes
+                .checked_sub(policy.headroom_bytes)
+                .ok_or_else(|| MemoryError::capacity("headroom exceeds global hard limit"))?;
+        let protected_postimage = non_headroom_after
+            .checked_add(unused_class_floor)
+            .ok_or_else(|| MemoryError::capacity("class protected postimage exceeds u64"))?;
+        if protected_postimage > non_headroom_band {
+            return Err(MemoryError::capacity(format!(
+                "non-headroom usage {non_headroom_after} plus unused class floors \
+                 {unused_class_floor} exceeds band {non_headroom_band}"
+            )));
+        }
+
+        for (owner, quota) in &policy.owner_quotas {
+            let used = owner_after(owner)?;
+            if used > quota.hard_cap_bytes {
+                return Err(MemoryError::capacity(format!(
+                    "owner {owner} hard cap {} below postimage {used}",
+                    quota.hard_cap_bytes
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Reserve `bytes` against (class, owner, context).
     ///
     /// Fail-closed: every cap check happens BEFORE any counter mutation, so a
@@ -396,84 +516,8 @@ impl AccountingLedger {
 
         // --- pure checks, no mutation yet ---
 
-        // Invariant 5: the global hard limit is the absolute ceiling on total
-        // owner bytes. Non-`Headroom` charges leave the reserved headroom band
-        // free; only the `Headroom` class may draw into it.
         let snapshot = self.snapshot();
-        snapshot.validate_exact()?;
-        let global_total_after = LedgerSnapshot::checked_axis_total(&snapshot.owner_usage)?
-            .checked_add(bytes)
-            .ok_or_else(|| MemoryError::capacity("global reserve total exceeds u64"))?;
-        if global_total_after > self.policy().global_hard_limit_bytes {
-            return Err(MemoryError::capacity(format!(
-                "global hard limit {} exceeded by reserve to {global_total_after} (class {class:?})",
-                self.policy().global_hard_limit_bytes
-            )));
-        }
-
-        // Non-headroom classes own a distinct distributable band. Protect the
-        // configured headroom once (not once plus its live usage), and protect
-        // every other class's still-unused reserved floor. The requested class
-        // may consume its own floor. Independent class/group axes can describe
-        // the same bytes, so group protection is enforced by the scheduler and
-        // is not added again here.
-        if class != MemoryClass::Headroom {
-            let non_headroom_current = snapshot
-                .class_usage
-                .iter()
-                .filter(|(candidate, _)| **candidate != MemoryClass::Headroom)
-                .try_fold(0u64, |total, (_, usage)| {
-                    total
-                        .checked_add(usage.checked_total()?)
-                        .ok_or_else(|| MemoryError::capacity("non-headroom usage exceeds u64"))
-                })?;
-            let non_headroom_after = non_headroom_current
-                .checked_add(bytes)
-                .ok_or_else(|| MemoryError::capacity("non-headroom reserve total exceeds u64"))?;
-            let protected_for_peers = self
-                .policy()
-                .classes
-                .iter()
-                .filter(|(candidate, _)| {
-                    **candidate != class && **candidate != MemoryClass::Headroom
-                })
-                .try_fold(0u64, |total, (candidate, budget)| {
-                    let used = self.class_usage(candidate).checked_total()?;
-                    total
-                        .checked_add(budget.reserved_bytes.saturating_sub(used))
-                        .ok_or_else(|| MemoryError::capacity("class reserved floor exceeds u64"))
-                })?;
-            let distributable = self
-                .policy()
-                .global_hard_limit_bytes
-                .checked_sub(self.policy().headroom_bytes)
-                .and_then(|bytes| bytes.checked_sub(protected_for_peers))
-                .ok_or_else(|| MemoryError::capacity("protected memory floors exceed global"))?;
-            if non_headroom_after > distributable {
-                return Err(MemoryError::capacity(format!(
-                    "non-headroom ceiling {distributable} exceeded by reserve to {non_headroom_after}; \
-                     {protected_for_peers} bytes remain protected for peer class floors"
-                )));
-            }
-        }
-
-        let owner_current = self.owner_usage(&owner).checked_total()?;
-        let owner_after = owner_current
-            .checked_add(bytes)
-            .ok_or_else(|| MemoryError::capacity("owner reserve total exceeds u64"))?;
-        if let Some(quota) = self.policy().owner_quotas.get(&owner) {
-            if owner_after > quota.hard_cap_bytes {
-                return Err(MemoryError::capacity(format!(
-                    "owner {owner} hard cap {} exceeded by reserve to {owner_after}",
-                    quota.hard_cap_bytes
-                )));
-            }
-        }
-
-        let class_current = self.class_usage(&class).checked_total()?;
-        let class_after = class_current
-            .checked_add(bytes)
-            .ok_or_else(|| MemoryError::capacity("class reserve total exceeds u64"))?;
+        Self::validate_policy_postimage(self.policy(), &snapshot, Some((&class, &owner, bytes)))?;
         self.context_usage
             .get(&context)
             .copied()
@@ -490,33 +534,6 @@ impl AccountingLedger {
                 return Err(MemoryError::capacity("ledger charge-kind slot exceeds u64"));
             }
         }
-        let Some(budget) = self.policy().classes.get(&class) else {
-            return Err(MemoryError::capacity(format!(
-                "class {class:?} is not configured in the active residency policy"
-            )));
-        };
-        if class_after > budget.hard_cap_bytes {
-            if !budget.borrow_from_shared_pool {
-                return Err(MemoryError::capacity(format!(
-                    "class {class:?} hard cap {} exceeded by reserve to {class_after} and class may not borrow",
-                    budget.hard_cap_bytes
-                )));
-            }
-            // Invariant 6: the over-cap remainder is borrowed from the shared
-            // burst pool, which is finite and shared across all borrowing
-            // classes. Recompute total borrow with this class's prospective
-            // usage and reject if it would overdraw the pool.
-            let total_borrow_after = self.total_borrow_with(&class, class_after)?;
-            if total_borrow_after > self.policy().shared_burst_pool_bytes {
-                return Err(MemoryError::capacity(format!(
-                    "class {class:?} borrow would draw total {total_borrow_after} from shared \
-                     burst pool {} (over cap by {})",
-                    self.policy().shared_burst_pool_bytes,
-                    class_after.saturating_sub(budget.hard_cap_bytes)
-                )));
-            }
-        }
-
         // --- all checks passed: mutate ---
         let id = self.next_ticket_id.ok_or_else(|| {
             MemoryError::InvalidState("reservation ticket id space exhausted".to_string())
@@ -534,29 +551,6 @@ impl AccountingLedger {
         }
 
         Ok(ReservationTicket { id, ledger: self.instance_id, class, owner, context, kind, bytes })
-    }
-
-    /// Total bytes borrowed from the shared burst pool across all borrowing
-    /// classes, evaluating `probe_class` at the hypothetical `probe_usage`
-    /// (its prospective post-reserve usage) and every other borrowing class at
-    /// its current usage. A class borrows the amount by which its usage exceeds
-    /// its own hard cap.
-    fn total_borrow_with(&self, probe_class: &MemoryClass, probe_usage: u64) -> MemoryResult<u64> {
-        let mut total: u64 = 0;
-        for (class, budget) in &self.policy().classes {
-            if !budget.borrow_from_shared_pool {
-                continue;
-            }
-            let usage = if class == probe_class {
-                probe_usage
-            } else {
-                self.class_usage(class).checked_total()?
-            };
-            total = total
-                .checked_add(usage.saturating_sub(budget.hard_cap_bytes))
-                .ok_or_else(|| MemoryError::capacity("shared borrow total exceeds u64"))?;
-        }
-        Ok(total)
     }
 
     /// Commit a reservation. In this model a committed reservation keeps its

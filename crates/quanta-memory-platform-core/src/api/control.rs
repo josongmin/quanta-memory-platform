@@ -924,6 +924,14 @@ impl LiveProcessMemoryBroker {
         // weighted-fair scheduler (anti-starvation) before it can reserve.
         let group = core.ledger.policy().owner_groups.get(&owner).cloned();
         let mut next_scheduler = core.scheduler.clone();
+        if let Some(ref group) = group {
+            if !next_scheduler.admits(group, bytes) {
+                return Err(MemoryError::capacity(format!(
+                    "resource group {group} admission denied for owner {owner} reserve of {bytes} bytes"
+                )));
+            }
+            next_scheduler.record_usage(group, bytes)?;
+        }
         if class != MemoryClass::Headroom {
             let snapshot = core.ledger.snapshot();
             snapshot.validate_exact()?;
@@ -939,42 +947,13 @@ impl LiveProcessMemoryBroker {
             let non_headroom_after = non_headroom_current
                 .checked_add(bytes)
                 .ok_or_else(|| MemoryError::capacity("non-headroom reserve total exceeds u64"))?;
-            let protected_for_peer_groups = core
-                .ledger
-                .policy()
-                .resource_groups
-                .iter()
-                .filter(|(candidate, _)| Some(candidate.as_str()) != group.as_deref())
-                .try_fold(0u64, |total, (name, budget)| {
-                    total
-                        .checked_add(
-                            budget
-                                .reserved_bytes
-                                .saturating_sub(core.scheduler.current_usage(name)),
-                        )
-                        .ok_or_else(|| MemoryError::capacity("group reserved floor exceeds u64"))
-                })?;
-            let group_ceiling = core
+            let band = core
                 .ledger
                 .policy()
                 .global_hard_limit_bytes
                 .checked_sub(core.ledger.policy().headroom_bytes)
-                .and_then(|band| band.checked_sub(protected_for_peer_groups))
-                .ok_or_else(|| MemoryError::capacity("protected group floors exceed global"))?;
-            if non_headroom_after > group_ceiling {
-                return Err(MemoryError::capacity(format!(
-                    "resource-group protected ceiling {group_ceiling} exceeded by reserve to \
-                     {non_headroom_after}; {protected_for_peer_groups} bytes remain protected"
-                )));
-            }
-        }
-        if let Some(ref group) = group {
-            if !next_scheduler.admits(group, bytes) {
-                return Err(MemoryError::capacity(format!(
-                    "resource group {group} admission denied for owner {owner} reserve of {bytes} bytes"
-                )));
-            }
-            next_scheduler.record_usage(group, bytes)?;
+                .ok_or_else(|| MemoryError::capacity("headroom exceeds global hard limit"))?;
+            next_scheduler.protected_floor_fits(non_headroom_after, band)?;
         }
 
         // ExecutionBudget: the memory-relevant cap is `max_execution_scratch_bytes`,
@@ -1127,105 +1106,14 @@ impl LiveProcessMemoryBroker {
 
         let snapshot = core.ledger.snapshot();
         snapshot.validate_exact()?;
+        AccountingLedger::validate_policy_postimage(new_policy, &snapshot, None)
+            .map_err(|error| MemoryError::InvalidState(format!("live reconfig denied: {error}")))?;
         let current_total = snapshot.total_owner_bytes();
-        if new_policy.global_hard_limit_bytes < current_total {
-            return Err(MemoryError::InvalidState(format!(
-                "live reconfig denied: new global hard limit {} below current usage {current_total}",
-                new_policy.global_hard_limit_bytes
-            )));
-        }
-
-        // Invariant 5 (headroom band) must keep holding for the LIVE state, not
-        // just for future reserves: non-`Headroom` bytes already resident must fit
-        // under the NEW effective non-Headroom ceiling. Raising `headroom_bytes`
-        // above the free space would otherwise silently strand existing
-        // non-Headroom usage inside the reserved band (a fail-open of invariant 5).
         let headroom_used =
             snapshot.class_usage.get(&MemoryClass::Headroom).map_or(0, |u| u.total());
         let non_headroom_used = current_total.saturating_sub(headroom_used);
         let new_non_headroom_ceiling =
             new_policy.global_hard_limit_bytes.saturating_sub(new_policy.headroom_bytes);
-        if non_headroom_used > new_non_headroom_ceiling {
-            return Err(MemoryError::InvalidState(format!(
-                "live reconfig denied: non-Headroom usage {non_headroom_used} exceeds the new \
-                 effective ceiling {new_non_headroom_ceiling} (global {} - headroom {})",
-                new_policy.global_hard_limit_bytes, new_policy.headroom_bytes
-            )));
-        }
-
-        let unused_class_floor = new_policy.classes.iter().try_fold(
-            0u64,
-            |total, (class, budget)| -> MemoryResult<u64> {
-                if *class == MemoryClass::Headroom {
-                    return Ok(total);
-                }
-                let used = snapshot.class_usage.get(class).map_or(0, |usage| usage.total());
-                total.checked_add(budget.reserved_bytes.saturating_sub(used)).ok_or_else(|| {
-                    MemoryError::InvalidState("class reserved floor exceeds u64".into())
-                })
-            },
-        )?;
-        let class_protected_postimage =
-            non_headroom_used.checked_add(unused_class_floor).ok_or_else(|| {
-                MemoryError::InvalidState("class protected postimage exceeds u64".into())
-            })?;
-        if class_protected_postimage > new_non_headroom_ceiling {
-            return Err(MemoryError::InvalidState(format!(
-                "live reconfig denied: usage {non_headroom_used} plus unused class floors \
-                 {unused_class_floor} exceeds non-headroom ceiling {new_non_headroom_ceiling}"
-            )));
-        }
-
-        // Fail-closed over LIVE class usage, while preserving a legal shared-pool
-        // borrow. Reconfigure uses the same aggregate borrow predicate as reserve.
-        let mut total_class_borrow = 0u64;
-        for (class, usage) in &snapshot.class_usage {
-            let class_used = usage.total();
-            if class_used == 0 {
-                continue;
-            }
-            match new_policy.classes.get(class) {
-                Some(budget) if budget.hard_cap_bytes >= class_used => {}
-                Some(budget) if budget.borrow_from_shared_pool => {
-                    total_class_borrow = total_class_borrow
-                        .checked_add(class_used - budget.hard_cap_bytes)
-                        .ok_or_else(|| {
-                            MemoryError::InvalidState("live class borrow exceeds u64".into())
-                        })?;
-                }
-                Some(budget) => {
-                    return Err(MemoryError::InvalidState(format!(
-                        "live reconfig denied: non-borrowing class {class:?} new hard cap {} \
-                         below current usage {class_used}",
-                        budget.hard_cap_bytes
-                    )));
-                }
-                None => {
-                    return Err(MemoryError::InvalidState(format!(
-                        "live reconfig denied: class {class:?} holds {class_used} live bytes but is \
-                         absent from the new policy (would silently uncap it)"
-                    )));
-                }
-            }
-        }
-        if total_class_borrow > new_policy.shared_burst_pool_bytes {
-            return Err(MemoryError::InvalidState(format!(
-                "live reconfig denied: class borrow {total_class_borrow} exceeds shared pool {}",
-                new_policy.shared_burst_pool_bytes
-            )));
-        }
-
-        // Any owner quota carried by the new policy must honor that owner's live
-        // usage, or the reconfig would install a quota the owner already violates.
-        for (owner, quota) in &new_policy.owner_quotas {
-            let owner_used = snapshot.owner_usage.get(owner).map_or(0, |u| u.total());
-            if quota.hard_cap_bytes < owner_used {
-                return Err(MemoryError::InvalidState(format!(
-                    "live reconfig denied: owner {owner} new hard cap {} below current usage {owner_used}",
-                    quota.hard_cap_bytes
-                )));
-            }
-        }
 
         let current_owner_groups = &core.ledger.policy().owner_groups;
         for (owner, usage) in &snapshot.owner_usage {
@@ -1272,25 +1160,9 @@ impl LiveProcessMemoryBroker {
             }
             candidate_scheduler.record_usage(group, *used)?;
         }
-        let unused_group_floor = new_policy.resource_groups.iter().try_fold(
-            0u64,
-            |total, (group, budget)| -> MemoryResult<u64> {
-                let used = live_group_usage.get(group).copied().unwrap_or(0);
-                total.checked_add(budget.reserved_bytes.saturating_sub(used)).ok_or_else(|| {
-                    MemoryError::InvalidState("group reserved floor exceeds u64".into())
-                })
-            },
-        )?;
-        let group_protected_postimage =
-            non_headroom_used.checked_add(unused_group_floor).ok_or_else(|| {
-                MemoryError::InvalidState("group protected postimage exceeds u64".into())
-            })?;
-        if group_protected_postimage > new_non_headroom_ceiling {
-            return Err(MemoryError::InvalidState(format!(
-                "live reconfig denied: usage {non_headroom_used} plus unused group floors \
-                 {unused_group_floor} exceeds non-headroom ceiling {new_non_headroom_ceiling}"
-            )));
-        }
+        candidate_scheduler
+            .protected_floor_fits(non_headroom_used, new_non_headroom_ceiling)
+            .map_err(|error| MemoryError::InvalidState(format!("live reconfig denied: {error}")))?;
 
         // Accepted: install the new policy by rebuilding the ledger's view while
         // preserving usage counters.

@@ -68,6 +68,32 @@ impl WeightedResourceGroupScheduler {
         self.usage.get(group_name).copied().unwrap_or(0)
     }
 
+    /// Validate the complete resource-group reservation postimage against the
+    /// non-headroom band. Every group's unused floor remains protected, while
+    /// bytes already consumed by that group reduce its remaining floor.
+    pub(crate) fn protected_floor_fits(
+        &self,
+        non_headroom_usage: u64,
+        non_headroom_band: u64,
+    ) -> MemoryResult<()> {
+        let unused_floor = self.groups.iter().try_fold(0u64, |total, (name, group)| {
+            total
+                .checked_add(group.reserved_bytes.saturating_sub(self.current_usage(name)))
+                .ok_or_else(|| MemoryError::capacity("resource-group reserved floor exceeds u64"))
+        })?;
+        let protected_postimage =
+            non_headroom_usage.checked_add(unused_floor).ok_or_else(|| {
+                MemoryError::capacity("resource-group protected postimage exceeds u64")
+            })?;
+        if protected_postimage > non_headroom_band {
+            return Err(MemoryError::capacity(format!(
+                "resource-group usage {non_headroom_usage} plus unused floors {unused_floor} \
+                 exceeds non-headroom band {non_headroom_band}"
+            )));
+        }
+        Ok(())
+    }
+
     fn total_weight(&self) -> u128 {
         self.groups.values().map(|g| u128::from(g.admission_weight)).sum()
     }
