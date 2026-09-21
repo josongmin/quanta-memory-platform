@@ -4,7 +4,10 @@ use std::sync::Mutex;
 
 use quanta_memory_platform_core::{MemoryError, MemoryResult};
 
-use crate::spill::{InProcessSpillController, SpillController};
+use crate::spill::{
+    DurableCommitFailure, DurableRestoreCandidate, DurableRestoreController,
+    DurableSpillController, InProcessSpillController, SpillController,
+};
 
 /// Destination authority established by a successful spill commit.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -104,6 +107,21 @@ pub trait SpillTarget<Handle>: SpillInventory {
 /// return [`SpillReceipt::InProcess`] on success.
 pub trait InProcessSpillTarget<Handle>: SpillTarget<Handle> {}
 
+/// Marker for targets that durably commit an encoded handle before returning
+/// [`SpillReceipt::Durable`].
+pub trait DurableSpillTarget<Handle>: SpillTarget<Handle> {}
+
+/// Durable byte targets expose a non-destructive prepare and exact commit so a
+/// source can establish charge authority before deleting the durable record.
+pub trait DurableRestoreTarget: DurableSpillTarget<Vec<u8>> {
+    /// Read the oldest record without removing or claiming it.
+    fn prepare_restore(&self) -> MemoryResult<Option<DurableRestoreCandidate>>;
+
+    /// Remove exactly the prepared FIFO sequence and classify failure as known
+    /// retained or commit-ambiguous.
+    fn commit_restore(&self, sequence: u64) -> Result<(), DurableCommitFailure>;
+}
+
 /// A missing spill tier: fail closed and return the original handle.
 #[derive(Clone, Debug, Default)]
 pub struct NoopSpillController;
@@ -164,6 +182,24 @@ where
 impl<Handle, T> InProcessSpillController<Handle> for RoutedSpillController<T> where
     T: InProcessSpillTarget<Handle>
 {
+}
+
+impl<Handle, T> DurableSpillController<Handle> for RoutedSpillController<T> where
+    T: DurableSpillTarget<Handle>
+{
+}
+
+impl<T> DurableRestoreController for RoutedSpillController<T>
+where
+    T: DurableRestoreTarget,
+{
+    fn prepare_restore(&self) -> MemoryResult<Option<DurableRestoreCandidate>> {
+        self.target.prepare_restore()
+    }
+
+    fn commit_restore(&self, sequence: u64) -> Result<(), DurableCommitFailure> {
+        self.target.commit_restore(sequence)
+    }
 }
 
 /// An in-memory spill target whose availability can be toggled. This is the

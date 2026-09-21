@@ -90,10 +90,10 @@ Owner symbols:
 
 ## Acceptance
 
-- [ ] process-resident bytes가 uncharged 상태로 tier 이동하지 않는다.
-- [ ] spill success는 destination ownership level을 typed result로 표현한다.
+- [x] process-resident bytes가 uncharged 상태로 tier 이동하지 않는다.
+- [x] spill success는 destination ownership level을 typed result로 표현한다.
 - [ ] destructive discard는 explicit API다.
-- [ ] restart 후 retained inventory와 controller telemetry가 일치한다.
+- [x] restart 후 retained inventory와 controller telemetry가 일치한다.
 - [ ] advertised backing feature가 canonical builder에서 reachable하다.
 - [ ] 모든 backing이 동일 semantic conformance suite를 통과한다.
 
@@ -123,4 +123,6 @@ The isolated QMP-070 owner branch introduces a `SpillFailure<Handle>` that retur
 
 The next checkpoint removes the controller's duplicate atomic count. `SpillInventory` makes the target's retained inventory authoritative, so a controller created over a reopened redb database immediately reports the persisted record count. Successful writes return a typed `SpillReceipt`: in-process targets return `InProcess { inventory_after }`, while redb returns `Durable { sequence, inventory_after }` only after commit. `InProcessSpillController` / `InProcessSpillTarget` marker contracts prevent the charge-carrying revocable handle path from accepting a durable byte tier by accident.
 
-These tests prove only that scoped in-process path, ordinary returned errors, typed tier receipt, and restart-safe inventory observation. They **do not** prove the ticket's revocable-to-durable transfer, canonical moka/scc integration or removal, concurrent spill/reclaim/restore, or panic/abort fault model. In particular, a `SpillController` implementation that panics after consuming a handle can still lose source recovery authority. A redb commit error also needs post-error inventory reconciliation before the returned byte handle can safely be retried: a failed/ambiguous commit cannot be treated as proof that no destination record exists. The protocol must not be advertised as transactional across untrusted callbacks or ambiguous durable commits. Keep QMP-070 `IN_PROGRESS` until the remaining acceptance items have source-bound receipts.
+The durable revocable checkpoint adds a separate encoded-byte protocol. `spill_one_durable` keeps the source entry and charge live through encoding and destination commit, restores the original FIFO entry on encoder error/panic or returned destination error, and releases the source only after `SpillReceipt::Durable`. Reverse transfer uses `prepare_restore` to read without deletion, admits the exact source charge, then deletes the exact durable sequence and publishes locally. Admission or a known-retained delete failure leaves the durable record authoritative and rolls back the provisional source charge. A commit-ambiguous delete publishes a conservatively charged source and returns `DurableRestoreOutcome::RecoveryRequired { sequence, ... }`; it does not claim exactly-once completion. The redb round-trip, denial, retained-error, and ambiguity-classification paths execute this protocol.
+
+These tests prove the scoped in-process path, ordinary returned errors, typed tier receipt, restart-safe inventory observation, and the normal/returned-error durable transfer path. They **do not** prove canonical moka/scc integration or removal, concurrent spill/reclaim/restore, or the complete panic/abort and I/O ambiguity model. In particular, a custom `SpillController` that panics after consuming a handle can still lose source recovery authority. redb's `commit()` may return after entering its commit path, so a storage-level commit error requires persisted intent/reconciliation before the returned byte handle can safely be retried or an exact restore deletion can be classified. The current protocol must not be advertised as transactional across untrusted callbacks or ambiguous durable commits. Keep QMP-070 `IN_PROGRESS` until those remaining acceptance items have source-bound receipts.

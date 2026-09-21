@@ -266,8 +266,10 @@ fn prepared_publication_builder_exposes_root_bound_resolution_contract() {
 use quanta_memory_platform_core::MemoryResult;
 #[cfg(feature = "spill")]
 use quanta_memory_platform_facade::{
-    InMemorySpillTarget, NoopSpillController, RetainingSpillTarget, RoutedSpillController,
-    SpillController, SpillTarget,
+    DurableCommitFailure, DurableRestoreCandidate, DurableRestoreController, DurableRestoreOutcome,
+    DurableRestoreTarget, DurableSpillController, DurableSpillTarget, InMemorySpillTarget,
+    InProcessSpillController, InProcessSpillTarget, NoopSpillController, RetainingSpillTarget,
+    RoutedSpillController, SpillController, SpillInventory, SpillReceipt, SpillTarget,
 };
 
 /// Pins the `spill` slice's public exports, including the controller and target
@@ -282,6 +284,18 @@ fn names_spill_reexports() {
     );
     type _Targets =
         (Box<dyn SpillTarget<u64>>, InMemorySpillTarget<u64>, RetainingSpillTarget<u64>);
+    type _Inventory = Box<dyn SpillInventory>;
+    type _InProcess = (Box<dyn InProcessSpillController<u64>>, Box<dyn InProcessSpillTarget<u64>>);
+    type _Durable = (
+        Box<dyn DurableSpillController<Vec<u8>>>,
+        Box<dyn DurableRestoreController>,
+        Box<dyn DurableSpillTarget<Vec<u8>>>,
+        Box<dyn DurableRestoreTarget>,
+        SpillReceipt,
+        DurableRestoreCandidate,
+        DurableRestoreOutcome,
+        DurableCommitFailure,
+    );
 }
 
 // ---------------------------------------------------------------------------

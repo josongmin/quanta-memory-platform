@@ -11,7 +11,10 @@ use std::path::Path;
 use quanta_memory_platform_core::{MemoryError, MemoryResult};
 use redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition};
 
-use crate::spill::{SpillFailure, SpillInventory, SpillReceipt, SpillTarget};
+use crate::spill::{
+    DurableCommitFailure, DurableRestoreCandidate, DurableRestoreTarget, DurableSpillTarget,
+    SpillFailure, SpillInventory, SpillReceipt, SpillTarget,
+};
 
 /// The single FIFO queue table: monotonic sequence -> opaque handle bytes.
 const SPILL_QUEUE: TableDefinition<'static, u64, &[u8]> = TableDefinition::new("qmp_spill_queue");
@@ -113,27 +116,93 @@ impl SpillTarget<Vec<u8>> for RedbSpillBacking {
     }
 
     fn restore(&self) -> MemoryResult<Option<Vec<u8>>> {
-        let txn = self
-            .database
-            .begin_write()
-            .map_err(|e| MemoryError::report(format!("redb spill write txn failed: {e}")))?;
-        let popped = {
-            let mut table = txn
-                .open_table(SPILL_QUEUE)
-                .map_err(|e| MemoryError::report(format!("redb spill table open failed: {e}")))?;
-            let entry = table
-                .pop_first()
-                .map_err(|e| MemoryError::report(format!("redb spill pop failed: {e}")))?;
-            entry.map(|(_seq, value)| value.value().to_vec())
+        let Some(candidate) = DurableRestoreTarget::prepare_restore(self)? else {
+            return Ok(None);
         };
-        txn.commit().map_err(|e| MemoryError::report(format!("redb spill commit failed: {e}")))?;
-        Ok(popped)
+        if let Err(failure) = DurableRestoreTarget::commit_restore(self, candidate.sequence) {
+            let error = match failure {
+                DurableCommitFailure::Retained(error) | DurableCommitFailure::Ambiguous(error) => {
+                    error
+                }
+            };
+            return Err(*error);
+        }
+        Ok(Some(candidate.bytes))
     }
 }
 
 impl SpillInventory for RedbSpillBacking {
     fn retained_count(&self) -> MemoryResult<u64> {
         RedbSpillBacking::retained_count(self)
+    }
+}
+
+impl DurableSpillTarget<Vec<u8>> for RedbSpillBacking {}
+
+impl DurableRestoreTarget for RedbSpillBacking {
+    fn prepare_restore(&self) -> MemoryResult<Option<DurableRestoreCandidate>> {
+        let read = self
+            .database
+            .begin_read()
+            .map_err(|e| MemoryError::report(format!("redb spill read txn failed: {e}")))?;
+        match read.open_table(SPILL_QUEUE) {
+            Ok(table) => table
+                .first()
+                .map_err(|e| MemoryError::report(format!("redb spill first failed: {e}")))
+                .map(|entry| {
+                    entry.map(|(sequence, bytes)| DurableRestoreCandidate {
+                        sequence: sequence.value(),
+                        bytes: bytes.value().to_vec(),
+                    })
+                }),
+            Err(redb::TableError::TableDoesNotExist(_)) => Ok(None),
+            Err(e) => Err(MemoryError::report(format!("redb spill table open failed: {e}"))),
+        }
+    }
+
+    fn commit_restore(&self, sequence: u64) -> Result<(), DurableCommitFailure> {
+        let txn = self.database.begin_write().map_err(|e| {
+            DurableCommitFailure::retained(MemoryError::report(format!(
+                "redb spill write txn failed: {e}"
+            )))
+        })?;
+        {
+            let mut table = txn.open_table(SPILL_QUEUE).map_err(|e| {
+                DurableCommitFailure::retained(MemoryError::report(format!(
+                    "redb spill table open failed: {e}"
+                )))
+            })?;
+            let first_sequence = table
+                .first()
+                .map_err(|e| {
+                    DurableCommitFailure::retained(MemoryError::report(format!(
+                        "redb spill first failed: {e}"
+                    )))
+                })?
+                .map(|(key, _)| key.value());
+            if first_sequence != Some(sequence) {
+                return Err(DurableCommitFailure::retained(MemoryError::InvalidState(
+                    format!(
+                        "durable restore candidate {sequence} is stale; current first is {first_sequence:?}"
+                    ),
+                )));
+            }
+            let removed = table.pop_first().map_err(|e| {
+                DurableCommitFailure::retained(MemoryError::report(format!(
+                    "redb spill pop failed: {e}"
+                )))
+            })?;
+            if removed.is_none() {
+                return Err(DurableCommitFailure::retained(MemoryError::InvalidState(
+                    "durable restore candidate vanished before commit".into(),
+                )));
+            }
+        }
+        txn.commit().map_err(|e| {
+            DurableCommitFailure::ambiguous(MemoryError::report(format!(
+                "redb spill restore commit outcome is ambiguous: {e}"
+            )))
+        })
     }
 }
 
