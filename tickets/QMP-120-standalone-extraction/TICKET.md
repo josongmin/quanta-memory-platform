@@ -94,6 +94,13 @@ the currently integrated implementation remains `READY` or still fails.
 Remote `.github/workflows/standalone-extraction.yml` execution remains
 unobserved; keep `IMPLEMENTED`, not `QUALIFIED` or `DONE`.
 
+Current-source refresh: actual extraction of
+`f1d45c9bb28982f2c5ee3fcaac4a5d8ce4329be9` passed the complete 638-test
+doctor, feature-runtime lanes, selector validator, PM lint, deny and clean Git
+postcondition. See
+[`receipts/2026-09-21T105625Z-f1d45c9.md`](receipts/2026-09-21T105625Z-f1d45c9.md).
+The remote workflow remains unobserved, so lifecycle stays `IMPLEMENTED`.
+
 ## Verification
 
 ```bash

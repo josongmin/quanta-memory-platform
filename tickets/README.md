@@ -64,7 +64,7 @@ override.
 
 | ID | 우선순위 | 상태 | 목적 | depends_on | 주요 write set |
 | --- | --- | --- | --- | --- | --- |
-| [QMP-000](QMP-000-campaign-admission/TICKET.md) | P1 | IMPLEMENTED | status/claim, receipt identity, committed-source digest, selected-count, and current-transition admission enforced; exact-head dynamic rerun deferred | — | `tickets/**`, `tools/tickets/**`, validator front door |
+| [QMP-000](QMP-000-campaign-admission/TICKET.md) | P1 | QUALIFIED | status/claim, receipt identity, source digest, selected-count and current-transition admission reject negative fixtures and pass exact-head extraction at `f1d45c9` | — | `tickets/**`, `tools/tickets/**`, validator front door |
 | [QMP-010](QMP-010-policy-totality/TICKET.md) | P1 | QUALIFIED | mandatory class totality, validated policy authority, fail-closed reserve and current-source doctor pass at `aeeffe3` | QMP-000 | core `policy.rs`, `config.rs`, builder/policy tests |
 | [QMP-020](QMP-020-reservation-lifecycle/TICKET.md) | P1 | QUALIFIED | raw/discardable authority sealed behind managed RAII; duplicate commit and pending-drop rollback pass at `aeeffe3` | QMP-010 | core `ledger.rs`, recharge/control seams |
 | [QMP-030](QMP-030-enforced-builder-runtime-view/TICKET.md) | P1 | QUALIFIED | enforced builder/runtime scratch and managed RAII authority; current builder/control/public surface refreshed at `f9f6d15` | QMP-010, QMP-020 | core/facade builders, broker/control/scratch API, examples |
@@ -76,7 +76,7 @@ override.
 | [QMP-090](QMP-090-conformance-model/TICKET.md) | P1 | QUALIFIED | independent model, negative-family mapping, five Loom models and focused core/facade Miri remain green at `aeeffe3` | QMP-020, QMP-040, QMP-070 | testkit conformance/fakes/faults |
 | [QMP-100](QMP-100-scaling-benchmarks/TICKET.md) | P2 | QUALIFIED | full 160-sample qualification remains authoritative; current 0.2 source passes 30-sample smoke and doctor at `aeeffe3` | QMP-040, QMP-050, QMP-070 | payload/revocable containers, benches, CI scripts |
 | [QMP-110](QMP-110-operability-observation/TICKET.md) | P2 | QUALIFIED | typed one-lock observation, poison truth and bounded events remain green at `aeeffe3` | QMP-030, QMP-040, QMP-080 | stats traits, metrics adapters, broker/store emitters |
-| [QMP-120](QMP-120-standalone-extraction/TICKET.md) | P1 | IMPLEMENTED | local HEAD/tree/blob/mode-bound extraction and negative fixtures pass at `4fdac520`; remote workflow remains unobserved | QMP-000 | extraction manifest/scripts, lockfile, release CI |
+| [QMP-120](QMP-120-standalone-extraction/TICKET.md) | P1 | IMPLEMENTED | local HEAD/tree/blob/mode-bound extraction, 638-test doctor and clean extracted commit pass at `f1d45c9`; remote workflow remains unobserved | QMP-000 | extraction manifest/scripts, lockfile, release CI |
 | [QMP-130](QMP-130-host-adoption/TICKET.md) | P1 | BLOCKED | Semantica currently resolves adjacent shared-main QMP, not the audited/qualified revision; exact-root qualification absent | QMP-030..QMP-120 | external host repo only; QMP repo read-only except receipts |
 | [QMP-140](QMP-140-semver-docs-closeout/TICKET.md) | P2 | BLOCKED | public API/SemVer, stale test selectors/docs, receipt schema and final closeout | QMP-010..QMP-130 | public exports, README/EXTRACTION/docs, Cargo metadata |
 

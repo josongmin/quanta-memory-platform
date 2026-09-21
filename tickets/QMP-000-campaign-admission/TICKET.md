@@ -133,3 +133,12 @@ Implemented at `6f01f673972a01553500e5f27b9809e235e581ed`. A validator GREEN is
 admission evidence for receipt structure and committed source identity; it does
 not replace product behavior evidence. Exact-head workspace and extraction
 reruns remain required before `QUALIFIED`.
+
+## Current-source qualification (2026-09-21)
+
+The complete ticket tree, all 28 validator fixtures, PM lint, full standalone
+doctor, and actual extraction pass at committed source
+`f1d45c9bb28982f2c5ee3fcaac4a5d8ce4329be9`. The extracted tree also runs
+`verify-tickets: OK`, so the admission authority is self-hosting rather than a
+source-worktree-only check. See
+[`receipts/2026-09-21T105625Z-f1d45c9.md`](receipts/2026-09-21T105625Z-f1d45c9.md).
