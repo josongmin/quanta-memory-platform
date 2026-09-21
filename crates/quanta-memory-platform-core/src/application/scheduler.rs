@@ -26,15 +26,20 @@ pub trait ResourceGroupScheduler {
 ///    (`admission_weight / sum(admission_weight)`);
 /// 3. an unknown group is never admitted (fail-closed).
 ///
-/// "Fair share" is recomputed from live usage on every call, so a group that
-/// has already consumed its weighted slice is denied further burst even while
-/// other groups still have headroom — this is what prevents starvation under a
-/// repeatedly noisy owner.
+/// Weighted shares are policy-static and are precomputed once when the
+/// scheduler is built. Admission combines that cached allowance with live
+/// usage, so a group that has already consumed its weighted slice is denied
+/// further burst even while other groups still have headroom. Reconfiguration
+/// builds a new scheduler and therefore a new allocation table.
 #[derive(Clone, Debug, Default)]
 pub struct WeightedResourceGroupScheduler {
     groups: BTreeMap<String, ResourceGroup>,
     usage: BTreeMap<String, u64>,
     shared_burst_pool_bytes: u64,
+    /// Hamilton allocation of the shared pool. Keeping this policy-static
+    /// result avoids an O(group_count * log(group_count)) sort on every
+    /// admission decision.
+    fair_burst_shares: BTreeMap<String, u64>,
     /// Sum of `max(group.reserved_bytes - live_usage, 0)`. Kept as u128 so a
     /// large group registry cannot overflow while the externally enforced
     /// non-headroom band remains u64.
@@ -46,10 +51,13 @@ impl WeightedResourceGroupScheduler {
     pub fn new(groups: BTreeMap<String, ResourceGroup>, shared_burst_pool_bytes: u64) -> Self {
         let unused_reserved_floor_bytes =
             groups.values().fold(0u128, |total, group| total + u128::from(group.reserved_bytes));
+        let fair_burst_shares =
+            Self::precompute_fair_burst_shares(&groups, shared_burst_pool_bytes);
         Self {
             groups,
             usage: BTreeMap::new(),
             shared_burst_pool_bytes,
+            fair_burst_shares,
             unused_reserved_floor_bytes,
         }
     }
@@ -60,6 +68,11 @@ impl WeightedResourceGroupScheduler {
 
     /// Checked growth postimage without mutating scheduler state.
     pub(crate) fn usage_after_growth(&self, group_name: &str, delta: u64) -> MemoryResult<u64> {
+        if !self.groups.contains_key(group_name) {
+            return Err(MemoryError::InvalidState(format!(
+                "cannot record usage for unknown resource group {group_name}"
+            )));
+        }
         self.current_usage(group_name)
             .checked_add(delta)
             .ok_or_else(|| MemoryError::capacity("resource-group usage exceeds u64"))
@@ -67,6 +80,11 @@ impl WeightedResourceGroupScheduler {
 
     /// Checked release postimage without mutating scheduler state.
     pub(crate) fn usage_after_release(&self, group_name: &str, delta: u64) -> MemoryResult<u64> {
+        if !self.groups.contains_key(group_name) {
+            return Err(MemoryError::InvalidState(format!(
+                "cannot record release for unknown resource group {group_name}"
+            )));
+        }
         self.current_usage(group_name)
             .checked_sub(delta)
             .ok_or_else(|| MemoryError::InvalidState("resource-group release exceeds usage".into()))
@@ -174,51 +192,53 @@ impl WeightedResourceGroupScheduler {
         Ok(())
     }
 
-    fn total_weight(&self) -> u128 {
-        self.groups.values().map(|g| u128::from(g.admission_weight)).sum()
-    }
-
-    /// Weighted fair share of the shared burst pool for one named group.
-    ///
-    /// Uses Hamilton's largest-remainder allocation: every group receives the
-    /// floor of its exact weighted share, then leftover bytes are assigned by
-    /// descending fractional remainder with the stable group name as the tie
-    /// break. The sum is exactly the configured pool, including huge inputs.
-    fn fair_burst_share(&self, group_name: &str) -> u64 {
-        let Some(group) = self.groups.get(group_name) else {
-            return 0;
-        };
-        let total = self.total_weight();
+    /// Precompute Hamilton's largest-remainder allocation. Every group receives
+    /// the floor of its exact weighted share, then leftover bytes are assigned
+    /// by descending fractional remainder with the stable group name as the
+    /// tie break. The sum is exactly the configured pool when total weight is
+    /// non-zero, including huge inputs.
+    fn precompute_fair_burst_shares(
+        groups: &BTreeMap<String, ResourceGroup>,
+        shared_burst_pool_bytes: u64,
+    ) -> BTreeMap<String, u64> {
+        let total: u128 = groups.values().map(|group| u128::from(group.admission_weight)).sum();
         if total == 0 {
-            return 0;
+            return groups.keys().map(|name| (name.clone(), 0)).collect();
         }
-        let pool = u128::from(self.shared_burst_pool_bytes);
-        let numerator = pool * u128::from(group.admission_weight);
-        let base = numerator / total;
-        let allocated_base: u128 = self
-            .groups
-            .values()
-            .map(|candidate| pool * u128::from(candidate.admission_weight) / total)
-            .sum();
-        let leftover = usize::try_from(pool - allocated_base).unwrap_or(usize::MAX);
-
-        let mut remainders: Vec<(&str, u128)> = self
-            .groups
+        let pool = u128::from(shared_burst_pool_bytes);
+        let mut shares = BTreeMap::new();
+        let mut allocated_base = 0u128;
+        let mut remainders: Vec<(&str, u128)> = groups
             .iter()
             .map(|(name, candidate)| {
-                (name.as_str(), pool * u128::from(candidate.admission_weight) % total)
+                let numerator = pool * u128::from(candidate.admission_weight);
+                let base = numerator / total;
+                allocated_base += base;
+                shares.insert(
+                    name.clone(),
+                    u64::try_from(base).expect("a weighted share cannot exceed the u64 pool"),
+                );
+                (name.as_str(), numerator % total)
             })
             .collect();
         remainders.sort_by(|(left_name, left_remainder), (right_name, right_remainder)| {
             right_remainder.cmp(left_remainder).then_with(|| left_name.cmp(right_name))
         });
-        let remainder_byte =
-            if remainders.iter().take(leftover).any(|(name, _)| *name == group_name) {
-                1
-            } else {
-                0
-            };
-        u64::try_from(base + remainder_byte).unwrap_or(u64::MAX)
+        let leftover = pool - allocated_base;
+        for (index, (name, _)) in remainders.into_iter().enumerate() {
+            if u128::try_from(index).expect("usize always fits u128") >= leftover {
+                break;
+            }
+            if let Some(share) = shares.get_mut(name) {
+                *share += 1;
+            }
+        }
+        shares
+    }
+
+    /// Cached weighted fair share of the shared burst pool for one named group.
+    fn fair_burst_share(&self, group_name: &str) -> u64 {
+        self.fair_burst_shares.get(group_name).copied().unwrap_or(0)
     }
 
     fn burst_allowance(&self, group_name: &str, group: &ResourceGroup) -> u64 {
@@ -284,8 +304,11 @@ mod tests {
 
     #[test]
     fn unknown_group_is_denied_fail_closed() {
-        let s = two_group_scheduler();
+        let mut s = two_group_scheduler();
         assert!(!s.admits("ghost", 1), "unknown group must never be admitted");
+        assert!(matches!(s.record_usage("ghost", 0), Err(MemoryError::InvalidState(_))));
+        assert!(matches!(s.record_release("ghost", 0), Err(MemoryError::InvalidState(_))));
+        assert_eq!(s.usage.len(), 0, "unknown groups must not grow scheduler state");
     }
 
     // --- Negative path 4: starvation under repeated noisy owner growth
@@ -434,6 +457,28 @@ mod tests {
         assert!(
             !s.admits("heavy", share.saturating_add(1)),
             "group may not borrow one byte beyond its computed fair share"
+        );
+    }
+
+    #[test]
+    fn admission_reuses_policy_static_fair_share_table_at_high_group_cardinality() {
+        let mut groups = BTreeMap::new();
+        for index in 0..10_000 {
+            groups.insert(format!("group-{index:05}"), group(1_000, 1));
+        }
+        let mut scheduler = WeightedResourceGroupScheduler::new(groups, 10_000);
+        assert_eq!(scheduler.fair_burst_shares.len(), 10_000);
+        assert_eq!(scheduler.fair_burst_shares.values().copied().sum::<u64>(), 10_000);
+
+        let allocation = scheduler.fair_burst_shares.clone();
+        scheduler.record_usage("group-05000", 1_000).expect("record hard-cap usage");
+        for _ in 0..1_000 {
+            assert!(scheduler.admits("group-05000", 1));
+            assert!(!scheduler.admits("group-05000", 2));
+        }
+        assert_eq!(
+            scheduler.fair_burst_shares, allocation,
+            "live admission must not rebuild policy-static shares"
         );
     }
 
