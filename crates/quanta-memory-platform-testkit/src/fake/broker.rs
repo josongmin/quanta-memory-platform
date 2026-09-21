@@ -20,7 +20,7 @@
 use std::collections::BTreeMap;
 
 use quanta_memory_platform_core::{
-    ChargeKind, MemoryClass, MemoryError, MemoryResult, OwnerKey, PressureState,
+    ChargeKind, MemoryClass, MemoryContextKind, MemoryError, MemoryResult, OwnerKey, PressureState,
 };
 
 /// A tentative reservation handle issued by the fake broker. Holding one means
@@ -32,6 +32,7 @@ pub struct FakeReservation {
     id: u64,
     class: MemoryClass,
     owner: OwnerKey,
+    group: Option<String>,
     kind: ChargeKind,
     bytes: u64,
 }
@@ -75,6 +76,14 @@ impl FakeUsage {
             .saturating_add(self.live_scratch_bytes)
     }
 
+    fn amount(&self, kind: ChargeKind) -> u64 {
+        match kind {
+            ChargeKind::RetainedPayload => self.retained_payload_bytes,
+            ChargeKind::RetainedMetadata => self.retained_metadata_bytes,
+            ChargeKind::LiveScratch => self.live_scratch_bytes,
+        }
+    }
+
     fn slot_mut(&mut self, kind: ChargeKind) -> &mut u64 {
         match kind {
             ChargeKind::RetainedPayload => &mut self.retained_payload_bytes,
@@ -105,6 +114,10 @@ impl FakeUsage {
 pub struct FakeBrokerSnapshot {
     pub class_usage: BTreeMap<MemoryClass, FakeUsage>,
     pub owner_usage: BTreeMap<OwnerKey, FakeUsage>,
+    pub context_usage: BTreeMap<MemoryContextKind, FakeUsage>,
+    pub group_usage: BTreeMap<String, u64>,
+    /// Pending plus committed ticket authorities that have not terminated.
+    pub live_ticket_count: usize,
     pub rebuild_in_progress: bool,
     pub pressure: PressureState,
     /// When `Some`, the reported class AND owner totals use this value instead of
@@ -169,6 +182,8 @@ pub enum AccountingFidelity {
 pub struct FakeProcessBroker {
     class_usage: BTreeMap<MemoryClass, FakeUsage>,
     owner_usage: BTreeMap<OwnerKey, FakeUsage>,
+    context_usage: BTreeMap<MemoryContextKind, FakeUsage>,
+    group_usage: BTreeMap<String, u64>,
     owner_hard_caps: BTreeMap<OwnerKey, u64>,
     group_owners: BTreeMap<String, Vec<OwnerKey>>,
     group_hard_caps: BTreeMap<String, u64>,
@@ -200,6 +215,8 @@ impl FakeProcessBroker {
         Self {
             class_usage: BTreeMap::new(),
             owner_usage: BTreeMap::new(),
+            context_usage: BTreeMap::new(),
+            group_usage: BTreeMap::new(),
             owner_hard_caps: BTreeMap::new(),
             group_owners: BTreeMap::new(),
             group_hard_caps: BTreeMap::new(),
@@ -253,14 +270,8 @@ impl FakeProcessBroker {
         self.group_owners.iter().find(|(_, owners)| owners.contains(owner)).map(|(group, _)| group)
     }
 
-    fn group_usage_total(&self, group: &str) -> u64 {
-        match self.group_owners.get(group) {
-            Some(owners) => owners
-                .iter()
-                .map(|owner| self.owner_usage.get(owner).map_or(0, FakeUsage::total))
-                .sum(),
-            None => 0,
-        }
+    pub(crate) fn group_usage_total(&self, group: &str) -> u64 {
+        self.group_usage.get(group).copied().unwrap_or(0)
     }
 
     /// Reserve bytes against (class, owner). Fail-closed before mutation:
@@ -279,8 +290,22 @@ impl FakeProcessBroker {
             ));
         }
 
-        let owner_after =
-            self.owner_usage.get(&owner).map_or(0, FakeUsage::total).saturating_add(bytes);
+        let owner_after = self
+            .owner_usage
+            .get(&owner)
+            .map_or(0, FakeUsage::total)
+            .checked_add(bytes)
+            .ok_or_else(|| MemoryError::capacity("fake broker: owner usage exceeds u64"))?;
+        self.class_usage
+            .get(&class)
+            .map_or(0, FakeUsage::total)
+            .checked_add(bytes)
+            .ok_or_else(|| MemoryError::capacity("fake broker: class usage exceeds u64"))?;
+        self.context_usage
+            .get(&MemoryContextKind::Request)
+            .map_or(0, FakeUsage::total)
+            .checked_add(bytes)
+            .ok_or_else(|| MemoryError::capacity("fake broker: context usage exceeds u64"))?;
         if let Some(cap) = self.owner_hard_caps.get(&owner) {
             if owner_after > *cap {
                 return Err(MemoryError::capacity(format!(
@@ -289,9 +314,13 @@ impl FakeProcessBroker {
             }
         }
 
-        if let Some(group) = self.group_of(&owner).cloned() {
-            if let Some(cap) = self.group_hard_caps.get(&group) {
-                let group_after = self.group_usage_total(&group).saturating_add(bytes);
+        let group = self.group_of(&owner).cloned();
+        if let Some(group) = group.as_ref() {
+            if let Some(cap) = self.group_hard_caps.get(group) {
+                let group_after = self
+                    .group_usage_total(group)
+                    .checked_add(bytes)
+                    .ok_or_else(|| MemoryError::capacity("fake broker: group usage exceeds u64"))?;
                 if group_after > *cap {
                     return Err(MemoryError::capacity(format!(
                         "fake broker: resource group {group} hard cap {cap} exceeded by reserve to {group_after}"
@@ -301,12 +330,21 @@ impl FakeProcessBroker {
         }
 
         let id = self.next_id;
-        self.next_id = self.next_id.saturating_add(1);
+        let next_id = self.next_id.checked_add(1).ok_or_else(|| {
+            MemoryError::InvalidState("fake broker: reservation id space exhausted".into())
+        })?;
         self.class_usage.entry(class.clone()).or_default().add(kind, bytes);
         self.owner_usage.entry(owner.clone()).or_default().add(kind, bytes);
+        self.context_usage.entry(MemoryContextKind::Request).or_default().add(kind, bytes);
+        if let Some(group) = group.as_ref() {
+            let usage = self.group_usage.entry(group.clone()).or_default();
+            *usage =
+                usage.checked_add(bytes).expect("fake group admission preflight checked postimage");
+        }
+        self.next_id = next_id;
         self.ticket_states.insert(id, FakeTicketState::Pending);
 
-        Ok(FakeReservation { id, class, owner, kind, bytes })
+        Ok(FakeReservation { id, class, owner, group, kind, bytes })
     }
 
     /// Commit a reservation. Mirrors the core ledger: reserve already moved the
@@ -338,16 +376,54 @@ impl FakeProcessBroker {
                 "fake broker: rebuild in progress, live release rejected".to_string(),
             ));
         }
-        if self.ticket_states.remove(&ticket.id).is_none() {
+        if !self.ticket_states.contains_key(&ticket.id) {
             return Err(MemoryError::InvalidState(
                 "fake broker: reservation is stale or already released".into(),
             ));
         }
+        for (axis, available) in [
+            (
+                "class",
+                self.class_usage.get(&ticket.class).map_or(0, |usage| usage.amount(ticket.kind)),
+            ),
+            (
+                "owner",
+                self.owner_usage.get(&ticket.owner).map_or(0, |usage| usage.amount(ticket.kind)),
+            ),
+            (
+                "context",
+                self.context_usage
+                    .get(&MemoryContextKind::Request)
+                    .map_or(0, |usage| usage.amount(ticket.kind)),
+            ),
+        ] {
+            if available < ticket.bytes {
+                return Err(MemoryError::InvalidState(format!(
+                    "fake broker: {axis} release exceeds usage"
+                )));
+            }
+        }
+        if let Some(group) = ticket.group.as_ref() {
+            if self.group_usage.get(group).copied().unwrap_or(0) < ticket.bytes {
+                return Err(MemoryError::InvalidState(
+                    "fake broker: group release exceeds usage".into(),
+                ));
+            }
+        }
+
+        self.ticket_states.remove(&ticket.id);
         if let Some(usage) = self.class_usage.get_mut(&ticket.class) {
             usage.sub(ticket.kind, ticket.bytes);
         }
         if let Some(usage) = self.owner_usage.get_mut(&ticket.owner) {
             usage.sub(ticket.kind, ticket.bytes);
+        }
+        if let Some(usage) = self.context_usage.get_mut(&MemoryContextKind::Request) {
+            usage.sub(ticket.kind, ticket.bytes);
+        }
+        if let Some(group) = ticket.group.as_ref() {
+            let usage = self.group_usage.get_mut(group).expect("release preflight checked group");
+            *usage = usage.checked_sub(ticket.bytes).expect("release preflight checked amount");
         }
         Ok(())
     }
@@ -368,6 +444,7 @@ impl FakeProcessBroker {
             _ => return 0,
         };
         let freed = owner_total.min(self.reclaim_yield_bytes);
+        let group = self.group_of(&owner).cloned();
         // Free proportionally from payload first, then metadata, then scratch.
         let mut remaining = freed;
         if let Some(usage) = self.owner_usage.get_mut(&owner) {
@@ -382,6 +459,26 @@ impl FakeProcessBroker {
                 let take = slot.min(remaining);
                 usage.sub(kind, take);
                 remaining = remaining.saturating_sub(take);
+            }
+        }
+        if let Some(usage) = self.context_usage.get_mut(&MemoryContextKind::Request) {
+            let mut remaining = freed;
+            for kind in
+                [ChargeKind::RetainedPayload, ChargeKind::RetainedMetadata, ChargeKind::LiveScratch]
+            {
+                let slot = match kind {
+                    ChargeKind::RetainedPayload => usage.retained_payload_bytes,
+                    ChargeKind::RetainedMetadata => usage.retained_metadata_bytes,
+                    ChargeKind::LiveScratch => usage.live_scratch_bytes,
+                };
+                let take = slot.min(remaining);
+                usage.sub(kind, take);
+                remaining = remaining.saturating_sub(take);
+            }
+        }
+        if let Some(group) = group {
+            if let Some(usage) = self.group_usage.get_mut(&group) {
+                *usage = usage.saturating_sub(freed);
             }
         }
         // Mirror the same subtraction on the class axis so invariant 1 holds. We
@@ -471,6 +568,9 @@ impl FakeProcessBroker {
         FakeBrokerSnapshot {
             class_usage,
             owner_usage,
+            context_usage: self.context_usage.clone(),
+            group_usage: self.group_usage.clone(),
+            live_ticket_count: self.ticket_states.len(),
             rebuild_in_progress: self.rebuild_in_progress,
             pressure: self.pressure,
             total_override,

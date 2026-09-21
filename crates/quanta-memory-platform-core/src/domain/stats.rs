@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use crate::domain::config::{OverrideRecord, ResolvedBudget};
 use crate::domain::ledger::LedgerSnapshot;
 use crate::domain::policy::{ExecutionBudget, MemoryBudgetManifest, MemoryPreset, ResidencyPolicy};
@@ -83,6 +85,9 @@ pub struct ReclaimRuntimeStats {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BrokerObservation {
     pub ledger: LedgerSnapshot,
+    /// Scheduler-owned live usage by declared resource group, sampled under the
+    /// same broker lock as the ledger.
+    pub resource_group_usage: BTreeMap<String, u64>,
     pub report: EffectiveMemoryBudgetReport,
     pub pressure: PressureState,
     pub reclaim: ReclaimRuntimeStats,

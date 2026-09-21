@@ -437,8 +437,11 @@ where
         total_class_bytes: 1_750,
         total_owner_bytes: 1_750,
         total_context_bytes: 1_750,
+        context_axis_bytes: [1_750, 0, 0, 0, 0],
         class_axis_bytes: [1_500, 250],
         owner_axis_bytes: [1_250, 500],
+        group_axis_bytes: [0, 0],
+        live_ticket_count: 3,
         total_retained_payload_bytes: 1_000,
         total_retained_metadata_bytes: 250,
         total_live_scratch_bytes: 500,
@@ -462,7 +465,7 @@ where
     let partition =
         InvariantAssertion::new(ContractFamily::OwnerPartition, "observed_owner_partitions");
     verdicts.push(partition.assert_that(
-        matches!(&observed_live, Ok(view) if view.total_owner_bytes == view.partition_sum() && view.total_owner_bytes == view.total_context_bytes),
+        matches!(&observed_live, Ok(view) if Some(view.total_owner_bytes) == view.checked_partition_sum() && view.total_owner_bytes == view.total_context_bytes && Some(view.total_context_bytes) == view.checked_context_sum()),
         format!("observed={observed_live:?}"),
     ));
 
@@ -1313,11 +1316,17 @@ mod tests {
     use super::*;
     use crate::conformance::target::{AccountingView, AllocatorAdvisoryView};
     use crate::fake::{AccountingFidelity, FakeProcessBroker, FakeReservation};
+    use proptest::prelude::*;
     use quanta_memory_platform_core::{
-        LiveProcessMemoryBroker, MemoryBudgetManifest, MemoryClass, MemoryClassBudget,
-        MemoryPreset, ReclaimPriority, ResidencyPolicy, StoreBindingHandle,
+        ChargeKind, LiveProcessMemoryBroker, MemoryBudgetManifest, MemoryClass, MemoryClassBudget,
+        MemoryContextKind, MemoryEvent, MemoryEventSink, MemoryPreset, ReclaimPriority,
+        ResidencyPolicy, ResourceGroup, StoreBindingHandle,
     };
     use quanta_memory_platform_facade::MemoryPlatformBuilder;
+    use std::sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc, Mutex,
+    };
 
     fn all_held(verdicts: &[AssertionVerdict]) -> bool {
         verdicts.iter().all(AssertionVerdict::held)
@@ -1408,7 +1417,9 @@ mod tests {
             }
             let mut view = BrokerConformanceTarget::view(&self.inner)?;
             match self.fault {
-                BrokerFault::WrongContextAxis => view.total_context_bytes = 0,
+                BrokerFault::WrongContextAxis => {
+                    view.context_axis_bytes = [0, view.total_context_bytes, 0, 0, 0];
+                }
                 BrokerFault::WrongChargeKindAxis => {
                     view.total_retained_metadata_bytes = view
                         .total_retained_metadata_bytes
@@ -1432,13 +1443,14 @@ mod tests {
         }
     }
 
-    fn assert_broken_target_rejected(fault: BrokerFault, family: ContractFamily) {
+    fn assert_broken_target_rejected(fault: BrokerFault, exact_families: &[ContractFamily]) {
         let mut target = BrokenBrokerTarget::new(fault);
         let verdicts = run_broker_accounting_suite(&mut target);
         assert!(!all_held(&verdicts), "{fault:?} must be rejected");
-        assert!(
-            violated(&verdicts).contains(&family),
-            "{fault:?} must localize to {family:?}: {verdicts:?}"
+        assert_eq!(
+            violated(&verdicts),
+            exact_families,
+            "{fault:?} must localize to its exact expected family set: {verdicts:?}"
         );
     }
 
@@ -1462,10 +1474,18 @@ mod tests {
     struct IndependentAccountingModel {
         class_axis_bytes: [u64; 2],
         owner_axis_bytes: [u64; 2],
+        group_axis_bytes: [u64; 2],
         kind_bytes: [u64; 3],
+        live_ticket_count: usize,
+        rebuild_in_progress: bool,
+        grouped: bool,
     }
 
     impl IndependentAccountingModel {
+        fn grouped() -> Self {
+            Self { grouped: true, ..Self::default() }
+        }
+
         fn apply_reserve(
             &mut self,
             class_axis: usize,
@@ -1475,13 +1495,21 @@ mod tests {
         ) {
             self.class_axis_bytes[class_axis] += bytes;
             self.owner_axis_bytes[owner_axis] += bytes;
+            if self.grouped {
+                self.group_axis_bytes[owner_axis] += bytes;
+            }
             self.kind_bytes[kind_index(kind)] += bytes;
+            self.live_ticket_count += 1;
         }
 
         fn apply_release<T>(&mut self, ticket: &ModelTicket<T>) {
             self.class_axis_bytes[ticket.class_axis] -= ticket.bytes;
             self.owner_axis_bytes[ticket.owner_axis] -= ticket.bytes;
+            if self.grouped {
+                self.group_axis_bytes[ticket.owner_axis] -= ticket.bytes;
+            }
             self.kind_bytes[kind_index(ticket.kind)] -= ticket.bytes;
+            self.live_ticket_count -= 1;
         }
 
         fn view(&self) -> AccountingView {
@@ -1490,12 +1518,15 @@ mod tests {
                 total_class_bytes: self.class_axis_bytes.iter().sum(),
                 total_owner_bytes: total,
                 total_context_bytes: total,
+                context_axis_bytes: [total, 0, 0, 0, 0],
                 class_axis_bytes: self.class_axis_bytes,
                 owner_axis_bytes: self.owner_axis_bytes,
+                group_axis_bytes: self.group_axis_bytes,
+                live_ticket_count: self.live_ticket_count,
                 total_retained_payload_bytes: self.kind_bytes[0],
                 total_retained_metadata_bytes: self.kind_bytes[1],
                 total_live_scratch_bytes: self.kind_bytes[2],
-                rebuild_in_progress: false,
+                rebuild_in_progress: self.rebuild_in_progress,
             }
         }
     }
@@ -1586,16 +1617,277 @@ mod tests {
     }
 
     #[test]
-    fn property_trace_matches_independent_model() {
+    fn deterministic_trace_matches_independent_model() {
         run_independent_trace(&mut FakeProcessBroker::honest());
         run_independent_trace(&mut live_broker());
+    }
+
+    #[derive(Clone, Debug)]
+    enum ModelOperation {
+        Reserve { class_axis: usize, owner_axis: usize, kind: ChargeAxis, bytes: u64 },
+        Commit(usize),
+        Release(usize),
+        BeginRebuild,
+        FinishRebuild,
+        Observe(Option<u64>),
+    }
+
+    fn model_operation() -> impl Strategy<Value = ModelOperation> {
+        let kind = prop_oneof![
+            Just(ChargeAxis::RetainedPayload),
+            Just(ChargeAxis::RetainedMetadata),
+            Just(ChargeAxis::LiveScratch),
+        ];
+        prop_oneof![
+            5 => (0usize..2, 0usize..2, kind, 0u64..=63).prop_map(
+                |(class_axis, owner_axis, kind, bytes)| ModelOperation::Reserve {
+                    class_axis,
+                    owner_axis,
+                    kind,
+                    bytes,
+                }
+            ),
+            1 => Just(ModelOperation::Reserve {
+                class_axis: 0,
+                owner_axis: 0,
+                kind: ChargeAxis::RetainedPayload,
+                bytes: u64::MAX,
+            }),
+            2 => (0usize..96).prop_map(ModelOperation::Commit),
+            3 => (0usize..96).prop_map(ModelOperation::Release),
+            1 => Just(ModelOperation::BeginRebuild),
+            1 => Just(ModelOperation::FinishRebuild),
+            2 => prop::option::of(0u64..=8_192).prop_map(ModelOperation::Observe),
+        ]
+    }
+
+    fn run_generated_trace<T: BrokerConformanceTarget>(
+        target: &mut T,
+        operations: &[ModelOperation],
+    ) {
+        let owners = ["owner:conformance-a", "owner:conformance-b"];
+        let mut model = IndependentAccountingModel::grouped();
+        let mut tickets: Vec<ModelTicket<T::Ticket>> = Vec::new();
+
+        for (step, operation) in operations.iter().enumerate() {
+            match *operation {
+                ModelOperation::Reserve { class_axis, owner_axis, kind, bytes } => {
+                    let before = target.view().expect("pre-reserve observation");
+                    let result = target.do_reserve(class_axis, owners[owner_axis], kind, bytes);
+                    if model.rebuild_in_progress || bytes == u64::MAX {
+                        assert!(result.is_err(), "step {step}: denied reserve unexpectedly passed");
+                        assert_eq!(target.view(), Ok(before), "step {step}: denial mutated state");
+                    } else {
+                        let ticket = result.unwrap_or_else(|error| {
+                            panic!("step {step}: admissible reserve failed: {error}")
+                        });
+                        model.apply_reserve(class_axis, owner_axis, kind, bytes);
+                        tickets.push(ModelTicket {
+                            target: ticket,
+                            class_axis,
+                            owner_axis,
+                            kind,
+                            bytes,
+                            state: ModelTicketState::Pending,
+                        });
+                    }
+                }
+                ModelOperation::Commit(slot)
+                    if !model.rebuild_in_progress && !tickets.is_empty() =>
+                {
+                    let index = slot % tickets.len();
+                    let ticket = &mut tickets[index];
+                    let result = target.do_commit(&ticket.target);
+                    if ticket.state == ModelTicketState::Pending {
+                        result.unwrap_or_else(|error| {
+                            panic!("step {step}: first commit failed: {error}")
+                        });
+                        ticket.state = ModelTicketState::Committed;
+                    } else {
+                        assert!(result.is_err(), "step {step}: non-pending commit passed");
+                    }
+                }
+                ModelOperation::Release(slot)
+                    if !model.rebuild_in_progress && !tickets.is_empty() =>
+                {
+                    let index = slot % tickets.len();
+                    let result = target.do_release(&tickets[index].target);
+                    if tickets[index].state == ModelTicketState::Released {
+                        assert!(result.is_err(), "step {step}: stale release passed");
+                    } else {
+                        result.unwrap_or_else(|error| {
+                            panic!("step {step}: terminal release failed: {error}")
+                        });
+                        model.apply_release(&tickets[index]);
+                        tickets[index].state = ModelTicketState::Released;
+                    }
+                }
+                ModelOperation::BeginRebuild if !model.rebuild_in_progress => {
+                    target
+                        .do_begin_rebuild()
+                        .unwrap_or_else(|error| panic!("step {step}: begin failed: {error}"));
+                    model.rebuild_in_progress = true;
+                }
+                ModelOperation::FinishRebuild if model.rebuild_in_progress => {
+                    target
+                        .do_finish_rebuild()
+                        .unwrap_or_else(|error| panic!("step {step}: finish failed: {error}"));
+                    model.rebuild_in_progress = false;
+                }
+                ModelOperation::Observe(resident_bytes) => {
+                    let advisory = target
+                        .observe_allocator(&AllocatorObservation { resident_bytes })
+                        .unwrap_or_else(|error| panic!("step {step}: observation failed: {error}"));
+                    assert_eq!(advisory.semantic_bytes, model.view().total_owner_bytes);
+                    assert_eq!(advisory.allocator_resident_bytes, resident_bytes);
+                }
+                _ => {}
+            }
+            assert_eq!(
+                target.view(),
+                Ok(model.view()),
+                "independent model divergence after generated step {step}: {operation:?}"
+            );
+        }
+
+        if model.rebuild_in_progress {
+            target.do_finish_rebuild().expect("final rebuild close");
+            model.rebuild_in_progress = false;
+        }
+        for ticket in &mut tickets {
+            if ticket.state != ModelTicketState::Released {
+                target.do_release(&ticket.target).expect("generated trace final drain");
+                model.apply_release(ticket);
+                ticket.state = ModelTicketState::Released;
+            }
+        }
+        assert_eq!(model.view(), AccountingView::default());
+        assert_eq!(target.view(), Ok(AccountingView::default()));
+    }
+
+    fn grouped_fake() -> FakeProcessBroker {
+        FakeProcessBroker::honest()
+            .with_resource_group(
+                "conformance-group-a",
+                6_000,
+                vec!["owner:conformance-a".to_string()],
+            )
+            .with_resource_group(
+                "conformance-group-b",
+                6_000,
+                vec!["owner:conformance-b".to_string()],
+            )
+    }
+
+    fn grouped_live_broker() -> LiveProcessMemoryBroker {
+        let group = ResourceGroup {
+            reserved_bytes: 0,
+            soft_cap_bytes: 4_000,
+            hard_cap_bytes: 6_000,
+            burst_percent: 0,
+            reclaim_priority: ReclaimPriority::Normal,
+            admission_weight: 1,
+        };
+        let residency = ResidencyPolicy::new(10_000_000)
+            .with_class_budget(
+                MemoryClass::ArtifactCache,
+                MemoryClassBudget {
+                    reserved_bytes: 0,
+                    soft_cap_bytes: 4_000,
+                    hard_cap_bytes: 6_000,
+                    borrow_from_shared_pool: false,
+                    reclaim_priority: ReclaimPriority::Normal,
+                },
+            )
+            .with_class_budget(
+                MemoryClass::EvidenceCache,
+                MemoryClassBudget {
+                    reserved_bytes: 0,
+                    soft_cap_bytes: 4_000,
+                    hard_cap_bytes: 6_000,
+                    borrow_from_shared_pool: false,
+                    reclaim_priority: ReclaimPriority::Normal,
+                },
+            )
+            .with_resource_group("conformance-group-a", group.clone())
+            .with_resource_group("conformance-group-b", group)
+            .with_owner_group("owner:conformance-a", "conformance-group-a")
+            .with_owner_group("owner:conformance-b", "conformance-group-b");
+        quanta_memory_platform_core::ProcessMemoryBrokerBuilder::new()
+            .with_manifest(MemoryBudgetManifest::new(
+                MemoryPreset::Ci,
+                quanta_memory_platform_core::ExecutionBudget::default(),
+                residency,
+            ))
+            .build()
+            .expect("valid grouped residency")
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 128,
+            max_shrink_iters: 8_192,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn property_trace_matches_independent_model(
+            operations in prop::collection::vec(model_operation(), 1..96)
+        ) {
+            run_generated_trace(&mut grouped_fake(), &operations);
+            run_generated_trace(&mut grouped_live_broker(), &operations);
+        }
+    }
+
+    #[derive(Default)]
+    struct ReentrantSink {
+        broker: Mutex<Option<LiveProcessMemoryBroker>>,
+        entered: AtomicBool,
+        reentries: AtomicUsize,
+    }
+
+    impl MemoryEventSink for ReentrantSink {
+        fn emit(&self, _event: MemoryEvent) {
+            if self.entered.swap(true, Ordering::AcqRel) {
+                return;
+            }
+            if let Some(broker) = self.broker.lock().expect("sink broker lock").clone() {
+                broker.observe().expect("reentrant observation must not deadlock");
+                self.reentries.fetch_add(1, Ordering::Release);
+            }
+        }
+    }
+
+    #[test]
+    fn reentrant_sink_is_contained_outside_owner_lock() {
+        let sink = Arc::new(ReentrantSink::default());
+        let broker = quanta_memory_platform_core::ProcessMemoryBrokerBuilder::new()
+            .with_preset(MemoryPreset::Development)
+            .with_event_sink(sink.clone())
+            .build()
+            .expect("broker");
+        *sink.broker.lock().expect("install broker") = Some(broker.clone());
+
+        let charge = broker
+            .reserve_managed_charge(
+                MemoryClass::ArtifactCache,
+                "reentrant-sink".into(),
+                MemoryContextKind::Request,
+                ChargeKind::RetainedPayload,
+                8,
+            )
+            .expect("reserve must survive reentrant advisory sink");
+        assert_eq!(sink.reentries.load(Ordering::Acquire), 1);
+        assert_eq!(broker.observe().expect("observation").semantic_bytes, 8);
+        drop(charge);
+        assert_eq!(broker.observe().expect("final observation").semantic_bytes, 0);
     }
 
     #[test]
     fn suite_rejects_black_hole_accounting() {
         assert_broken_target_rejected(
             BrokerFault::BlackHoleAccounting,
-            ContractFamily::OwnerPartition,
+            &[ContractFamily::OwnerPartition, ContractFamily::AllocatorAdvisory],
         );
     }
 
@@ -1603,7 +1895,7 @@ mod tests {
     fn suite_rejects_commit_swallowing_target() {
         assert_broken_target_rejected(
             BrokerFault::CommitSwallowing,
-            ContractFamily::TicketLifecycle,
+            &[ContractFamily::TicketLifecycle],
         );
     }
 
@@ -1611,7 +1903,7 @@ mod tests {
     fn suite_rejects_release_swallowing_target() {
         assert_broken_target_rejected(
             BrokerFault::ReleaseSwallowing,
-            ContractFamily::TicketLifecycle,
+            &[ContractFamily::TicketLifecycle],
         );
     }
 
@@ -1619,7 +1911,7 @@ mod tests {
     fn suite_rejects_duplicate_commit_accepting_target() {
         assert_broken_target_rejected(
             BrokerFault::DuplicateCommitAccepting,
-            ContractFamily::TicketLifecycle,
+            &[ContractFamily::TicketLifecycle],
         );
     }
 
@@ -1627,7 +1919,7 @@ mod tests {
     fn suite_rejects_wrong_context_axis() {
         assert_broken_target_rejected(
             BrokerFault::WrongContextAxis,
-            ContractFamily::OwnerPartition,
+            &[ContractFamily::OwnerPartition],
         );
     }
 
@@ -1635,7 +1927,7 @@ mod tests {
     fn suite_rejects_wrong_charge_kind_axis() {
         assert_broken_target_rejected(
             BrokerFault::WrongChargeKindAxis,
-            ContractFamily::OwnerPartition,
+            &[ContractFamily::OwnerPartition],
         );
     }
 
@@ -1643,7 +1935,7 @@ mod tests {
     fn suite_rejects_stale_ticket_accepting_target() {
         assert_broken_target_rejected(
             BrokerFault::StaleTicketAccepting,
-            ContractFamily::TicketLifecycle,
+            &[ContractFamily::TicketLifecycle],
         );
     }
 
@@ -1651,7 +1943,12 @@ mod tests {
     fn snapshot_error_is_failed_verdict_not_zero() {
         assert_broken_target_rejected(
             BrokerFault::ObservationError,
-            ContractFamily::OwnerPartition,
+            &[
+                ContractFamily::OwnerPartition,
+                ContractFamily::ClassOwnerBalance,
+                ContractFamily::AllocatorAdvisory,
+                ContractFamily::TicketLifecycle,
+            ],
         );
     }
 
@@ -1659,7 +1956,12 @@ mod tests {
     fn suite_rejects_transfer_double_owner() {
         assert_broken_target_rejected(
             BrokerFault::TransferDoubleOwner,
-            ContractFamily::OwnerPartition,
+            &[
+                ContractFamily::OwnerPartition,
+                ContractFamily::ClassOwnerBalance,
+                ContractFamily::AllocatorAdvisory,
+                ContractFamily::TicketLifecycle,
+            ],
         );
     }
 
@@ -2283,8 +2585,11 @@ mod tests {
                 total_class_bytes: self.class_payload_bytes,
                 total_owner_bytes: self.owner_payload_bytes,
                 total_context_bytes: self.owner_payload_bytes,
+                context_axis_bytes: [self.owner_payload_bytes, 0, 0, 0, 0],
                 class_axis_bytes: [self.class_payload_bytes, 0],
                 owner_axis_bytes: [self.owner_payload_bytes, 0],
+                group_axis_bytes: [0, 0],
+                live_ticket_count: 0,
                 total_retained_payload_bytes: self.owner_payload_bytes,
                 total_retained_metadata_bytes: 0,
                 total_live_scratch_bytes: 0,
@@ -2395,8 +2700,11 @@ mod tests {
                 total_class_bytes: bytes,
                 total_owner_bytes: bytes,
                 total_context_bytes: bytes,
+                context_axis_bytes: [bytes, 0, 0, 0, 0],
                 class_axis_bytes: [bytes, 0],
                 owner_axis_bytes: [bytes, 0],
+                group_axis_bytes: [0, 0],
+                live_ticket_count: 0,
                 total_retained_payload_bytes: bytes,
                 total_retained_metadata_bytes: 0,
                 total_live_scratch_bytes: 0,
@@ -2451,7 +2759,11 @@ mod tests {
         let mid = fake.view().expect("view");
         assert_eq!(mid.total_owner_bytes, 4_096, "committed bytes are accounted");
         assert_eq!(mid.total_class_bytes, mid.total_owner_bytes, "invariant 1 after commit");
-        assert_eq!(mid.partition_sum(), mid.total_owner_bytes, "invariant 2 after commit");
+        assert_eq!(
+            mid.checked_partition_sum(),
+            Some(mid.total_owner_bytes),
+            "invariant 2 after commit"
+        );
 
         fake.do_release(&t).expect("release succeeds");
         let end = fake.view().expect("view");
@@ -2476,7 +2788,11 @@ mod tests {
         let end = broker.view().expect("view");
         assert_eq!(end.total_owner_bytes, 0, "release zeroes owner usage on the real broker");
         assert_eq!(end.total_class_bytes, end.total_owner_bytes, "invariant 1 holds at zero");
-        assert_eq!(end.partition_sum(), end.total_owner_bytes, "invariant 2 holds at zero");
+        assert_eq!(
+            end.checked_partition_sum(),
+            Some(end.total_owner_bytes),
+            "invariant 2 holds at zero"
+        );
     }
 
     // -----------------------------------------------------------------------

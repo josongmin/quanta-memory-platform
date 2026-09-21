@@ -1399,8 +1399,16 @@ impl LiveProcessMemoryBroker {
             ledger.validate_exact()?;
             let semantic_bytes = ledger.checked_total_owner_bytes()?;
             let pressure = core.controller.update_from_semantic(semantic_bytes);
+            let resource_group_usage = core
+                .report
+                .residency
+                .resource_groups
+                .keys()
+                .map(|name| (name.clone(), core.scheduler.current_usage(name)))
+                .collect();
             Ok(BrokerObservation {
                 ledger,
+                resource_group_usage,
                 report: core.report.clone(),
                 pressure,
                 reclaim: core.reclaim_stats.clone(),
@@ -2384,6 +2392,9 @@ mod tests {
             matches!(denied, Err(MemoryError::InvalidState(_))),
             "lowering a group cap below live group usage must be denied, got {denied:?}"
         );
+        let observation = b.observe().expect("lock-consistent group observation");
+        assert_eq!(observation.resource_group_usage.get("g"), Some(&90_000));
+        assert_eq!(observation.ledger.live_ticket_count, 1);
 
         // Raising the cap to 120k (>= 90k live) is legal and accepted.
         let raised = ResidencyPolicy::new(10_000_000)
@@ -2392,6 +2403,9 @@ mod tests {
             .with_owner_group("owner:g", "g");
         b.try_live_reconfigure(raised).expect("raising the group cap over live usage is legal");
         b.release(&t).expect("release");
+        let drained = b.observe().expect("drained group observation");
+        assert_eq!(drained.resource_group_usage.get("g"), Some(&0));
+        assert_eq!(drained.ledger.live_ticket_count, 0);
     }
 
     // --- positive pair: a legal reconfig (raising caps) is accepted

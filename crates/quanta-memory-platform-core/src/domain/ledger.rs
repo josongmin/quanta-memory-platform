@@ -181,6 +181,9 @@ pub struct LedgerSnapshot {
     pub class_usage: BTreeMap<MemoryClass, UsageBreakdown>,
     pub owner_usage: BTreeMap<OwnerKey, UsageBreakdown>,
     pub context_usage: BTreeMap<MemoryContextKind, UsageBreakdown>,
+    /// Pending plus committed reservation authorities that have not terminated.
+    /// A zero-byte reservation still contributes one live authority.
+    pub live_ticket_count: usize,
     pub rebuild_in_progress: bool,
 }
 
@@ -813,6 +816,7 @@ impl AccountingLedger {
             class_usage: self.class_usage.clone(),
             owner_usage: self.owner_usage.clone(),
             context_usage: self.context_usage.clone(),
+            live_ticket_count: self.ticket_states.len(),
             rebuild_in_progress: self.rebuild_in_progress,
         }
     }
@@ -1185,15 +1189,18 @@ mod tests {
         let ticket = reserve(&mut ledger, MemoryClass::ArtifactCache, "o", 0)
             .expect("a zero-byte reserve is admitted");
         assert_eq!(ticket.bytes(), 0, "ticket carries 0 bytes");
+        assert_eq!(ledger.snapshot().live_ticket_count, 1);
         // A 0-byte reserve must not move any counter.
         assert_eq!(ledger.snapshot().total_owner_bytes(), 0, "0 bytes charged nothing");
         assert_axes_balanced(&ledger.snapshot());
 
         // Commit reports the (zero) charged bytes for an honest, live ticket.
         assert_eq!(ledger.commit(&ticket).expect("commit live zero-byte ticket"), 0);
+        assert_eq!(ledger.snapshot().live_ticket_count, 1);
 
         // First release succeeds and the ledger returns to its pre-reserve state.
         ledger.release(&ticket).expect("first release of zero-byte ticket");
+        assert_eq!(ledger.snapshot().live_ticket_count, 0);
         assert_eq!(ledger.snapshot(), before, "release of a 0-byte ticket is a no-op on counters");
 
         // Invariant 7 still bites for a zero-byte ticket: the second release of

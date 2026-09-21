@@ -25,10 +25,17 @@ pub struct AccountingView {
     pub total_owner_bytes: u64,
     /// Sum of the request context used by this conformance workload.
     pub total_context_bytes: u64,
+    /// Exact totals for Request, Session, Generation, Runtime and Background.
+    pub context_axis_bytes: [u64; 5],
     /// Exact totals for the two stable class axes.
     pub class_axis_bytes: [u64; 2],
     /// Exact totals for the two stable owners used by the suite.
     pub owner_axis_bytes: [u64; 2],
+    /// Exact totals for the two stable resource groups used by generated traces.
+    /// Targets without those groups report zeroes.
+    pub group_axis_bytes: [u64; 2],
+    /// Pending plus committed ticket authorities that have not terminated.
+    pub live_ticket_count: usize,
     /// Owner retained-payload bytes.
     pub total_retained_payload_bytes: u64,
     /// Owner retained-metadata bytes.
@@ -57,10 +64,16 @@ pub struct AllocatorAdvisoryView {
 impl AccountingView {
     /// The partition sum that owner usage must equal (invariant 2).
     #[must_use]
-    pub fn partition_sum(&self) -> u64 {
+    pub fn checked_partition_sum(&self) -> Option<u64> {
         self.total_retained_payload_bytes
-            .saturating_add(self.total_retained_metadata_bytes)
-            .saturating_add(self.total_live_scratch_bytes)
+            .checked_add(self.total_retained_metadata_bytes)?
+            .checked_add(self.total_live_scratch_bytes)
+    }
+
+    /// Checked sum of the five context axes.
+    #[must_use]
+    pub fn checked_context_sum(&self) -> Option<u64> {
+        self.context_axis_bytes.iter().try_fold(0u64, |sum, bytes| sum.checked_add(*bytes))
     }
 }
 
@@ -209,9 +222,35 @@ impl BrokerConformanceTarget for FakeProcessBroker {
         Ok(AccountingView {
             total_class_bytes: snap.total_class_bytes(),
             total_owner_bytes: snap.total_owner_bytes(),
-            total_context_bytes: snap.total_owner_bytes(),
+            total_context_bytes: snap
+                .context_usage
+                .values()
+                .map(crate::fake::FakeUsage::total)
+                .sum(),
+            context_axis_bytes: [
+                snap.context_usage
+                    .get(&quanta_memory_platform_core::MemoryContextKind::Request)
+                    .map_or(0, crate::fake::FakeUsage::total),
+                snap.context_usage
+                    .get(&quanta_memory_platform_core::MemoryContextKind::Session)
+                    .map_or(0, crate::fake::FakeUsage::total),
+                snap.context_usage
+                    .get(&quanta_memory_platform_core::MemoryContextKind::Generation)
+                    .map_or(0, crate::fake::FakeUsage::total),
+                snap.context_usage
+                    .get(&quanta_memory_platform_core::MemoryContextKind::Runtime)
+                    .map_or(0, crate::fake::FakeUsage::total),
+                snap.context_usage
+                    .get(&quanta_memory_platform_core::MemoryContextKind::Background)
+                    .map_or(0, crate::fake::FakeUsage::total),
+            ],
             class_axis_bytes,
             owner_axis_bytes,
+            group_axis_bytes: [
+                snap.group_usage.get("conformance-group-a").copied().unwrap_or(0),
+                snap.group_usage.get("conformance-group-b").copied().unwrap_or(0),
+            ],
+            live_ticket_count: snap.live_ticket_count,
             total_retained_payload_bytes: snap.total_retained_payload_bytes(),
             total_retained_metadata_bytes: snap.total_retained_metadata_bytes(),
             total_live_scratch_bytes: snap.total_live_scratch_bytes(),
@@ -312,31 +351,64 @@ impl BrokerConformanceTarget for LiveProcessMemoryBroker {
     // class_axes: uses the trait's provided default (CONFORMANCE_CLASS_AXES).
 
     fn view(&self) -> Result<AccountingView, String> {
-        self.ledger_snapshot()
-            .map(|snap| AccountingView {
-                total_class_bytes: snap.total_class_bytes(),
-                total_owner_bytes: snap.total_owner_bytes(),
-                total_context_bytes: snap.total_context_bytes(),
-                class_axis_bytes: [
-                    snap.class_usage
-                        .get(&quanta_memory_platform_core::MemoryClass::ArtifactCache)
-                        .map_or(0, quanta_memory_platform_core::UsageBreakdown::total),
-                    snap.class_usage
-                        .get(&quanta_memory_platform_core::MemoryClass::EvidenceCache)
-                        .map_or(0, quanta_memory_platform_core::UsageBreakdown::total),
-                ],
-                owner_axis_bytes: [
-                    snap.owner_usage
-                        .get("owner:conformance-a")
-                        .map_or(0, quanta_memory_platform_core::UsageBreakdown::total),
-                    snap.owner_usage
-                        .get("owner:conformance-b")
-                        .map_or(0, quanta_memory_platform_core::UsageBreakdown::total),
-                ],
-                total_retained_payload_bytes: snap.total_retained_payload_bytes(),
-                total_retained_metadata_bytes: snap.total_retained_metadata_bytes(),
-                total_live_scratch_bytes: snap.total_live_scratch_bytes(),
-                rebuild_in_progress: snap.rebuild_in_progress,
+        self.observe()
+            .map(|observation| {
+                let snap = observation.ledger;
+                AccountingView {
+                    total_class_bytes: snap.total_class_bytes(),
+                    total_owner_bytes: snap.total_owner_bytes(),
+                    total_context_bytes: snap.total_context_bytes(),
+                    context_axis_bytes: [
+                        snap.context_usage
+                            .get(&quanta_memory_platform_core::MemoryContextKind::Request)
+                            .map_or(0, quanta_memory_platform_core::UsageBreakdown::total),
+                        snap.context_usage
+                            .get(&quanta_memory_platform_core::MemoryContextKind::Session)
+                            .map_or(0, quanta_memory_platform_core::UsageBreakdown::total),
+                        snap.context_usage
+                            .get(&quanta_memory_platform_core::MemoryContextKind::Generation)
+                            .map_or(0, quanta_memory_platform_core::UsageBreakdown::total),
+                        snap.context_usage
+                            .get(&quanta_memory_platform_core::MemoryContextKind::Runtime)
+                            .map_or(0, quanta_memory_platform_core::UsageBreakdown::total),
+                        snap.context_usage
+                            .get(&quanta_memory_platform_core::MemoryContextKind::Background)
+                            .map_or(0, quanta_memory_platform_core::UsageBreakdown::total),
+                    ],
+                    class_axis_bytes: [
+                        snap.class_usage
+                            .get(&quanta_memory_platform_core::MemoryClass::ArtifactCache)
+                            .map_or(0, quanta_memory_platform_core::UsageBreakdown::total),
+                        snap.class_usage
+                            .get(&quanta_memory_platform_core::MemoryClass::EvidenceCache)
+                            .map_or(0, quanta_memory_platform_core::UsageBreakdown::total),
+                    ],
+                    owner_axis_bytes: [
+                        snap.owner_usage
+                            .get("owner:conformance-a")
+                            .map_or(0, quanta_memory_platform_core::UsageBreakdown::total),
+                        snap.owner_usage
+                            .get("owner:conformance-b")
+                            .map_or(0, quanta_memory_platform_core::UsageBreakdown::total),
+                    ],
+                    group_axis_bytes: [
+                        observation
+                            .resource_group_usage
+                            .get("conformance-group-a")
+                            .copied()
+                            .unwrap_or(0),
+                        observation
+                            .resource_group_usage
+                            .get("conformance-group-b")
+                            .copied()
+                            .unwrap_or(0),
+                    ],
+                    live_ticket_count: snap.live_ticket_count,
+                    total_retained_payload_bytes: snap.total_retained_payload_bytes(),
+                    total_retained_metadata_bytes: snap.total_retained_metadata_bytes(),
+                    total_live_scratch_bytes: snap.total_live_scratch_bytes(),
+                    rebuild_in_progress: snap.rebuild_in_progress,
+                }
             })
             .map_err(|error| error.to_string())
     }
