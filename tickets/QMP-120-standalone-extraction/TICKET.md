@@ -5,17 +5,13 @@ Lifecycle authority: `tickets/README.md`
 Depends on: QMP-000  
 Blocks: QMP-130, QMP-140
 
-Status: `IMPLEMENTED`. `e6f69c340239784a2d5af7d685ba8894c47ee0c1`
-is the isolated proof branch, not the current main product SHA. The extraction
-implementation was cherry-picked onto main in `4169a20` and `c03b16c`;
-`47021d3` records that integration. Local exact-content extraction and offline
-checks passed on the isolated source, but the new CI workflow has not yet
-produced an observed remote run and later main source needs its own receipt. See
-[`receipts/2026-09-20T233523Z-e6f69c3.md`](receipts/2026-09-20T233523Z-e6f69c3.md).
-An integrated post-QMP-020/QMP-050 fresh actual extraction at `2a827af`
-also passed locally with clean extracted git; see
-[`receipts/2026-09-21T003556Z-2a827af.md`](receipts/2026-09-21T003556Z-2a827af.md).
-Remote CI, external host rewire, and exact later ticket-doc SHA are still open.
+Status: `IMPLEMENTED`. The local isolated source at `4fdac520` freezes the exact
+committed HEAD/tree, derives the copy manifest from Git tree objects, binds each
+path to mode/blob/content identity, rejects tracked/index/mode drift, and passed
+a fresh actual extraction with clean destination commit. See
+[`receipts/2026-09-21T055538Z-4fdac52.md`](receipts/2026-09-21T055538Z-4fdac52.md).
+Remote workflow observation and external host rewiring remain open, so this is
+not promoted to `QUALIFIED` or `DONE`.
 
 ## Objective
 
@@ -92,8 +88,8 @@ the currently integrated implementation remains `READY` or still fails.
 - [x] no Semantica host noun/path dependency introduced.
 - [x] failure path가 invalid success commit을 만들지 않는다.
 - [x] release receipt에 rustc/cargo/cargo-deny/semgrep versions가 기록된다.
-- [ ] extraction input가 declared `HEAD` tree/mode와 동일함을 검증한다.
-- [ ] dirty tracked source와 executable-bit drift negative fixtures가 RED다.
+- [x] extraction input가 declared `HEAD` tree/mode와 동일함을 검증한다.
+- [x] dirty tracked source와 executable-bit drift negative fixtures가 RED다.
 
 Remote `.github/workflows/standalone-extraction.yml` execution remains
 unobserved; keep `IMPLEMENTED`, not `QUALIFIED` or `DONE`.
@@ -114,22 +110,31 @@ cargo metadata --locked --format-version 1 --manifest-path "${qmp_extract_dir}/C
 - Semantica rewire: QMP-130
 - crates.io publish decision: QMP-140
 
-## Final-audit P1-F03 — canonical digest is not HEAD-bound
+## Final-audit P1-F03 — resolved locally at `4fdac520`
 
-The extractor builds its file list with `git ls-files` but copies bytes from the
-working tree. It neither rejects tracked dirtiness nor compares copied blobs and
-modes with `HEAD`. The current digest covers path and content, not executable
-mode. A receipt can therefore name `HEAD=X` while extracting different tracked
-content, and the destination's fresh bootstrap commit hides that source dirtiness.
+The prior extractor built its file list with `git ls-files` but copied bytes from
+the working tree. It neither rejected tracked dirtiness nor compared copied
+blobs and modes with `HEAD`. The digest covered path/content but not executable
+mode, so a receipt could name `HEAD=X` while extracting different bytes.
 
-Required repair:
+Implemented repair:
 
 1. Freeze source `HEAD` and tree ID; reject relevant tracked/index dirtiness at
    both start and end, or extract directly from the frozen tree object.
 2. Derive the manifest from `git ls-tree -r HEAD` and bind mode, blob ID, path,
    content digest, and destination mode.
 3. Emit the frozen tree ID and canonical manifest digest in the receipt.
-4. Add dirty-tracked, staged-only, executable-bit, omitted-source, verification-
-   failure-before-commit, final-dirty-injection, and repeated-extraction fixtures.
+4. Add dirty-tracked, staged-only, executable-bit and repeated-extraction
+   fixtures; retain the existing omitted-source and pre-commit failure contracts.
 5. Two extractions from the same tree must produce the same canonical manifest
    digest; a different tree may never reuse the prior receipt.
+
+Local checkpoint:
+
+```text
+source HEAD: 4fdac520e877e56a1c3a51dcd8ee715d1f73d18b
+source tree: af7d81b6d1b04360680584ec5fb0cf2870f76277
+canonical manifest SHA-256: 53bc8aebf3cb77fd31d71aa157538c7c2b0a50a54c47265bbfc81165a3ef1847
+extracted bootstrap commit: 9eadc03104c894fbc21a34414eba48abe66af22b
+extracted git status: clean
+```
