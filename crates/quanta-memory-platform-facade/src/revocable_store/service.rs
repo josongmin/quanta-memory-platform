@@ -13,7 +13,7 @@ use crate::shared::accounting::{Budgeted, StoreAccounting};
 use crate::shared::lifecycle::{retire_client_value, BeginClose, StoreLifecycle};
 use crate::shared::measure::{semantic_cost_v1, ByteSized, RetainedCostV1};
 #[cfg(feature = "spill")]
-use crate::spill::{SpillController, SpillFailure};
+use crate::spill::{InProcessSpillController, SpillFailure};
 
 #[derive(Debug)]
 struct RevocableEntry<Key, Value> {
@@ -264,7 +264,7 @@ impl<Key, Value> SimpleRevocableStore<Key, Value, Budgeted> {
     /// which is restored at its original FIFO position before the error escapes.
     pub fn spill_one_into<C>(&self, controller: &C) -> MemoryResult<bool>
     where
-        C: SpillController<RevocableSpillHandle<Key, Value>>,
+        C: InProcessSpillController<RevocableSpillHandle<Key, Value>>,
     {
         let _mutation = self.lifecycle.begin_mutation()?;
         let (entry, next_committed) = {
@@ -284,7 +284,7 @@ impl<Key, Value> SimpleRevocableStore<Key, Value, Budgeted> {
 
         let handle = RevocableSpillHandle { binding: self.binding.clone(), entry: Some(entry) };
         match controller.spill(handle) {
-            Ok(()) => {
+            Ok(_) => {
                 self.lock_state_for_commit().committed_bytes = next_committed;
                 Ok(true)
             }
@@ -495,7 +495,8 @@ mod tests {
     use super::*;
     #[cfg(feature = "spill")]
     use crate::spill::{
-        InMemorySpillTarget, NoopSpillController, RoutedSpillController, SpillTarget,
+        InMemorySpillTarget, InProcessSpillTarget, NoopSpillController, RoutedSpillController,
+        SpillController, SpillReceipt, SpillTarget,
     };
     use quanta_memory_platform_core::{
         ExecutionBudget, MemoryBudgetManifest, MemoryClass, MemoryClassBudget, MemoryPreset,
@@ -614,7 +615,7 @@ mod tests {
             store.committed_bytes().expect("source bytes"),
             expected_entry_cost("second", 6)
         );
-        assert_eq!(controller.spilled_count(), 1);
+        assert_eq!(controller.spilled_count(), Ok(1));
         assert_eq!(
             broker.ledger_snapshot().expect("retained tier charge").total_owner_bytes(),
             total
@@ -624,7 +625,7 @@ mod tests {
         assert_eq!(handle.key(), "first");
         assert_eq!(handle.value(), &vec![1; 4]);
         assert_eq!(handle.charged_bytes(), expected_entry_cost("first", 4));
-        assert_eq!(controller.spilled_count(), 0);
+        assert_eq!(controller.spilled_count(), Ok(0));
         store.accept_restored(handle).expect("reattach original authority");
         assert_eq!(store.stats().expect("restored stats").item_count, 2);
         assert_eq!(broker.ledger_snapshot().expect("restored ledger").total_owner_bytes(), total);
@@ -641,10 +642,16 @@ mod tests {
             fn is_available(&self) -> bool {
                 true
             }
-            fn accept(&self, handle: Handle) -> Result<(), SpillFailure<Handle>> {
+            fn accept(&self, handle: Handle) -> Result<SpillReceipt, SpillFailure<Handle>> {
                 Err(SpillFailure::new(MemoryError::capacity("injected write failure"), handle))
             }
         }
+        impl crate::spill::SpillInventory for RejectingTarget {
+            fn retained_count(&self) -> MemoryResult<u64> {
+                Ok(0)
+            }
+        }
+        impl<Handle> InProcessSpillTarget<Handle> for RejectingTarget {}
         let broker = live_broker(1_000_000);
         let store = store_with_broker(&broker);
         store.insert_checked("first".into(), vec![1; 4]).expect("first");
@@ -653,7 +660,7 @@ mod tests {
         let controller = RoutedSpillController::new(RejectingTarget);
 
         assert!(matches!(store.spill_one_into(&controller), Err(MemoryError::Capacity(_))));
-        assert_eq!(controller.spilled_count(), 0);
+        assert_eq!(controller.spilled_count(), Ok(0));
         assert_eq!(store.committed_bytes().expect("unchanged"), total);
         assert_eq!(store.stats().expect("source stats").item_count, 2);
         assert_eq!(broker.ledger_snapshot().expect("unchanged ledger").total_owner_bytes(), total);

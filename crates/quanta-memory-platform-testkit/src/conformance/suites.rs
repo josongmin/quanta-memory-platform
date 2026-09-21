@@ -1197,25 +1197,25 @@ fn run_transcript_slice(kit: &MemoryTestKit) -> Vec<AssertionVerdict> {
 /// The SpillRouting round-trip verdict over an INJECTED controller, so the suite
 /// can be driven against a broken (handle-dropping) target and proven to BITE —
 /// not merely accept the honest in-memory target. A spill then restore must hand
-/// back the same handle (1 -> 0 on the counter).
+/// back the same handle (canonical target inventory 1 -> 0).
 #[cfg(feature = "fixtures")]
 fn spill_round_trip_verdict<T: SpillTarget<String>>(
     online: &RoutedSpillController<T>,
 ) -> AssertionVerdict {
     let spill = InvariantAssertion::new(ContractFamily::SpillRouting, "spill_round_trip");
     let spill_ok = online.spill("handle-a".to_string());
-    // Capture the count BETWEEN spill and restore: a broken counter stuck at 0
+    // Capture inventory BETWEEN spill and restore: a target that drops the handle
     // would survive an "after == 0" check alone. The round-trip must go 1 -> 0.
     let before_restore = online.spilled_count();
     let restore = online.restore();
     let after = online.spilled_count();
     spill.assert_that(
         spill_ok.is_ok()
-            && before_restore == 1
+            && before_restore == Ok(1)
             && matches!(&restore, Ok(Some(handle)) if handle == "handle-a")
-            && after == 0,
+            && after == Ok(0),
         format!(
-            "spill_ok={spill_ok:?} before_restore={before_restore} restore={restore:?} after={after}"
+            "spill_ok={spill_ok:?} before_restore={before_restore:?} restore={restore:?} after={after:?}"
         ),
     )
 }
@@ -1238,8 +1238,8 @@ fn run_spill_slice() -> Vec<AssertionVerdict> {
         round_trip,
         fail_closed.assert_that(
             matches!(&spill_denied, Err(failure) if matches!(failure.error(), MemoryError::Capacity(_)) && failure.handle() == "handle-b")
-                && offline_spilled_after == 0,
-            format!("spill_denied={spill_denied:?} offline_spilled_after={offline_spilled_after}",),
+                && offline_spilled_after == Ok(0),
+            format!("spill_denied={spill_denied:?} offline_spilled_after={offline_spilled_after:?}",),
         ),
     ]
 }
@@ -2188,10 +2188,20 @@ mod tests {
         fn accept(
             &self,
             _handle: String,
-        ) -> Result<(), quanta_memory_platform_facade::SpillFailure<String>> {
-            Ok(()) // BUG under test: reports success but drops the handle.
+        ) -> Result<
+            quanta_memory_platform_facade::SpillReceipt,
+            quanta_memory_platform_facade::SpillFailure<String>,
+        > {
+            Ok(quanta_memory_platform_facade::SpillReceipt::InProcess { inventory_after: 0 })
         }
         // restore uses the trait default -> always Ok(None): nothing comes back.
+    }
+
+    #[cfg(feature = "fixtures")]
+    impl quanta_memory_platform_facade::SpillInventory for DroppingSpillTarget {
+        fn retained_count(&self) -> quanta_memory_platform_core::MemoryResult<u64> {
+            Ok(0)
+        }
     }
 
     // The SpillRouting verdict must be able to VIOLATE: driving the SUITE's own

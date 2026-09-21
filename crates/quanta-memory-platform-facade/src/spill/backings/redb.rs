@@ -11,7 +11,7 @@ use std::path::Path;
 use quanta_memory_platform_core::{MemoryError, MemoryResult};
 use redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition};
 
-use crate::spill::{SpillFailure, SpillTarget};
+use crate::spill::{SpillFailure, SpillInventory, SpillReceipt, SpillTarget};
 
 /// The single FIFO queue table: monotonic sequence -> opaque handle bytes.
 const SPILL_QUEUE: TableDefinition<'static, u64, &[u8]> = TableDefinition::new("qmp_spill_queue");
@@ -76,13 +76,13 @@ impl SpillTarget<Vec<u8>> for RedbSpillBacking {
         true
     }
 
-    fn accept(&self, handle: Vec<u8>) -> Result<(), SpillFailure<Vec<u8>>> {
-        let commit = (|| -> MemoryResult<()> {
+    fn accept(&self, handle: Vec<u8>) -> Result<SpillReceipt, SpillFailure<Vec<u8>>> {
+        let commit = (|| -> MemoryResult<SpillReceipt> {
             let txn = self
                 .database
                 .begin_write()
                 .map_err(|e| MemoryError::report(format!("redb spill write txn failed: {e}")))?;
-            {
+            let (sequence, inventory_after) = {
                 let mut table = txn.open_table(SPILL_QUEUE).map_err(|e| {
                     MemoryError::report(format!("redb spill table open failed: {e}"))
                 })?;
@@ -100,10 +100,14 @@ impl SpillTarget<Vec<u8>> for RedbSpillBacking {
                 table
                     .insert(next, handle.as_slice())
                     .map_err(|e| MemoryError::report(format!("redb spill insert failed: {e}")))?;
-            }
+                let inventory_after = table.len().map_err(|e| {
+                    MemoryError::report(format!("redb spill post-insert len failed: {e}"))
+                })?;
+                (next, inventory_after)
+            };
             txn.commit()
                 .map_err(|e| MemoryError::report(format!("redb spill commit failed: {e}")))?;
-            Ok(())
+            Ok(SpillReceipt::Durable { sequence, inventory_after })
         })();
         commit.map_err(|error| SpillFailure::new(error, handle))
     }
@@ -127,9 +131,16 @@ impl SpillTarget<Vec<u8>> for RedbSpillBacking {
     }
 }
 
+impl SpillInventory for RedbSpillBacking {
+    fn retained_count(&self) -> MemoryResult<u64> {
+        RedbSpillBacking::retained_count(self)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::spill::{RoutedSpillController, SpillController};
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static SEQ: AtomicU64 = AtomicU64::new(0);
@@ -153,8 +164,10 @@ mod tests {
         let backing = RedbSpillBacking::create(&path).expect("open");
 
         // Reached only through the SpillTarget abstraction — no redb types in sight.
-        SpillTarget::accept(&backing, b"first".to_vec()).expect("accept 1");
-        SpillTarget::accept(&backing, b"second".to_vec()).expect("accept 2");
+        let first = SpillTarget::accept(&backing, b"first".to_vec()).expect("accept 1");
+        let second = SpillTarget::accept(&backing, b"second".to_vec()).expect("accept 2");
+        assert_eq!(first, SpillReceipt::Durable { sequence: 0, inventory_after: 1 });
+        assert_eq!(second, SpillReceipt::Durable { sequence: 1, inventory_after: 2 });
         assert_eq!(backing.retained_count().expect("len"), 2);
 
         assert_eq!(SpillTarget::restore(&backing).expect("r1"), Some(b"first".to_vec()));
@@ -171,13 +184,39 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         {
             let backing = RedbSpillBacking::create(&path).expect("open 1");
-            SpillTarget::accept(&backing, b"persisted".to_vec()).expect("accept");
+            let _receipt = SpillTarget::accept(&backing, b"persisted".to_vec()).expect("accept");
         }
         // Reopen: the persisted handle survives and the sequence does not collide.
         let backing = RedbSpillBacking::create(&path).expect("open 2");
-        SpillTarget::accept(&backing, b"after-restart".to_vec()).expect("accept again");
+        let receipt =
+            SpillTarget::accept(&backing, b"after-restart".to_vec()).expect("accept again");
+        assert_eq!(receipt, SpillReceipt::Durable { sequence: 1, inventory_after: 2 });
         assert_eq!(SpillTarget::restore(&backing).expect("r1"), Some(b"persisted".to_vec()));
         assert_eq!(SpillTarget::restore(&backing).expect("r2"), Some(b"after-restart".to_vec()));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn reopened_redb_reconciles_controller_count_from_persisted_inventory() {
+        let path = temp_db_path();
+        let _ = std::fs::remove_file(&path);
+        {
+            let controller =
+                RoutedSpillController::new(RedbSpillBacking::create(&path).expect("open 1"));
+            let first = controller.spill(b"first".to_vec()).expect("first");
+            let second = controller.spill(b"second".to_vec()).expect("second");
+            assert_eq!(first, SpillReceipt::Durable { sequence: 0, inventory_after: 1 });
+            assert_eq!(second, SpillReceipt::Durable { sequence: 1, inventory_after: 2 });
+            assert_eq!(controller.spilled_count(), Ok(2));
+        }
+
+        let reopened = RoutedSpillController::new(RedbSpillBacking::create(&path).expect("open 2"));
+        assert_eq!(reopened.spilled_count(), Ok(2));
+        assert_eq!(reopened.restore().expect("restore first"), Some(b"first".to_vec()));
+        assert_eq!(reopened.spilled_count(), Ok(1));
+        assert_eq!(reopened.restore().expect("restore second"), Some(b"second".to_vec()));
+        assert_eq!(reopened.spilled_count(), Ok(0));
+        drop(reopened);
         let _ = std::fs::remove_file(&path);
     }
 
@@ -201,7 +240,8 @@ mod tests {
             handles.push(std::thread::spawn(move || {
                 for i in 0..per_thread {
                     let payload = format!("t{t}-{i}").into_bytes();
-                    SpillTarget::accept(&*backing, payload).expect("concurrent accept");
+                    let _receipt =
+                        SpillTarget::accept(&*backing, payload).expect("concurrent accept");
                 }
             }));
         }

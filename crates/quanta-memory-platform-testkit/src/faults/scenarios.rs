@@ -159,14 +159,14 @@ pub fn drive_spill_failure_after_reservation() -> FaultOutcome {
     let before = controller.spilled_count();
     let result = controller.spill("spillable-handle".to_string());
     let after = controller.spilled_count();
-    match result {
-        Err(e) if before == after => FaultOutcome::Contained {
+    match (before, result, after) {
+        (Ok(before), Err(e), Ok(after)) if before == after => FaultOutcome::Contained {
             evidence: format!("spill failed closed ({e}); spilled_count stayed at {after}"),
         },
-        Err(e) => FaultOutcome::Escaped {
-            evidence: format!("spill failed ({e}) but spilled_count moved {before}->{after}"),
+        (before, Err(e), after) => FaultOutcome::Escaped {
+            evidence: format!("spill failed ({e}) but inventory proof was {before:?}->{after:?}"),
         },
-        Ok(()) => FaultOutcome::Escaped {
+        (_, Ok(_), _) => FaultOutcome::Escaped {
             evidence: "spill to an unavailable target reported success".to_string(),
         },
     }
@@ -217,7 +217,7 @@ mod tests {
                 Err(e) => {
                     FaultOutcome::Contained { evidence: format!("spill failed closed ({e})") }
                 }
-                Ok(()) => FaultOutcome::Escaped {
+                Ok(_) => FaultOutcome::Escaped {
                     evidence: "spill to an unavailable target reported success".to_string(),
                 },
             }
@@ -230,8 +230,11 @@ mod tests {
             fn spill(
                 &self,
                 _handle: String,
-            ) -> Result<(), quanta_memory_platform_facade::SpillFailure<String>> {
-                Ok(()) // contract violation: an unavailable spill must fail closed.
+            ) -> Result<
+                quanta_memory_platform_facade::SpillReceipt,
+                quanta_memory_platform_facade::SpillFailure<String>,
+            > {
+                Ok(quanta_memory_platform_facade::SpillReceipt::InProcess { inventory_after: 0 })
             }
         }
 

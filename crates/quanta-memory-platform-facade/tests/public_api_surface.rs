@@ -602,7 +602,7 @@ fn spill_controller_round_trips_a_handle_via_restore() {
 
     let spilled = controller.spill(42);
     assert!(spilled.is_ok(), "an available target must accept the spill: {spilled:?}");
-    assert_eq!(controller.spilled_count(), 1, "a successful spill increments the count");
+    assert_eq!(controller.spilled_count(), Ok(1), "a successful spill increments inventory");
 
     let restored: MemoryResult<Option<u64>> = controller.restore();
     assert_eq!(
@@ -610,7 +610,7 @@ fn spill_controller_round_trips_a_handle_via_restore() {
         Some(42),
         "a retaining target restores the spilled handle"
     );
-    assert_eq!(controller.spilled_count(), 0, "restoring a handle decrements the spilled count");
+    assert_eq!(controller.spilled_count(), Ok(0), "restoring a handle decrements inventory");
 }
 
 /// A routed controller over an UNAVAILABLE target fails closed on spill (it never
@@ -623,7 +623,7 @@ fn spill_controller_fails_closed_when_target_unavailable() {
     let failure = result.expect_err("an unavailable spill target must fail closed");
     assert!(matches!(failure.error(), quanta_memory_platform_core::MemoryError::Capacity(_)));
     assert_eq!(failure.into_parts().1, 7, "failed spill returns the only handle");
-    assert_eq!(controller.spilled_count(), 0, "a failed spill must not increment the count");
+    assert_eq!(controller.spilled_count(), Ok(0), "a failed spill must not increment inventory");
 }
 
 /// No configured target must not certify a destructive discard as persistence.

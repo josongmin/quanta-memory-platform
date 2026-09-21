@@ -92,8 +92,9 @@ pub use shared::builder::PreparedPublicationServiceBuilder;
 pub use shared::builder::SessionTranscriptStoreBuilder;
 #[cfg(feature = "spill")]
 pub use spill::{
-    InMemorySpillTarget, NoopSpillController, RetainingSpillTarget, RoutedSpillController,
-    SpillController, SpillFailure, SpillTarget,
+    InMemorySpillTarget, InProcessSpillController, InProcessSpillTarget, NoopSpillController,
+    RetainingSpillTarget, RoutedSpillController, SpillController, SpillFailure, SpillInventory,
+    SpillReceipt, SpillTarget,
 };
 #[cfg(feature = "transcript")]
 pub use transcript_store::{

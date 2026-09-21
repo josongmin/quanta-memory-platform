@@ -184,9 +184,11 @@ fn e2e_spill_tier_round_trips_fifo_and_never_touches_the_ledger() {
     assert_eq!(ledger_before, map_cost("resident", 500));
 
     let controller = RoutedSpillController::new(RetainingSpillTarget::available());
-    controller.spill("h1".to_string()).expect("spill 1");
-    controller.spill("h2".to_string()).expect("spill 2");
-    assert_eq!(controller.spilled_count(), 2);
+    let first = controller.spill("h1".to_string()).expect("spill 1");
+    let second = controller.spill("h2".to_string()).expect("spill 2");
+    assert_eq!(first.inventory_after(), 1);
+    assert_eq!(second.inventory_after(), 2);
+    assert_eq!(controller.spilled_count(), Ok(2));
     // Accounting-neutral: routing handles to the spill tier moves no broker bytes.
     assert_eq!(b.broker().ledger_snapshot().expect("snap").total_owner_bytes(), ledger_before);
 
@@ -194,7 +196,7 @@ fn e2e_spill_tier_round_trips_fifo_and_never_touches_the_ledger() {
     assert_eq!(controller.restore().expect("r1"), Some("h1".to_string()));
     assert_eq!(controller.restore().expect("r2"), Some("h2".to_string()));
     assert_eq!(controller.restore().expect("drained"), None);
-    assert_eq!(controller.spilled_count(), 0);
+    assert_eq!(controller.spilled_count(), Ok(0));
     assert_eq!(
         b.broker().ledger_snapshot().expect("snap").total_owner_bytes(),
         ledger_before,

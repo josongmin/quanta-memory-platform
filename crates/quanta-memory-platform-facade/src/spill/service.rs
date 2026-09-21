@@ -4,7 +4,28 @@ use std::sync::Mutex;
 
 use quanta_memory_platform_core::{MemoryError, MemoryResult};
 
-use crate::spill::SpillController;
+use crate::spill::{InProcessSpillController, SpillController};
+
+/// Destination authority established by a successful spill commit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[must_use = "a successful spill receipt identifies the authoritative tier"]
+pub enum SpillReceipt {
+    /// The handle remains process-resident and must retain its memory charge.
+    InProcess { inventory_after: u64 },
+    /// The opaque bytes committed to durable storage under a stable sequence.
+    Durable { sequence: u64, inventory_after: u64 },
+}
+
+impl SpillReceipt {
+    #[must_use]
+    pub fn inventory_after(self) -> u64 {
+        match self {
+            Self::InProcess { inventory_after } | Self::Durable { inventory_after, .. } => {
+                inventory_after
+            }
+        }
+    }
+}
 
 /// A failed spill returns the exact handle supplied by the caller. Losing the
 /// handle on a pre-commit error would make source rollback impossible.
@@ -49,12 +70,18 @@ impl<Handle> std::fmt::Display for SpillFailure<Handle> {
 /// `restore` makes spill a two-way tier instead of write-only: a target that
 /// merely offloads-and-forgets (eviction) keeps the default `Ok(None)`, while a
 /// retaining target ([`RetainingSpillTarget`]) returns spilled handles in order.
-pub trait SpillTarget<Handle> {
+pub trait SpillInventory {
+    /// Canonical current inventory, including persisted records from earlier
+    /// process lifetimes.
+    fn retained_count(&self) -> MemoryResult<u64>;
+}
+
+pub trait SpillTarget<Handle>: SpillInventory {
     /// Whether the target can currently accept a spill.
     fn is_available(&self) -> bool;
 
     /// Accept the spilled handle. Only called when [`Self::is_available`] is true.
-    fn accept(&self, handle: Handle) -> Result<(), SpillFailure<Handle>>;
+    fn accept(&self, handle: Handle) -> Result<SpillReceipt, SpillFailure<Handle>>;
 
     /// Restore the next previously spilled handle (oldest first).
     ///
@@ -73,15 +100,21 @@ pub trait SpillTarget<Handle> {
     }
 }
 
+/// Marker for targets that retain the exact handle in process and therefore
+/// return [`SpillReceipt::InProcess`] on success.
+pub trait InProcessSpillTarget<Handle>: SpillTarget<Handle> {}
+
 /// A missing spill tier: fail closed and return the original handle.
 #[derive(Clone, Debug, Default)]
 pub struct NoopSpillController;
 
 impl<Handle> SpillController<Handle> for NoopSpillController {
-    fn spill(&self, handle: Handle) -> Result<(), SpillFailure<Handle>> {
+    fn spill(&self, handle: Handle) -> Result<SpillReceipt, SpillFailure<Handle>> {
         Err(SpillFailure::new(MemoryError::capacity("spill target not configured"), handle))
     }
 }
+
+impl<Handle> InProcessSpillController<Handle> for NoopSpillController {}
 
 /// A spill controller that routes handles to a [`SpillTarget`], failing closed when
 /// the target is unavailable (negative path 4: spill target unavailable).
@@ -92,17 +125,20 @@ impl<Handle> SpillController<Handle> for NoopSpillController {
 #[derive(Clone, Debug, Default)]
 pub struct RoutedSpillController<T> {
     target: T,
-    spilled_count: std::sync::Arc<AtomicU64>,
 }
 
 impl<T> RoutedSpillController<T> {
     pub fn new(target: T) -> Self {
-        Self { target, spilled_count: std::sync::Arc::new(AtomicU64::new(0)) }
+        Self { target }
     }
 
-    /// Number of handles successfully spilled. Never counts a failed spill.
-    pub fn spilled_count(&self) -> u64 {
-        self.spilled_count.load(Ordering::SeqCst)
+    /// Current authoritative inventory, including records opened from a
+    /// previous process lifetime.
+    pub fn spilled_count(&self) -> MemoryResult<u64>
+    where
+        T: SpillInventory,
+    {
+        self.target.retained_count()
     }
 }
 
@@ -110,40 +146,24 @@ impl<Handle, T> SpillController<Handle> for RoutedSpillController<T>
 where
     T: SpillTarget<Handle>,
 {
-    fn spill(&self, handle: Handle) -> Result<(), SpillFailure<Handle>> {
+    fn spill(&self, handle: Handle) -> Result<SpillReceipt, SpillFailure<Handle>> {
         if !self.target.is_available() {
             return Err(SpillFailure::new(
                 MemoryError::capacity("spill target unavailable"),
                 handle,
             ));
         }
-        // Reserve the count slot BEFORE accept so a concurrent restore can never
-        // decrement past a not-yet-counted spill and permanently drift the count
-        // (the saturating_sub floor would otherwise lose that decrement). Roll the
-        // increment back if accept fails, so a failed spill still counts nothing.
-        self.spilled_count.fetch_add(1, Ordering::SeqCst);
-        if let Err(failure) = self.target.accept(handle) {
-            // Roll back the reservation with a SATURATING decrement, symmetric with
-            // the restore path: a plain fetch_sub could wrap to u64::MAX if a
-            // concurrent restore already drove the count to 0.
-            let _ = self
-                .spilled_count
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |c| Some(c.saturating_sub(1)));
-            return Err(failure);
-        }
-        Ok(())
+        self.target.accept(handle)
     }
 
     fn restore(&self) -> MemoryResult<Option<Handle>> {
-        let restored = self.target.restore()?;
-        if restored.is_some() {
-            // A restored handle is no longer spilled; never underflow the count.
-            let _ = self
-                .spilled_count
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |c| Some(c.saturating_sub(1)));
-        }
-        Ok(restored)
+        self.target.restore()
     }
+}
+
+impl<Handle, T> InProcessSpillController<Handle> for RoutedSpillController<T> where
+    T: InProcessSpillTarget<Handle>
+{
 }
 
 /// An in-memory spill target whose availability can be toggled. This is the
@@ -196,8 +216,13 @@ impl<Handle> InMemorySpillTarget<Handle> {
     }
 
     /// Number of spilled handles currently retained (restorable).
-    pub fn retained_count(&self) -> usize {
-        self.store.lock().map(|s| s.len()).unwrap_or(0)
+    pub fn retained_count(&self) -> MemoryResult<u64> {
+        let len = self
+            .store
+            .lock()
+            .map_err(|_| MemoryError::InvalidState("spill target store poisoned".to_string()))?
+            .len();
+        u64::try_from(len).map_err(|_| MemoryError::capacity("spill inventory exceeds u64"))
     }
 }
 
@@ -206,7 +231,7 @@ impl<Handle> SpillTarget<Handle> for InMemorySpillTarget<Handle> {
         self.available.load(Ordering::SeqCst)
     }
 
-    fn accept(&self, handle: Handle) -> Result<(), SpillFailure<Handle>> {
+    fn accept(&self, handle: Handle) -> Result<SpillReceipt, SpillFailure<Handle>> {
         if !self.available.load(Ordering::SeqCst) {
             return Err(SpillFailure::new(
                 MemoryError::capacity("spill target unavailable at accept time"),
@@ -225,9 +250,18 @@ impl<Handle> SpillTarget<Handle> for InMemorySpillTarget<Handle> {
                 ));
             }
         };
+        let inventory_after = match u64::try_from(store.len()).ok().and_then(|n| n.checked_add(1)) {
+            Some(count) => count,
+            None => {
+                return Err(SpillFailure::new(
+                    MemoryError::capacity("spill inventory exceeds u64"),
+                    handle,
+                ));
+            }
+        };
         store.push_back(handle);
         self.accepted.fetch_add(1, Ordering::SeqCst);
-        Ok(())
+        Ok(SpillReceipt::InProcess { inventory_after })
     }
 
     fn restore(&self) -> MemoryResult<Option<Handle>> {
@@ -242,6 +276,14 @@ impl<Handle> SpillTarget<Handle> for InMemorySpillTarget<Handle> {
             .lock()
             .map_err(|_| MemoryError::InvalidState("spill target store poisoned".to_string()))?
             .pop_front())
+    }
+}
+
+impl<Handle> InProcessSpillTarget<Handle> for InMemorySpillTarget<Handle> {}
+
+impl<Handle> SpillInventory for InMemorySpillTarget<Handle> {
+    fn retained_count(&self) -> MemoryResult<u64> {
+        InMemorySpillTarget::retained_count(self)
     }
 }
 
@@ -277,9 +319,13 @@ impl<Handle> RetainingSpillTarget<Handle> {
     }
 
     /// Number of spilled handles currently retained (restorable).
-    #[must_use]
-    pub fn retained_count(&self) -> usize {
-        self.store.lock().map(|s| s.len()).unwrap_or(0)
+    pub fn retained_count(&self) -> MemoryResult<u64> {
+        let len = self
+            .store
+            .lock()
+            .map_err(|_| MemoryError::InvalidState("spill target store poisoned".to_string()))?
+            .len();
+        u64::try_from(len).map_err(|_| MemoryError::capacity("spill inventory exceeds u64"))
     }
 }
 
@@ -288,7 +334,7 @@ impl<Handle> SpillTarget<Handle> for RetainingSpillTarget<Handle> {
         self.available.load(Ordering::SeqCst)
     }
 
-    fn accept(&self, handle: Handle) -> Result<(), SpillFailure<Handle>> {
+    fn accept(&self, handle: Handle) -> Result<SpillReceipt, SpillFailure<Handle>> {
         if !self.available.load(Ordering::SeqCst) {
             return Err(SpillFailure::new(
                 MemoryError::capacity("spill target unavailable at accept time"),
@@ -304,8 +350,17 @@ impl<Handle> SpillTarget<Handle> for RetainingSpillTarget<Handle> {
                 ));
             }
         };
+        let inventory_after = match u64::try_from(store.len()).ok().and_then(|n| n.checked_add(1)) {
+            Some(count) => count,
+            None => {
+                return Err(SpillFailure::new(
+                    MemoryError::capacity("spill inventory exceeds u64"),
+                    handle,
+                ));
+            }
+        };
         store.push_back(handle);
-        Ok(())
+        Ok(SpillReceipt::InProcess { inventory_after })
     }
 
     fn restore(&self) -> MemoryResult<Option<Handle>> {
@@ -320,6 +375,14 @@ impl<Handle> SpillTarget<Handle> for RetainingSpillTarget<Handle> {
             .lock()
             .map_err(|_| MemoryError::InvalidState("spill target store poisoned".to_string()))?
             .pop_front())
+    }
+}
+
+impl<Handle> InProcessSpillTarget<Handle> for RetainingSpillTarget<Handle> {}
+
+impl<Handle> SpillInventory for RetainingSpillTarget<Handle> {
+    fn retained_count(&self) -> MemoryResult<u64> {
+        RetainingSpillTarget::retained_count(self)
     }
 }
 
@@ -343,7 +406,7 @@ mod tests {
         assert_eq!(drops.load(Ordering::SeqCst), 0, "denial must return ownership");
         let (error, handle) = failure.into_parts();
         assert!(matches!(error, MemoryError::Capacity(_)));
-        assert_eq!(controller.spilled_count(), 0);
+        assert_eq!(controller.spilled_count(), Ok(0));
         drop(handle);
         assert_eq!(drops.load(Ordering::SeqCst), 1, "caller alone retires the handle");
     }
@@ -360,14 +423,15 @@ mod tests {
     #[test]
     fn routed_spill_to_available_target_succeeds_and_counts() {
         let controller = RoutedSpillController::new(InMemorySpillTarget::available());
-        controller.spill("handle-1".to_string()).expect("spill to available");
-        controller.spill("handle-2".to_string()).expect("spill again");
-        assert_eq!(controller.spilled_count(), 2);
+        let first = controller.spill("handle-1".to_string()).expect("spill to available");
+        let second = controller.spill("handle-2".to_string()).expect("spill again");
+        assert_eq!(first, SpillReceipt::InProcess { inventory_after: 1 });
+        assert_eq!(second, SpillReceipt::InProcess { inventory_after: 2 });
+        assert_eq!(controller.spilled_count(), Ok(2));
     }
 
     /// A target that reports available but whose `accept` always fails — drives the
-    /// spill accept-failure rollback branch (which `InMemorySpillTarget` can't, as
-    /// its accept only fails when unavailable, gated out before the count bump).
+    /// accept-failure branch after the availability preflight.
     #[derive(Debug, Default)]
     struct AcceptFailingTarget;
 
@@ -375,26 +439,31 @@ mod tests {
         fn is_available(&self) -> bool {
             true // passes the controller's guard...
         }
-        fn accept(&self, handle: Handle) -> Result<(), SpillFailure<Handle>> {
+        fn accept(&self, handle: Handle) -> Result<SpillReceipt, SpillFailure<Handle>> {
             Err(SpillFailure::new(MemoryError::capacity("accept always fails"), handle))
+        }
+    }
+
+    impl SpillInventory for AcceptFailingTarget {
+        fn retained_count(&self) -> MemoryResult<u64> {
+            Ok(0)
         }
     }
 
     #[test]
     fn routed_spill_rolls_back_the_count_when_accept_fails() {
         let controller = RoutedSpillController::new(AcceptFailingTarget);
-        // is_available() is true, so we pass the guard and increment the count;
-        // accept then fails and the increment is rolled back (saturating): 0.
+        // is_available() is true, but accept fails before target inventory moves.
         let r = controller.spill("h".to_string());
         assert!(
             matches!(&r, Err(failure) if matches!(failure.error(), MemoryError::Capacity(_))),
             "accept failure surfaces, got {r:?}"
         );
         assert_eq!(r.expect_err("accept denied").into_parts().1, "h");
-        assert_eq!(controller.spilled_count(), 0, "a failed spill counts nothing (rollback)");
+        assert_eq!(controller.spilled_count(), Ok(0), "a failed spill counts nothing");
         // Repeated failures never drift the count or wrap it negative.
         let _ = controller.spill("h2".to_string());
-        assert_eq!(controller.spilled_count(), 0, "rollback is saturating and stable");
+        assert_eq!(controller.spilled_count(), Ok(0), "inventory is stable");
     }
 
     #[test]
@@ -409,8 +478,8 @@ mod tests {
         assert_eq!(err.into_parts().1, "handle");
         assert_eq!(
             controller.spilled_count(),
-            0,
-            "a failed spill must not increment the spilled count"
+            Ok(0),
+            "a failed spill must not change target inventory"
         );
     }
 
@@ -419,14 +488,14 @@ mod tests {
         // Positive / negative pair over the same controller type, differing only in
         // target availability (the one core condition).
         let online = RoutedSpillController::new(InMemorySpillTarget::available());
-        online.spill(1u32).expect("online spill ok");
-        assert_eq!(online.spilled_count(), 1);
+        let _receipt = online.spill(1u32).expect("online spill ok");
+        assert_eq!(online.spilled_count(), Ok(1));
 
         let offline = RoutedSpillController::new(InMemorySpillTarget::unavailable());
         let err = offline.spill(2u32).expect_err("offline rejects");
         assert!(matches!(err.error(), MemoryError::Capacity(_)), "got {err:?}");
         assert_eq!(err.into_parts().1, 2);
-        assert_eq!(offline.spilled_count(), 0);
+        assert_eq!(offline.spilled_count(), Ok(0));
     }
 
     #[test]
@@ -439,14 +508,14 @@ mod tests {
     }
 
     #[test]
-    fn routed_spill_after_target_goes_offline_fails_closed_leaving_counters_unchanged() {
+    fn routed_spill_after_target_goes_offline_fails_closed_leaving_inventory_unchanged() {
         // scenario F (fail-closed): a routed controller that spilled successfully,
         // then whose target goes offline, must reject the next spill and leave BOTH
-        // the controller's spilled count and the target's accepted count byte-for-byte
-        // unchanged. Capture counts BEFORE the denied op, assert identical AFTER.
+        // the target inventory byte-for-byte unchanged. Capture it before the
+        // denied op and assert the same authoritative value afterward.
         let controller = RoutedSpillController::new(InMemorySpillTarget::available());
-        controller.spill("first".to_string()).expect("first spill ok");
-        assert_eq!(controller.spilled_count(), 1);
+        let _receipt = controller.spill("first".to_string()).expect("first spill ok");
+        assert_eq!(controller.spilled_count(), Ok(1));
 
         // The controller owns the target by value; take availability offline by
         // building a fresh offline controller representing the same transition path.
@@ -463,14 +532,14 @@ mod tests {
         assert_eq!(
             offline.spilled_count(),
             count_before,
-            "a denied spill must not advance the spilled counter"
+            "a denied spill must not advance target inventory"
         );
     }
 
     #[test]
     fn in_memory_target_accept_after_toggle_offline_is_rejected() {
         let target = InMemorySpillTarget::available();
-        SpillTarget::accept(&target, 1u32).expect("accept while available");
+        let _receipt = SpillTarget::accept(&target, 1u32).expect("accept while available");
         assert_eq!(target.accepted_count(), 1);
         target.set_available(false);
         let err = SpillTarget::accept(&target, 2u32).expect_err("accept while offline must fail");
@@ -487,15 +556,15 @@ mod tests {
         // tier — a spilled handle is brought back EXACTLY by restore, in FIFO order,
         // then None once drained. accepted_count stays cumulative.
         let target = InMemorySpillTarget::available();
-        SpillTarget::accept(&target, "first".to_string()).expect("accept 1");
-        SpillTarget::accept(&target, "second".to_string()).expect("accept 2");
+        let _first = SpillTarget::accept(&target, "first".to_string()).expect("accept 1");
+        let _second = SpillTarget::accept(&target, "second".to_string()).expect("accept 2");
         assert_eq!(target.accepted_count(), 2, "accepted_count is cumulative");
-        assert_eq!(target.retained_count(), 2, "both handles are retained for restore");
+        assert_eq!(target.retained_count(), Ok(2), "both handles are retained for restore");
 
         // Restore returns the spilled payloads oldest-first, byte-for-byte.
         assert_eq!(target.restore().expect("r1"), Some("first".to_string()));
         assert_eq!(target.restore().expect("r2"), Some("second".to_string()));
-        assert_eq!(target.retained_count(), 0, "restore drains the retained handles");
+        assert_eq!(target.retained_count(), Ok(0), "restore drains the retained handles");
     }
 
     #[test]
@@ -504,7 +573,7 @@ mod tests {
         // typed Ok(None) — "nothing spilled to bring back" — distinct from the
         // offline failure path below. Restoring past empty stays None.
         let target = InMemorySpillTarget::available();
-        SpillTarget::accept(&target, 7u32).expect("accept");
+        let _receipt = SpillTarget::accept(&target, 7u32).expect("accept");
         assert_eq!(target.restore().expect("drain the one handle"), Some(7u32));
         // The handle is now gone: a further restore finds nothing.
         assert_eq!(
@@ -520,9 +589,10 @@ mod tests {
         // went offline, must reject restore with a typed Capacity error and leave the
         // retained handle byte-for-byte intact (recoverable once back online).
         let target = InMemorySpillTarget::available();
-        SpillTarget::accept(&target, "durable".to_string()).expect("accept while available");
+        let _receipt =
+            SpillTarget::accept(&target, "durable".to_string()).expect("accept while available");
         let retained_before = target.retained_count();
-        assert_eq!(retained_before, 1);
+        assert_eq!(retained_before, Ok(1));
 
         // Backend goes offline.
         target.set_available(false);
@@ -550,15 +620,15 @@ mod tests {
     #[test]
     fn retaining_target_round_trips_handles_fifo() {
         let target = RetainingSpillTarget::available();
-        SpillTarget::accept(&target, "first".to_string()).expect("accept 1");
-        SpillTarget::accept(&target, "second".to_string()).expect("accept 2");
-        assert_eq!(target.retained_count(), 2);
+        let _first = SpillTarget::accept(&target, "first".to_string()).expect("accept 1");
+        let _second = SpillTarget::accept(&target, "second".to_string()).expect("accept 2");
+        assert_eq!(target.retained_count(), Ok(2));
 
         // Restore returns spilled handles oldest-first, then None when drained.
         assert_eq!(target.restore().expect("r1"), Some("first".to_string()));
         assert_eq!(target.restore().expect("r2"), Some("second".to_string()));
         assert_eq!(target.restore().expect("r3"), None);
-        assert_eq!(target.retained_count(), 0);
+        assert_eq!(target.retained_count(), Ok(0));
     }
 
     #[test]
@@ -567,7 +637,7 @@ mod tests {
         let err = SpillTarget::accept(&target, 1u32).expect_err("offline accept rejected");
         assert!(matches!(err.error(), MemoryError::Capacity(_)), "got {err:?}");
         assert_eq!(err.into_parts().1, 1);
-        assert_eq!(target.retained_count(), 0, "rejected accept retains nothing");
+        assert_eq!(target.retained_count(), Ok(0), "rejected accept retains nothing");
     }
 
     // ---- LSP: both SpillTarget impls honor the SAME offline-restore contract ----
@@ -578,11 +648,11 @@ mod tests {
         // closed (Capacity) when restore is called offline — NOT return Ok(None),
         // which a caller would misread as "drained". State stays intact.
         let target = RetainingSpillTarget::available();
-        SpillTarget::accept(&target, "durable".to_string()).expect("accept");
+        let _receipt = SpillTarget::accept(&target, "durable".to_string()).expect("accept");
         target.set_available(false);
         let err = SpillTarget::restore(&target).expect_err("offline restore must fail closed");
         assert!(matches!(err, MemoryError::Capacity(_)), "got {err:?}");
-        assert_eq!(target.retained_count(), 1, "denied restore is non-destructive");
+        assert_eq!(target.retained_count(), Ok(1), "denied restore is non-destructive");
         target.set_available(true);
         assert_eq!(
             SpillTarget::restore(&target).expect("restore after recovery"),
@@ -594,7 +664,7 @@ mod tests {
     /// an online-drained restore is Ok(None). Exercised for BOTH impls so the trait
     /// is substitutable — a consumer cannot tell them apart by offline behavior.
     fn assert_offline_restore_contract<T: SpillTarget<u32>>(target: T, set_offline: impl Fn(&T)) {
-        SpillTarget::accept(&target, 9u32).expect("accept online");
+        let _receipt = SpillTarget::accept(&target, 9u32).expect("accept online");
         set_offline(&target);
         assert!(
             matches!(SpillTarget::restore(&target), Err(MemoryError::Capacity(_))),
@@ -615,26 +685,25 @@ mod tests {
     #[test]
     fn routed_controller_spill_then_restore_balances_the_spilled_count() {
         let controller = RoutedSpillController::new(RetainingSpillTarget::available());
-        controller.spill("h1".to_string()).expect("spill 1");
-        controller.spill("h2".to_string()).expect("spill 2");
-        assert_eq!(controller.spilled_count(), 2);
+        let _first = controller.spill("h1".to_string()).expect("spill 1");
+        let _second = controller.spill("h2".to_string()).expect("spill 2");
+        assert_eq!(controller.spilled_count(), Ok(2));
 
-        // Each restore pulls a handle back and decrements the live spilled count.
+        // Each restore pulls a handle back and changes canonical target inventory.
         assert_eq!(controller.restore().expect("restore 1"), Some("h1".to_string()));
-        assert_eq!(controller.spilled_count(), 1);
+        assert_eq!(controller.spilled_count(), Ok(1));
         assert_eq!(controller.restore().expect("restore 2"), Some("h2".to_string()));
-        assert_eq!(controller.spilled_count(), 0);
+        assert_eq!(controller.spilled_count(), Ok(0));
         // Draining past empty is inert and never underflows the count.
         assert_eq!(controller.restore().expect("restore empty"), None);
-        assert_eq!(controller.spilled_count(), 0);
+        assert_eq!(controller.spilled_count(), Ok(0));
     }
 
     #[test]
     fn concurrent_spills_keep_spilled_count_consistent_then_drain_to_zero() {
         use std::sync::Arc;
-        // Many concurrent spillers stress the count's fetch_add; a single drain then
-        // proves the saturating-CAS decrement returns it to exactly 0 (no drift, no
-        // underflow wrap), and every spilled handle is recoverable.
+        // Many concurrent spillers stress the target's canonical queue; a full
+        // drain proves inventory reaches exactly zero and every handle is recovered.
         let controller = Arc::new(RoutedSpillController::new(RetainingSpillTarget::available()));
         let threads = 8u32;
         let per_thread = 20u32;
@@ -643,7 +712,7 @@ mod tests {
             let c = Arc::clone(&controller);
             handles.push(std::thread::spawn(move || {
                 for i in 0..per_thread {
-                    c.spill(format!("t{t}-{i}")).expect("concurrent spill");
+                    let _receipt = c.spill(format!("t{t}-{i}")).expect("concurrent spill");
                 }
             }));
         }
@@ -651,14 +720,14 @@ mod tests {
             h.join().expect("thread panicked");
         }
         let total = u64::from(threads * per_thread);
-        assert_eq!(controller.spilled_count(), total, "every concurrent spill counted once");
+        assert_eq!(controller.spilled_count(), Ok(total), "every concurrent spill counted once");
 
         let mut drained = 0u64;
         while controller.restore().expect("restore").is_some() {
             drained += 1;
         }
         assert_eq!(drained, total, "all spilled handles restored");
-        assert_eq!(controller.spilled_count(), 0, "count balances to 0 after a full drain");
+        assert_eq!(controller.spilled_count(), Ok(0), "count balances to 0 after a full drain");
     }
 
     #[test]
