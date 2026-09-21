@@ -92,6 +92,9 @@ class ScalingResultTests(unittest.TestCase):
     def test_baseline_regression_is_rejected(self) -> None:
         baseline = valid_records()
         current = valid_records()
+        for record in baseline + current:
+            if record.get("schema") == MODULE.SAMPLE_SCHEMA:
+                record["elapsed_ns"] = 20_000_000
         for record in current:
             if record.get("schema") == MODULE.SAMPLE_SCHEMA:
                 record["throughput_ops_per_sec"] = 400
@@ -102,6 +105,15 @@ class ScalingResultTests(unittest.TestCase):
                 baseline,
                 max_throughput_regression_percent=50,
             )
+
+    def test_baseline_p99_regression_beyond_noise_floor_is_rejected(self) -> None:
+        baseline = valid_records()
+        current = valid_records()
+        for record in current:
+            if record.get("schema") == MODULE.SAMPLE_SCHEMA:
+                record["p99_ns"] = 2_000_000
+        with self.assertRaisesRegex(MODULE.ValidationError, "p99 regressed"):
+            MODULE.validate(current, {1, 2}, baseline)
 
 
 if __name__ == "__main__":

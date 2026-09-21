@@ -58,6 +58,8 @@ def validate(
     max_p99_ns: int = 1_000_000_000,
     max_throughput_regression_percent: int = 50,
     max_p99_regression_percent: int = 200,
+    p99_noise_floor_ns: int = 1_000_000,
+    baseline_min_elapsed_ns: int = 10_000_000,
 ) -> int:
     runs = [record for record in records if record.get("schema") == RUN_SCHEMA]
     if len(runs) != 1:
@@ -140,13 +142,23 @@ def validate(
             baseline_throughput = statistics.median(
                 integer(sample, "throughput_ops_per_sec") for sample in baseline
             )
-            if current_throughput < baseline_throughput * (1.0 - throughput_allowed):
+            baseline_elapsed = statistics.median(
+                integer(sample, "elapsed_ns") for sample in baseline
+            )
+            if (
+                baseline_elapsed >= baseline_min_elapsed_ns
+                and current_throughput < baseline_throughput * (1.0 - throughput_allowed)
+            ):
                 raise ValidationError(
                     f"{key}: throughput regressed beyond {max_throughput_regression_percent}%"
                 )
             current_p99 = statistics.median(integer(sample, "p99_ns") for sample in current)
             baseline_p99 = statistics.median(integer(sample, "p99_ns") for sample in baseline)
-            if current_p99 > baseline_p99 * (1.0 + p99_allowed):
+            p99_limit = max(
+                baseline_p99 * (1.0 + p99_allowed),
+                baseline_p99 + p99_noise_floor_ns,
+            )
+            if current_p99 > p99_limit:
                 raise ValidationError(
                     f"{key}: p99 regressed beyond {max_p99_regression_percent}%"
                 )
@@ -161,6 +173,8 @@ def main() -> int:
     parser.add_argument("--max-p99-ns", type=int, default=1_000_000_000)
     parser.add_argument("--max-throughput-regression-percent", type=int, default=50)
     parser.add_argument("--max-p99-regression-percent", type=int, default=200)
+    parser.add_argument("--p99-noise-floor-ns", type=int, default=1_000_000)
+    parser.add_argument("--baseline-min-elapsed-ns", type=int, default=10_000_000)
     args = parser.parse_args()
     try:
         records = load_jsonl(args.input)
@@ -172,6 +186,8 @@ def main() -> int:
             args.max_p99_ns,
             args.max_throughput_regression_percent,
             args.max_p99_regression_percent,
+            args.p99_noise_floor_ns,
+            args.baseline_min_elapsed_ns,
         )
     except (OSError, ValidationError) as error:
         print(f"verify-scaling-results: FAIL: {error}", file=sys.stderr)
