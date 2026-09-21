@@ -5,9 +5,9 @@ Lifecycle authority: `tickets/README.md`
 Depends on: QMP-030, QMP-040, QMP-080  
 Blocks: QMP-130, QMP-140
 
-Status: `READY`. QMP-030, QMP-040 and QMP-080 have compatible current-source
-qualification receipts. Start only with a new claim because broker/control and
-store observation paths overlap multiple qualified source authorities.
+Status: `QUALIFIED` at product source `163d28fd30c781e37f5be4e8018ebb12083abc9d`.
+The exact-source receipt is
+[`receipts/2026-09-21T085212Z-163d28f.md`](receipts/2026-09-21T085212Z-163d28f.md).
 
 ## Objective
 
@@ -95,10 +95,10 @@ bounded enum labels로 최소 다음을 집계한다.
 ## Acceptance
 
 - [x] control/admission code가 infallible zero-on-error stats를 사용하지 않는다.
-- [ ] poison과 empty가 모든 public authority에서 구분된다.
-- [ ] major operational outcomes에 emission call site가 있다.
-- [ ] labels가 bounded set임을 test가 고정한다.
-- [ ] semantic counters와 telemetry가 단방향 observation 관계를 유지한다.
+- [x] poison과 empty가 모든 public authority에서 구분된다.
+- [x] major operational outcomes에 emission call site가 있다.
+- [x] labels가 bounded set임을 test가 고정한다.
+- [x] semantic counters와 telemetry가 단방향 observation 관계를 유지한다.
 - [x] snapshot values와 provenance revision이 일치한다.
 
 ## Verification
