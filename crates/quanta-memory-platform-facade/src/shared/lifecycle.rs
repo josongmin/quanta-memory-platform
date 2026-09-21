@@ -257,14 +257,19 @@ mod tests {
             return;
         }
 
-        let status = std::process::Command::new(std::env::current_exe().expect("test binary"))
+        let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
             .arg("--exact")
             .arg("shared::lifecycle::tests::hostile_panic_payload_drop_cannot_abort_outer_unwind")
             .arg("--nocapture")
             .env(CHILD, "1")
-            .status()
+            .output()
             .expect("run isolated destructor-panic child");
-        assert!(status.success(), "hostile panic payload must not abort the child: {status}");
+        assert!(
+            output.status.success(),
+            "hostile panic payload must not abort the child: status={} stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]
