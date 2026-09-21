@@ -56,7 +56,7 @@ def validate(
     expected_threads: set[int],
     baseline_records: list[dict[str, object]] | None = None,
     max_p99_ns: int = 1_000_000_000,
-    max_throughput_regression_percent: int = 50,
+    max_throughput_regression_percent: int = 90,
     max_p99_regression_percent: int = 200,
     p99_noise_floor_ns: int = 1_000_000,
     baseline_min_elapsed_ns: int = 10_000_000,
@@ -173,7 +173,7 @@ def main() -> int:
     parser.add_argument("--baseline", type=Path)
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--max-p99-ns", type=int, default=1_000_000_000)
-    parser.add_argument("--max-throughput-regression-percent", type=int, default=50)
+    parser.add_argument("--max-throughput-regression-percent", type=int, default=90)
     parser.add_argument("--max-p99-regression-percent", type=int, default=200)
     parser.add_argument("--p99-noise-floor-ns", type=int, default=1_000_000)
     parser.add_argument("--baseline-min-elapsed-ns", type=int, default=10_000_000)

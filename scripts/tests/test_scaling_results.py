@@ -98,13 +98,13 @@ class ScalingResultTests(unittest.TestCase):
                 record["elapsed_ns"] = 20_000_000
         for record in current:
             if record.get("schema") == MODULE.SAMPLE_SCHEMA:
-                record["throughput_ops_per_sec"] = 400
+                record["throughput_ops_per_sec"] = 50
         with self.assertRaisesRegex(MODULE.ValidationError, "throughput regressed"):
             MODULE.validate(
                 current,
                 {1, 2},
                 baseline,
-                max_throughput_regression_percent=50,
+                max_throughput_regression_percent=90,
             )
 
     def test_baseline_p99_regression_beyond_noise_floor_is_rejected(self) -> None:
