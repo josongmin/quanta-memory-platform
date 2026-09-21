@@ -106,7 +106,7 @@ bounded enum labels로 최소 다음을 집계한다.
 ```bash
 cargo test -p quanta-memory-platform-core --all-features observation
 cargo test -p quanta-memory-platform-facade --all-features poisoned
-cargo test -p quanta-memory-platform-testkit --all-features observation_error
+cargo test -p quanta-memory-platform-testkit --all-features snapshot_error_is_failed_verdict_not_zero
 cargo test --workspace --all-features
 ```
 
