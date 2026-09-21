@@ -5,9 +5,9 @@ Lifecycle authority: `tickets/README.md`
 Depends on: QMP-030, QMP-040, QMP-080  
 Blocks: QMP-130, QMP-140
 
-Status: `QUALIFIED` at product source `163d28fd30c781e37f5be4e8018ebb12083abc9d`.
-The exact-source receipt is
-[`receipts/2026-09-21T085212Z-163d28f.md`](receipts/2026-09-21T085212Z-163d28f.md).
+Status: `QUALIFIED`; current-source refresh at product source
+`aeeffe3588561398dcc1ad8c12332fe740f5f655` is recorded in
+[`receipts/2026-09-21T104013Z-aeeffe3.md`](receipts/2026-09-21T104013Z-aeeffe3.md).
 
 ## Objective
 

@@ -111,7 +111,7 @@ Property tests:
 - [x] tested zero-value large-key/identity 경로는 cap을 우회하지 못한다.
 - [x] tested transcript/prepared tombstone/index byte가 stats와 ledger에서 사라지지 않는다.
 - [x] QMP-050 semantic component/lease arithmetic은 checked이며 saturation으로 cost drift를 숨기지 않는다. **Core ledger 전축 exactness는 별도 QMP-020**의 통합 proof를 요구한다.
-- [ ] formula V1은 명명됐으나 public compatibility/migration policy는 QMP-140에서 확정해야 한다.
+- [x] formula V1, `PayloadRef: Eq + Hash`, 89→121 fixture delta, and shared spill-binding identity are recorded as a pre-1.0 breaking migration in `MIGRATION.md`/`CHANGELOG.md` with package version `0.2.0`.
 - [x] prepared/transcript에 independent literal oracle과 underbilling fake RED가 있다. 전체 facade store state-machine oracle은 QMP-090에서 확장한다.
 
 ## Verification
@@ -233,8 +233,12 @@ fixture the independent literal changes from 89 to 121 bytes. This is a real
 public bound/cost-model migration and must be recorded by QMP-140 rather than
 hidden behind compatibility prose.
 
-The independent transcript/prepared underbilling fakes and all workspace rails
-pass at `0c126a25aeab11f457e20c4a209fc7bb631ea859`; see
-[`receipts/2026-09-21T072928Z-0c126a2.md`](receipts/2026-09-21T072928Z-0c126a2.md).
-QMP-050 remains `IMPLEMENTED`: public version/migration policy and the
-in-process spill identity-cost decision remain open.
+The independent transcript/prepared underbilling fakes remain covered by the
+workspace doctor. At `aeeffe3588561398dcc1ad8c12332fe740f5f655`, the
+in-process spill handle reuses the store binding through `Arc` identity rather
+than deep-cloning large owner/runtime strings. A 128-entry hellgate checks
+pointer identity, exact strong-owner count, exact ledger cost after every
+spill/restore, source close, and tier drop. `MIGRATION.md` and `CHANGELOG.md`
+record the public `0.2.0` cost/bound changes. QMP-050 is therefore locally
+`QUALIFIED`; see
+[`receipts/2026-09-21T104013Z-aeeffe3.md`](receipts/2026-09-21T104013Z-aeeffe3.md).
