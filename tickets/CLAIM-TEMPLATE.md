@@ -11,5 +11,6 @@ start timestamp UTC:
 
 Claims live under `tickets/claims/<ticket-id>-<owner>.md` only while active.
 The validator rejects unknown tickets, incomplete records, overlapping active
-claims, and overlap between a claim's write set and its recorded foreign dirty
-paths.
+claims, unknown base commits, and overlap between a claim's write set and its
+recorded foreign dirty paths. Inventory status must be `IN_PROGRESS` while a
+claim exists, and every `IN_PROGRESS` ticket must have exactly one claim.

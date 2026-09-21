@@ -64,6 +64,7 @@ SELF_HOSTING_REQUIRED_PATHS=(
   "scripts/tests/test_extraction_metadata.py"
   "scripts/regression-guards.sh"
   "scripts/verify-tickets.sh"
+  "scripts/run-ticket-test"
   "tools/pm/pm.py"
   "tools/pm/targets.yaml"
   "tools/pm/templates/agents.md.j2"
@@ -72,6 +73,7 @@ SELF_HOSTING_REQUIRED_PATHS=(
   "tools/semgrep/qmp-regressions.yml"
   "tools/tickets/verify_tickets.py"
   "tools/tickets/test_verify_tickets.py"
+  "tools/tickets/run_cargo_test.py"
   "docs/verification-scenarios.md"
   "tickets/README.md"
 )

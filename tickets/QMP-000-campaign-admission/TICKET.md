@@ -19,7 +19,8 @@ Blocks: every implementation ticket
 ## Write set
 
 - `tickets/**`
-- 필요 시 ticket 검증 전용 `scripts/verify-tickets.sh` 또는 `tools/tickets/**`
+- ticket 검증 전용 `scripts/verify-tickets.sh`, `scripts/run-ticket-test`,
+  `tools/tickets/**`, standalone self-hosting manifest entry
 
 금지:
 
@@ -107,19 +108,25 @@ exit/count, or whether named selectors resolve.
 
 Required governance hardening:
 
-1. Represent receipt commands and results in a machine-readable schema.
-2. Require every named-test row to record `selected > 0`; `0 tests` is RED even
+1. [x] Represent receipt commands and results in machine-validated
+   `qmp-receipt-v1` verification rows.
+2. [x] Require every focused row to record `selected > 0`; `0 tests` is RED even
    when Cargo exits 0.
-3. Validate allowed states and `IN_PROGRESS iff exactly one matching claim`.
-4. Match receipt `ticket`, directory, filename SHA prefix, and full `HEAD`; verify
+3. [x] Validate allowed states and `IN_PROGRESS iff exactly one matching claim`.
+4. [x] Match receipt `ticket`, directory, timestamp, filename SHA prefix, and full `HEAD`; verify
    both commits exist.
-5. Require the latest transition receipt, not any historical receipt, for
+5. [x] Require the latest transition receipt, not any historical receipt, for
    `IMPLEMENTED`/terminal states.
-6. Recompute source status/digest at execution time instead of trusting the
-   literal `source changed during run: no` field.
-7. Add negative fixtures for zero-test selection, mismatched receipt identity,
+6. [x] Recompute the committed mode/blob/path source digest and terminal
+   owned-path drift instead of trusting only the literal source-change field.
+7. [x] Add negative fixtures for zero-test selection, mismatched receipt identity,
    invalid status, orphan claim, missing claim, stale transition receipt, and
    command/source drift.
+
+`scripts/run-ticket-test` is the canonical Cargo selector front door. It parses
+all Cargo test-result lines, sums actually executed pass/fail counts across
+targets, emits `qmp-cargo-test-evidence-v1` JSON with an output digest, and exits
+3 when Cargo itself exits 0 but selected count is zero.
 
 Until this is implemented, `scripts/verify-tickets.sh` GREEN proves structural
 consistency only. It is not qualification evidence by itself.
