@@ -30,6 +30,8 @@ use std::collections::BTreeMap;
 #[cfg(feature = "live_control")]
 use std::collections::BTreeSet;
 #[cfg(feature = "live_control")]
+use std::collections::HashMap;
+#[cfg(feature = "live_control")]
 use std::sync::atomic::{AtomicU64, Ordering};
 
 #[cfg(feature = "live_control")]
@@ -331,7 +333,9 @@ pub(crate) struct AccountingLedger {
     instance_id: u64,
     /// Canonical reservation state machine. An id exists exactly while its
     /// charge is live, and can transition only Pending -> Committed -> absent.
-    ticket_states: BTreeMap<u64, TicketState>,
+    /// This is a membership-only private index: no externally observable
+    /// behavior depends on ticket iteration order.
+    ticket_states: HashMap<u64, TicketState>,
     /// `None` means the u64 id space was exhausted. IDs never wrap or reuse.
     next_ticket_id: Option<u64>,
     rebuild_in_progress: bool,
@@ -351,7 +355,7 @@ impl AccountingLedger {
             total_usage: UsageBreakdown::default(),
             non_headroom_bytes: 0,
             instance_id: LEDGER_INSTANCE.fetch_add(1, Ordering::Relaxed),
-            ticket_states: BTreeMap::new(),
+            ticket_states: HashMap::new(),
             next_ticket_id: Some(1),
             rebuild_in_progress: false,
             #[cfg(test)]
