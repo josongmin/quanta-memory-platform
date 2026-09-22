@@ -36,6 +36,9 @@ extraction, host-pair qualification, and deployment activation.
   public API.
 - The extraction manifest rejects both tracked and untracked content beneath a
   copied root. This closes the prior false clean-extraction admission path.
+- Dependency direction and extraction-locality are now checked from Cargo's
+  resolved metadata graph, rather than manifest-text matching; renamed
+  dependencies and comment lookalikes cannot evade the extraction fence.
 - Testkit's public API surface now pins the public transcript conformance
   aliases; conformance bite tests still reject broken lifecycle fakes.
 
@@ -69,10 +72,11 @@ cargo deny --locked --all-features check
 scripts/check-workspace.sh
 ```
 
-The canonical workspace rail additionally exercised the feature matrix, 10
-advertised non-zero runtime paths, 166 documented selectors, PM drift checks,
-Semgrep regressions, and dependency policy. No assertion was weakened and no
-skip/allowlist was added for this receipt.
+The canonical workspace rail additionally exercised shell syntax, the resolved
+Cargo workspace graph, the feature matrix, 10 advertised non-zero runtime
+paths, 166 documented selectors, PM drift checks, Semgrep regressions, and
+dependency policy. No assertion was weakened and no skip/allowlist was added
+for this receipt.
 
 ## FINAL-004 extraction receipt
 
@@ -83,10 +87,9 @@ scripts/extract-to-standalone-repo.sh --dry-run /tmp/qmp-final-extraction
 scripts/extract-to-standalone-repo.sh /tmp/qmp-final-extract.dT5cnb
 ```
 
-The real extracted repository matched manifest
-`b217353102b9367509409ab4083e1751cb76554f0acbacb7d7476ccbebaa5e1a` and
-completed its canonical workspace rail. Directly in the extracted repository,
-the following also exited zero:
+The real extracted repository's source manifest and generated commit/tree are
+recorded in the annotated tag, and it completed its canonical workspace rail.
+Directly in the extracted repository, the following also exited zero:
 
 ```text
 cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
@@ -139,6 +142,8 @@ builder/adapter boundary.
 - QMP local `main` is clean at the recorded implementation receipt. Semantica
   retains unrelated dirty work outside all host-adapter paths; the host commit
   was fast-forwarded only after confirming no path overlap.
+- The clean, merged `qmp-host-qualification` worktree is removed after its
+  exact-pair commands complete; the merged commit remains on Semantica `main`.
 
 ## Residual operational risk
 

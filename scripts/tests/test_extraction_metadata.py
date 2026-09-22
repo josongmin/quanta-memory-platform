@@ -21,6 +21,7 @@ class ExtractionMetadataTests(unittest.TestCase):
                     "name": name,
                     "source": None,
                     "manifest_path": str(self.root / "crates" / name / "Cargo.toml"),
+                    "dependencies": [],
                 }
                 for id_, name in zip(
                     ["core", "facade", "testkit"], sorted(MODULE.EXPECTED_MEMBERS)
@@ -63,9 +64,41 @@ class ExtractionMetadataTests(unittest.TestCase):
                 "name": "extra-package",
                 "source": None,
                 "manifest_path": str(self.root / "crates/extra-package/Cargo.toml"),
+                "dependencies": [],
             }
         )
         with self.assertRaisesRegex(ValueError, "unexpected workspace members"):
+            MODULE.check_metadata(self.metadata, self.root)
+
+    def test_core_upward_dependency_is_rejected_from_resolved_graph(self):
+        core = next(
+            package
+            for package in self.metadata["packages"]
+            if package["name"] == "quanta-memory-platform-core"
+        )
+        core["dependencies"] = [
+            {
+                "name": "quanta-memory-platform-facade",
+                "rename": "innocent_alias",
+            }
+        ]
+        with self.assertRaisesRegex(
+            ValueError,
+            "quanta-memory-platform-core -> quanta-memory-platform-facade",
+        ):
+            MODULE.check_metadata(self.metadata, self.root)
+
+    def test_facade_upward_dependency_is_rejected(self):
+        facade = next(
+            package
+            for package in self.metadata["packages"]
+            if package["name"] == "quanta-memory-platform-facade"
+        )
+        facade["dependencies"] = [{"name": "quanta-memory-platform-testkit"}]
+        with self.assertRaisesRegex(
+            ValueError,
+            "quanta-memory-platform-facade -> quanta-memory-platform-testkit",
+        ):
             MODULE.check_metadata(self.metadata, self.root)
 
 

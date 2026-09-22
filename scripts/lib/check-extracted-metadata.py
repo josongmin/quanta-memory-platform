@@ -12,6 +12,13 @@ EXPECTED_MEMBERS = {
     "quanta-memory-platform-testkit",
 }
 FORBIDDEN_PACKAGES = {"quanta-memory-host", "quanta-runtime", "semantica"}
+FORBIDDEN_EDGES = {
+    "quanta-memory-platform-core": {
+        "quanta-memory-platform-facade",
+        "quanta-memory-platform-testkit",
+    },
+    "quanta-memory-platform-facade": {"quanta-memory-platform-testkit"},
+}
 
 
 def check_metadata(metadata: dict, root: Path) -> None:
@@ -22,6 +29,17 @@ def check_metadata(metadata: dict, root: Path) -> None:
     }
     if member_names != EXPECTED_MEMBERS:
         raise ValueError(f"unexpected workspace members: {sorted(member_names)}")
+
+    packages_by_id = {package["id"]: package for package in metadata["packages"]}
+    for member_id in members:
+        package = packages_by_id[member_id]
+        forbidden = FORBIDDEN_EDGES.get(package["name"], set())
+        for dependency in package.get("dependencies", []):
+            if dependency["name"] in forbidden:
+                raise ValueError(
+                    "forbidden dependency direction: "
+                    f"{package['name']} -> {dependency['name']}"
+                )
 
     for package in metadata["packages"]:
         name = package["name"]

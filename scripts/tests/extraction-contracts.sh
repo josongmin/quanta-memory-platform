@@ -18,6 +18,7 @@ expect_failure() {
 
 # A required executable/config path may not silently disappear from the copy
 # plan, even when its source still exists.
+# shellcheck disable=SC2016 # The child bash intentionally expands the copied arrays.
 expect_failure "omitted semgrep config" bash -c '
   source scripts/lib/self-hosting-manifest.sh
   SELF_HOSTING_COPY_PATHS=("${SELF_HOSTING_COPY_PATHS[@]/tools\/semgrep/}")
@@ -58,6 +59,36 @@ fn allowed(bytes: u64) {
 EOF
 semgrep --config tools/semgrep/qmp-regressions.yml --error --strict --metrics=off \
   "${fixture}/allowed.rs" >/dev/null
+
+# Pure-layer architecture rules are path-scoped, so mirror the real crate path
+# in the fixture and prove each forbidden dependency shape is rejected.
+pure_fixture="${fixture}/pure/crates/quanta-memory-platform-core/src/domain"
+mkdir -p "${pure_fixture}"
+cat > "${pure_fixture}/bad.rs" <<'EOF'
+use crate::adapters::metrics::MetricsAdapter;
+use std::time::SystemTime;
+
+fn bad() {
+    let _ = std::fs::read("state");
+    let _ = std::env::var("QMP_STATE");
+    let _ = SystemTime::now();
+}
+EOF
+expect_failure "semgrep pure-layer architecture fixtures" \
+  semgrep --config tools/semgrep/qmp-regressions.yml --error --strict --metrics=off \
+    "${fixture}/pure"
+
+cat > "${pure_fixture}/good.rs" <<'EOF'
+trait StatePort {
+    fn read(&self) -> Result<Vec<u8>, String>;
+}
+
+fn read_state(port: &dyn StatePort) -> Result<Vec<u8>, String> {
+    port.read()
+}
+EOF
+semgrep --config tools/semgrep/qmp-regressions.yml --error --strict --metrics=off \
+  "${fixture}/pure" --exclude "**/bad.rs" >/dev/null
 
 # A changed manifest must never rewrite the extracted lockfile implicitly.
 mkdir -p "${fixture}/locked/src"

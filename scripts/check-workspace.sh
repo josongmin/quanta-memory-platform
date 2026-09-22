@@ -7,6 +7,15 @@ cd "${repo_root}"
 echo "[check-workspace] fmt --check"
 cargo fmt --all --check
 
+echo "[check-workspace] shell syntax"
+while IFS= read -r -d '' script; do
+  bash -n "${script}"
+done < <(find scripts -type f -name '*.sh' -print0)
+
+echo "[check-workspace] resolved workspace graph"
+cargo metadata --locked --format-version 1 | \
+  python3 scripts/lib/check-extracted-metadata.py "${repo_root}"
+
 echo "[check-workspace] workspace policy"
 python3 scripts/verify-workspace-policy.py
 

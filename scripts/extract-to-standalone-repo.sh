@@ -74,31 +74,9 @@ for m in "${MEMBERS[@]}"; do
   fi
 done
 
-# 0b. Dependency-direction fence: `core` must not depend on facade/testkit;
-#     `facade` must not depend on testkit. (core <- facade <- testkit)
-core_manifest="$(cat crates/quanta-memory-platform-core/Cargo.toml)"
-facade_manifest="$(cat crates/quanta-memory-platform-facade/Cargo.toml)"
-if grep -q "quanta-memory-platform-facade\|quanta-memory-platform-testkit" <<<"${core_manifest}"; then
-  echo "FAIL: core depends upward on facade/testkit (cyclic / wrong direction)" >&2
-  exit 1
-fi
-if grep -q "quanta-memory-platform-testkit" <<<"${facade_manifest}"; then
-  echo "FAIL: facade depends upward on testkit (cyclic / wrong direction)" >&2
-  exit 1
-fi
-
-# 0c. No member may carry a path dependency that escapes the workspace (would
-#     break after extraction). Inter-member path deps must stay relative within
-#     `crates/`.
-for m in "${MEMBERS[@]}"; do
-  if grep -E 'path = "\.\./\.\./\.\./' "${m}/Cargo.toml" >/dev/null 2>&1; then
-    echo "FAIL: ${m} has a path dependency escaping the workspace; resolve before extraction" >&2
-    exit 1
-  fi
-done
-
-# 0d. The lockfile and full local dependency graph must resolve without
-# mutation, and no local package may escape this workspace.
+# 0b. Cargo's resolved graph is the authority for dependency direction, host
+#     back-edges, local packages, and path dependencies escaping the workspace.
+#     This catches renamed dependencies and ignores comments/string lookalikes.
 cargo metadata --locked --format-version 1 | \
   python3 scripts/lib/check-extracted-metadata.py "${repo_root}"
 
