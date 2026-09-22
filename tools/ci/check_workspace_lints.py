@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import re
 import sys
 from pathlib import Path
 
@@ -26,8 +27,8 @@ def lint_policy_errors(root: Path) -> list[str]:
         .get("rust", {})
         .get("unsafe_code")
     )
-    if unsafe_policy != "forbid":
-        errors.append("workspace.lints.rust.unsafe_code must be `forbid`")
+    if unsafe_policy != "deny":
+        errors.append("workspace.lints.rust.unsafe_code must be `deny`")
 
     members = root_manifest.get("workspace", {}).get("members", [])
     if not isinstance(members, list):
@@ -40,6 +41,16 @@ def lint_policy_errors(root: Path) -> list[str]:
         manifest = load_toml(manifest_path)
         if manifest.get("lints", {}).get("workspace") is not True:
             errors.append(f"workspace member does not inherit lints: {member}")
+        library_root = root / member / "src/lib.rs"
+        if library_root.is_file() and not library_root.read_text().startswith(
+            "#![forbid(unsafe_code)]\n"
+        ):
+            errors.append(f"library root does not forbid unsafe code: {member}")
+        exception = re.compile(r"#\s*!?\s*\[\s*(?:allow|expect)\s*\(\s*unsafe_code\s*\)")
+        allowed_exception = root / "crates/quanta-memory-platform-facade/benches/scaling.rs"
+        for source in (root / member).rglob("*.rs"):
+            if source != allowed_exception and exception.search(source.read_text()):
+                errors.append(f"unauthorized unsafe-code exception: {source.relative_to(root)}")
     return errors
 
 

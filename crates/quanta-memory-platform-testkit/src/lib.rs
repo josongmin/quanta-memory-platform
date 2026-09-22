@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! `quanta-memory-platform-testkit`: reusable conformance, chaos, and allocation
 //! tooling for the memory platform.
 //!

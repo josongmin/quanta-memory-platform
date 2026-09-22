@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Builder-first portable memory platform.
 //!
 //! Report-only resolution returns data, not runtime authority:

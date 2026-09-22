@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Portable memory-budget authority.
 //!
 //! Raw ledger construction is intentionally not part of the public API:

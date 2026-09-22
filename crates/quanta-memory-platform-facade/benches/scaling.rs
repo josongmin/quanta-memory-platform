@@ -1,3 +1,7 @@
+// This benchmark alone instruments GlobalAlloc. Product crates forbid unsafe
+// code; the workspace deny policy requires this explicit target-local exception.
+#![allow(unsafe_code)]
+
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::collections::BTreeMap;
 use std::hint::black_box;
