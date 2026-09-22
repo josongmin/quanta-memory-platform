@@ -313,3 +313,36 @@ exact-source receipt still owed).
   `make_contiguous()` is a no-op on a never-wrapped deque (ratio
   1.03x). The rail correctly passed both and fired only on the
   genuinely quadratic rescan.
+
+## 15. Review correction after `943cf0a` (candidate evidence, not a tag)
+
+The review of `main@943cf0aaff3177831c3fb75ffa10ceb39e3eab99` found a
+late-attach false negative: adding a public `charged_against(self) -> Self`
+to retained map left its `compile_fail` doctest GREEN because the example used
+`store.charged_against` as a field. The other store examples used the same
+pattern; payload's actual call depended on a specific method signature.
+
+- All five late-attach snippets now resolve the associated method item by
+  concrete type. Clean `cargo test -p quanta-memory-platform-facade --doc
+  --all-features` passed 23/23 before mutation.
+- Retained-map public-method mutant: doctest exit 101, exactly its late-attach
+  snippet failed with `Test compiled successfully, but it's marked
+  compile_fail` (22 passed, 1 failed).
+- The same public-method mutant applied to payload, revocable, transcript,
+  and prepared publication: doctest exit 101; all four corresponding snippets
+  failed by compiling (19 passed, 4 failed). Mutants were removed; no public
+  method remains.
+- The unclassified `e535f54` production `ticket_states: HashMap` change is
+  reverted to `BTreeMap`, as the TO-05 writer lease specified. The 32/128
+  owner bounded-probe keeper is unchanged.
+- TO-02's matrix wording now admits the already implemented deduplication of
+  identical resolved feature sets. The three escape-hatch absence profiles,
+  per-crate bare checks, and workspace all-features union remain executable.
+
+At the reviewed `943cf0a` source, independent mutant checks also reproduced
+TO-05 (`35` vs `3`), TO-09 (`41` vs `148`), and TO-02d (normalized growth
+`17.71x` vs `4.0x`). Each returned to focused GREEN, and each owner-file diff
+returned to its pre-mutation state. `scripts/check-workspace.sh` exited 0 on
+that pre-correction source, including Semgrep 6 rules / 66 targets / 0 findings.
+The correction still requires a committed source identity, full rail, and a
+new annotated receipt; earlier tags do not cover it.

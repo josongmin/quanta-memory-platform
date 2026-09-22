@@ -158,3 +158,23 @@ Each item names the owner and the exact artifact owed. Substitute evidence
   provenance.
 - Rollback order if needed: revert per owner file only; shared `scaling.rs`
   unwinds TO-02 before TO-03 (writer order TO-03→TO-02).
+
+## Post-`943cf0a` review reconciliation
+
+This section updates the historical gap list above without rewriting its
+original observation. Receipts §§11, 13, and 14 supply the previously missing
+owner mutant and keeper proofs; the later `qmp-final-qualified-d370529` tag
+binds only its own older source. A new review found two post-tag issues:
+
+1. TO-02 late-attach rustdoc used method-as-field expressions. A public
+   `charged_against` method left retained-map doctests GREEN. The correction
+   resolves method items on all five affected concrete types, and public
+   mutants now make each corresponding doctest RED (receipts §15).
+2. `e535f54` changed the production ledger's ticket map outside TO-05's
+   test-only lease. The correction restores `BTreeMap` (receipts §15).
+
+The command-level TO-02 matrix discrepancy is reconciled as a deduplication
+of identical resolved feature sets in the ticket and final inventory. The
+Semgrep CA startup failure is historical: `scripts/check-workspace.sh` passed
+at `943cf0a` in the review host. Current-source qualification remains open
+until a newer annotated tag binds a clean committed source and its host pair.

@@ -35,7 +35,9 @@ Depends on: `TO-03` for `scaling.rs`
 
 - Delete only `source_has_no_public_raw_constructor_or_late_attach`.
 - Keep the two `SimplePayloadStore` rustdoc `compile_fail` examples for
-  `charged_against` and raw `new` construction unchanged.
+  `charged_against` and raw `new` construction. The late-attach snippet must
+  resolve the associated method item so a public method of any signature makes
+  that snippet compile and rustdoc fail.
 - Do not change `new_budgeted`, `new_unbudgeted`, `with_accounting`, visibility, or store tests.
 - File proof: facade doctest must select both snippets; temporary public constructor/late attach
   mutant must make the relevant compile-fail snippet compile and therefore fail rustdoc.
@@ -43,8 +45,9 @@ Depends on: `TO-03` for `scaling.rs`
 ### `crates/quanta-memory-platform-facade/src/retained_map/service.rs`
 
 - Extend `SimpleRetainedMapStore` rustdoc with two separate `compile_fail` examples:
-  external call to private `new_budgeted`, and nonexistent `charged_against` late attach. Keep them
-  separate so exposing one path cannot be masked by the other snippet still failing.
+  external call to private `new_budgeted`, and nonexistent `charged_against` late attach. Resolve
+  the associated method item in the latter so a public method of any signature makes it compile.
+  Keep them separate so exposing one path cannot be masked by the other snippet still failing.
 - Delete `retained_map_owner_has_one_keyed_container_and_no_linear_point_path`; do not replace it
   with another container-name grep.
 - Keep `first_and_last_key_point_operations_share_one_n_independent_probe_bound_v1` and its 4,096
@@ -87,7 +90,11 @@ Depends on: `TO-03` for `scaling.rs`
   `--no-default-features --features full-backings`.
 - Match the resolved line `quanta-memory-platform-facade feature "unbudgeted-stores"`; do not parse
   Cargo.toml text. Print the label and full offending tree on failure.
-- Keep bare-facade core default/live-control leak check and all clippy matrix combinations intact.
+- Keep the bare-facade core default/live-control leak check and every distinct
+  resolved feature set in the Clippy matrix. The later deduplication may skip
+  an identical singleton-default or empty-default invocation. The workspace
+  all-features union remains required; the workspace bare union is covered by
+  the per-crate bare checks while all intra-workspace dependency edges disable defaults.
 - `--all-features` is an intentional positive activation and must not be passed to this absence
   helper.
 
@@ -221,3 +228,21 @@ rg -n 'include_str!|read_to_string' crates/quanta-memory-platform-facade/src cra
   `make_contiguous()`, 1.03x — correctly stayed GREEN.)
 - Smoke artifact: receipts §10 (`00ab2a6`, exit 0, 33 samples).
 - All mutants reverted; production byte-identical to HEAD after each.
+
+### Review correction (post-`943cf0a`, exact-source receipt pending)
+
+- The prior late-attach examples on retained map, revocable store, transcript,
+  and prepared publication used `store.charged_against` as a field expression.
+  A public method still left those examples compile-failing. The payload
+  example depended on a specific method signature.
+- All five now resolve `ConcreteType::<...>::charged_against` as an associated
+  method item. With no public method, facade doctests passed 23/23. A temporary
+  public `charged_against(self) -> Self` on retained map made its own doctest
+  fail (`Test compiled successfully, but it's marked compile_fail`); the same
+  mutation on the other four types made all four corresponding doctests fail.
+  Each mutant was reverted and the owner files contain no production change.
+- The feature matrix's later deduplication retains every distinct feature set:
+  empty defaults and singleton defaults are identical to their bare/singleton
+  checks; all intra-workspace edges disable defaults. The workspace all-features
+  union remains an executable gate. The ticket's previous literal command
+  preservation wording has been corrected to this resolved-set contract.

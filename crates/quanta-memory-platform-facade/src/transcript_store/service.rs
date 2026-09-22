@@ -231,9 +231,7 @@ fn validate_component_counters<SessionId, MessageId, Message>(
 ///
 /// ```compile_fail
 /// # use quanta_memory_platform_facade::{Budgeted, SimpleSessionTranscriptStore};
-/// # fn cannot_rebind(store: SimpleSessionTranscriptStore<String, String, String, Budgeted>) {
-/// let _ = store.charged_against;
-/// # }
+/// let _ = SimpleSessionTranscriptStore::<String, String, String, Budgeted>::charged_against;
 /// ```
 #[derive(Debug)]
 pub struct SimpleSessionTranscriptStore<SessionId, MessageId, Message, Mode> {

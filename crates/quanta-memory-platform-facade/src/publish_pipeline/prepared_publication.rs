@@ -310,9 +310,7 @@ fn active_cost(
 ///
 /// ```compile_fail
 /// use quanta_memory_platform_facade::{Budgeted, PreparedPublicationService};
-/// fn late_attach(service: PreparedPublicationService<Vec<u8>, Budgeted>) {
-///     let _ = service.charged_against;
-/// }
+/// let _ = PreparedPublicationService::<Vec<u8>, Budgeted>::charged_against;
 /// ```
 #[derive(Debug)]
 pub struct PreparedPublicationService<Payload, Mode> {

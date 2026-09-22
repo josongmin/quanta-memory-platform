@@ -114,9 +114,7 @@ impl<Key, Value> Drop for MapStatePlan<'_, Key, Value> {
 /// ```compile_fail
 /// use quanta_memory_platform_facade::{Budgeted, SimpleRetainedMapStore};
 ///
-/// fn late_attach(store: SimpleRetainedMapStore<String, Vec<u8>, Budgeted>) {
-///     let _ = store.charged_against;
-/// }
+/// let _ = SimpleRetainedMapStore::<String, Vec<u8>, Budgeted>::charged_against;
 /// ```
 #[derive(Debug)]
 pub struct SimpleRetainedMapStore<Key, Value, Mode> {

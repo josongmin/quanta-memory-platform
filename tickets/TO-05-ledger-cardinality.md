@@ -86,3 +86,11 @@ cargo test -p quanta-memory-platform-core --lib
 - Post-revert: 1 passed; production byte-identical to HEAD.
 - Medians (same host/profile, warm, 3 runs): before 0.09s → after
   0.00s. No time assertion in code.
+
+### Review correction (post-`943cf0a`, exact-source receipt pending)
+
+The later `e535f54` commit changed production `ticket_states` from `BTreeMap`
+to `HashMap` inside this ticket's owner file without a separate production
+contract or receipt. The review correction restores `BTreeMap` and removes the
+unused `HashMap` import. The bounded-probe test and production preflight
+algorithm are unchanged; the original 32/128-owner mutant proof remains valid.

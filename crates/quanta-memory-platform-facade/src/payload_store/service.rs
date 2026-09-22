@@ -71,11 +71,8 @@ struct PayloadState<PayloadRef, Bytes> {
 /// attachment:
 ///
 /// ```compile_fail
-/// # use quanta_memory_platform_facade::{Budgeted, SimplePayloadStore};
-/// # use quanta_memory_platform_core::LiveProcessMemoryBroker;
-/// # fn late_attach(store: SimplePayloadStore<String, Vec<u8>, Budgeted>, broker: LiveProcessMemoryBroker) {
-/// let rebound = store.charged_against(broker);
-/// # }
+/// use quanta_memory_platform_facade::{Budgeted, SimplePayloadStore};
+/// let _ = SimplePayloadStore::<String, Vec<u8>, Budgeted>::charged_against;
 /// ```
 ///
 /// ```compile_fail

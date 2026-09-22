@@ -70,6 +70,17 @@ and public/doctest rails are required again after the candidate is committed.
 No current candidate change introduces a host noun, upward dependency, raw
 authority export, generated-file hand edit, test skip, or assertion weakening.
 
+## Post-`943cf0a` review correction
+
+| Owner / purpose | Paths reviewed | Disposition |
+| --- | --- | --- |
+| Late accounting attachment contract | `facade/src/{payload_store,retained_map,revocable_store,transcript_store}/service.rs`; `facade/src/publish_pipeline/prepared_publication.rs`; `tickets/TO-02-contract-authority.md` | Five rustdoc examples now resolve the method item. A public no-op method turns each targeted compile-fail example RED; no public API is added. |
+| Ledger ticket index | `core/src/domain/ledger.rs`; `tickets/TO-05-ledger-cardinality.md` | Reverts the unclassified post-tag `HashMap` production change from `e535f54`, restoring the `BTreeMap` required by the TO-05 lease. |
+| Feature matrix contract | `tickets/TO-02-contract-authority.md` | Reconciles the ticket's command-preservation wording with the already documented deduplication of identical resolved feature sets. No script or Cargo graph change. |
+
+The earlier `qmp-final-qualified-d370529` annotation does not cover this
+correction or other post-tag commits. A new source-bound receipt is required.
+
 | Owner / purpose | Paths reviewed | Verdict |
 | --- | --- | --- |
 | Removed local-only build preferences | `.cargo/config.toml` (delete); `clippy.toml` (delete); `deny.toml` | Correct: portable rail owns its settings and deny has no stale exception. |

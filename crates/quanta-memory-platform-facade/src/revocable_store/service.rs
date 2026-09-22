@@ -133,9 +133,7 @@ struct RevocableState<Key, Value> {
 /// ```compile_fail
 /// use quanta_memory_platform_facade::{Budgeted, SimpleRevocableStore};
 ///
-/// fn late_attach(store: SimpleRevocableStore<String, Vec<u8>, Budgeted>) {
-///     let _ = store.charged_against;
-/// }
+/// let _ = SimpleRevocableStore::<String, Vec<u8>, Budgeted>::charged_against;
 /// ```
 #[derive(Debug)]
 pub struct SimpleRevocableStore<Key, Value, Mode> {
