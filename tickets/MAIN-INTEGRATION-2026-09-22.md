@@ -51,3 +51,16 @@ receipts or the status inventory in `tickets/README.md`.
   contains conflict markers. Local repairs were intentionally **not pushed**:
   the user requested local-main integration. Remote main therefore remains
   broken until a separately authorized push or another writer's repair.
+
+## Campaign boundary cleanup at `75231ef`
+
+Commit `8af9850`/`75231ef` separates campaign admission from the product
+extraction boundary. `scripts/verify-tickets.sh`,
+`tools/tickets/{verify_tickets.py,test_verify_tickets.py}`, and `tickets/**`
+remain in this source checkout for audit governance, but are excluded from the
+extraction manifest and archive. The generic `scripts/run-ticket-test` runner
+remains because the feature-capability rail executes it. An actual extraction
+at `75231ef` completed with the standalone doctor and PM lint rails green, and
+confirmed all excluded campaign paths are absent. This is boundary cleanup,
+not requalification: the eight stale terminal receipts listed above still
+require exact-current-source reruns or explicit status transitions.
