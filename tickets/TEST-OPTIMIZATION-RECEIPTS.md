@@ -177,9 +177,10 @@ observation, not the final annotated receipt and not host activation evidence.
 - The earlier Semgrep startup blocker in this file is historical: current
   exact-source execution scanned all 66 Rust targets with all six rules and
   returned zero production findings.
-- Still open: the per-ticket mutation excerpts required above, an immutable
-  receipt bound after the last tracked ticket change, current Semantica host
-  pair qualification, deployment, and activation.
+- At that snapshot, the remaining work was the per-ticket mutation excerpts,
+  an immutable receipt bound after the last tracked ticket change, host-pair
+  qualification, deployment, and activation. This historical list is not a
+  current completion status; resolve the newest annotated receipt instead.
 
 ## 10. TO-02 scaling smoke artifact
 
