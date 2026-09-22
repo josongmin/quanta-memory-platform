@@ -197,3 +197,64 @@ The clean source `00ab2a68ee47bf23ce746ba6ff242365b07175bf`
 
 This closes the missing TO-02 smoke artifact. It does not close the remaining
 temporary-mutant or host-pair requirements, and it is not a deployment receipt.
+
+## 11. Owner-executed mutant proofs (this session, same host)
+
+Each proof: temporary mutant applied → focused test RED (excerpt below) →
+mutant reverted → `git diff HEAD -- <file>` empty → focused test green.
+No mutant was committed; all production regions verified byte-identical
+after revert. Tickets remain `IMPLEMENTED`, not `DONE` (exact-source
+annotated receipt still owed per §9).
+
+- TO-04 (`faults/scenarios.rs`, success arm → `Contained`):
+  `spill_fault_classification_reports_escaped_for_a_lying_controller`
+  FAILED at `scenarios.rs:263`; drift/unreadable poles still passed
+  (separate arms, correct). Post-revert: 3 passed.
+- TO-06 (`ledger.rs` `validate_reserve_postimage`, pool allowance +1):
+  `zero_shared_pool_cannot_extend_borrowing_class_hard_cap` FAILED at
+  `policy_contracts.rs:310` (+1-byte `Capacity` denial missing).
+  Post-revert: 1 passed.
+- TO-07 (`builder.rs` `build`, reclaimer → `None`):
+  `builder_reclaimer_reaches_build_live_broker` FAILED at `builder.rs:297`
+  (request-count assertion). Post-revert: 1 passed.
+- TO-05 (`ledger.rs` `preflight_release_batch`, full `owner_usage` scan
+  added to probe counter): cardinality test FAILED at `ledger.rs:1518`
+  with `left: 35, right: 3` (3 + 32 owners) on the exact-`3` assertion.
+  Post-revert: 1 passed.
+- TO-01 (`redb.rs` `reserve_record_id`, constant duplicate ID 0):
+  `concurrent_accepts_lose_no_handle_and_assign_distinct_keys` FAILED —
+  worker threads panicked at `redb.rs:1243` (duplicate-key commit
+  rejected; receipts never reached the sequence oracle). Post-revert:
+  1 passed (0.42s).
+- TO-02a (`payload_store/service.rs`, temporary `pub fn new`):
+  doctest `SimplePayloadStore (line 81) - compile fail` FAILED (snippet
+  compiled once the ctor was public). Post-revert: doctests green.
+- TO-02b (`facade/Cargo.toml`, `unbudgeted-stores` added to `full`):
+  `scripts/verify-feature-matrix.sh` exit `1` with
+  `feature-matrix: facade feature 'full' must not enable unbudgeted-stores`
+  plus offending tree. Post-revert: `feature-matrix: OK`.
+- TO-03: `cargo bench -p quanta-memory-platform-facade --features
+  payload_store,revocable_store --bench scaling --no-run` builds
+  (`scaling-25a2413b61efab4d`). Epoch revert-mutant RED still owed
+  (requires a bench execution, not just compile).
+- TO-08 keeper-implication diff proof (analysis, ticket requires no
+  mutant): (a) deleted telemetry case's exact row `(2_000, 1_000, 1_000,
+  true)` present in keeper table (`telemetry.rs:267`) with
+  semantic-authority assertion; (b) deleted
+  `assert_ne!(after.total_owner_bytes(), 600_000)` implied by keepers
+  `after == before` (`control.rs:2083`) + `after == 400_000` (`:2088`);
+  (c) eight→nine comment matches nine-element exhaustive array
+  (`public_api_surface.rs:174-179`, no wildcard arm). `git diff` shows no
+  production hunk for all three files.
+- Still owed: TO-02c (linear-scan probe-bound RED), TO-02d
+  (quadratic-drain normalized-growth RED on 1k/10k fixtures), TO-03
+  epoch revert-mutant RED.
+
+## 12. Extraction-gate reconciliation
+
+The wave owner's earlier objection to the `check-extracted-metadata.py`
+dest-pipe removal is withdrawn. Verified live: the check now runs in
+extraction pre-flight (step 0b, `extract-to-standalone-repo.sh:80`
+against `repo_root`) and `scripts/check-workspace.sh:26` runs the locked
+resolved-graph check inside the destination rail — the removed call was
+genuinely duplicate validation. No edit war; §8 as rewritten stands.
