@@ -27,6 +27,9 @@
 - Added a workspace-wide `redundant_clone` guard and removed the existing
   unnecessary policy/configuration clones; rejected broader allocation lints
   that misclassify intentional collect-then-join concurrency tests.
+- Consolidated four Semgrep fixture processes into one exact rule-ID scan,
+  reducing lint startup cost while strengthening the negative contract so each
+  of the six regression rules must independently produce evidence.
 
 ## 0.2.0 - 2026-09-21
 

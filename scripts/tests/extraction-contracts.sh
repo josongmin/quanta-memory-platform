@@ -39,8 +39,10 @@ cp scripts/regression-guards.sh "${fixture}/scripts/regression-guards.sh"
 expect_failure "missing semgrep config" "${fixture}/scripts/regression-guards.sh"
 expect_failure "missing semgrep binary" env PATH=/usr/bin:/bin scripts/regression-guards.sh
 
-# The regression rules must bite on each historical bug shape and accept the
-# documented scoped exception mechanism.
+# Build one fixture corpus so Semgrep starts once. The result check below proves
+# every historical rule ID bites and the documented clean/suppressed cases stay
+# clean; merely expecting a non-zero scan would let one working rule mask five
+# broken rules.
 cat > "${fixture}/bad.rs" <<'EOF'
 fn bad(bytes: u64, a: u64, b: u64, c: u64, counter: &std::sync::atomic::AtomicU64) {
     let _signed = bytes as i64;
@@ -48,21 +50,16 @@ fn bad(bytes: u64, a: u64, b: u64, c: u64, counter: &std::sync::atomic::AtomicU6
     counter.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
 }
 EOF
-expect_failure "semgrep historical bug fixtures" \
-  semgrep --config tools/semgrep/qmp-regressions.yml --error --strict --metrics=off \
-    "${fixture}/bad.rs"
 
 cat > "${fixture}/allowed.rs" <<'EOF'
 fn allowed(bytes: u64) {
     let _signed = bytes as i64; // nosemgrep: qmp-magnitude-as-signed -- reason: fixture proves scoped suppression
 }
 EOF
-semgrep --config tools/semgrep/qmp-regressions.yml --error --strict --metrics=off \
-  "${fixture}/allowed.rs" >/dev/null
 
 # Pure-layer architecture rules are path-scoped, so mirror the real crate path
 # in the fixture and prove each forbidden dependency shape is rejected.
-pure_fixture="${fixture}/pure/crates/quanta-memory-platform-core/src/domain"
+pure_fixture="${fixture}/crates/quanta-memory-platform-core/src/domain"
 mkdir -p "${pure_fixture}"
 cat > "${pure_fixture}/bad.rs" <<'EOF'
 use crate::adapters::metrics::MetricsAdapter;
@@ -74,9 +71,6 @@ fn bad() {
     let _ = SystemTime::now();
 }
 EOF
-expect_failure "semgrep pure-layer architecture fixtures" \
-  semgrep --config tools/semgrep/qmp-regressions.yml --error --strict --metrics=off \
-    "${fixture}/pure"
 
 cat > "${pure_fixture}/good.rs" <<'EOF'
 trait StatePort {
@@ -87,8 +81,51 @@ fn read_state(port: &dyn StatePort) -> Result<Vec<u8>, String> {
     port.read()
 }
 EOF
+
+semgrep_json="${fixture}/semgrep-results.json"
+semgrep_stderr="${fixture}/semgrep.stderr"
+semgrep_status=0
 semgrep --config tools/semgrep/qmp-regressions.yml --error --strict --metrics=off \
-  "${fixture}/pure" --exclude "**/bad.rs" >/dev/null
+  --disable-version-check --jobs=1 --json "${fixture}" \
+  >"${semgrep_json}" 2>"${semgrep_stderr}" || semgrep_status=$?
+if [[ "${semgrep_status}" -ne 1 ]]; then
+  echo "FAIL: consolidated Semgrep fixture scan returned ${semgrep_status}, expected findings exit 1" >&2
+  sed -n '1,160p' "${semgrep_stderr}" >&2
+  exit 1
+fi
+python3 -c '
+import json
+import pathlib
+import sys
+
+payload = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+expected = {
+    "qmp-atomic-fetch-sub",
+    "qmp-magnitude-as-signed",
+    "qmp-pure-layer-no-adapter-import",
+    "qmp-pure-layer-no-fs-env",
+    "qmp-pure-layer-no-wall-clock",
+    "qmp-saturating-mul-then-divide",
+}
+results = payload.get("results", [])
+seen = {result["check_id"].rsplit(".", 1)[-1] for result in results}
+errors = payload.get("errors", [])
+clean_hits = sorted(
+    result["path"]
+    for result in results
+    if pathlib.Path(result["path"]).name in {"allowed.rs", "good.rs"}
+)
+failures = []
+if seen != expected:
+    failures.append(f"rule IDs differ: missing={sorted(expected - seen)} extra={sorted(seen - expected)}")
+if errors:
+    failures.append(f"Semgrep reported {len(errors)} parse/runtime errors")
+if clean_hits:
+    failures.append(f"clean/suppressed fixtures produced findings: {clean_hits}")
+if failures:
+    raise SystemExit("; ".join(failures))
+' "${semgrep_json}"
+echo "PASS: consolidated Semgrep fixtures exercised all 6 rules and clean cases"
 
 # A changed manifest must never rewrite the extracted lockfile implicitly.
 mkdir -p "${fixture}/locked/src"

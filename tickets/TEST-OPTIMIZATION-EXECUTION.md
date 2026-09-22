@@ -1,9 +1,11 @@
 # Test Optimization — Structural Remediation Queue
 
-Status: `OPEN`
+Status: `IMPLEMENTED; exact-source repository/extraction candidate verified; per-ticket mutation receipts and host-pair qualification remain open`
 
 이 문서는 `docs/bugbash/sep-22-test-optimization/`에서 실제 문제로 남긴
-항목 중 현재도 열린 9개 문제의 실행 SSOT다. 기존 `tickets/FINAL-CLOSEOUT.md`의
+9개 항목의 실행 SSOT다. 구현은 현재 `main` 열에 합쳐졌지만, 각 티켓의
+temporary-mutant RED 증적과 최종 host-pair 자격은 아직 종결 조건이다. 기존
+`tickets/FINAL-CLOSEOUT.md`의
 `qmp-final-qualified` historical receipt를 수정하거나 소급 무효화하지 않는다.
 아래 구현이 들어가면 별도의 exact-head qualification 영수증을 새로 발급한다.
 
