@@ -34,6 +34,14 @@ pub struct AccountingView {
     /// Exact totals for the two stable resource groups used by generated traces.
     /// Targets without those groups report zeroes.
     pub group_axis_bytes: [u64; 2],
+    /// Per-bucket kind split `[payload, metadata, scratch]` for the two stable
+    /// class axes (FUP-004). Scalar totals can balance while one axis hides a
+    /// kind swap, so each axis reports its own split.
+    pub class_kind_bytes: [[u64; 3]; 2],
+    /// Per-bucket kind split for the two stable owners.
+    pub owner_kind_bytes: [[u64; 3]; 2],
+    /// Per-bucket kind split for the five context axes.
+    pub context_kind_bytes: [[u64; 3]; 5],
     /// Pending plus committed ticket authorities that have not terminated.
     pub live_ticket_count: usize,
     /// Owner retained-payload bytes.
@@ -74,6 +82,34 @@ impl AccountingView {
     #[must_use]
     pub fn checked_context_sum(&self) -> Option<u64> {
         self.context_axis_bytes.iter().try_fold(0u64, |sum, bytes| sum.checked_add(*bytes))
+    }
+
+    /// Checked per-kind totals of the class axis: `[payload, metadata, scratch]`.
+    #[must_use]
+    pub fn checked_class_kind_totals(&self) -> Option<[u64; 3]> {
+        Self::sum_kind_matrix(&self.class_kind_bytes)
+    }
+
+    /// Checked per-kind totals of the owner axis.
+    #[must_use]
+    pub fn checked_owner_kind_totals(&self) -> Option<[u64; 3]> {
+        Self::sum_kind_matrix(&self.owner_kind_bytes)
+    }
+
+    /// Checked per-kind totals of the context axis.
+    #[must_use]
+    pub fn checked_context_kind_totals(&self) -> Option<[u64; 3]> {
+        Self::sum_kind_matrix(&self.context_kind_bytes)
+    }
+
+    fn sum_kind_matrix<const N: usize>(matrix: &[[u64; 3]; N]) -> Option<[u64; 3]> {
+        matrix.iter().try_fold([0u64; 3], |sums, row| {
+            Some([
+                sums[0].checked_add(row[0])?,
+                sums[1].checked_add(row[1])?,
+                sums[2].checked_add(row[2])?,
+            ])
+        })
     }
 }
 
@@ -206,18 +242,39 @@ impl BrokerConformanceTarget for FakeProcessBroker {
     // class_axes: uses the trait's provided default (CONFORMANCE_CLASS_AXES).
 
     fn view(&self) -> Result<AccountingView, String> {
+        use quanta_memory_platform_core::{MemoryClass, MemoryContextKind};
+        fn kinds(usage: Option<&crate::fake::FakeUsage>) -> [u64; 3] {
+            usage.map_or([0, 0, 0], |u| {
+                [u.retained_payload_bytes, u.retained_metadata_bytes, u.live_scratch_bytes]
+            })
+        }
         let snap = self.snapshot();
         let class_axis_bytes = [
             snap.class_usage
-                .get(&quanta_memory_platform_core::MemoryClass::ArtifactCache)
+                .get(&MemoryClass::ArtifactCache)
                 .map_or(0, crate::fake::FakeUsage::total),
             snap.class_usage
-                .get(&quanta_memory_platform_core::MemoryClass::EvidenceCache)
+                .get(&MemoryClass::EvidenceCache)
                 .map_or(0, crate::fake::FakeUsage::total),
         ];
         let owner_axis_bytes = [
             snap.owner_usage.get("owner:conformance-a").map_or(0, crate::fake::FakeUsage::total),
             snap.owner_usage.get("owner:conformance-b").map_or(0, crate::fake::FakeUsage::total),
+        ];
+        let class_kind_bytes = [
+            kinds(snap.class_usage.get(&MemoryClass::ArtifactCache)),
+            kinds(snap.class_usage.get(&MemoryClass::EvidenceCache)),
+        ];
+        let owner_kind_bytes = [
+            kinds(snap.owner_usage.get("owner:conformance-a")),
+            kinds(snap.owner_usage.get("owner:conformance-b")),
+        ];
+        let context_kind_bytes = [
+            kinds(snap.context_usage.get(&MemoryContextKind::Request)),
+            kinds(snap.context_usage.get(&MemoryContextKind::Session)),
+            kinds(snap.context_usage.get(&MemoryContextKind::Generation)),
+            kinds(snap.context_usage.get(&MemoryContextKind::Runtime)),
+            kinds(snap.context_usage.get(&MemoryContextKind::Background)),
         ];
         Ok(AccountingView {
             total_class_bytes: snap.total_class_bytes(),
@@ -229,19 +286,19 @@ impl BrokerConformanceTarget for FakeProcessBroker {
                 .sum(),
             context_axis_bytes: [
                 snap.context_usage
-                    .get(&quanta_memory_platform_core::MemoryContextKind::Request)
+                    .get(&MemoryContextKind::Request)
                     .map_or(0, crate::fake::FakeUsage::total),
                 snap.context_usage
-                    .get(&quanta_memory_platform_core::MemoryContextKind::Session)
+                    .get(&MemoryContextKind::Session)
                     .map_or(0, crate::fake::FakeUsage::total),
                 snap.context_usage
-                    .get(&quanta_memory_platform_core::MemoryContextKind::Generation)
+                    .get(&MemoryContextKind::Generation)
                     .map_or(0, crate::fake::FakeUsage::total),
                 snap.context_usage
-                    .get(&quanta_memory_platform_core::MemoryContextKind::Runtime)
+                    .get(&MemoryContextKind::Runtime)
                     .map_or(0, crate::fake::FakeUsage::total),
                 snap.context_usage
-                    .get(&quanta_memory_platform_core::MemoryContextKind::Background)
+                    .get(&MemoryContextKind::Background)
                     .map_or(0, crate::fake::FakeUsage::total),
             ],
             class_axis_bytes,
@@ -250,6 +307,9 @@ impl BrokerConformanceTarget for FakeProcessBroker {
                 snap.group_usage.get("conformance-group-a").copied().unwrap_or(0),
                 snap.group_usage.get("conformance-group-b").copied().unwrap_or(0),
             ],
+            class_kind_bytes,
+            owner_kind_bytes,
+            context_kind_bytes,
             live_ticket_count: snap.live_ticket_count,
             total_retained_payload_bytes: snap.total_retained_payload_bytes(),
             total_retained_metadata_bytes: snap.total_retained_metadata_bytes(),
@@ -351,6 +411,15 @@ impl BrokerConformanceTarget for LiveProcessMemoryBroker {
     // class_axes: uses the trait's provided default (CONFORMANCE_CLASS_AXES).
 
     fn view(&self) -> Result<AccountingView, String> {
+        use quanta_memory_platform_core::{MemoryClass, MemoryContextKind, UsageBreakdown};
+        // The live adapter reports raw per-bucket kind numbers straight from
+        // the observed snapshot. It never reuses a production validation
+        // helper as its own oracle; the suite's assertions do the checking.
+        fn kinds(usage: Option<&UsageBreakdown>) -> [u64; 3] {
+            usage.map_or([0, 0, 0], |u| {
+                [u.retained_payload_bytes, u.retained_metadata_bytes, u.live_scratch_bytes]
+            })
+        }
         self.observe()
             .map(|observation| {
                 let snap = observation.ledger;
@@ -360,36 +429,36 @@ impl BrokerConformanceTarget for LiveProcessMemoryBroker {
                     total_context_bytes: snap.total_context_bytes(),
                     context_axis_bytes: [
                         snap.context_usage
-                            .get(&quanta_memory_platform_core::MemoryContextKind::Request)
-                            .map_or(0, quanta_memory_platform_core::UsageBreakdown::total),
+                            .get(&MemoryContextKind::Request)
+                            .map_or(0, UsageBreakdown::total),
                         snap.context_usage
-                            .get(&quanta_memory_platform_core::MemoryContextKind::Session)
-                            .map_or(0, quanta_memory_platform_core::UsageBreakdown::total),
+                            .get(&MemoryContextKind::Session)
+                            .map_or(0, UsageBreakdown::total),
                         snap.context_usage
-                            .get(&quanta_memory_platform_core::MemoryContextKind::Generation)
-                            .map_or(0, quanta_memory_platform_core::UsageBreakdown::total),
+                            .get(&MemoryContextKind::Generation)
+                            .map_or(0, UsageBreakdown::total),
                         snap.context_usage
-                            .get(&quanta_memory_platform_core::MemoryContextKind::Runtime)
-                            .map_or(0, quanta_memory_platform_core::UsageBreakdown::total),
+                            .get(&MemoryContextKind::Runtime)
+                            .map_or(0, UsageBreakdown::total),
                         snap.context_usage
-                            .get(&quanta_memory_platform_core::MemoryContextKind::Background)
-                            .map_or(0, quanta_memory_platform_core::UsageBreakdown::total),
+                            .get(&MemoryContextKind::Background)
+                            .map_or(0, UsageBreakdown::total),
                     ],
                     class_axis_bytes: [
                         snap.class_usage
-                            .get(&quanta_memory_platform_core::MemoryClass::ArtifactCache)
-                            .map_or(0, quanta_memory_platform_core::UsageBreakdown::total),
+                            .get(&MemoryClass::ArtifactCache)
+                            .map_or(0, UsageBreakdown::total),
                         snap.class_usage
-                            .get(&quanta_memory_platform_core::MemoryClass::EvidenceCache)
-                            .map_or(0, quanta_memory_platform_core::UsageBreakdown::total),
+                            .get(&MemoryClass::EvidenceCache)
+                            .map_or(0, UsageBreakdown::total),
                     ],
                     owner_axis_bytes: [
                         snap.owner_usage
                             .get("owner:conformance-a")
-                            .map_or(0, quanta_memory_platform_core::UsageBreakdown::total),
+                            .map_or(0, UsageBreakdown::total),
                         snap.owner_usage
                             .get("owner:conformance-b")
-                            .map_or(0, quanta_memory_platform_core::UsageBreakdown::total),
+                            .map_or(0, UsageBreakdown::total),
                     ],
                     group_axis_bytes: [
                         observation
@@ -402,6 +471,21 @@ impl BrokerConformanceTarget for LiveProcessMemoryBroker {
                             .get("conformance-group-b")
                             .copied()
                             .unwrap_or(0),
+                    ],
+                    class_kind_bytes: [
+                        kinds(snap.class_usage.get(&MemoryClass::ArtifactCache)),
+                        kinds(snap.class_usage.get(&MemoryClass::EvidenceCache)),
+                    ],
+                    owner_kind_bytes: [
+                        kinds(snap.owner_usage.get("owner:conformance-a")),
+                        kinds(snap.owner_usage.get("owner:conformance-b")),
+                    ],
+                    context_kind_bytes: [
+                        kinds(snap.context_usage.get(&MemoryContextKind::Request)),
+                        kinds(snap.context_usage.get(&MemoryContextKind::Session)),
+                        kinds(snap.context_usage.get(&MemoryContextKind::Generation)),
+                        kinds(snap.context_usage.get(&MemoryContextKind::Runtime)),
+                        kinds(snap.context_usage.get(&MemoryContextKind::Background)),
                     ],
                     live_ticket_count: snap.live_ticket_count,
                     total_retained_payload_bytes: snap.total_retained_payload_bytes(),

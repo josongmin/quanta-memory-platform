@@ -88,6 +88,11 @@ pub enum DurableRecordResolution {
     Finalized,
     /// The reserved record never became durable.
     Absent,
+    /// The record was durably consumed by a DIFFERENT restore claim than the
+    /// one presenting for reconciliation. Only a restore reconcile can produce
+    /// this: the presenting claimant's fenced provisional copy must be retired,
+    /// never published. The write path never observes this variant.
+    Superseded,
 }
 
 /// Durable write failure with an explicit authority disposition.
@@ -120,6 +125,69 @@ pub trait ReconciledDurableSpillController:
     fn resolve_record(&self, record_id: DurableRecordId) -> MemoryResult<DurableRecordResolution>;
 }
 
+/// Unforgeable single-owner lease for one durable restore attempt (FUP-002).
+///
+/// A restore candidate's bare sequence is stable across restarts and retries,
+/// so it cannot identify WHO may consume the record. Each `prepare` or
+/// recovery issues a fresh claim binding the backend identity, the sequence,
+/// and a persisted monotonic generation. Every authority-changing operation
+/// (`commit` / `finalize` / `abort` / `reconcile`) validates the presented
+/// claim against the backend's persisted active claimant; a stale or foreign
+/// claim is rejected, so exactly one claimant can publish each record.
+///
+/// The fields are private and there is no public constructor: only the
+/// backend that issued a claim can mint it, and only holders of a live
+/// candidate can present it. A bare sequence can no longer authorize a
+/// permission change:
+///
+/// ```compile_fail
+/// use quanta_memory_platform_facade::DurableRestoreClaim;
+/// let forged = DurableRestoreClaim { backend: 0, generation: 0, sequence: 0 };
+/// ```
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct DurableRestoreClaim {
+    backend: u128,
+    generation: u64,
+    sequence: u64,
+}
+
+impl DurableRestoreClaim {
+    /// Backend-issued claim. Only crate backends mint claims; callers receive
+    /// them exclusively through a live restore candidate.
+    #[cfg(any(feature = "spill-redb", all(test, feature = "revocable_store")))]
+    pub(crate) fn issued(backend: u128, generation: u64, sequence: u64) -> Self {
+        Self { backend, generation, sequence }
+    }
+
+    /// Test-only claim for in-crate fake targets. Real backends never accept a
+    /// claim whose backend identity they did not persist themselves.
+    #[cfg(all(test, feature = "revocable_store"))]
+    pub(crate) fn for_test(backend: u128, generation: u64, sequence: u64) -> Self {
+        Self::issued(backend, generation, sequence)
+    }
+
+    /// Persisted identity of the backend file that issued this claim. Stable
+    /// across renames and reopens; distinct files hold distinct identities.
+    #[must_use]
+    pub fn backend(&self) -> u128 {
+        self.backend
+    }
+
+    /// Per-backend monotonic attempt number. Only the latest generation for an
+    /// active sequence carries authority; older generations are stale.
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Durable sequence this claim authorizes. Numeric sequences collide across
+    /// files, so the backend always pairs it with [`Self::backend`].
+    #[must_use]
+    pub fn sequence(&self) -> u64 {
+        self.sequence
+    }
+}
+
 /// Non-destructive durable restore candidate protected by a persisted claim.
 /// The destination remains authoritative until
 /// [`DurableRestoreController::commit_restore`] succeeds.
@@ -127,6 +195,17 @@ pub trait ReconciledDurableSpillController:
 pub struct DurableRestoreCandidate {
     pub sequence: u64,
     pub bytes: Vec<u8>,
+    /// Single-owner lease authorizing this candidate's permission changes.
+    /// Mirrors `sequence`; the backend validates the claim, never the bare id.
+    pub claim: DurableRestoreClaim,
+}
+
+impl DurableRestoreCandidate {
+    /// Test-only candidate for in-crate fake targets.
+    #[cfg(all(test, feature = "revocable_store"))]
+    pub(crate) fn for_test(sequence: u64, bytes: Vec<u8>, claim: DurableRestoreClaim) -> Self {
+        Self { sequence, bytes, claim }
+    }
 }
 
 /// Persisted phase of an interrupted durable restore.
@@ -176,16 +255,28 @@ pub enum DurableRestoreOutcome {
 
 pub trait DurableRestoreController: DurableSpillController<Vec<u8>> {
     fn prepare_restore(&self) -> MemoryResult<Option<DurableRestoreCandidate>>;
-    fn commit_restore(&self, sequence: u64) -> Result<(), DurableCommitFailure>;
+    /// Move exactly the claimed record into the recovery slot. The presented
+    /// claim must be the backend's current active claimant; stale or foreign
+    /// claims are rejected without touching the record.
+    fn commit_restore(&self, claim: &DurableRestoreClaim) -> Result<(), DurableCommitFailure>;
     /// Delete the durable recovery payload only after the resident copy has a
-    /// live charge and is ready for publication.
-    fn finalize_restore(&self, sequence: u64) -> MemoryResult<()>;
+    /// live charge and is ready for publication. Idempotent only for the same
+    /// claimant's retry; any other claimant must present its own live claim.
+    fn finalize_restore(&self, claim: &DurableRestoreClaim) -> MemoryResult<()>;
     /// Release a prepared claim when decode or destination admission fails.
-    fn abort_restore(&self, sequence: u64) -> MemoryResult<()>;
+    fn abort_restore(&self, claim: &DurableRestoreClaim) -> MemoryResult<()>;
     /// Resolve an ambiguous exact-delete outcome and release a retained claim.
-    fn reconcile_restore(&self, sequence: u64) -> MemoryResult<DurableRecordResolution>;
+    /// A record consumed by a different claimant resolves
+    /// [`DurableRecordResolution::Superseded`] so the presenting claimant
+    /// retires its provisional copy instead of publishing it.
+    fn reconcile_restore(
+        &self,
+        claim: &DurableRestoreClaim,
+    ) -> MemoryResult<DurableRecordResolution>;
     /// Persisted claim left by an interrupted or ambiguous restore.
     fn active_restore(&self) -> MemoryResult<Option<DurableRecordId>>;
-    /// Read restart recovery material without changing its persisted phase.
+    /// Claim the persisted restore for this caller and read its recovery
+    /// material without changing its phase. Each call mints a fresh claim
+    /// generation; older holders of the same sequence lose authority.
     fn recover_active_restore(&self) -> MemoryResult<Option<DurableRestoreRecovery>>;
 }

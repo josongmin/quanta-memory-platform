@@ -1,0 +1,313 @@
+//! Real forced-termination / reopen rail for the durable spill tier (FUP-006).
+//!
+//! Boundary proved here: the child process is ended with
+//! [`std::process::Child::kill`] — `SIGKILL` on Unix, which runs no
+//! destructors and flushes nothing — and a survivor reopens the SAME database
+//! file cold. This is strictly stronger than the in-module drop/reopen
+//! simulation (same process, descriptors closed cleanly) and the injected
+//! crash-point tests (faults at write boundaries, same address space).
+//!
+//! Boundary NOT proved here: power loss. A `SIGKILL` rail cannot fail the
+//! storage device mid-sector-write, so power-loss durability stays
+//! `UNVERIFIED` in the FUP-006 receipt.
+//!
+//! Every test drives recovery through the public
+//! [`ReconciledDurableSpillTarget`] / [`DurableRestoreTarget`] surface only.
+//! The exercised interruption boundaries are explicit:
+//!
+//! - after committed records plus a persisted restore claim;
+//! - while a child continuously issues reserve/commit operations (the exact
+//!   scheduler point relative to an individual redb transaction is unknown);
+//! - after a reserved-but-never-committed record ID.
+//!
+//! This rail does not prove an interrupt inside a specific redb transaction or
+//! at the ACK, source-release, restore-delete, or finalize boundaries.
+//! Run with:
+//!
+//! ```bash
+//! cargo test --locked -p quanta-memory-platform-facade --features spill-redb \
+//!     --test spill_redb_kill_reopen
+//! ```
+
+#![cfg(feature = "spill-redb")]
+
+use std::io::{BufRead, BufReader};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{mpsc, OnceLock};
+use std::time::Duration;
+
+use quanta_memory_platform_facade::spill::backings::redb::RedbSpillBacking;
+use quanta_memory_platform_facade::spill::service::{
+    DurableRestoreTarget, ReconciledDurableSpillTarget,
+};
+use quanta_memory_platform_facade::spill::{DurableRecordId, DurableRecordResolution};
+
+static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Unique scratch database path removed on drop, even on assertion failure.
+struct ScratchDb {
+    path: PathBuf,
+}
+
+impl ScratchDb {
+    fn new(tag: &str) -> Self {
+        let id = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "qmp-fup006-{}-{}-{tag}.redb",
+            std::process::id(),
+            id
+        ));
+        Self { path }
+    }
+}
+
+impl Drop for ScratchDb {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Build and locate the crash-child binary exactly once per test process.
+/// A direct `cargo test --test ...` does not rebuild examples, so merely
+/// accepting an existing path can execute a stale helper and invalidate the
+/// crash boundary. The locked offline build is usually a no-op, but makes
+/// source freshness an executable prerequisite.
+fn crash_child_binary() -> PathBuf {
+    static BINARY: OnceLock<PathBuf> = OnceLock::new();
+    BINARY
+        .get_or_init(|| {
+            let direct = std::env::current_exe()
+                .expect("current test binary")
+                .parent()
+                .expect("deps dir")
+                .parent()
+                .expect("target dir")
+                .join("examples")
+                .join(format!("spill_redb_crash_child{}", std::env::consts::EXE_SUFFIX));
+            let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .expect("crates dir")
+                .parent()
+                .expect("workspace root")
+                .to_path_buf();
+            let build = Command::new("cargo")
+                .arg("build")
+                .arg("--locked")
+                .arg("--offline")
+                .arg("-p")
+                .arg("quanta-memory-platform-facade")
+                .arg("--features")
+                .arg("spill-redb")
+                .arg("--example")
+                .arg("spill_redb_crash_child")
+                .current_dir(&workspace_root)
+                .output()
+                .expect("freshness build for crash child");
+            assert!(
+                build.status.success(),
+                "crash-child freshness build failed: {}",
+                String::from_utf8_lossy(&build.stderr)
+            );
+            assert!(direct.is_file(), "crash-child binary missing at {}", direct.display());
+            direct
+        })
+        .clone()
+}
+
+/// Spawn the child, returning its handle plus the lines it prints before the
+/// parent kills it. `READY` must arrive within the timeout; anything else
+/// (early exit, timeout, unreadable pipe) fails the test with the child
+/// stderr attached.
+fn spawn_until_ready(db: &Path, mode_args: &[&str]) -> (Child, Vec<String>) {
+    let mut child = Command::new(crash_child_binary())
+        .arg(db)
+        .args(mode_args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn crash child");
+    let stdout = child.stdout.take().expect("piped stdout");
+    let (lines_tx, lines_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let reader = BufReader::new(stdout);
+        for line in reader.lines().map_while(Result::ok) {
+            if lines_tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let mut lines = Vec::new();
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        assert!(!remaining.is_zero(), "crash child never printed READY");
+        match lines_rx.recv_timeout(remaining) {
+            Ok(line) => {
+                lines.push(line.clone());
+                if line == "READY" {
+                    return (child, lines);
+                }
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let output = child.wait_with_output().expect("reap silent child");
+                panic!(
+                    "crash child produced no READY (status {}):\n{}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        }
+    }
+}
+
+/// End the child by force and prove it died by the kill — not by exiting on
+/// its own (which would downgrade this rail to a clean-shutdown test wearing
+/// a crash costume).
+fn sigkill_child(child: &mut Child) {
+    child.kill().expect("SIGKILL the crash child");
+    let status = child.wait().expect("reap the crash child");
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(status.signal(), Some(9), "child must die by SIGKILL, got {status:?}");
+    }
+    #[cfg(not(unix))]
+    {
+        assert!(!status.success(), "child must not exit cleanly, got {status:?}");
+    }
+}
+
+/// Drain every record oldest-first through the full
+/// prepare -> commit -> finalize protocol, returning `(sequence, payload
+/// index)` pairs. Any ambiguity fails the test: after a kill, recovery must
+/// converge, not strand records behind unknown outcomes.
+fn drain_all(backing: &RedbSpillBacking) -> Vec<(u64, u64)> {
+    let mut drained = Vec::new();
+    while let Some(candidate) = backing.prepare_restore().expect("prepare") {
+        let sequence = candidate.sequence;
+        let bytes = candidate.bytes.clone();
+        backing.commit_restore(&candidate.claim).expect("commit converges after kill");
+        backing.finalize_restore(&candidate.claim).expect("finalize");
+        assert_eq!(bytes.len(), 32, "no torn payload survives a kill");
+        let mut index = [0u8; 8];
+        index.copy_from_slice(&bytes[..8]);
+        assert!(
+            bytes[8..].iter().all(|byte| *byte == 0xA5),
+            "filler torn by the kill on sequence {sequence}"
+        );
+        drained.push((sequence, u64::from_le_bytes(index)));
+    }
+    drained
+}
+
+#[test]
+fn sep23_fup006_sigkill_after_commit_reopens_with_stable_identity_and_exact_drain() {
+    let db = ScratchDb::new("fill");
+    let (mut handle, lines) = spawn_until_ready(&db.path, &["fill", "16"]);
+    let printed_backend: u128 = lines
+        .iter()
+        .find_map(|line| line.strip_prefix("BACKEND "))
+        .expect("child prints its backend identity")
+        .parse()
+        .expect("backend identity parses");
+    sigkill_child(&mut handle);
+
+    // The survivor reopens the same file cold: the interrupted prepare is
+    // claimed under a FRESH generation bound to the SAME persisted backend.
+    let backing = RedbSpillBacking::create(&db.path).expect("cold reopen");
+    let recovery = backing
+        .recover_active_restore()
+        .expect("recover")
+        .expect("interrupted prepare survives SIGKILL");
+    assert_eq!(
+        recovery.candidate.claim.backend(),
+        printed_backend,
+        "backend identity is stable across SIGKILL, not re-minted"
+    );
+    assert_eq!(recovery.candidate.sequence, 0, "oldest record restores first");
+    backing.commit_restore(&recovery.candidate.claim).expect("recovered claim commits");
+    backing.finalize_restore(&recovery.candidate.claim).expect("recovered claim finalizes");
+
+    let mut drained = vec![(0u64, 0u64)];
+    drained.extend(drain_all(&backing));
+    assert_eq!(drained.len(), 16, "every committed record is recovered exactly once");
+    for (position, (sequence, index)) in drained.iter().enumerate() {
+        assert_eq!(*sequence, position as u64, "oldest-first order survives the kill");
+        assert_eq!(*index, position as u64, "payload content survives the kill");
+    }
+    assert_eq!(backing.retained_count().expect("count"), 0, "exact drain");
+    assert_eq!(backing.active_restore().expect("active"), None, "no stranded claim");
+}
+
+#[test]
+fn sep23_fup006_sigkill_during_write_stream_converges_without_duplicates_or_tears() {
+    let db = ScratchDb::new("stream");
+    let (mut handle, _) = spawn_until_ready(&db.path, &["stream"]);
+    // READY is emitted only after record zero is durable. Killing immediately
+    // therefore exercises an arbitrary non-empty committed prefix without a
+    // timing assumption. The exact scheduler point relative to the next redb
+    // transaction is deliberately not claimed.
+    sigkill_child(&mut handle);
+
+    let backing = RedbSpillBacking::create(&db.path).expect("cold reopen");
+    let drained = drain_all(&backing);
+    assert!(!drained.is_empty(), "the stream committed before the kill");
+    let mut previous = None;
+    for (sequence, index) in &drained {
+        if let Some((previous_sequence, previous_index)) = previous {
+            assert!(
+                sequence > previous_sequence,
+                "sequences strictly increase: {previous_sequence} then {sequence}"
+            );
+            assert!(
+                index > previous_index,
+                "payload indexes strictly increase (no dup, no reorder): \
+                 {previous_index} then {index}"
+            );
+        }
+        previous = Some((sequence, index));
+    }
+    // A kill between reserve and commit leaves a genuine hole: low holes with
+    // no payload evidence resolve Absent, never Finalized, never guessed.
+    let first = drained.first().expect("nonempty").0;
+    let last = drained.last().expect("nonempty").0;
+    let present: std::collections::BTreeSet<u64> =
+        drained.iter().map(|(sequence, _)| *sequence).collect();
+    for missing in first..=last {
+        if !present.contains(&missing) {
+            assert_eq!(
+                backing.resolve_record(DurableRecordId::new(missing)).expect("resolve"),
+                DurableRecordResolution::Absent,
+                "kill-created hole {missing} resolves Absent"
+            );
+        }
+    }
+    assert_eq!(backing.retained_count().expect("count"), 0, "exact drain");
+    assert_eq!(backing.active_restore().expect("active"), None, "no stranded claim");
+}
+
+#[test]
+fn sep23_fup006_reserved_hole_stays_absent_across_sigkill() {
+    let db = ScratchDb::new("hole");
+    let (mut handle, lines) = spawn_until_ready(&db.path, &["hole"]);
+    let hole: u64 = lines
+        .iter()
+        .find_map(|line| line.strip_prefix("HOLE "))
+        .expect("child prints its reserved hole")
+        .parse()
+        .expect("hole id parses");
+    sigkill_child(&mut handle);
+
+    let backing = RedbSpillBacking::create(&db.path).expect("cold reopen");
+    assert_eq!(
+        backing.resolve_record(DurableRecordId::new(hole)).expect("resolve"),
+        DurableRecordResolution::Absent,
+        "a reserved-never-committed id is Absent after SIGKILL, not Finalized"
+    );
+    let drained = drain_all(&backing);
+    assert_eq!(drained, vec![(0, 0), (1, 1)], "only committed records drain");
+    assert_eq!(backing.retained_count().expect("count"), 0, "exact drain");
+}

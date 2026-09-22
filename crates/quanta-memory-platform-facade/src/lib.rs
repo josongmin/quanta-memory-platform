@@ -105,11 +105,12 @@ pub use shared::builder::SessionTranscriptStoreBuilder;
 #[cfg(feature = "spill")]
 pub use spill::{
     DurableCommitFailure, DurableRecordId, DurableRecordResolution, DurableRestoreCandidate,
-    DurableRestoreController, DurableRestoreOutcome, DurableRestorePhase, DurableRestoreRecovery,
-    DurableRestoreTarget, DurableSpillController, DurableSpillTarget, DurableWriteFailure,
-    InMemorySpillTarget, InProcessSpillController, InProcessSpillTarget, NoopSpillController,
-    ReconciledDurableSpillController, RetainingSpillTarget, RoutedSpillController, SpillController,
-    SpillFailure, SpillInventory, SpillReceipt, SpillTarget,
+    DurableRestoreClaim, DurableRestoreController, DurableRestoreOutcome, DurableRestorePhase,
+    DurableRestoreRecovery, DurableRestoreTarget, DurableSpillController, DurableSpillTarget,
+    DurableWriteFailure, InMemorySpillTarget, InProcessSpillController, InProcessSpillTarget,
+    NoopSpillController, ReconciledDurableSpillController, RetainingSpillTarget,
+    RoutedSpillController, SpillController, SpillFailure, SpillInventory, SpillReceipt,
+    SpillTarget,
 };
 #[cfg(feature = "transcript")]
 pub use transcript_store::{

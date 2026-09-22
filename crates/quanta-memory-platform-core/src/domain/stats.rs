@@ -77,6 +77,12 @@ pub struct ReclaimRuntimeStats {
     pub successes: u128,
     pub failures: u128,
     pub reported_reclaimed_bytes: u128,
+    /// Denials issued without any callback because the preflight proved no
+    /// reclaim could help (terminal) or no reclaimer was attached.
+    pub terminal_denials: u128,
+    /// Refusals issued without any callback for non-capacity reasons
+    /// (rebuild fence, unknown class, exhausted ticket space, internal).
+    pub blocked_denials: u128,
 }
 
 /// One lock-consistent broker observation. Consumers no longer need to join a

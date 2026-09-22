@@ -346,3 +346,68 @@ returned to its pre-mutation state. `scripts/check-workspace.sh` exited 0 on
 that pre-correction source, including Semgrep 6 rules / 66 targets / 0 findings.
 The correction still requires a committed source identity, full rail, and a
 new annotated receipt; earlier tags do not cover it.
+
+## 16. Current-worktree audit after `0284489` (2026-09-23, non-qualifying)
+
+Audit base: `028448946caa95676df034481a830c1d3e3b1f33` plus an uncommitted
+SEP-23/FUP overlay. The SHA-256 over the sorted `path + content digest` list
+for every file below `crates/` (including untracked source/test files) is
+`70d0b8572313f5015105fde9c61407484d9882b48c91553cd017783c2f4f93fb`.
+This digest identifies this audit input but is not a Git source identity.
+
+The audit found and repaired six executable gaps:
+
+- TO-04's file-local command omitted the `faults` feature and selected zero
+  tests. The ticket now uses the locked `faults::scenarios` selector; it
+  selected and passed all seven scenarios.
+- Production-only builds warned about a test-only scheduler accessor and a
+  redb-only restore-claim constructor. Their compile gates now match their
+  consumers; the `spill`-only slice no longer carries unused constructors.
+- The SEP-23 overlay contained four redundant ownership clones plus a
+  redundant `map_err` closure and a non-minimal boolean. The code now moves
+  final-use values and expresses the direct predicates; no warning suppression
+  was added.
+- The overlay was not rustfmt-clean. `cargo fmt --all` normalized the touched
+  Rust files, and the canonical format check now passes.
+- The new SIGKILL rail used a 300ms sleep to hope a non-empty prefix had
+  committed. Its child now commits record zero before the `READY` handshake,
+  so the parent can kill immediately with no timing oracle.
+- A focused `--test spill_redb_kill_reopen` run could execute an existing stale
+  example binary. The integration test now performs one locked/offline
+  freshness build per test process before spawning the helper. Before this
+  repair, the sleep-free focused rail ran the stale READY-before-commit helper
+  and failed `the stream committed before the kill` (two passed, one failed);
+  after the freshness repair, all three process cases passed.
+
+Current-worktree evidence after those repairs:
+
+- `scripts/check-workspace.sh`: exit `0`. This includes warning-denied
+  per-feature clippy, workspace/all-feature tests, 10 non-zero advertised
+  feature capability selectors, 166 documented selectors, Semgrep (six rules,
+  zero findings), ShellCheck, extraction contract tests, PM lint, and
+  `cargo deny`.
+- `cargo test --locked --workspace --all-features`: exit `0`; core `222`,
+  facade `278`, testkit `82`, all integration suites (including the three real
+  SIGKILL/reopen cases), and doctests passed.
+- All three untracked Rust files (`domain/admission.rs` plus the crash helper
+  and integration rail) were also passed explicitly to the same Semgrep
+  config: six rules, three targets, zero findings.
+- `cargo bench --locked -p quanta-memory-platform-facade --all-features
+  --bench scaling --no-run`: exit `0`.
+- Both public examples (`hello_world`, `effective_budget_report`) ran with exit
+  `0` against the real facade API.
+
+The SIGKILL rail proves three explicit boundaries: committed rows plus a
+persisted restore claim, a forced kill while the child continuously issues
+reserve/commit operations, and a reserved-but-never-committed hole. The exact
+scheduler point inside an individual redb transaction is not observed. Kills at
+the ACK, source-release, restore-delete, and finalize boundaries, plus power
+loss, remain unverified and must not be inferred from these three cases.
+
+Qualification remains open by construction. The exact command
+`scripts/extract-to-standalone-repo.sh --dry-run <empty-dir>` exits `1` with
+`tracked extraction input differs from frozen HEAD`, because the audited
+source is still dirty. Do not mark this overlay or TO-01..TO-09 `DONE`, and do
+not mint a replacement annotated receipt, until the intended code is committed,
+the source digest is re-frozen, the standalone extraction succeeds, and the
+required host-pair/tag gates are rerun on that exact commit.

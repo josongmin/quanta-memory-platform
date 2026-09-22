@@ -6,8 +6,9 @@ use quanta_memory_platform_core::{MemoryError, MemoryResult};
 
 use crate::spill::{
     DurableCommitFailure, DurableRecordId, DurableRecordResolution, DurableRestoreCandidate,
-    DurableRestoreController, DurableRestoreRecovery, DurableSpillController, DurableWriteFailure,
-    InProcessSpillController, ReconciledDurableSpillController, SpillController,
+    DurableRestoreClaim, DurableRestoreController, DurableRestoreRecovery, DurableSpillController,
+    DurableWriteFailure, InProcessSpillController, ReconciledDurableSpillController,
+    SpillController,
 };
 
 /// Capability seals for accounting-bearing transfer paths. Generic
@@ -136,12 +137,15 @@ pub trait DurableRestoreTarget: DurableSpillTarget<Vec<u8>> {
     /// must persist the claim before returning the candidate.
     fn prepare_restore(&self) -> MemoryResult<Option<DurableRestoreCandidate>>;
 
-    /// Remove exactly the prepared FIFO sequence and classify failure as known
-    /// retained or commit-ambiguous.
-    fn commit_restore(&self, sequence: u64) -> Result<(), DurableCommitFailure>;
-    fn finalize_restore(&self, sequence: u64) -> MemoryResult<()>;
-    fn abort_restore(&self, sequence: u64) -> MemoryResult<()>;
-    fn reconcile_restore(&self, sequence: u64) -> MemoryResult<DurableRecordResolution>;
+    /// Remove exactly the claimed record and classify failure as known
+    /// retained or commit-ambiguous. Only the active claimant may commit.
+    fn commit_restore(&self, claim: &DurableRestoreClaim) -> Result<(), DurableCommitFailure>;
+    fn finalize_restore(&self, claim: &DurableRestoreClaim) -> MemoryResult<()>;
+    fn abort_restore(&self, claim: &DurableRestoreClaim) -> MemoryResult<()>;
+    fn reconcile_restore(
+        &self,
+        claim: &DurableRestoreClaim,
+    ) -> MemoryResult<DurableRecordResolution>;
     fn active_restore(&self) -> MemoryResult<Option<DurableRecordId>>;
     fn recover_active_restore(&self) -> MemoryResult<Option<DurableRestoreRecovery>>;
 }
@@ -265,20 +269,23 @@ where
         self.target.prepare_restore()
     }
 
-    fn commit_restore(&self, sequence: u64) -> Result<(), DurableCommitFailure> {
-        self.target.commit_restore(sequence)
+    fn commit_restore(&self, claim: &DurableRestoreClaim) -> Result<(), DurableCommitFailure> {
+        self.target.commit_restore(claim)
     }
 
-    fn finalize_restore(&self, sequence: u64) -> MemoryResult<()> {
-        self.target.finalize_restore(sequence)
+    fn finalize_restore(&self, claim: &DurableRestoreClaim) -> MemoryResult<()> {
+        self.target.finalize_restore(claim)
     }
 
-    fn abort_restore(&self, sequence: u64) -> MemoryResult<()> {
-        self.target.abort_restore(sequence)
+    fn abort_restore(&self, claim: &DurableRestoreClaim) -> MemoryResult<()> {
+        self.target.abort_restore(claim)
     }
 
-    fn reconcile_restore(&self, sequence: u64) -> MemoryResult<DurableRecordResolution> {
-        self.target.reconcile_restore(sequence)
+    fn reconcile_restore(
+        &self,
+        claim: &DurableRestoreClaim,
+    ) -> MemoryResult<DurableRecordResolution> {
+        self.target.reconcile_restore(claim)
     }
 
     fn active_restore(&self) -> MemoryResult<Option<DurableRecordId>> {

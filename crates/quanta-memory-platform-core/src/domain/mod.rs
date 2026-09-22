@@ -1,3 +1,5 @@
+#[cfg(feature = "live_control")]
+pub mod admission;
 pub mod config;
 pub mod context;
 pub mod errors;

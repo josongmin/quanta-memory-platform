@@ -8,6 +8,7 @@
 
 use std::collections::BTreeMap;
 
+use crate::domain::admission;
 use crate::domain::errors::{MemoryError, MemoryResult};
 use crate::domain::policy::ResourceGroup;
 
@@ -52,7 +53,7 @@ impl WeightedResourceGroupScheduler {
         let unused_reserved_floor_bytes =
             groups.values().fold(0u128, |total, group| total + u128::from(group.reserved_bytes));
         let fair_burst_shares =
-            Self::precompute_fair_burst_shares(&groups, shared_burst_pool_bytes);
+            admission::precompute_fair_burst_shares(&groups, shared_burst_pool_bytes);
         Self {
             groups,
             usage: BTreeMap::new(),
@@ -142,7 +143,9 @@ impl WeightedResourceGroupScheduler {
     }
 
     /// Validate the floor after one prospective group growth without cloning
-    /// the scheduler or scanning every configured group.
+    /// the scheduler or scanning every configured group. Delegates to the
+    /// shared admission engine (FUP-003) so the preflight and the attempt
+    /// enforce byte-identical rules.
     pub(crate) fn protected_floor_fits_after_growth(
         &self,
         group_name: Option<&str>,
@@ -150,27 +153,33 @@ impl WeightedResourceGroupScheduler {
         non_headroom_usage: u64,
         non_headroom_band: u64,
     ) -> MemoryResult<()> {
-        let prospective_unused = if let Some(group_name) = group_name {
-            let before = self.current_usage(group_name);
-            let after = self.usage_after_growth(group_name, delta)?;
-            self.unused_reserved_floor_bytes
-                .checked_sub(u128::from(self.unused_floor_for(group_name, before)))
-                .and_then(|total| {
-                    total.checked_add(u128::from(self.unused_floor_for(group_name, after)))
-                })
-                .ok_or_else(|| {
-                    MemoryError::InvalidState(
-                        "resource-group floor aggregate is inconsistent".into(),
-                    )
-                })?
-        } else {
-            self.unused_reserved_floor_bytes
-        };
-        self.protected_floor_fits_with_unused(
+        admission::check_group_floor(
+            &self.groups,
+            self.unused_reserved_floor_bytes,
+            group_name,
+            group_name.map_or(0, |name| self.current_usage(name)),
+            delta,
             non_headroom_usage,
             non_headroom_band,
-            prospective_unused,
         )
+        .map_err(|failure| failure.into_error())
+    }
+
+    /// Cached Hamilton fair shares for the admission preflight, which reads
+    /// them as pure inputs instead of recomputing the allocation per reserve.
+    pub(crate) fn fair_burst_shares(&self) -> &BTreeMap<String, u64> {
+        &self.fair_burst_shares
+    }
+
+    /// Cached weighted fair share of the shared burst pool for one named group.
+    #[cfg(test)]
+    fn fair_burst_share(&self, group_name: &str) -> u64 {
+        self.fair_burst_shares.get(group_name).copied().unwrap_or(0)
+    }
+
+    /// Live unused-floor aggregate for the admission preflight.
+    pub(crate) fn unused_reserved_floor_bytes(&self) -> u128 {
+        self.unused_reserved_floor_bytes
     }
 
     fn protected_floor_fits_with_unused(
@@ -191,83 +200,22 @@ impl WeightedResourceGroupScheduler {
         }
         Ok(())
     }
-
-    /// Precompute Hamilton's largest-remainder allocation. Every group receives
-    /// the floor of its exact weighted share, then leftover bytes are assigned
-    /// by descending fractional remainder with the stable group name as the
-    /// tie break. The sum is exactly the configured pool when total weight is
-    /// non-zero, including huge inputs.
-    fn precompute_fair_burst_shares(
-        groups: &BTreeMap<String, ResourceGroup>,
-        shared_burst_pool_bytes: u64,
-    ) -> BTreeMap<String, u64> {
-        let total: u128 = groups.values().map(|group| u128::from(group.admission_weight)).sum();
-        if total == 0 {
-            return groups.keys().map(|name| (name.clone(), 0)).collect();
-        }
-        let pool = u128::from(shared_burst_pool_bytes);
-        let mut shares = BTreeMap::new();
-        let mut allocated_base = 0u128;
-        let mut remainders: Vec<(&str, u128)> = groups
-            .iter()
-            .map(|(name, candidate)| {
-                let numerator = pool * u128::from(candidate.admission_weight);
-                let base = numerator / total;
-                allocated_base += base;
-                shares.insert(
-                    name.clone(),
-                    u64::try_from(base).expect("a weighted share cannot exceed the u64 pool"),
-                );
-                (name.as_str(), numerator % total)
-            })
-            .collect();
-        remainders.sort_by(|(left_name, left_remainder), (right_name, right_remainder)| {
-            right_remainder.cmp(left_remainder).then_with(|| left_name.cmp(right_name))
-        });
-        let leftover = pool - allocated_base;
-        for (index, (name, _)) in remainders.into_iter().enumerate() {
-            if u128::try_from(index).expect("usize always fits u128") >= leftover {
-                break;
-            }
-            if let Some(share) = shares.get_mut(name) {
-                *share += 1;
-            }
-        }
-        shares
-    }
-
-    /// Cached weighted fair share of the shared burst pool for one named group.
-    fn fair_burst_share(&self, group_name: &str) -> u64 {
-        self.fair_burst_shares.get(group_name).copied().unwrap_or(0)
-    }
-
-    fn burst_allowance(&self, group_name: &str, group: &ResourceGroup) -> u64 {
-        let percentage_cap = u64::try_from(
-            u128::from(self.shared_burst_pool_bytes) * u128::from(group.burst_percent) / 100,
-        )
-        .unwrap_or(u64::MAX);
-        self.fair_burst_share(group_name).min(percentage_cap)
-    }
 }
 
 impl ResourceGroupScheduler for WeightedResourceGroupScheduler {
     fn admits(&self, group_name: &str, requested_bytes: u64) -> bool {
-        let Some(group) = self.groups.get(group_name) else {
-            return false;
-        };
-        let current = self.current_usage(group_name);
-        let Some(after) = current.checked_add(requested_bytes) else {
-            return false;
-        };
-
-        if after <= group.hard_cap_bytes {
-            return true;
-        }
-
-        // Above hard cap: only admit the overflow if it fits within this
-        // group's weighted fair share of the shared burst pool.
-        let borrow = after - group.hard_cap_bytes;
-        borrow <= self.burst_allowance(group_name, group)
+        // Delegates to the shared admission engine (FUP-003); the owner name
+        // only shapes the discarded denial message, so eliding it is exact.
+        admission::check_group_admission(
+            &self.groups,
+            self.shared_burst_pool_bytes,
+            &self.fair_burst_shares,
+            self.current_usage(group_name),
+            group_name,
+            "",
+            requested_bytes,
+        )
+        .is_ok()
     }
 }
 

@@ -31,7 +31,7 @@ classifier가 있다. 그러나 `spill_fault_classification_reports_escaped_for_
 - Honest positive pole also calls the same helper; public driver test remains as end-to-end coverage.
 - Do not export the helper, change `FaultOutcome`, or modify facade `SpillController` APIs.
 - File-local verification:
-  `cargo test -p quanta-memory-platform-testkit spill_failure -- --nocapture`.
+  `cargo test --locked -p quanta-memory-platform-testkit --features faults faults::scenarios -- --nocapture`.
 
 ## Target seam
 
@@ -60,8 +60,7 @@ temporary mutant로 success arm을 `Contained`로 바꾼다. lying-controller te
 한다. 별도 local classifier가 RED인 것은 인정하지 않는다.
 
 ```bash
-cargo test -p quanta-memory-platform-testkit --features faults spill_failure -- --nocapture
-cargo test -p quanta-memory-platform-testkit --features faults faults::scenarios
+cargo test --locked -p quanta-memory-platform-testkit --features faults faults::scenarios -- --nocapture
 ```
 
 ## Acceptance / reopen

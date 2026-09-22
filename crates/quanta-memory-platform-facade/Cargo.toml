@@ -53,6 +53,10 @@ full-backings = ["full", "spill-redb"]
 name = "hello_world"
 required-features = ["core-live-accounting"]
 
+[[example]]
+name = "spill_redb_crash_child"
+required-features = ["spill-redb"]
+
 [[bench]]
 name = "scaling"
 harness = false

@@ -229,6 +229,25 @@ impl LedgerSnapshot {
         })
     }
 
+    /// Checked per-kind totals of one accounting axis:
+    /// `[payload, metadata, scratch]`.
+    #[cfg(feature = "live_control")]
+    fn checked_kind_totals<K: Ord>(axis: &BTreeMap<K, UsageBreakdown>) -> MemoryResult<[u64; 3]> {
+        axis.values().try_fold([0u64; 3], |sums, usage| {
+            Ok([
+                sums[0].checked_add(usage.retained_payload_bytes).ok_or_else(|| {
+                    MemoryError::InvalidState("ledger payload kind total exceeds u64".into())
+                })?,
+                sums[1].checked_add(usage.retained_metadata_bytes).ok_or_else(|| {
+                    MemoryError::InvalidState("ledger metadata kind total exceeds u64".into())
+                })?,
+                sums[2].checked_add(usage.live_scratch_bytes).ok_or_else(|| {
+                    MemoryError::InvalidState("ledger scratch kind total exceeds u64".into())
+                })?,
+            ])
+        })
+    }
+
     #[cfg(feature = "live_control")]
     pub(crate) fn validate_exact(&self) -> MemoryResult<()> {
         let class = Self::checked_axis_total(&self.class_usage)?;
@@ -247,6 +266,18 @@ impl LedgerSnapshot {
         })?;
         if kinds != owner {
             return Err(MemoryError::InvalidState("ledger kind partition is unbalanced".into()));
+        }
+        // FUP-004: scalar totals are not enough — the per-kind split must
+        // agree on EVERY axis. A payload↔metadata swap confined to one axis
+        // preserves all scalar totals but corrupts the kind accounting.
+        let class_kinds = Self::checked_kind_totals(&self.class_usage)?;
+        let owner_kinds = Self::checked_kind_totals(&self.owner_usage)?;
+        let context_kinds = Self::checked_kind_totals(&self.context_usage)?;
+        if class_kinds != owner_kinds || owner_kinds != context_kinds {
+            return Err(MemoryError::InvalidState(format!(
+                "ledger kind split diverges across axes: class={class_kinds:?} \
+                 owner={owner_kinds:?} context={context_kinds:?}"
+            )));
         }
         Ok(())
     }
@@ -364,6 +395,23 @@ impl AccountingLedger {
         self.policy.as_policy()
     }
 
+    /// Read-only usage maps for the admission preflight (FUP-003). The
+    /// preflight evaluates the same rule engine the attempt path enforces.
+    #[must_use]
+    pub(crate) fn usage_view(&self) -> crate::domain::admission::UsageView<'_> {
+        crate::domain::admission::UsageView {
+            class_usage: &self.class_usage,
+            owner_usage: &self.owner_usage,
+            context_usage: &self.context_usage,
+            total_usage: &self.total_usage,
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn ticket_id_space_exhausted(&self) -> bool {
+        self.next_ticket_id.is_none()
+    }
+
     /// Swap the active residency policy in place, preserving all live usage
     /// counters. This is the live-reconfiguration primitive: the caller is
     /// responsible for having already validated that the new policy does not
@@ -403,6 +451,9 @@ impl AccountingLedger {
     }
 
     /// Exact semantic usage without cloning or scanning reporting maps.
+    /// Test-only since the admission engine reads the aggregate through the
+    /// preflight usage view (FUP-003).
+    #[cfg(test)]
     pub(crate) fn total_semantic_bytes(&self) -> u64 {
         self.total_usage.total()
     }
@@ -415,103 +466,6 @@ impl AccountingLedger {
     /// Exact live-scratch usage without cloning or scanning owner maps.
     pub(crate) fn total_live_scratch_bytes(&self) -> u64 {
         self.total_usage.live_scratch_bytes
-    }
-
-    /// Validate one reservation from the current known-valid state by reading
-    /// only the affected owner/class slots plus the fixed policy taxonomy.
-    /// This is equivalent to `validate_policy_postimage(..., Some(delta))`
-    /// without cloning all live owner and context maps under the broker lock.
-    fn validate_reserve_postimage(
-        &self,
-        class: &MemoryClass,
-        owner: &OwnerKey,
-        bytes: u64,
-    ) -> MemoryResult<()> {
-        let policy = self.policy();
-        if !policy.classes.contains_key(class) {
-            return Err(MemoryError::capacity(format!(
-                "class {class:?} is not configured in the active residency policy"
-            )));
-        }
-
-        let global_after = self
-            .total_semantic_bytes()
-            .checked_add(bytes)
-            .ok_or_else(|| MemoryError::capacity("global postimage exceeds u64"))?;
-        if global_after > policy.global_hard_limit_bytes {
-            return Err(MemoryError::capacity(format!(
-                "global hard limit {} below postimage {global_after}",
-                policy.global_hard_limit_bytes
-            )));
-        }
-
-        let mut non_headroom_after = 0u64;
-        let mut unused_class_floor = 0u64;
-        let mut total_borrow = 0u64;
-        for (candidate, budget) in &policy.classes {
-            let current = self.class_usage(candidate).checked_total()?;
-            let used = if candidate == class {
-                current
-                    .checked_add(bytes)
-                    .ok_or_else(|| MemoryError::capacity("class postimage exceeds u64"))?
-            } else {
-                current
-            };
-            if *candidate != MemoryClass::Headroom {
-                non_headroom_after = non_headroom_after
-                    .checked_add(used)
-                    .ok_or_else(|| MemoryError::capacity("non-headroom postimage exceeds u64"))?;
-                unused_class_floor = unused_class_floor
-                    .checked_add(budget.reserved_bytes.saturating_sub(used))
-                    .ok_or_else(|| MemoryError::capacity("class reserved floor exceeds u64"))?;
-            }
-            if used > budget.hard_cap_bytes {
-                if !budget.borrow_from_shared_pool {
-                    return Err(MemoryError::capacity(format!(
-                        "non-borrowing class {candidate:?} hard cap {} below postimage {used}",
-                        budget.hard_cap_bytes
-                    )));
-                }
-                total_borrow = total_borrow
-                    .checked_add(used - budget.hard_cap_bytes)
-                    .ok_or_else(|| MemoryError::capacity("class borrow exceeds u64"))?;
-            }
-        }
-        if total_borrow > policy.shared_burst_pool_bytes {
-            return Err(MemoryError::capacity(format!(
-                "class borrow {total_borrow} exceeds shared pool {}",
-                policy.shared_burst_pool_bytes
-            )));
-        }
-        let non_headroom_band =
-            policy
-                .global_hard_limit_bytes
-                .checked_sub(policy.headroom_bytes)
-                .ok_or_else(|| MemoryError::capacity("headroom exceeds global hard limit"))?;
-        let protected_postimage = non_headroom_after
-            .checked_add(unused_class_floor)
-            .ok_or_else(|| MemoryError::capacity("class protected postimage exceeds u64"))?;
-        if protected_postimage > non_headroom_band {
-            return Err(MemoryError::capacity(format!(
-                "non-headroom usage {non_headroom_after} plus unused class floors \
-                 {unused_class_floor} exceeds band {non_headroom_band}"
-            )));
-        }
-
-        if let Some(quota) = policy.owner_quotas.get(owner) {
-            let owner_after = self
-                .owner_usage(owner)
-                .checked_total()?
-                .checked_add(bytes)
-                .ok_or_else(|| MemoryError::capacity("owner postimage exceeds u64"))?;
-            if owner_after > quota.hard_cap_bytes {
-                return Err(MemoryError::capacity(format!(
-                    "owner {owner} hard cap {} below postimage {owner_after}",
-                    quota.hard_cap_bytes
-                )));
-            }
-        }
-        Ok(())
     }
 
     /// Canonical legal-state predicate shared by reserve and live reconfigure.
@@ -657,25 +611,23 @@ impl AccountingLedger {
         }
 
         // --- pure checks, no mutation yet ---
+        //
+        // The admission engine is the single rule implementation shared with
+        // the broker preflight (FUP-003): same checks, same order, same
+        // byte-identical errors. This is equivalent to
+        // `validate_policy_postimage(..., Some(delta))` plus the
+        // reserve-specific overflow guards, without cloning maps.
 
-        self.validate_reserve_postimage(&class, &owner, bytes)?;
-        self.context_usage
-            .get(&context)
-            .copied()
-            .unwrap_or_default()
-            .checked_total()?
-            .checked_add(bytes)
-            .ok_or_else(|| MemoryError::capacity("context reserve total exceeds u64"))?;
-        for usage in [
-            self.class_usage.get(&class),
-            self.owner_usage.get(&owner),
-            self.context_usage.get(&context),
-            Some(&self.total_usage),
-        ] {
-            if usage.map_or(0, |u| u.slot(kind)).checked_add(bytes).is_none() {
-                return Err(MemoryError::capacity("ledger charge-kind slot exceeds u64"));
-            }
-        }
+        let usage = self.usage_view();
+        let request = crate::domain::admission::AdmissionRequest {
+            class: &class,
+            owner: &owner,
+            context,
+            kind,
+            bytes,
+        };
+        crate::domain::admission::check_ledger_postimage(self.policy(), &usage, &request)
+            .map_err(|failure| failure.into_error())?;
         // --- all checks passed: mutate ---
         let id = self.next_ticket_id.ok_or_else(|| {
             MemoryError::InvalidState("reservation ticket id space exhausted".to_string())
@@ -1870,5 +1822,117 @@ mod tests {
         assert_eq!(snap.total_class_bytes(), 0, "all class bytes returned");
         assert_eq!(snap.total_context_bytes(), 0, "all context bytes returned");
         assert_axes_balanced(&snap);
+    }
+
+    // --- FUP-004: per-axis kind validation ---------------------------------
+    //
+    // Scalar axis totals can balance while the kind split diverges on one
+    // axis. The snapshot validator must compare kind vectors per axis, not
+    // just scalar totals plus an owner-side re-sum.
+
+    fn sep23_mixed_kind_ledger() -> AccountingLedger {
+        let mut ledger = ledger_from_policy(ResidencyPolicy::new(1_000_000));
+        for (class, owner, context, kind, bytes) in [
+            (
+                MemoryClass::ArtifactCache,
+                "owner:a",
+                MemoryContextKind::Request,
+                ChargeKind::RetainedPayload,
+                1_000,
+            ),
+            (
+                MemoryClass::EvidenceCache,
+                "owner:a",
+                MemoryContextKind::Session,
+                ChargeKind::RetainedMetadata,
+                250,
+            ),
+            (
+                MemoryClass::ArtifactCache,
+                "owner:b",
+                MemoryContextKind::Request,
+                ChargeKind::LiveScratch,
+                500,
+            ),
+        ] {
+            let ticket = ledger
+                .reserve(class, owner.to_string(), context, kind, bytes)
+                .expect("mixed-kind reserve");
+            ledger.commit(&ticket).expect("commit");
+        }
+        ledger
+    }
+
+    #[test]
+    fn sep23_fup004_honest_mixed_kind_snapshot_validates() {
+        let ledger = sep23_mixed_kind_ledger();
+        let snap = ledger.snapshot();
+        snap.validate_exact().expect("honest kind splits validate");
+        assert_eq!(
+            LedgerSnapshot::checked_kind_totals(&snap.class_usage).expect("kinds"),
+            [1_000, 250, 500]
+        );
+        assert_eq!(
+            LedgerSnapshot::checked_kind_totals(&snap.owner_usage).expect("kinds"),
+            [1_000, 250, 500]
+        );
+        assert_eq!(
+            LedgerSnapshot::checked_kind_totals(&snap.context_usage).expect("kinds"),
+            [1_000, 250, 500]
+        );
+    }
+
+    #[test]
+    fn sep23_fup004_class_kind_swap_preserving_totals_is_rejected() {
+        let ledger = sep23_mixed_kind_ledger();
+        let mut snap = ledger.snapshot();
+        // Move 250 payload<->metadata inside ONE class bucket; every scalar
+        // total stays identical.
+        let bucket = snap.class_usage.get_mut(&MemoryClass::ArtifactCache).expect("bucket");
+        assert_eq!((bucket.retained_payload_bytes, bucket.retained_metadata_bytes), (1_000, 0));
+        bucket.retained_payload_bytes = 750;
+        bucket.retained_metadata_bytes = 250;
+        assert_eq!(snap.total_class_bytes(), snap.total_owner_bytes(), "totals still balance");
+        assert_eq!(snap.total_owner_bytes(), snap.total_context_bytes());
+        let verdict = snap.validate_exact();
+        assert!(
+            matches!(verdict, Err(MemoryError::InvalidState(_))),
+            "class-confined kind swap must be rejected, got {verdict:?}"
+        );
+    }
+
+    #[test]
+    fn sep23_fup004_context_kind_swap_preserving_totals_is_rejected() {
+        let ledger = sep23_mixed_kind_ledger();
+        let mut snap = ledger.snapshot();
+        let bucket = snap.context_usage.get_mut(&MemoryContextKind::Request).expect("bucket");
+        assert_eq!((bucket.retained_payload_bytes, bucket.live_scratch_bytes), (1_000, 500));
+        bucket.retained_payload_bytes = 500;
+        bucket.live_scratch_bytes = 1_000;
+        assert_eq!(snap.total_class_bytes(), snap.total_owner_bytes(), "totals still balance");
+        assert_eq!(snap.total_owner_bytes(), snap.total_context_bytes());
+        let verdict = snap.validate_exact();
+        assert!(
+            matches!(verdict, Err(MemoryError::InvalidState(_))),
+            "context-confined kind swap must be rejected, got {verdict:?}"
+        );
+    }
+
+    #[test]
+    fn sep23_fup004_owner_kind_swap_preserving_totals_is_rejected() {
+        let ledger = sep23_mixed_kind_ledger();
+        let mut snap = ledger.snapshot();
+        // The old owner-side re-sum cannot see this either: the kinds still
+        // add up to the same owner total.
+        let bucket = snap.owner_usage.get_mut("owner:a").expect("bucket");
+        assert_eq!((bucket.retained_payload_bytes, bucket.retained_metadata_bytes), (1_000, 250));
+        bucket.retained_payload_bytes = 250;
+        bucket.retained_metadata_bytes = 1_000;
+        assert_eq!(snap.total_class_bytes(), snap.total_owner_bytes(), "totals still balance");
+        let verdict = snap.validate_exact();
+        assert!(
+            matches!(verdict, Err(MemoryError::InvalidState(_))),
+            "owner-confined kind swap must be rejected, got {verdict:?}"
+        );
     }
 }

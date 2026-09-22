@@ -444,6 +444,11 @@ where
         class_axis_bytes: [1_500, 250],
         owner_axis_bytes: [1_250, 500],
         group_axis_bytes: [0, 0],
+        // t1: class0/A/payload/1000; t2: class1/A/metadata/250;
+        // t3: class0/B/scratch/500. Every bucket carries its exact kind split.
+        class_kind_bytes: [[1_000, 0, 500], [0, 250, 0]],
+        owner_kind_bytes: [[1_000, 250, 0], [0, 0, 500]],
+        context_kind_bytes: [[1_000, 250, 500], [0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0]],
         live_ticket_count: 3,
         total_retained_payload_bytes: 1_000,
         total_retained_metadata_bytes: 250,
@@ -469,6 +474,17 @@ where
         InvariantAssertion::new(ContractFamily::OwnerPartition, "observed_owner_partitions");
     verdicts.push(partition.assert_that(
         matches!(&observed_live, Ok(view) if Some(view.total_owner_bytes) == view.checked_partition_sum() && view.total_owner_bytes == view.total_context_bytes && Some(view.total_context_bytes) == view.checked_context_sum()),
+        format!("observed={observed_live:?}"),
+    ));
+    // FUP-004: the kind split must agree on EVERY axis, not just the owner
+    // axis. A payload<->metadata swap confined to one axis preserves every
+    // scalar total; only the per-axis kind vectors catch it.
+    let kinds = InvariantAssertion::new(
+        ContractFamily::OwnerPartition,
+        "observed_kind_split_agrees_across_axes",
+    );
+    verdicts.push(kinds.assert_that(
+        matches!(&observed_live, Ok(view) if view.checked_class_kind_totals().is_some_and(|class| Some(class) == view.checked_owner_kind_totals() && Some(class) == view.checked_context_kind_totals())),
         format!("observed={observed_live:?}"),
     ));
 
@@ -1354,6 +1370,9 @@ mod tests {
         DuplicateCommitAccepting,
         WrongContextAxis,
         WrongChargeKindAxis,
+        WrongClassKindAxis,
+        WrongContextKindAxis,
+        SwapKindAcrossClassBuckets,
         StaleTicketAccepting,
         ObservationError,
         TransferDoubleOwner,
@@ -1429,6 +1448,26 @@ mod tests {
                         .saturating_add(view.total_retained_payload_bytes);
                     view.total_retained_payload_bytes = 0;
                 }
+                // FUP-004: payload<->metadata swap confined to ONE class
+                // bucket. Every scalar total still balances; only the per-axis
+                // kind vectors diverge.
+                BrokerFault::WrongClassKindAxis => {
+                    view.class_kind_bytes[0].swap(0, 1);
+                }
+                BrokerFault::WrongContextKindAxis => {
+                    view.context_kind_bytes[0].swap(0, 1);
+                }
+                // FUP-004: move payload across class buckets while preserving
+                // every aggregate (axis totals AND per-kind global totals).
+                // Aggregate checks are blind to this; only the bucket x kind
+                // model comparison bites.
+                BrokerFault::SwapKindAcrossClassBuckets => {
+                    let moved = view.class_kind_bytes[0][0].min(1_000);
+                    view.class_kind_bytes[0][0] -= moved;
+                    view.class_kind_bytes[1][0] = view.class_kind_bytes[1][0].saturating_add(moved);
+                    view.class_axis_bytes[0] -= moved;
+                    view.class_axis_bytes[1] = view.class_axis_bytes[1].saturating_add(moved);
+                }
                 BrokerFault::TransferDoubleOwner => {
                     view.total_owner_bytes = view.total_owner_bytes.saturating_add(1_000);
                     view.owner_axis_bytes[1] = view.owner_axis_bytes[1].saturating_add(1_000);
@@ -1479,6 +1518,11 @@ mod tests {
         owner_axis_bytes: [u64; 2],
         group_axis_bytes: [u64; 2],
         kind_bytes: [u64; 3],
+        // FUP-004: the model tracks bucket x kind from the operation trace
+        // itself — never by asking the target — so a cross-bucket kind swap
+        // that preserves every aggregate still diverges from the view.
+        class_axis_kind_bytes: [[u64; 3]; 2],
+        owner_axis_kind_bytes: [[u64; 3]; 2],
         live_ticket_count: usize,
         rebuild_in_progress: bool,
         grouped: bool,
@@ -1502,6 +1546,8 @@ mod tests {
                 self.group_axis_bytes[owner_axis] += bytes;
             }
             self.kind_bytes[kind_index(kind)] += bytes;
+            self.class_axis_kind_bytes[class_axis][kind_index(kind)] += bytes;
+            self.owner_axis_kind_bytes[owner_axis][kind_index(kind)] += bytes;
             self.live_ticket_count += 1;
         }
 
@@ -1512,11 +1558,16 @@ mod tests {
                 self.group_axis_bytes[ticket.owner_axis] -= ticket.bytes;
             }
             self.kind_bytes[kind_index(ticket.kind)] -= ticket.bytes;
+            self.class_axis_kind_bytes[ticket.class_axis][kind_index(ticket.kind)] -= ticket.bytes;
+            self.owner_axis_kind_bytes[ticket.owner_axis][kind_index(ticket.kind)] -= ticket.bytes;
             self.live_ticket_count -= 1;
         }
 
         fn view(&self) -> AccountingView {
             let total = self.owner_axis_bytes.iter().sum();
+            // Both targets charge every conformance reserve to the Request
+            // context, so the model's whole kind vector sits in bucket 0.
+            let context_kind_bytes = [self.kind_bytes, [0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0]];
             AccountingView {
                 total_class_bytes: self.class_axis_bytes.iter().sum(),
                 total_owner_bytes: total,
@@ -1525,6 +1576,9 @@ mod tests {
                 class_axis_bytes: self.class_axis_bytes,
                 owner_axis_bytes: self.owner_axis_bytes,
                 group_axis_bytes: self.group_axis_bytes,
+                class_kind_bytes: self.class_axis_kind_bytes,
+                owner_kind_bytes: self.owner_axis_kind_bytes,
+                context_kind_bytes,
                 live_ticket_count: self.live_ticket_count,
                 total_retained_payload_bytes: self.kind_bytes[0],
                 total_retained_metadata_bytes: self.kind_bytes[1],
@@ -1932,6 +1986,120 @@ mod tests {
             BrokerFault::WrongChargeKindAxis,
             &[ContractFamily::OwnerPartition],
         );
+    }
+
+    // --- FUP-004: per-axis kind validation ---------------------------------
+    //
+    // Aggregate totals can balance while one axis hides a kind swap. The suite
+    // must reject axis-confined swaps (per-axis kind vectors) and
+    // aggregate-preserving cross-bucket swaps (model bucket x kind comparison).
+
+    #[test]
+    fn sep23_fup004_suite_rejects_class_confined_kind_swap() {
+        assert_broken_target_rejected(
+            BrokerFault::WrongClassKindAxis,
+            &[ContractFamily::OwnerPartition],
+        );
+        // The rejection must include the per-axis kind verdict itself — not
+        // just the exact-model mismatch — so a checker that drops the class
+        // axis goes red here.
+        let report = run_broker_accounting_suite(&mut BrokenBrokerTarget::new(
+            BrokerFault::WrongClassKindAxis,
+        ));
+        assert!(
+            report.iter().any(|verdict| {
+                verdict.name == "observed_kind_split_agrees_across_axes" && !verdict.held
+            }),
+            "class swap must violate the kind-axis verdict: {report:?}"
+        );
+    }
+
+    #[test]
+    fn sep23_fup004_suite_rejects_context_confined_kind_swap() {
+        assert_broken_target_rejected(
+            BrokerFault::WrongContextKindAxis,
+            &[ContractFamily::OwnerPartition],
+        );
+        let report = run_broker_accounting_suite(&mut BrokenBrokerTarget::new(
+            BrokerFault::WrongContextKindAxis,
+        ));
+        assert!(
+            report.iter().any(|verdict| {
+                verdict.name == "observed_kind_split_agrees_across_axes" && !verdict.held
+            }),
+            "context swap must violate the kind-axis verdict: {report:?}"
+        );
+    }
+
+    #[test]
+    fn sep23_fup004_suite_rejects_aggregate_preserving_bucket_swap() {
+        // The swap preserves every aggregate the old checks could see, so the
+        // rejection must come from the bucket x kind model comparison — prove
+        // the distinction by checking the aggregates still agree.
+        let mut broken = BrokenBrokerTarget::new(BrokerFault::SwapKindAcrossClassBuckets);
+        let _t1 = broken
+            .do_reserve(0, "owner:conformance-a", ChargeAxis::RetainedPayload, 1_000)
+            .expect("t1");
+        let _t2 = broken
+            .do_reserve(1, "owner:conformance-a", ChargeAxis::RetainedMetadata, 250)
+            .expect("t2");
+        let _t3 =
+            broken.do_reserve(0, "owner:conformance-b", ChargeAxis::LiveScratch, 500).expect("t3");
+        let view = broken.view().expect("broken view");
+        assert_eq!(view.total_class_bytes, 1_750, "scalar totals preserved");
+        assert_eq!(view.total_owner_bytes, 1_750);
+        assert_eq!(
+            view.checked_class_kind_totals(),
+            view.checked_owner_kind_totals(),
+            "aggregate kind vectors still agree"
+        );
+        assert_eq!(view.checked_owner_kind_totals(), view.checked_context_kind_totals());
+        assert_eq!(view.class_axis_bytes, [500, 1_250], "buckets moved");
+        assert_eq!(view.class_kind_bytes, [[0, 0, 500], [1_000, 250, 0]]);
+        assert_broken_target_rejected(
+            BrokerFault::SwapKindAcrossClassBuckets,
+            &[ContractFamily::OwnerPartition],
+        );
+    }
+
+    #[test]
+    fn sep23_fup004_mixed_kind_trace_agrees_on_every_axis_bucket() {
+        // Fixed mixed-kind script asserting the FULL kind matrices on both
+        // honest targets — not just the scalar projections.
+        let script = [
+            (0usize, 0usize, ChargeAxis::RetainedPayload, 1_000u64),
+            (1, 0, ChargeAxis::RetainedMetadata, 250),
+            (0, 1, ChargeAxis::LiveScratch, 500),
+            (1, 1, ChargeAxis::RetainedPayload, 100),
+        ];
+        let owners = ["owner:conformance-a", "owner:conformance-b"];
+        let mut model = IndependentAccountingModel::default();
+        let mut fake = FakeProcessBroker::honest();
+        let mut fake_tickets = Vec::new();
+        for (class, owner, kind, bytes) in script {
+            let ticket = fake.do_reserve(class, owners[owner], kind, bytes).expect("reserve");
+            fake.do_commit(&ticket).expect("commit");
+            model.apply_reserve(class, owner, kind, bytes);
+            // Hold the ticket guards: dropping them releases the charge.
+            fake_tickets.push(ticket);
+        }
+        assert_eq!(fake.view().expect("fake view"), model.view(), "fake full view");
+
+        let mut model = IndependentAccountingModel::default();
+        let mut live = live_broker();
+        let mut live_tickets = Vec::new();
+        for (class, owner, kind, bytes) in script {
+            let ticket = live.do_reserve(class, owners[owner], kind, bytes).expect("reserve");
+            live.do_commit(&ticket).expect("commit");
+            model.apply_reserve(class, owner, kind, bytes);
+            live_tickets.push(ticket);
+        }
+        assert_eq!(live.view().expect("live view"), model.view(), "live full view");
+
+        let view = model.view();
+        assert_eq!(view.class_kind_bytes, [[1_000, 0, 500], [100, 250, 0]]);
+        assert_eq!(view.owner_kind_bytes, [[1_000, 250, 0], [100, 0, 500]]);
+        assert_eq!(view.context_kind_bytes[0], [1_100, 250, 500], "every reserve lands in Request");
     }
 
     #[test]
@@ -2592,6 +2760,15 @@ mod tests {
                 class_axis_bytes: [self.class_payload_bytes, 0],
                 owner_axis_bytes: [self.owner_payload_bytes, 0],
                 group_axis_bytes: [0, 0],
+                class_kind_bytes: [[self.class_payload_bytes, 0, 0], [0, 0, 0]],
+                owner_kind_bytes: [[self.owner_payload_bytes, 0, 0], [0, 0, 0]],
+                context_kind_bytes: [
+                    [self.owner_payload_bytes, 0, 0],
+                    [0, 0, 0],
+                    [0, 0, 0],
+                    [0, 0, 0],
+                    [0, 0, 0],
+                ],
                 live_ticket_count: 0,
                 total_retained_payload_bytes: self.owner_payload_bytes,
                 total_retained_metadata_bytes: 0,
@@ -2707,6 +2884,9 @@ mod tests {
                 class_axis_bytes: [bytes, 0],
                 owner_axis_bytes: [bytes, 0],
                 group_axis_bytes: [0, 0],
+                class_kind_bytes: [[bytes, 0, 0], [0, 0, 0]],
+                owner_kind_bytes: [[bytes, 0, 0], [0, 0, 0]],
+                context_kind_bytes: [[bytes, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0]],
                 live_ticket_count: 0,
                 total_retained_payload_bytes: bytes,
                 total_retained_metadata_bytes: 0,
