@@ -5,6 +5,9 @@ license.workspace = true
 version.workspace = true
 publish.workspace = true
 
+[lints]
+workspace = true
+
 [features]
 default = ["core-live-accounting"]
 # Facade-local gate for live-broker accounting paths. Forward core's

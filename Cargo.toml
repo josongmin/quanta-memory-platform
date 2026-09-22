@@ -12,6 +12,9 @@ license = "UNLICENSED"
 publish = false
 version = "0.1.0"
 
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
 [workspace.dependencies]
 blake3 = "=1.5.3"
 hdrhistogram = "7.5.4"

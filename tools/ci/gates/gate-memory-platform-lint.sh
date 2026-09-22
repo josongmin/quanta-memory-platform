@@ -4,6 +4,8 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 cd "${repo_root}"
 
+python3 tools/ci/check_workspace_lints.py
+python3 -m unittest -q tools.ci.tests.test_workspace_lints
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 
