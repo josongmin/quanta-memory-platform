@@ -94,7 +94,7 @@ dependency direction. Not prose: every step is a command or a verifiable gate.
 
 ## Standalone extraction qualification
 
-- Extracted repo: `scripts/check-workspace.sh` passes. It includes shell syntax,
+- Extracted repo: `scripts/check-workspace.sh` passes. It includes ShellCheck,
   resolved dependency-graph, static, contract, test, feature, selector,
   prompt-manager, and dependency checks.
 - Source/extracted tree-bound canonical digests and file modes match, the source

@@ -16,8 +16,7 @@
         "sources/operational/agent-router.md",
         "sources/operational/agent-core.md",
         "sources/rules/cheatsheet.md",
-        "sources/operational/agent-playbook.md",
-        "sources/agent-specific/claude.md"
+        "sources/operational/agent-playbook.md"
       ]
     },
     "cursor_rules": {
@@ -30,8 +29,7 @@
         "sources/rules/tests.md",
         "sources/rules/determinism.md",
         "sources/rules/error-handling.md",
-        "sources/rules/dependencies.md",
-        "sources/agent-specific/cursor.md"
+        "sources/rules/dependencies.md"
       ]
     }
   }

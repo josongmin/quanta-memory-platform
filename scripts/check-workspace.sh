@@ -7,14 +7,17 @@ cd "${repo_root}"
 echo "[check-workspace] fmt --check"
 cargo fmt --all --check
 
-echo "[check-workspace] shell syntax"
+echo "[check-workspace] shellcheck"
 shell_scripts=()
 while IFS= read -r -d '' script; do
-  bash -n "${script}"
   shell_scripts+=("${script}")
 done < <(find scripts -type f -name '*.sh' -print0)
 if ! command -v shellcheck >/dev/null 2>&1; then
   echo "check-workspace: shellcheck unavailable" >&2
+  exit 1
+fi
+if [[ "${#shell_scripts[@]}" -eq 0 ]]; then
+  echo "check-workspace: no shell scripts found" >&2
   exit 1
 fi
 shellcheck "${shell_scripts[@]}"

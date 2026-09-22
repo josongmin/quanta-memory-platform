@@ -1,11 +1,11 @@
 ## Build & Verification Front Door
 
 Plain `cargo` is the build front door. `scripts/check-workspace.sh` is the only
-repository-wide verification front door. It owns formatting, shell syntax and
-ShellCheck, resolved workspace-graph and safety policy, Python and extraction
-contracts, Semgrep regression guards, the Cargo feature matrix, workspace
-tests, isolated feature capability tests, documented selector validation,
-generated-guidance drift, and dependency policy.
+repository-wide verification front door. It owns formatting, ShellCheck,
+resolved workspace-graph and safety policy, Python and extraction contracts,
+Semgrep regression guards, the Cargo feature matrix, workspace tests, isolated
+feature capability tests, documented selector validation, generated-guidance
+drift, and dependency policy.
 
 ```bash
 scripts/check-workspace.sh
@@ -36,7 +36,10 @@ python3 -m unittest -q tools/pm/tests/test_pm.py
 The prompt manager is Python-standard-library-only. Its JSON manifest rejects
 orphan sources, duplicate outputs, path escapes, missing outputs, and drift.
 The Rust toolchain version is owned solely by `rust-toolchain.toml`; dependency
-policy is owned by `deny.toml`; formatting is owned by `rustfmt.toml`.
+policy is owned by `deny.toml`; formatting is owned by `rustfmt.toml`. Workspace
+Rust/Clippy lint levels are owned by the root `Cargo.toml`; each library root
+also retains `#![forbid(unsafe_code)]` so a local `allow` cannot weaken the
+portable-library boundary.
 
 Extraction is mechanical and fail-closed:
 

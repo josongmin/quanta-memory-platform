@@ -201,7 +201,7 @@ is rejected up front.
 
 This repo carries one authoritative verification front door:
 
-- `scripts/check-workspace.sh` — fmt, shell syntax, resolved Cargo-graph and
+- `scripts/check-workspace.sh` — fmt, ShellCheck, resolved Cargo-graph and
   workspace safety policy, Python and extraction contracts, Semgrep regression
   guards, metadata-driven feature matrix, workspace tests, isolated feature
   runtime tests, documented-selector validation, prompt-manager tests/drift

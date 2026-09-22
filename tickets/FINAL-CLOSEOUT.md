@@ -1,8 +1,9 @@
 # Final Closeout SSOT
 
-Status: qualification complete for the portable library and the checked
-Semantica host pair. Deployment and production activation remain separate
-operational approvals; neither is claimed here.
+Status: historical qualification complete at `qmp-final-qualified` (`014eb65`);
+current `main` requalification is in progress. The open test-optimization
+queue is not covered by the historical receipt. Deployment and production
+activation remain separate operational approvals; neither is claimed here.
 
 ## Scope and non-goals
 
@@ -16,12 +17,12 @@ extraction, host-pair qualification, and deployment activation.
 
 | Gate | Required evidence | Result |
 | --- | --- | --- |
-| FINAL-001 source freeze | File ownership, generated-doc authority, direction/purity/public-surface review, clean diff check | Passed. `FINAL-001-file-inventory.md` owns the original consolidation; follow-up extraction and public-interface fixes are committed separately. |
-| FINAL-002 repository qualification | PM, canonical workspace rail, locked fmt/clippy/test/deny on one clean source | Passed at `qmp-final-qualified`; resolve the immutable annotated tag for SHA/tree/commands. |
-| FINAL-003 exact-HEAD freeze | Clean `main`, source SHA/tree recorded after qualification | Passed at `qmp-final-qualified`; its annotation is the exact source receipt. |
-| FINAL-004 standalone extraction | Clean-source dry run and real extraction; extracted locked qualification and matching manifest | Passed at `qmp-final-qualified`; its annotation records source and extracted manifest/commit. |
-| FINAL-005 host adoption | Exact QMP/host pair, root and nested locked resolution, host adapter tests and hello-world | Passed for `qmp-final-qualified` + Semantica `main` `2822dc1eeedba119ccf87815a81d35447a8ac06d`. |
-| FINAL-006 closeout | This SSOT, cleanup disposition, reproducible commands, residual-risk boundary | Complete after the final QMP receipt requalification below. |
+| FINAL-001 source freeze | File ownership, generated-doc authority, direction/purity/public-surface review, clean diff check | In progress for the current post-`014eb65` source. The historical inventory remains evidence only for its own frozen base. |
+| FINAL-002 repository qualification | PM, canonical workspace rail, locked fmt/clippy/test/deny on one clean source | Historical pass at `qmp-final-qualified`; rerun required after the current freeze. |
+| FINAL-003 exact-HEAD freeze | Clean `main`, source SHA/tree recorded after qualification | Historical pass at `qmp-final-qualified`; rerun required after the current freeze. |
+| FINAL-004 standalone extraction | Clean-source dry run and real extraction; extracted locked qualification and matching manifest | Historical pass at `qmp-final-qualified`; rerun required after the current freeze. |
+| FINAL-005 host adoption | Exact QMP/host pair, root and nested locked resolution, host adapter tests and hello-world | Historical pass for `qmp-final-qualified` + Semantica `2822dc1`; rerun required after the current freeze. |
+| FINAL-006 closeout | This SSOT, cleanup disposition, reproducible commands, residual-risk boundary | Pending the current FINAL-001 through FINAL-005 sequence. |
 
 ## FINAL-001 audit result
 
@@ -58,9 +59,10 @@ The executable and extraction receipt is the immutable annotated local tag
 source manifest, extracted SHA/tree, host SHA, commands, and outcome. Resolve
 it with `git show --no-patch --format=fuller qmp-final-qualified`.
 
-The tag is intentionally created **after** the last tracked ticket change:
-`tickets/` contributes to the extraction manifest, so embedding a self-SHA in
-this file would create a new source and invalidate the stated receipt.
+The tag is intentionally created **after** the last tracked receipt change:
+`tickets/` is not an extraction-manifest input, but any tracked ticket edit
+changes the source commit/tree. Embedding a self-SHA in this file would create a
+new source and invalidate the stated receipt.
 
 ## FINAL-002 and FINAL-003 receipt
 
@@ -76,7 +78,7 @@ cargo deny --locked --all-features check
 scripts/check-workspace.sh
 ```
 
-The canonical workspace rail additionally exercised shell syntax, the resolved
+The canonical workspace rail additionally exercised ShellCheck, the resolved
 Cargo workspace graph, the feature matrix, 10 advertised non-zero runtime
 paths, 166 documented selectors, PM drift checks, Semgrep regressions, and
 dependency policy. No assertion was weakened and no skip/allowlist was added

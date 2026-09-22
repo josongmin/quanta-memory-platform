@@ -37,6 +37,5 @@ tools/pm/
   sources/
     rules/
     operational/
-    agent-specific/
   tests/
 ```

@@ -11,9 +11,13 @@
   metadata-driven. The guidance generator is now standard-library-only and
   rejects orphan sources, duplicate outputs, path escapes, and drift.
 - Replaced manifest-text dependency checks with a resolved Cargo-graph contract,
-  added fail-closed shell syntax and ShellCheck validation to the canonical
-  rail, and hardened generated guidance against source/output symlink escapes
-  and reserved Git paths.
+  added fail-closed ShellCheck validation to the canonical rail, and hardened
+  generated guidance against source/output symlink escapes and reserved Git
+  paths.
+- Removed duplicate shell parsing, crate-local unsafe lint declarations, and
+  repeated agent-specific guidance; centralized low-noise Clippy policy in the
+  workspace manifest and corrected review-only rules that were mislabeled as
+  automated gates.
 
 ## 0.2.0 - 2026-09-21
 

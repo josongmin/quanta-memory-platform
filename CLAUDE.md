@@ -103,14 +103,14 @@ fail-closed. A Semgrep exception requires a trailing
 
 | Don't write this | Write this instead | Enforced by |
 | --- | --- | --- |
-| `x.unwrap()` in non-test code | `x.ok_or_else(|| MemoryError::config("…"))?` | clippy `-D warnings`, review |
-| `panic!` / `unreachable!` / `todo!` / `unimplemented!` in shipping paths | return a `MemoryError` variant | clippy, review |
+| `x.unwrap()` in non-test code | `x.ok_or_else(|| MemoryError::config("…"))?` | review |
+| `panic!` / `unreachable!` / `todo!` / `unimplemented!` in shipping paths | return a `MemoryError` variant | review |
 | `.expect("")` / `.expect("TODO")` | only in `#[cfg(test)]`, with `.expect("<why this cannot fail>")` | review |
 | `Err(_) => {}` / `let _ = fallible();` / `.ok();` | propagate with `?` or map to a typed `MemoryError` | review |
-| `map_err(|_| …)` (drops the source) | preserve it: `map_err(|e| MemoryError::config(format!("…: {e}")))` | clippy `map_err_ignore`, review |
+| `map_err(|_| …)` when the source carries actionable context | preserve it: `map_err(|e| MemoryError::config(format!("…: {e}")))`; discarding poison or range-conversion details is allowed when the replacement error is complete | review |
 | bare `#[allow(<lint>)]` (no reason) | append `-- reason: <…>` on the same line | review |
-| `arr[i]` / `&s[a..b]` on untrusted indices | `arr.get(i)` / checked slicing | clippy, review |
-| `n as u64` (lossy / truncating) | `u64::try_from(n)?` or a checked/saturating op | clippy cast lints |
+| `arr[i]` / `&s[a..b]` on untrusted indices | `arr.get(i)` / checked slicing | review |
+| `n as u64` (lossy / truncating) | `u64::try_from(n)?` or a checked/saturating op | review |
 | `x as i64` / `as i32` / `as i16` / `as i8` (sign-flips a magnitude — the `bytes as i64` ledger-corruption bug) | keep `u64` magnitudes with saturating/checked ops; `i64::try_from(..)?`; widen a signed *diff* to `i128` | regression-guards (`qmp-magnitude-as-signed`) |
 | `a.saturating_mul(b) / c` (saturates BEFORE the divide → under-reports the ratio: the pressure-percent / weighted-cap bug) | `u64::try_from(u128::from(a) * u128::from(b) / u128::from(c))` | regression-guards (`qmp-saturating-mul-then-divide`) |
 | `Atomic::fetch_sub(..)` on a counter (can underflow → wraps to MAX: the spilled-count drift) | saturating CAS: `c.fetch_update(SeqCst, SeqCst, \|v\| Some(v.saturating_sub(n)))` | regression-guards (`qmp-atomic-fetch-sub`) |
@@ -123,7 +123,7 @@ fail-closed. A Semgrep exception requires a trailing
 | `std::fs` / `std::env` / `SystemTime::now` / `Instant::now` in `domain/` or `ports/` | route through a port + adapter; keep domain pure | regression-guards (`qmp-pure-layer-no-fs-env`, `qmp-pure-layer-no-wall-clock`) |
 | `crate::adapters` imported from `domain/` or `ports/` | depend on the port trait only | regression-guards (`qmp-pure-layer-no-adapter-import`) |
 | resolved dependency from `core` to facade/testkit (or facade to testkit), including a renamed dependency | keep `core <- facade <- testkit` | Cargo-metadata graph contract in `check-workspace`, extraction pre-flight |
-| Semantica nouns (`Semantica*`, `quanta_runtime`, `codegraph`) in public API | keep the library host-independent | review + extraction contract |
+| Semantica nouns (`Semantica*`, `quanta_runtime`, `codegraph`) in public API | keep the library host-independent | review |
 | raw broker constructor backdoor in public code | go through the builder-first surface | public API compile-fail tests |
 | stale `V1`/`V2` / old renamed symbols | use the current names | review |
 | allocator telemetry mutating ledger counters | telemetry is **advisory** — never writes counters | review (ledger invariant) |
@@ -184,17 +184,3 @@ Known risk:
 Fail-closed principle: if `pm lint` fails, sync — do not patch generated files.
 If tests fail, fix behavior; do not weaken assertions to greenwash. Never invert
 the `core <- facade <- testkit` direction to make something compile.
-
-## Claude Code Notes
-
-- `CLAUDE.md` is generated from `tools/pm/sources/**`. Never hand-edit it; run
-  `python3 tools/pm/pm.py sync` after source edits, then `python3 tools/pm/pm.py lint`.
-- Self-check against the Rule Cheatsheet before claiming a slice is done.
-- The two reflexes reviewers check first: (1) never invert `core <- facade <-
-  testkit`, and (2) never let Semantica/host nouns into the public API. If a
-  change makes you reach upward or import the host, stop and re-plan.
-- Keep `domain/` pure — if you need fs/clock/env, add a port + adapter instead.
-- For accounting changes, assert the ledger invariants in tests; "it returned Ok"
-  is not a test.
-- When unsure whether a change preserves portability, run
-  `scripts/extract-to-standalone-repo.sh --dry-run /tmp/qmp`.

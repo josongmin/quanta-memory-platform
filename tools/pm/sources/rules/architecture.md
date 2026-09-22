@@ -65,12 +65,12 @@ Forbidden usages (fail-closed under `-D warnings` + the repo-local rail + deny):
 - Raw constructor backdoors leaking past the builder-first surface; public API
   compile-fail contracts and review own this boundary.
 
-Enforcement: `cargo clippy --workspace --all-targets --all-features -- -D warnings`,
-`cargo deny --all-features check`, `scripts/check-workspace.sh`, and the
-extraction pre-flight in `scripts/extract-to-standalone-repo.sh`. The shared
-Cargo-metadata checker owns member presence, resolved dependency direction,
-host back-edges, and local path dependencies escaping the workspace; it catches
-renamed dependencies without treating comments as edges. The extractor also
-owns the self-hosting file set and exact committed-tree export. If a change
-needs a NEW crate edge, stop and reconsider — do not add the import to make it
-compile.
+Enforcement: the root workspace lint policy, `cargo clippy --workspace
+--all-targets --all-features -- -D warnings`, `cargo deny --all-features check`,
+`scripts/check-workspace.sh`, and the extraction pre-flight in
+`scripts/extract-to-standalone-repo.sh`. The shared Cargo-metadata checker owns
+member presence, resolved dependency direction, host back-edges, and local path
+dependencies escaping the workspace; it catches renamed dependencies without
+treating comments as edges. The extractor also owns the self-hosting file set
+and exact committed-tree export. If a change needs a NEW crate edge, stop and
+reconsider — do not add the import to make it compile.

@@ -16,6 +16,10 @@ version = "0.2.0"
 [workspace.lints.rust]
 unsafe_code = "deny"
 
+[workspace.lints.clippy]
+dbg_macro = "deny"
+float_cmp = "deny"
+
 [workspace.dependencies]
 blake3 = "=1.5.3"
 hdrhistogram = "7.5.4"

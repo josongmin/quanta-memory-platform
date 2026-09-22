@@ -73,15 +73,15 @@ Forbidden usages (fail-closed under `-D warnings` + the repo-local rail + deny):
 - Raw constructor backdoors leaking past the builder-first surface; public API
   compile-fail contracts and review own this boundary.
 
-Enforcement: `cargo clippy --workspace --all-targets --all-features -- -D warnings`,
-`cargo deny --all-features check`, `scripts/check-workspace.sh`, and the
-extraction pre-flight in `scripts/extract-to-standalone-repo.sh`. The shared
-Cargo-metadata checker owns member presence, resolved dependency direction,
-host back-edges, and local path dependencies escaping the workspace; it catches
-renamed dependencies without treating comments as edges. The extractor also
-owns the self-hosting file set and exact committed-tree export. If a change
-needs a NEW crate edge, stop and reconsider — do not add the import to make it
-compile.
+Enforcement: the root workspace lint policy, `cargo clippy --workspace
+--all-targets --all-features -- -D warnings`, `cargo deny --all-features check`,
+`scripts/check-workspace.sh`, and the extraction pre-flight in
+`scripts/extract-to-standalone-repo.sh`. The shared Cargo-metadata checker owns
+member presence, resolved dependency direction, host back-edges, and local path
+dependencies escaping the workspace; it catches renamed dependencies without
+treating comments as edges. The extractor also owns the self-hosting file set
+and exact committed-tree export. If a change needs a NEW crate edge, stop and
+reconsider — do not add the import to make it compile.
 
 ## Rule Cheatsheet (self-check before the gate)
 
@@ -93,14 +93,14 @@ fail-closed. A Semgrep exception requires a trailing
 
 | Don't write this | Write this instead | Enforced by |
 | --- | --- | --- |
-| `x.unwrap()` in non-test code | `x.ok_or_else(|| MemoryError::config("…"))?` | clippy `-D warnings`, review |
-| `panic!` / `unreachable!` / `todo!` / `unimplemented!` in shipping paths | return a `MemoryError` variant | clippy, review |
+| `x.unwrap()` in non-test code | `x.ok_or_else(|| MemoryError::config("…"))?` | review |
+| `panic!` / `unreachable!` / `todo!` / `unimplemented!` in shipping paths | return a `MemoryError` variant | review |
 | `.expect("")` / `.expect("TODO")` | only in `#[cfg(test)]`, with `.expect("<why this cannot fail>")` | review |
 | `Err(_) => {}` / `let _ = fallible();` / `.ok();` | propagate with `?` or map to a typed `MemoryError` | review |
-| `map_err(|_| …)` (drops the source) | preserve it: `map_err(|e| MemoryError::config(format!("…: {e}")))` | clippy `map_err_ignore`, review |
+| `map_err(|_| …)` when the source carries actionable context | preserve it: `map_err(|e| MemoryError::config(format!("…: {e}")))`; discarding poison or range-conversion details is allowed when the replacement error is complete | review |
 | bare `#[allow(<lint>)]` (no reason) | append `-- reason: <…>` on the same line | review |
-| `arr[i]` / `&s[a..b]` on untrusted indices | `arr.get(i)` / checked slicing | clippy, review |
-| `n as u64` (lossy / truncating) | `u64::try_from(n)?` or a checked/saturating op | clippy cast lints |
+| `arr[i]` / `&s[a..b]` on untrusted indices | `arr.get(i)` / checked slicing | review |
+| `n as u64` (lossy / truncating) | `u64::try_from(n)?` or a checked/saturating op | review |
 | `x as i64` / `as i32` / `as i16` / `as i8` (sign-flips a magnitude — the `bytes as i64` ledger-corruption bug) | keep `u64` magnitudes with saturating/checked ops; `i64::try_from(..)?`; widen a signed *diff* to `i128` | regression-guards (`qmp-magnitude-as-signed`) |
 | `a.saturating_mul(b) / c` (saturates BEFORE the divide → under-reports the ratio: the pressure-percent / weighted-cap bug) | `u64::try_from(u128::from(a) * u128::from(b) / u128::from(c))` | regression-guards (`qmp-saturating-mul-then-divide`) |
 | `Atomic::fetch_sub(..)` on a counter (can underflow → wraps to MAX: the spilled-count drift) | saturating CAS: `c.fetch_update(SeqCst, SeqCst, \|v\| Some(v.saturating_sub(n)))` | regression-guards (`qmp-atomic-fetch-sub`) |
@@ -113,7 +113,7 @@ fail-closed. A Semgrep exception requires a trailing
 | `std::fs` / `std::env` / `SystemTime::now` / `Instant::now` in `domain/` or `ports/` | route through a port + adapter; keep domain pure | regression-guards (`qmp-pure-layer-no-fs-env`, `qmp-pure-layer-no-wall-clock`) |
 | `crate::adapters` imported from `domain/` or `ports/` | depend on the port trait only | regression-guards (`qmp-pure-layer-no-adapter-import`) |
 | resolved dependency from `core` to facade/testkit (or facade to testkit), including a renamed dependency | keep `core <- facade <- testkit` | Cargo-metadata graph contract in `check-workspace`, extraction pre-flight |
-| Semantica nouns (`Semantica*`, `quanta_runtime`, `codegraph`) in public API | keep the library host-independent | review + extraction contract |
+| Semantica nouns (`Semantica*`, `quanta_runtime`, `codegraph`) in public API | keep the library host-independent | review |
 | raw broker constructor backdoor in public code | go through the builder-first surface | public API compile-fail tests |
 | stale `V1`/`V2` / old renamed symbols | use the current names | review |
 | allocator telemetry mutating ledger counters | telemetry is **advisory** — never writes counters | review (ledger invariant) |
@@ -126,11 +126,11 @@ Run the full rail with `scripts/check-workspace.sh`.
 ## Build & Verification Front Door
 
 Plain `cargo` is the build front door. `scripts/check-workspace.sh` is the only
-repository-wide verification front door. It owns formatting, shell syntax and
-ShellCheck, resolved workspace-graph and safety policy, Python and extraction
-contracts, Semgrep regression guards, the Cargo feature matrix, workspace
-tests, isolated feature capability tests, documented selector validation,
-generated-guidance drift, and dependency policy.
+repository-wide verification front door. It owns formatting, ShellCheck,
+resolved workspace-graph and safety policy, Python and extraction contracts,
+Semgrep regression guards, the Cargo feature matrix, workspace tests, isolated
+feature capability tests, documented selector validation, generated-guidance
+drift, and dependency policy.
 
 ```bash
 scripts/check-workspace.sh
@@ -161,7 +161,9 @@ python3 -m unittest -q tools/pm/tests/test_pm.py
 The prompt manager is Python-standard-library-only. Its JSON manifest rejects
 orphan sources, duplicate outputs, path escapes, missing outputs, and drift.
 The Rust toolchain version is owned solely by `rust-toolchain.toml`; dependency
-policy is owned by `deny.toml`; formatting is owned by `rustfmt.toml`.
+policy is owned by `deny.toml`; formatting is owned by `rustfmt.toml`. Workspace
+Rust/Clippy lint levels are owned by the root `Cargo.toml`; keep project-wide
+lints there instead of repeating crate attributes.
 
 Extraction is mechanical and fail-closed:
 
@@ -338,54 +340,3 @@ against `deny.toml`.
 `deny.toml` notes: private unpublished members are license-exempt and duplicate
 versions fail. MPL-2.0 is accepted only for the testkit tracking-allocator path.
 Revisit that allowance before any distributed binary release.
-
-## Cursor Notes (mandatory)
-
-### Generated rules
-
-- `.cursorrules` is **generated** from `tools/pm/sources/**`.
-- **Never** hand-edit `.cursorrules`, `AGENTS.md`, or `CLAUDE.md`.
-- After changing sources: `python3 tools/pm/pm.py sync` then `python3 tools/pm/pm.py lint`.
-
-### Architecture is not negotiable
-
-Read the generated architecture, cheatsheet, build, test, determinism, error,
-and dependency rules in this file before every task. Treat them as a checklist,
-not background reading.
-
-**Stop and re-plan** if your diff:
-
-- Makes `core` name `facade`/`testkit`, or `facade` name `testkit` (inverts direction)
-- Adds a dependency from this repo back to Semantica / the host adapter
-- Adds `std::fs` / `std::env` / `SystemTime::now` to `domain/` or `ports/`
-- Imports `crate::adapters` from `domain/` or `ports/`
-- Introduces a Semantica noun (`Semantica*`, `quanta_runtime`, `codegraph`) into
-  the public API
-- Adds a raw broker constructor instead of going through the builder-first surface
-
-### Scoped edits
-
-| Task | Allowed touch set |
-| --- | --- |
-| Ledger / policy / config | `crates/quanta-memory-platform-core/src/domain/**` + tests |
-| Pressure / scheduler | `crates/quanta-memory-platform-core/src/application/**` + tests |
-| New port / adapter | `crates/quanta-memory-platform-core/src/{ports,adapters}/**` |
-| Public broker / builder | `crates/quanta-memory-platform-core/src/api/**` + examples |
-| Facade store / pipeline | `crates/quanta-memory-platform-facade/src/<feature>/**` |
-| Conformance / chaos tooling | `crates/quanta-memory-platform-testkit/src/**` |
-
-Do **not** "drive-by" refactor unrelated crates.
-
-### Clippy / gate
-
-- The lint bar is `cargo clippy --workspace --all-targets --all-features
-  -- -D warnings`. Fix violations; do not blanket-`allow` without a one-line
-  `-- reason: <…>` on that item.
-- `map_err(|_| …)` is **always wrong** — include `{e}` in the message.
-- Closeout for Rust changes: `scripts/check-workspace.sh` must pass, and the
-  extraction dry-run if you changed any `Cargo.toml` or cross-crate `use` path.
-
-### Portability
-
-- The library must stay host-independent and extractable. When unsure, run
-  `scripts/extract-to-standalone-repo.sh --dry-run /tmp/qmp`.
