@@ -60,18 +60,10 @@ dependency direction. Not prose: every step is a command or a verifiable gate.
    python3 tools/pm/pm.py lint
    ```
 
-   Campaign ticket admission (`scripts/verify-tickets.sh` and `tickets/**`)
-   remains source-checkout governance only and is intentionally excluded from
-   the standalone product extraction.
-
    Both build rails require the lockfile, `semgrep`, and `cargo-deny`; missing
    tooling fails the extraction. After verification, the script commits the
    extracted tree and requires `git status --porcelain` to be empty. A failed
    verification leaves no success commit.
-
-   CI then runs `scripts/check-workspace-offline.sh` as a separate `--frozen`
-   lane against the warmed Cargo/advisory caches. It is not a substitute for
-   the online locked release rail.
 
 3. Validate repo-local rails in the extracted repo:
 
@@ -80,7 +72,6 @@ dependency direction. Not prose: every step is a command or a verifiable gate.
    scripts/scaffold-external-repo.sh   # required self-hosting file set present, no copied gates
    scripts/check-workspace.sh          # fmt + clippy -D warnings + check + examples + feature matrix + deny
    scripts/memory-platform-doctor      # repo-local doctor rail, includes workspace tests, no tools/ci/gates dependency
-   scripts/check-workspace-offline.sh  # separate frozen/cache-only recheck
    scripts/tests/extraction-contracts.sh # negative release-rail contracts
    python3 -m unittest -v scripts/tests/test_extraction_metadata.py scripts/tests/test_extraction_manifest.py # dependency/tree negative fixtures
    python3 -m unittest -v scripts/tests/test_scaling_results.py # performance-gate negative fixtures
@@ -119,9 +110,7 @@ dependency direction. Not prose: every step is a command or a verifiable gate.
 ## Standalone extraction gate (QMP-120)
 
 - Extracted repo: `scripts/check-workspace.sh`, `scripts/memory-platform-doctor`,
-  `scripts/scaffold-external-repo.sh`, and PM lint all pass. Campaign ticket
-  admission remains a source-checkout governance rail and is not an extracted
-  product dependency.
+  `scripts/scaffold-external-repo.sh`, and PM lint all pass.
 - Source/extracted tree-bound canonical digests and file modes match, the source
   stays at the frozen clean `HEAD`, and the extracted git worktree is clean.
 - All Cargo resolution is locked; missing Semgrep or cargo-deny fails closed.

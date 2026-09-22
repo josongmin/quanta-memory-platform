@@ -2,8 +2,7 @@
 
 What must be **verified** in this repo, derived from the contracts and invariants
 (ledger SSOT, policy/config validation, control plane, scheduler, facade stores,
-testkit conformance, extraction rails) and from the 2026-06-07 deep audit
-([AUDIT-2026-06-07.md](../AUDIT-2026-06-07.md)).
+testkit conformance, extraction rails).
 
 This is a living checklist. Correctness scenarios are **tests** (not benchmarks);
 performance/allocation regressions are guarded separately (see *Test vs Bench*).
@@ -219,7 +218,7 @@ New invariants promoted to the public API boundary:
 
 ---
 
-## Current campaign status — 🚧
+## Local verification status — 🚧
 
 - Standalone implementation is locally covered by default/bare/leaf/full/all
   warning-free feature slices, non-zero runtime capability tests for every

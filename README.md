@@ -9,12 +9,8 @@ designed to be extracted into its own repository without rewrites.
 > passed; external host adoption remains unobserved on the current release
 > candidate. Standalone performance,
 > observability, extraction, and conformance rails are locally qualified; they
-> do not substitute for host-product GREEN. The authoritative remediation
-> inventory, status, dependencies, acceptance criteria, and receipts live in
-> [`tickets/README.md`](./tickets/README.md) in this source checkout. Ticket
-> admission and historical receipts are campaign governance; they are not
-> copied into a standalone product extraction. Passing a focused test or
-> dry-run does not supersede that status.
+> do not substitute for host-product GREEN. Passing a focused test or dry-run
+> does not supersede that status.
 
 ## Packages and dependency direction
 
@@ -225,7 +221,6 @@ This repo now carries its own verification front doors:
 - `scripts/memory-platform-doctor` — repo-local doctor: fmt + clippy `-D warnings`
   + per-feature compile/runtime matrix + workspace check/tests + documented
   selector validation + example builds + `cargo deny` when available.
-- `scripts/memory-platform-{fix,report}` — mechanical fix/report helpers.
 - `scripts/scaffold-external-repo.sh` — asserts the extracted self-hosting file
   set is present in-source and that the copy plan excludes `tools/ci/gates`.
 

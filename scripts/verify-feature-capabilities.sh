@@ -8,7 +8,7 @@ run_lib() {
   local features="$1"
   local selector="$2"
   echo "[feature-capability] ${features}: ${selector}"
-  scripts/run-ticket-test --locked \
+  scripts/run-checked-cargo-test --locked \
     -p quanta-memory-platform-facade \
     --no-default-features \
     --features "${features}" \
@@ -20,7 +20,7 @@ run_test() {
   local target="$2"
   local selector="$3"
   echo "[feature-capability] ${features}: ${target}::${selector}"
-  scripts/run-ticket-test --locked \
+  scripts/run-checked-cargo-test --locked \
     -p quanta-memory-platform-facade \
     --no-default-features \
     --features "${features}" \

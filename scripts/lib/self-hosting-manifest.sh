@@ -26,20 +26,8 @@ SELF_HOSTING_COPY_PATHS=(
   "scripts"
   "tools/pm"
   "tools/semgrep"
-  "tools/tickets"
   "tools/ci/feature-matrix.sh"
   "docs"
-)
-
-# Campaign admission and its receipts are repository-local governance. They
-# must not become part of the extracted product repository. Keep the generic
-# Cargo evidence runner, which is used by the feature-capability rail, but
-# exclude the validator and all ticket evidence from extraction.
-SELF_HOSTING_EXCLUDED_PATHS=(
-  "scripts/verify-tickets.sh"
-  "tools/tickets/verify_tickets.py"
-  "tools/tickets/test_verify_tickets.py"
-  "tickets"
 )
 
 SELF_HOSTING_REQUIRED_PATHS=(
@@ -64,12 +52,9 @@ SELF_HOSTING_REQUIRED_PATHS=(
   "crates/quanta-memory-platform-testkit/Cargo.toml"
   "crates/quanta-memory-platform-facade/examples/hello_world.rs"
   "scripts/check-workspace.sh"
-  "scripts/check-workspace-offline.sh"
   "scripts/extract-to-standalone-repo.sh"
   "scripts/scaffold-external-repo.sh"
   "scripts/memory-platform-doctor"
-  "scripts/memory-platform-fix"
-  "scripts/memory-platform-report"
   "scripts/run-scaling-bench.sh"
   "scripts/verify-scaling-results.py"
   "scripts/verify-feature-capabilities.sh"
@@ -83,14 +68,14 @@ SELF_HOSTING_REQUIRED_PATHS=(
   "scripts/tests/test_scaling_results.py"
   "scripts/tests/test_doc_test_selectors.py"
   "scripts/regression-guards.sh"
-  "scripts/run-ticket-test"
+  "scripts/run-checked-cargo-test"
+  "scripts/lib/run_cargo_test.py"
   "tools/pm/pm.py"
   "tools/pm/targets.yaml"
   "tools/pm/templates/agents.md.j2"
   "tools/pm/sources/operational/agent-core.md"
   "tools/ci/feature-matrix.sh"
   "tools/semgrep/qmp-regressions.yml"
-  "tools/tickets/run_cargo_test.py"
   "docs/verification-scenarios.md"
 )
 
@@ -168,13 +153,6 @@ self_hosting_assert_extracted_layout() {
   for path in "${SELF_HOSTING_FORBIDDEN_PATHS[@]}"; do
     if [[ -e "${dest}/${path}" ]]; then
       echo "forbidden extracted path present: ${path}" >&2
-      missing=1
-    fi
-  done
-
-  for path in "${SELF_HOSTING_EXCLUDED_PATHS[@]}"; do
-    if [[ -e "${dest}/${path}" ]]; then
-      echo "excluded campaign path present in extracted repo: ${path}" >&2
       missing=1
     fi
   done

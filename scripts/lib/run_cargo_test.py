@@ -58,7 +58,7 @@ def main(argv: list[str] | None = None) -> int:
     if args[:1] == ["--"]:
         args = args[1:]
     if not args:
-        print("usage: run-ticket-test [cargo test arguments...]", file=sys.stderr)
+        print("usage: run-checked-cargo-test [cargo test arguments...]", file=sys.stderr)
         return 2
 
     command = ["cargo", "test", *args]
@@ -93,7 +93,7 @@ def main(argv: list[str] | None = None) -> int:
             "admission_error": str(exc),
         }
         print("QMP_TEST_EVIDENCE=" + json.dumps(evidence, separators=(",", ":")))
-        print(f"run-ticket-test: FAIL: {exc}", file=sys.stderr)
+        print(f"run-checked-cargo-test: FAIL: {exc}", file=sys.stderr)
         return 3
 
     evidence = {

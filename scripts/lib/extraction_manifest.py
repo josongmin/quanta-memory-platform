@@ -61,17 +61,7 @@ def manifest_digest(manifest: dict[str, Any]) -> str:
     return digest_fields(fields)
 
 
-def path_is_excluded(path: str, excludes: list[str]) -> bool:
-    return any(
-        path == exclude or path.startswith(exclude.rstrip("/") + "/")
-        for exclude in excludes
-    )
-
-
-def build_manifest(
-    repo: Path, revision: str, roots: list[str], excludes: list[str] | None = None
-) -> dict[str, Any]:
-    excludes = excludes or []
+def build_manifest(repo: Path, revision: str, roots: list[str]) -> dict[str, Any]:
     commit = resolve_commit(repo, revision)
     command = ["ls-tree", "-r", "-z", "--full-tree", commit, "--", *roots]
     raw = git(repo, *command).stdout
@@ -82,8 +72,6 @@ def build_manifest(
         metadata, raw_path = record.split(b"\t", 1)
         mode, object_type, oid = metadata.decode().split()
         path = os.fsdecode(raw_path)
-        if path_is_excluded(path, excludes):
-            continue
         if object_type != "blob" or mode not in SUPPORTED_MODES:
             raise ManifestError(
                 f"unsupported extraction entry {os.fsdecode(raw_path)!r}: {mode} {object_type}"
@@ -148,10 +136,7 @@ def verify_destination(manifest: dict[str, Any], destination: Path) -> None:
             raise ManifestError(f"content mismatch for {entry['path']}")
 
 
-def assert_clean(
-    repo: Path, commit: str, roots: list[str], excludes: list[str] | None = None
-) -> None:
-    excludes = excludes or []
+def assert_clean(repo: Path, commit: str, roots: list[str]) -> None:
     if resolve_commit(repo, "HEAD") != commit:
         raise ManifestError(f"source HEAD moved after freeze: expected {commit}")
     result = git(
@@ -166,11 +151,7 @@ def assert_clean(
     )
     if result.returncode != 0:
         raise ManifestError(result.stderr.decode(errors="replace").strip())
-    changed = [
-        os.fsdecode(path)
-        for path in result.stdout.splitlines()
-        if not path_is_excluded(os.fsdecode(path), excludes)
-    ]
+    changed = [os.fsdecode(path) for path in result.stdout.splitlines()]
     if changed:
         raise ManifestError("tracked extraction input differs from frozen HEAD")
 
@@ -183,7 +164,6 @@ def parser() -> argparse.ArgumentParser:
     snapshot.add_argument("--repo", type=Path, required=True)
     snapshot.add_argument("--revision", required=True)
     snapshot.add_argument("--output", type=Path, required=True)
-    snapshot.add_argument("--exclude", action="append", default=[])
     snapshot.add_argument("paths", nargs="+")
 
     verify = subparsers.add_parser("verify")
@@ -193,7 +173,6 @@ def parser() -> argparse.ArgumentParser:
     clean = subparsers.add_parser("assert-clean")
     clean.add_argument("--repo", type=Path, required=True)
     clean.add_argument("--commit", required=True)
-    clean.add_argument("--exclude", action="append", default=[])
     clean.add_argument("paths", nargs="+")
 
     paths = subparsers.add_parser("paths")
@@ -205,9 +184,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     try:
         if args.command == "snapshot":
-            manifest = build_manifest(
-                args.repo.resolve(), args.revision, args.paths, args.exclude
-            )
+            manifest = build_manifest(args.repo.resolve(), args.revision, args.paths)
             args.output.write_text(
                 json.dumps(manifest, sort_keys=True, separators=(",", ":")),
                 encoding="utf-8",
@@ -220,7 +197,7 @@ def main(argv: list[str] | None = None) -> int:
             verify_destination(manifest, args.destination.resolve())
             print(manifest["digest"])
         elif args.command == "assert-clean":
-            assert_clean(args.repo.resolve(), args.commit, args.paths, args.exclude)
+            assert_clean(args.repo.resolve(), args.commit, args.paths)
         elif args.command == "paths":
             manifest = load_manifest(args.manifest)
             for entry in manifest["entries"]:
