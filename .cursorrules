@@ -126,10 +126,11 @@ Run the full rail with `scripts/check-workspace.sh`.
 ## Build & Verification Front Door
 
 Plain `cargo` is the build front door. `scripts/check-workspace.sh` is the only
-repository-wide verification front door. It owns formatting, workspace safety
-policy, Python and extraction contracts, Semgrep regression guards, the Cargo
-feature matrix, workspace tests, isolated feature capability tests, documented
-selector validation, generated-guidance drift, and dependency policy.
+repository-wide verification front door. It owns formatting, shell syntax and
+ShellCheck, resolved workspace-graph and safety policy, Python and extraction
+contracts, Semgrep regression guards, the Cargo feature matrix, workspace
+tests, isolated feature capability tests, documented selector validation,
+generated-guidance drift, and dependency policy.
 
 ```bash
 scripts/check-workspace.sh

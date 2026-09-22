@@ -207,5 +207,5 @@ This repo carries one authoritative verification front door:
   runtime tests, documented-selector validation, prompt-manager tests/drift
   lint, and warning-free `cargo deny`.
 
-The rail requires Python 3.9+, Semgrep, and `cargo-deny`; missing tooling fails
-closed rather than silently skipping a check.
+The rail requires Python 3.9+, ShellCheck, Semgrep, and `cargo-deny`; missing
+tooling fails closed rather than silently skipping a check.

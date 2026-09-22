@@ -8,9 +8,16 @@ echo "[check-workspace] fmt --check"
 cargo fmt --all --check
 
 echo "[check-workspace] shell syntax"
+shell_scripts=()
 while IFS= read -r -d '' script; do
   bash -n "${script}"
+  shell_scripts+=("${script}")
 done < <(find scripts -type f -name '*.sh' -print0)
+if ! command -v shellcheck >/dev/null 2>&1; then
+  echo "check-workspace: shellcheck unavailable" >&2
+  exit 1
+fi
+shellcheck "${shell_scripts[@]}"
 
 echo "[check-workspace] resolved workspace graph"
 cargo metadata --locked --format-version 1 | \

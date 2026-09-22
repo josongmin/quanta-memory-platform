@@ -16,8 +16,8 @@ dependency direction. Not prose: every step is a command or a verifiable gate.
 ## Inputs / Outputs
 
 - Input: this repo (`quanta-memory-platform/`) with committed `Cargo.lock`,
-  pinned `rust-toolchain.toml`, Python 3.9+, and installed `cargo-deny` and
-  `semgrep`.
+  pinned `rust-toolchain.toml`, Python 3.9+, and installed ShellCheck,
+  `cargo-deny`, and `semgrep`.
 - Output: a standalone git repo at `<dest>` that builds in isolation with its
   own repo-local rails, plus a one-line manual rewire on the Semantica host
   adapter manifest.
@@ -59,10 +59,10 @@ dependency direction. Not prose: every step is a command or a verifiable gate.
    scripts/check-workspace.sh
    ```
 
-   The canonical rail requires the lockfile, `semgrep`, and `cargo-deny`; missing
-   tooling fails the extraction. After verification, the script commits the
-   extracted tree and requires `git status --porcelain` to be empty. A failed
-   verification leaves no success commit.
+   The canonical rail requires the lockfile, ShellCheck, `semgrep`, and
+   `cargo-deny`; missing tooling fails the extraction. After verification, the
+   script commits the extracted tree and requires `git status --porcelain` to be
+   empty. A failed verification leaves no success commit.
 
 3. Validate repo-local rails in the extracted repo:
 
@@ -99,7 +99,8 @@ dependency direction. Not prose: every step is a command or a verifiable gate.
   prompt-manager, and dependency checks.
 - Source/extracted tree-bound canonical digests and file modes match, the source
   stays at the frozen clean `HEAD`, and the extracted git worktree is clean.
-- All Cargo resolution is locked; missing Semgrep or cargo-deny fails closed.
+- All Cargo resolution is locked; missing ShellCheck, Semgrep, or cargo-deny
+  fails closed.
 - Qualification runs the fresh actual extraction command directly from a clean,
   frozen source checkout. This repository intentionally has no GitHub Actions
   workflow; a nonexistent remote job is not an acceptance dependency.
