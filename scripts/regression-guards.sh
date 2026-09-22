@@ -23,5 +23,5 @@ fi
 echo "[regression-guards] semgrep ${config}"
 # --error makes any finding non-zero; --strict fails on rule/parse errors.
 semgrep --config "${config}" --error --strict --metrics=off \
-  --disable-version-check --jobs=1 crates/
+  --disable-version-check --jobs=1 --include 'crates/**/*.rs' .
 echo "[regression-guards] semgrep: clean"
