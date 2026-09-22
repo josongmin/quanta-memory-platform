@@ -10,6 +10,9 @@
   moved every portable policy check under `scripts/`, and made feature coverage
   metadata-driven. The guidance generator is now standard-library-only and
   rejects orphan sources, duplicate outputs, path escapes, and drift.
+- Replaced manifest-text dependency checks with a resolved Cargo-graph contract,
+  added shell syntax validation to the canonical rail, and hardened generated
+  guidance against source/output symlink escapes and reserved Git paths.
 
 ## 0.2.0 - 2026-09-21
 

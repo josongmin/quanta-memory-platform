@@ -37,7 +37,13 @@ def _safe_relative_path(value: object, *, field: str, target: str) -> str:
     if not isinstance(value, str) or not value:
         raise PmError(f"target '{target}' {field} must be a non-empty string")
     path = PurePosixPath(value)
-    if path.is_absolute() or ".." in path.parts:
+    if (
+        path.is_absolute()
+        or path == PurePosixPath(".")
+        or ".." in path.parts
+        or path.parts[:1] == (".git",)
+        or path.as_posix() != value
+    ):
         raise PmError(f"target '{target}' {field} escapes its root: {value}")
     return value
 
@@ -69,6 +75,14 @@ def load_targets(targets_path: Path) -> dict[str, Target]:
         safe_sections = tuple(
             _safe_relative_path(section, field="section", target=name) for section in sections
         )
+        if any(
+            PurePosixPath(section).parts[:1] != ("sources",)
+            or PurePosixPath(section).suffix != ".md"
+            for section in safe_sections
+        ):
+            raise PmError(f"target '{name}' sections must be Markdown files under sources/")
+        if len(set(safe_sections)) != len(safe_sections):
+            raise PmError(f"target '{name}' contains duplicate sections")
         if output in outputs:
             raise PmError(f"duplicate generated output: {output}")
         outputs.add(output)
@@ -76,8 +90,15 @@ def load_targets(targets_path: Path) -> dict[str, Target]:
         targets[name] = Target(name, output, title, safe_sections)
 
     source_root = targets_path.parent / "sources"
+    source_paths = list(source_root.rglob("*.md"))
+    symlinked = [path for path in source_paths if path.is_symlink()]
+    if symlinked:
+        rendered = ", ".join(
+            path.relative_to(targets_path.parent).as_posix() for path in symlinked
+        )
+        raise PmError(f"symlinked source file(s) are not allowed: {rendered}")
     actual_sources = {
-        path.relative_to(targets_path.parent).as_posix() for path in source_root.rglob("*.md")
+        path.relative_to(targets_path.parent).as_posix() for path in source_paths
     }
     orphaned = sorted(actual_sources - referenced_sources)
     if orphaned:
@@ -87,8 +108,13 @@ def load_targets(targets_path: Path) -> dict[str, Target]:
 
 def _read_sections(pm_dir: Path, target: Target) -> str:
     chunks: list[str] = []
+    source_root = (pm_dir / "sources").resolve()
     for section in target.sections:
         section_path = pm_dir / section
+        if section_path.is_symlink() or not section_path.resolve().is_relative_to(source_root):
+            raise PmError(
+                f"target '{target.name}': source file escapes sources/: {section_path}"
+            )
         if not section_path.is_file():
             raise PmError(f"target '{target.name}': missing source file {section_path}")
         chunks.append(section_path.read_text(encoding="utf-8").rstrip("\n"))
@@ -100,7 +126,13 @@ def render_target(target: Target, pm_dir: Path = PM_DIR) -> str:
 
 
 def output_path(target: Target, repo_root: Path = REPO_ROOT) -> Path:
-    return repo_root / target.output
+    root = repo_root.resolve()
+    out = repo_root / target.output
+    if out.is_symlink():
+        raise PmError(f"target '{target.name}': generated output may not be a symlink: {out}")
+    if not out.parent.resolve().is_relative_to(root):
+        raise PmError(f"target '{target.name}': generated output escapes repository: {out}")
+    return out
 
 
 def sync_target(target: Target, pm_dir: Path, repo_root: Path) -> Path:

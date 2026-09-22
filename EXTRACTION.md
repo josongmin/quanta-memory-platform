@@ -32,9 +32,9 @@ dependency direction. Not prose: every step is a command or a verifiable gate.
 
    This runs the fail-closed pre-flight:
    - all three member manifests exist,
-   - `core` has no upward dep on facade/testkit,
-   - `facade` has no upward dep on testkit,
-   - no member has a path dep escaping the workspace,
+   - the resolved Cargo graph has no upward core/facade dependency,
+   - the resolved graph contains no host back-edge or local path dependency
+     escaping the workspace, including renamed dependencies,
    - `cargo metadata --locked` resolves without changing the lockfile,
    - the self-hosting extracted file set is present in-source.
 
@@ -94,8 +94,9 @@ dependency direction. Not prose: every step is a command or a verifiable gate.
 
 ## Standalone extraction qualification
 
-- Extracted repo: `scripts/check-workspace.sh` passes. It includes static,
-  contract, test, feature, selector, prompt-manager, and dependency checks.
+- Extracted repo: `scripts/check-workspace.sh` passes. It includes shell syntax,
+  resolved dependency-graph, static, contract, test, feature, selector,
+  prompt-manager, and dependency checks.
 - Source/extracted tree-bound canonical digests and file modes match, the source
   stays at the frozen clean `HEAD`, and the extracted git worktree is clean.
 - All Cargo resolution is locked; missing Semgrep or cargo-deny fails closed.

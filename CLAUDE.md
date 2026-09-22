@@ -120,9 +120,9 @@ fail-closed. A Semgrep exception requires a trailing
 | durable-queue FIFO key taken from an atomic counter OUTSIDE the write txn | derive the next key from the table INSIDE the write transaction (atomic, restart-safe, no skipped/duplicate keys) | review (spill backing) |
 | `a == b` on floats | epsilon / ordered comparison | clippy `float_cmp` |
 | `dbg!(...)` | remove it | clippy `dbg_macro` |
-| `std::fs` / `std::env` / `SystemTime::now` / `Instant::now` in `domain/` or `ports/` | route through a port + adapter; keep domain pure | review, architecture rule |
-| `crate::adapters` imported from `domain/` or `ports/` | depend on the port trait only | review (inward-only) |
-| `facade`/`testkit` named from `core` (or `testkit` from `facade`) | keep `core <- facade <- testkit` | extraction pre-flight, review |
+| `std::fs` / `std::env` / `SystemTime::now` / `Instant::now` in `domain/` or `ports/` | route through a port + adapter; keep domain pure | regression-guards (`qmp-pure-layer-no-fs-env`, `qmp-pure-layer-no-wall-clock`) |
+| `crate::adapters` imported from `domain/` or `ports/` | depend on the port trait only | regression-guards (`qmp-pure-layer-no-adapter-import`) |
+| resolved dependency from `core` to facade/testkit (or facade to testkit), including a renamed dependency | keep `core <- facade <- testkit` | Cargo-metadata graph contract in `check-workspace`, extraction pre-flight |
 | Semantica nouns (`Semantica*`, `quanta_runtime`, `codegraph`) in public API | keep the library host-independent | review + extraction contract |
 | raw broker constructor backdoor in public code | go through the builder-first surface | public API compile-fail tests |
 | stale `V1`/`V2` / old renamed symbols | use the current names | review |

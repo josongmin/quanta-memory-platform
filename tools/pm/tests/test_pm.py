@@ -84,6 +84,45 @@ class PromptManagerTest(unittest.TestCase):
         with self.assertRaisesRegex(pm.PmError, "escapes its root"):
             pm.load_targets(self.targets_path)
 
+    def test_section_outside_sources_is_rejected(self) -> None:
+        config = json.loads(self.targets_path.read_text(encoding="utf-8"))
+        config["targets"]["demo"]["sections"] = ["README.md"]
+        self.targets_path.write_text(json.dumps(config), encoding="utf-8")
+        with self.assertRaisesRegex(pm.PmError, "Markdown files under sources"):
+            pm.load_targets(self.targets_path)
+
+    def test_duplicate_section_is_rejected(self) -> None:
+        config = json.loads(self.targets_path.read_text(encoding="utf-8"))
+        config["targets"]["demo"]["sections"] = ["sources/a.md", "sources/a.md"]
+        self.targets_path.write_text(json.dumps(config), encoding="utf-8")
+        with self.assertRaisesRegex(pm.PmError, "duplicate sections"):
+            pm.load_targets(self.targets_path)
+
+    def test_git_metadata_output_is_rejected(self) -> None:
+        config = json.loads(self.targets_path.read_text(encoding="utf-8"))
+        config["targets"]["demo"]["output"] = ".git/config"
+        self.targets_path.write_text(json.dumps(config), encoding="utf-8")
+        with self.assertRaisesRegex(pm.PmError, "escapes its root"):
+            pm.load_targets(self.targets_path)
+
+    def test_symlinked_source_is_rejected(self) -> None:
+        outside = Path(self.temp.name) / "outside.md"
+        outside.write_text("outside", encoding="utf-8")
+        (self.pm_dir / "sources/link.md").symlink_to(outside)
+        with self.assertRaisesRegex(pm.PmError, "symlinked source"):
+            pm.load_targets(self.targets_path)
+
+    def test_symlinked_output_is_rejected(self) -> None:
+        target = self.target()
+        output = pm.output_path(target, self.repo)
+        output.parent.mkdir(parents=True)
+        outside = Path(self.temp.name) / "outside-output.md"
+        outside.write_text("outside", encoding="utf-8")
+        output.symlink_to(outside)
+        with self.assertRaisesRegex(pm.PmError, "may not be a symlink"):
+            pm.sync_target(target, self.pm_dir, self.repo)
+        self.assertEqual(outside.read_text(encoding="utf-8"), "outside")
+
     def test_drift_states(self) -> None:
         target = self.target()
         self.assertEqual(pm.check_drift(target, self.pm_dir, self.repo), "missing")

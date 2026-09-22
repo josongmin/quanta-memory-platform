@@ -201,10 +201,11 @@ is rejected up front.
 
 This repo carries one authoritative verification front door:
 
-- `scripts/check-workspace.sh` — fmt, workspace safety policy, Python and
-  extraction contracts, Semgrep regression guards, metadata-driven feature
-  matrix, workspace tests, isolated feature runtime tests, documented-selector
-  validation, prompt-manager tests/drift lint, and warning-free `cargo deny`.
+- `scripts/check-workspace.sh` — fmt, shell syntax, resolved Cargo-graph and
+  workspace safety policy, Python and extraction contracts, Semgrep regression
+  guards, metadata-driven feature matrix, workspace tests, isolated feature
+  runtime tests, documented-selector validation, prompt-manager tests/drift
+  lint, and warning-free `cargo deny`.
 
 The rail requires Python 3.9+, Semgrep, and `cargo-deny`; missing tooling fails
 closed rather than silently skipping a check.

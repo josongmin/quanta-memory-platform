@@ -40,6 +40,7 @@ scripts/check-workspace.sh
 
 Regression guards (`scripts/regression-guards.sh`, rules in
 `tools/semgrep/qmp-regressions.yml`) pin bug classes this repo already hit —
-magnitude-to-signed casts, saturate-before-divide ratios, and underflowing
-`fetch_sub`. A flagged-but-safe use needs a trailing
+magnitude-to-signed casts, saturate-before-divide ratios, underflowing
+`fetch_sub`, and direct I/O/clock/adapter access from pure layers. A
+flagged-but-safe use needs a trailing
 `// nosemgrep: <rule-id> -- reason: <…>`.

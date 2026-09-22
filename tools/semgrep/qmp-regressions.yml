@@ -50,3 +50,47 @@ rules:
       `// nosemgrep: qmp-atomic-fetch-sub -- reason: <why>`.
     patterns:
       - pattern: $A.fetch_sub($N, $O)
+
+  - id: qmp-pure-layer-no-fs-env
+    languages: [rust]
+    severity: ERROR
+    message: >-
+      domain/ and ports/ are pure. Route filesystem/environment access through
+      a port implemented by an adapter.
+    paths:
+      include:
+        - /crates/quanta-memory-platform-core/src/domain/**/*.rs
+        - /crates/quanta-memory-platform-core/src/ports/**/*.rs
+    pattern-either:
+      - pattern: std::fs::$FUNC(...)
+      - pattern: std::env::$FUNC(...)
+      - pattern-regex: '(?m)^\s*use\s+std::(?:(?:fs|env)\b|\{[^\n]*(?:fs|env)\b)'
+
+  - id: qmp-pure-layer-no-wall-clock
+    languages: [rust]
+    severity: ERROR
+    message: >-
+      domain/ and ports/ may not read the wall or monotonic clock directly.
+      Inject time through a port.
+    paths:
+      include:
+        - /crates/quanta-memory-platform-core/src/domain/**/*.rs
+        - /crates/quanta-memory-platform-core/src/ports/**/*.rs
+    pattern-either:
+      - pattern: SystemTime::now()
+      - pattern: Instant::now()
+      - pattern: std::time::SystemTime::now()
+      - pattern: std::time::Instant::now()
+
+  - id: qmp-pure-layer-no-adapter-import
+    languages: [rust]
+    severity: ERROR
+    message: >-
+      domain/ and ports/ depend on port traits, never concrete adapters.
+    paths:
+      include:
+        - /crates/quanta-memory-platform-core/src/domain/**/*.rs
+        - /crates/quanta-memory-platform-core/src/ports/**/*.rs
+    pattern-either:
+      - pattern-regex: '(?m)^\s*use\s+crate::adapters(?:::|\s*;)'
+      - pattern: crate::adapters::$FUNC(...)
