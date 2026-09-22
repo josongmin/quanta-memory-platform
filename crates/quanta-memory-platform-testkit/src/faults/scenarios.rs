@@ -156,7 +156,6 @@ pub fn drive_rebuild_race_accepts_write_too_early() -> FaultOutcome {
 #[must_use]
 pub fn drive_spill_failure_after_reservation() -> FaultOutcome {
     let controller = RoutedSpillController::new(InMemorySpillTarget::unavailable());
-<<<<<<< HEAD
     let before = controller.spilled_count();
     let result = controller.spill("spillable-handle".to_string());
     let after = controller.spilled_count();
@@ -168,36 +167,6 @@ pub fn drive_spill_failure_after_reservation() -> FaultOutcome {
             evidence: format!("spill failed ({e}) but inventory proof was {before:?}->{after:?}"),
         },
         (_, Ok(_), _) => FaultOutcome::Escaped {
-=======
-    let handle = "spillable-handle".to_string();
-    let before = controller.spilled_count::<String>();
-    let result = controller.spill(handle.clone());
-    let after = controller.spilled_count::<String>();
-    match (result, before, after) {
-        (Err(failure), Ok(before), Ok(after)) => {
-            let (error, recovered) = failure.into_parts();
-            if before == after && recovered == handle {
-                FaultOutcome::Contained {
-                    evidence: format!(
-                        "spill failed closed ({error}); source authority recovered; spilled_count stayed at {after}"
-                    ),
-                }
-            } else {
-                FaultOutcome::Escaped {
-                    evidence: format!(
-                        "spill failed ({error}) but source/counter drifted: recovered={recovered:?} expected={handle:?} count={before}->{after}"
-                    ),
-                }
-            }
-        }
-        (Err(failure), before, after) => FaultOutcome::Escaped {
-            evidence: format!(
-                "spill failed ({}) but spilled_count observation failed: before={before:?} after={after:?}",
-                failure.error()
-            ),
-        },
-        (Ok(_), _, _) => FaultOutcome::Escaped {
->>>>>>> codex/qmp130-upstream-hardening
             evidence: "spill to an unavailable target reported success".to_string(),
         },
     }
@@ -206,7 +175,6 @@ pub fn drive_spill_failure_after_reservation() -> FaultOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use quanta_memory_platform_facade::{SpillOwnership, SpillReceiptV1, SpillTransferError};
 
     #[test]
     fn reclaim_returns_zero_is_contained() {
@@ -259,7 +227,6 @@ mod tests {
         #[derive(Debug, Default)]
         struct LyingSpillController;
         impl SpillController<String> for LyingSpillController {
-<<<<<<< HEAD
             fn spill(
                 &self,
                 _handle: String,
@@ -268,10 +235,6 @@ mod tests {
                 quanta_memory_platform_facade::SpillFailure<String>,
             > {
                 Ok(quanta_memory_platform_facade::SpillReceipt::InProcess { inventory_after: 0 })
-=======
-            fn spill(&self, _handle: String) -> Result<SpillReceiptV1, SpillTransferError<String>> {
-                Ok(SpillReceiptV1::new(SpillOwnership::InProcessRetained))
->>>>>>> codex/qmp130-upstream-hardening
             }
         }
 

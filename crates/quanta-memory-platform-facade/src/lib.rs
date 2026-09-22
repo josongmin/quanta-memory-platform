@@ -85,40 +85,24 @@ pub use retained_map::{
 #[cfg(all(feature = "revocable_store", feature = "spill"))]
 pub use revocable_store::RevocableSpillHandle;
 #[cfg(feature = "revocable_store")]
-pub use revocable_store::{
-    ReclaimFinalizeError, ReclaimedEntry, RestoreReclaimedError, RevocableStore,
-    RevocableStoreBuilder, SimpleRevocableStore,
-};
+pub use revocable_store::{RevocableStore, RevocableStoreBuilder, SimpleRevocableStore};
 #[cfg(feature = "publish_pipeline")]
 pub use shared::builder::PreparedPublicationServiceBuilder;
 #[cfg(feature = "transcript")]
 pub use shared::builder::SessionTranscriptStoreBuilder;
-#[cfg(all(feature = "spill", feature = "revocable_store"))]
-pub use spill::DurableSpillTransferError;
 #[cfg(feature = "spill")]
 pub use spill::{
-<<<<<<< HEAD
     DurableCommitFailure, DurableRecordId, DurableRecordResolution, DurableRestoreCandidate,
     DurableRestoreController, DurableRestoreOutcome, DurableRestorePhase, DurableRestoreRecovery,
     DurableRestoreTarget, DurableSpillController, DurableSpillTarget, DurableWriteFailure,
     InMemorySpillTarget, InProcessSpillController, InProcessSpillTarget, NoopSpillController,
     ReconciledDurableSpillController, RetainingSpillTarget, RoutedSpillController, SpillController,
     SpillFailure, SpillInventory, SpillReceipt, SpillTarget,
-=======
-    DiscardSpillController, DurableSpillTarget, InMemorySpillTarget, RetainingSpillTarget,
-    RoutedSpillController, SpillController, SpillOwnership, SpillReceiptV1, SpillTarget,
-    SpillTransferError, UnavailableSpillController,
->>>>>>> codex/qmp130-upstream-hardening
 };
 #[cfg(feature = "transcript")]
 pub use transcript_store::{
     SessionTranscriptStore, SimpleSessionTranscriptStore, TranscriptAppendDispositionV1,
     TranscriptAppendErrorV1, TranscriptAppendIdentityV1, TranscriptAppendRequestV1,
-<<<<<<< HEAD
     TranscriptRecordV1, TranscriptRetainDispositionV1, TranscriptRetentionPolicyV2,
     TranscriptRetentionReconfigureErrorV2, TranscriptRetentionStatsV2, TranscriptSnapshotV1,
-=======
-    TranscriptEvidenceStatsV1, TranscriptRecordV1, TranscriptRetainDispositionV1,
-    TranscriptRetentionPolicyV2, TranscriptSnapshotV1,
->>>>>>> codex/qmp130-upstream-hardening
 };

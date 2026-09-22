@@ -4,7 +4,6 @@ use std::sync::Mutex;
 
 use quanta_memory_platform_core::{MemoryError, MemoryResult};
 
-<<<<<<< HEAD
 use crate::spill::{
     DurableCommitFailure, DurableRecordId, DurableRecordResolution, DurableRestoreCandidate,
     DurableRestoreController, DurableRestoreRecovery, DurableSpillController, DurableWriteFailure,
@@ -75,9 +74,6 @@ impl<Handle> std::fmt::Display for SpillFailure<Handle> {
         self.error.fmt(formatter)
     }
 }
-=======
-use crate::spill::{SpillController, SpillOwnership, SpillReceiptV1, SpillTransferError};
->>>>>>> codex/qmp130-upstream-hardening
 
 /// A destination a spillable handle can be flushed to — and restored from.
 ///
@@ -89,7 +85,6 @@ use crate::spill::{SpillController, SpillOwnership, SpillReceiptV1, SpillTransfe
 /// `restore` makes spill a two-way tier instead of write-only: a target that
 /// merely offloads-and-forgets (eviction) keeps the default `Ok(None)`, while a
 /// retaining target ([`RetainingSpillTarget`]) returns spilled handles in order.
-<<<<<<< HEAD
 pub trait SpillInventory {
     /// Canonical current inventory, including persisted records from earlier
     /// process lifetimes.
@@ -97,25 +92,11 @@ pub trait SpillInventory {
 }
 
 pub trait SpillTarget<Handle>: SpillInventory {
-=======
-pub trait SpillTarget<Handle> {
-    /// Ownership level established by a successful commit.
-    fn ownership(&self) -> SpillOwnership;
-
->>>>>>> codex/qmp130-upstream-hardening
     /// Whether the target can currently accept a spill.
     fn is_available(&self) -> bool;
 
     /// Accept the spilled handle. Only called when [`Self::is_available`] is true.
-<<<<<<< HEAD
     fn accept(&self, handle: Handle) -> Result<SpillReceipt, SpillFailure<Handle>>;
-=======
-    fn accept(&self, handle: Handle) -> Result<SpillReceiptV1, SpillTransferError<Handle>>;
-
-    /// Current committed destination inventory. Controllers delegate telemetry
-    /// to the destination so reopen cannot reset it to zero.
-    fn inventory_count(&self) -> MemoryResult<u64>;
->>>>>>> codex/qmp130-upstream-hardening
 
     /// Restore the next previously spilled handle (oldest first).
     ///
@@ -134,7 +115,6 @@ pub trait SpillTarget<Handle> {
     }
 }
 
-<<<<<<< HEAD
 /// Marker for targets that retain the exact handle in process and therefore
 /// return [`SpillReceipt::InProcess`] on success.
 pub trait InProcessSpillTarget<Handle>:
@@ -173,62 +153,6 @@ pub struct NoopSpillController;
 impl<Handle> SpillController<Handle> for NoopSpillController {
     fn spill(&self, handle: Handle) -> Result<SpillReceipt, SpillFailure<Handle>> {
         Err(SpillFailure::new(MemoryError::capacity("spill target not configured"), handle))
-=======
-pub(crate) mod sealed {
-    pub trait DurableSpillTargetSealed {}
-}
-
-/// Sealed marker for targets whose successful receipt means the handle survived
-/// a durable commit. In-process and downstream targets cannot opt into source
-/// release without repository-owned conformance.
-pub trait DurableSpillTarget<Handle>:
-    SpillTarget<Handle> + sealed::DurableSpillTargetSealed
-{
-}
-
-#[cfg(feature = "revocable_store")]
-#[derive(Debug)]
-pub struct DurableSpillTransferError<Key, Value> {
-    error: MemoryError,
-    entry: Box<crate::revocable_store::ReclaimedEntry<Key, Value>>,
-}
-
-#[cfg(feature = "revocable_store")]
-impl<Key, Value> DurableSpillTransferError<Key, Value> {
-    #[must_use]
-    pub fn error(&self) -> &MemoryError {
-        &self.error
-    }
-
-    #[must_use]
-    pub fn into_parts(self) -> (MemoryError, crate::revocable_store::ReclaimedEntry<Key, Value>) {
-        (self.error, *self.entry)
-    }
-}
-
-/// Explicitly unavailable spill controller. It never reports successful
-/// persistence and always returns the original handle.
-#[derive(Clone, Debug, Default)]
-pub struct UnavailableSpillController;
-
-impl<Handle> SpillController<Handle> for UnavailableSpillController {
-    fn spill(&self, handle: Handle) -> Result<SpillReceiptV1, SpillTransferError<Handle>> {
-        Err(SpillTransferError::new(
-            MemoryError::capacity("spill target is not configured"),
-            handle,
-        ))
-    }
-}
-
-/// Explicit destructive eviction. Success is typed as `Discarded` and makes no
-/// restore or persistence claim.
-#[derive(Clone, Debug, Default)]
-pub struct DiscardSpillController;
-
-impl<Handle> SpillController<Handle> for DiscardSpillController {
-    fn spill(&self, _handle: Handle) -> Result<SpillReceiptV1, SpillTransferError<Handle>> {
-        Ok(SpillReceiptV1::new(SpillOwnership::Discarded))
->>>>>>> codex/qmp130-upstream-hardening
     }
 }
 
@@ -251,7 +175,6 @@ impl<T> RoutedSpillController<T> {
         Self { target }
     }
 
-<<<<<<< HEAD
     /// Current authoritative inventory, including records opened from a
     /// previous process lifetime.
     pub fn spilled_count(&self) -> MemoryResult<u64>
@@ -259,59 +182,6 @@ impl<T> RoutedSpillController<T> {
         T: SpillInventory,
     {
         self.target.retained_count()
-=======
-    /// Current destination inventory, including durable rows recovered after a
-    /// process restart.
-    pub fn spilled_count<Handle>(&self) -> MemoryResult<u64>
-    where
-        T: SpillTarget<Handle>,
-    {
-        self.target.inventory_count()
-    }
-}
-
-#[cfg(feature = "revocable_store")]
-impl<T> RoutedSpillController<T> {
-    /// Commit a serialized copy to a durable tier while the source entry still
-    /// owns its live accounting lease. Only after the durable receipt exists is
-    /// the source authority dropped and released. Encoding or destination
-    /// failure returns the complete source entry unchanged.
-    pub fn spill_reclaimed_durable<Key, Value, Encode>(
-        &self,
-        entry: crate::revocable_store::ReclaimedEntry<Key, Value>,
-        encode: Encode,
-    ) -> Result<SpillReceiptV1, DurableSpillTransferError<Key, Value>>
-    where
-        T: DurableSpillTarget<Vec<u8>>,
-        Encode: FnOnce(&Key, &Value) -> MemoryResult<Vec<u8>>,
-    {
-        let payload = match encode(entry.key(), entry.value()) {
-            Ok(payload) => payload,
-            Err(error) => return Err(DurableSpillTransferError { error, entry: Box::new(entry) }),
-        };
-        match self.spill(payload) {
-            Ok(receipt) => {
-                if receipt.ownership() != SpillOwnership::DurableCommitted {
-                    return Err(DurableSpillTransferError {
-                        error: MemoryError::InvalidState(
-                            "durable spill target returned a non-durable receipt".to_string(),
-                        ),
-                        entry: Box::new(entry),
-                    });
-                }
-                // ManagedCharge::drop releases immediately or defers exact
-                // release through its issuing broker. It can never create an
-                // uncharged source-resident interval before destination commit.
-                drop(entry);
-                Ok(receipt)
-            }
-            Err(failure) => {
-                let (error, payload) = failure.into_parts();
-                drop(payload);
-                Err(DurableSpillTransferError { error, entry: Box::new(entry) })
-            }
-        }
->>>>>>> codex/qmp130-upstream-hardening
     }
 }
 
@@ -319,15 +189,9 @@ impl<Handle, T> SpillController<Handle> for RoutedSpillController<T>
 where
     T: SpillTarget<Handle>,
 {
-<<<<<<< HEAD
     fn spill(&self, handle: Handle) -> Result<SpillReceipt, SpillFailure<Handle>> {
         if !self.target.is_available() {
             return Err(SpillFailure::new(
-=======
-    fn spill(&self, handle: Handle) -> Result<SpillReceiptV1, SpillTransferError<Handle>> {
-        if !self.target.is_available() {
-            return Err(SpillTransferError::new(
->>>>>>> codex/qmp130-upstream-hardening
                 MemoryError::capacity("spill target unavailable"),
                 handle,
             ));
@@ -336,7 +200,6 @@ where
     }
 
     fn restore(&self) -> MemoryResult<Option<Handle>> {
-<<<<<<< HEAD
         self.target.restore()
     }
 }
@@ -424,10 +287,6 @@ where
 
     fn recover_active_restore(&self) -> MemoryResult<Option<DurableRestoreRecovery>> {
         self.target.recover_active_restore()
-=======
-        let restored = self.target.restore()?;
-        Ok(restored)
->>>>>>> codex/qmp130-upstream-hardening
     }
 }
 
@@ -488,23 +347,13 @@ impl<Handle> InMemorySpillTarget<Handle> {
 }
 
 impl<Handle> SpillTarget<Handle> for InMemorySpillTarget<Handle> {
-    fn ownership(&self) -> SpillOwnership {
-        SpillOwnership::InProcessRetained
-    }
-
     fn is_available(&self) -> bool {
         self.available.load(Ordering::SeqCst)
     }
 
-<<<<<<< HEAD
     fn accept(&self, handle: Handle) -> Result<SpillReceipt, SpillFailure<Handle>> {
         if !self.available.load(Ordering::SeqCst) {
             return Err(SpillFailure::new(
-=======
-    fn accept(&self, handle: Handle) -> Result<SpillReceiptV1, SpillTransferError<Handle>> {
-        if !self.available.load(Ordering::SeqCst) {
-            return Err(SpillTransferError::new(
->>>>>>> codex/qmp130-upstream-hardening
                 MemoryError::capacity("spill target unavailable at accept time"),
                 handle,
             ));
@@ -515,7 +364,6 @@ impl<Handle> SpillTarget<Handle> for InMemorySpillTarget<Handle> {
         let mut store = match self.store.lock() {
             Ok(store) => store,
             Err(_) => {
-<<<<<<< HEAD
                 return Err(SpillFailure::new(MemoryError::poisoned("spill target store"), handle));
             }
         };
@@ -524,30 +372,13 @@ impl<Handle> SpillTarget<Handle> for InMemorySpillTarget<Handle> {
             None => {
                 return Err(SpillFailure::new(
                     MemoryError::capacity("spill inventory exceeds u64"),
-=======
-                return Err(SpillTransferError::new(
-                    MemoryError::InvalidState("spill target store poisoned".to_string()),
->>>>>>> codex/qmp130-upstream-hardening
                     handle,
                 ));
             }
         };
         store.push_back(handle);
         self.accepted.fetch_add(1, Ordering::SeqCst);
-<<<<<<< HEAD
         Ok(SpillReceipt::InProcess { inventory_after })
-=======
-        Ok(SpillReceiptV1::new(self.ownership()))
-    }
-
-    fn inventory_count(&self) -> MemoryResult<u64> {
-        let len = self
-            .store
-            .lock()
-            .map_err(|_| MemoryError::InvalidState("spill target store poisoned".to_string()))?
-            .len();
-        u64::try_from(len).map_err(|_| MemoryError::capacity("spill inventory count overflow"))
->>>>>>> codex/qmp130-upstream-hardening
     }
 
     fn restore(&self) -> MemoryResult<Option<Handle>> {
@@ -609,23 +440,13 @@ impl<Handle> RetainingSpillTarget<Handle> {
 }
 
 impl<Handle> SpillTarget<Handle> for RetainingSpillTarget<Handle> {
-    fn ownership(&self) -> SpillOwnership {
-        SpillOwnership::InProcessRetained
-    }
-
     fn is_available(&self) -> bool {
         self.available.load(Ordering::SeqCst)
     }
 
-<<<<<<< HEAD
     fn accept(&self, handle: Handle) -> Result<SpillReceipt, SpillFailure<Handle>> {
         if !self.available.load(Ordering::SeqCst) {
             return Err(SpillFailure::new(
-=======
-    fn accept(&self, handle: Handle) -> Result<SpillReceiptV1, SpillTransferError<Handle>> {
-        if !self.available.load(Ordering::SeqCst) {
-            return Err(SpillTransferError::new(
->>>>>>> codex/qmp130-upstream-hardening
                 MemoryError::capacity("spill target unavailable at accept time"),
                 handle,
             ));
@@ -633,7 +454,6 @@ impl<Handle> SpillTarget<Handle> for RetainingSpillTarget<Handle> {
         let mut store = match self.store.lock() {
             Ok(store) => store,
             Err(_) => {
-<<<<<<< HEAD
                 return Err(SpillFailure::new(MemoryError::poisoned("spill target store"), handle));
             }
         };
@@ -642,29 +462,12 @@ impl<Handle> SpillTarget<Handle> for RetainingSpillTarget<Handle> {
             None => {
                 return Err(SpillFailure::new(
                     MemoryError::capacity("spill inventory exceeds u64"),
-=======
-                return Err(SpillTransferError::new(
-                    MemoryError::InvalidState("spill target store poisoned".to_string()),
->>>>>>> codex/qmp130-upstream-hardening
                     handle,
                 ));
             }
         };
         store.push_back(handle);
-<<<<<<< HEAD
         Ok(SpillReceipt::InProcess { inventory_after })
-=======
-        Ok(SpillReceiptV1::new(self.ownership()))
-    }
-
-    fn inventory_count(&self) -> MemoryResult<u64> {
-        let len = self
-            .store
-            .lock()
-            .map_err(|_| MemoryError::InvalidState("spill target store poisoned".to_string()))?
-            .len();
-        u64::try_from(len).map_err(|_| MemoryError::capacity("spill inventory count overflow"))
->>>>>>> codex/qmp130-upstream-hardening
     }
 
     fn restore(&self) -> MemoryResult<Option<Handle>> {
@@ -739,17 +542,11 @@ mod tests {
     #[test]
     fn routed_spill_to_available_target_succeeds_and_counts() {
         let controller = RoutedSpillController::new(InMemorySpillTarget::available());
-<<<<<<< HEAD
         let first = controller.spill("handle-1".to_string()).expect("spill to available");
         let second = controller.spill("handle-2".to_string()).expect("spill again");
         assert_eq!(first, SpillReceipt::InProcess { inventory_after: 1 });
         assert_eq!(second, SpillReceipt::InProcess { inventory_after: 2 });
         assert_eq!(controller.spilled_count(), Ok(2));
-=======
-        controller.spill("handle-1".to_string()).expect("spill to available");
-        controller.spill("handle-2".to_string()).expect("spill again");
-        assert_eq!(controller.spilled_count::<String>().expect("count"), 2);
->>>>>>> codex/qmp130-upstream-hardening
     }
 
     /// A target that reports available but whose `accept` always fails — drives the
@@ -758,14 +555,9 @@ mod tests {
     struct AcceptFailingTarget;
 
     impl<Handle> SpillTarget<Handle> for AcceptFailingTarget {
-        fn ownership(&self) -> SpillOwnership {
-            SpillOwnership::InProcessRetained
-        }
-
         fn is_available(&self) -> bool {
             true // passes the controller's guard...
         }
-<<<<<<< HEAD
         fn accept(&self, handle: Handle) -> Result<SpillReceipt, SpillFailure<Handle>> {
             Err(SpillFailure::new(MemoryError::capacity("accept always fails"), handle))
         }
@@ -773,14 +565,6 @@ mod tests {
 
     impl SpillInventory for AcceptFailingTarget {
         fn retained_count(&self) -> MemoryResult<u64> {
-=======
-
-        fn accept(&self, handle: Handle) -> Result<SpillReceiptV1, SpillTransferError<Handle>> {
-            Err(SpillTransferError::new(MemoryError::capacity("accept always fails"), handle))
-        }
-
-        fn inventory_count(&self) -> MemoryResult<u64> {
->>>>>>> codex/qmp130-upstream-hardening
             Ok(0)
         }
     }
@@ -794,24 +578,11 @@ mod tests {
             matches!(&r, Err(failure) if matches!(failure.error(), MemoryError::Capacity(_))),
             "accept failure surfaces, got {r:?}"
         );
-<<<<<<< HEAD
         assert_eq!(r.expect_err("accept denied").into_parts().1, "h");
         assert_eq!(controller.spilled_count(), Ok(0), "a failed spill counts nothing");
         // Repeated failures never drift the count or wrap it negative.
         let _ = controller.spill("h2".to_string());
         assert_eq!(controller.spilled_count(), Ok(0), "inventory is stable");
-=======
-        let (_, recovered) = r.expect_err("failure").into_parts();
-        assert_eq!(recovered, "h", "a failed spill returns source recovery authority");
-        assert_eq!(
-            controller.spilled_count::<String>().expect("count"),
-            0,
-            "a failed spill counts nothing"
-        );
-        // Repeated failures never drift the count or wrap it negative.
-        let _ = controller.spill("h2".to_string());
-        assert_eq!(controller.spilled_count::<String>().expect("count"), 0);
->>>>>>> codex/qmp130-upstream-hardening
     }
 
     #[test]
@@ -825,15 +596,9 @@ mod tests {
         );
         assert_eq!(err.into_parts().1, "handle");
         assert_eq!(
-<<<<<<< HEAD
             controller.spilled_count(),
             Ok(0),
             "a failed spill must not change target inventory"
-=======
-            controller.spilled_count::<String>().expect("count"),
-            0,
-            "a failed spill must not increment the spilled count"
->>>>>>> codex/qmp130-upstream-hardening
         );
     }
 
@@ -842,18 +607,12 @@ mod tests {
         // Positive / negative pair over the same controller type, differing only in
         // target availability (the one core condition).
         let online = RoutedSpillController::new(InMemorySpillTarget::available());
-<<<<<<< HEAD
         let _receipt = online.spill(1u32).expect("online spill ok");
         assert_eq!(online.spilled_count(), Ok(1));
-=======
-        online.spill(1u32).expect("online spill ok");
-        assert_eq!(online.spilled_count::<u32>().expect("count"), 1);
->>>>>>> codex/qmp130-upstream-hardening
 
         let offline = RoutedSpillController::new(InMemorySpillTarget::unavailable());
         let err = offline.spill(2u32).expect_err("offline rejects");
         assert!(matches!(err.error(), MemoryError::Capacity(_)), "got {err:?}");
-<<<<<<< HEAD
         assert_eq!(err.into_parts().1, 2);
         assert_eq!(offline.spilled_count(), Ok(0));
     }
@@ -865,27 +624,6 @@ mod tests {
             .expect_err("Noop is not persistence");
         assert!(matches!(failure.error(), MemoryError::Capacity(_)));
         assert_eq!(failure.into_parts().1, "anything");
-=======
-        assert_eq!(offline.spilled_count::<u32>().expect("count"), 0);
-    }
-
-    #[test]
-    fn unavailable_controller_fails_and_returns_the_handle() {
-        let controller = UnavailableSpillController;
-        let failure = SpillController::spill(&controller, "anything".to_string())
-            .expect_err("unconfigured spill must fail");
-        let (error, handle) = failure.into_parts();
-        assert!(matches!(error, MemoryError::Capacity(_)));
-        assert_eq!(handle, "anything");
-    }
-
-    #[test]
-    fn discard_controller_has_explicit_discard_receipt() {
-        let controller = DiscardSpillController;
-        let receipt =
-            SpillController::spill(&controller, "anything".to_string()).expect("explicit discard");
-        assert_eq!(receipt.ownership(), SpillOwnership::Discarded);
->>>>>>> codex/qmp130-upstream-hardening
     }
 
     #[test]
@@ -895,31 +633,23 @@ mod tests {
         // the target inventory byte-for-byte unchanged. Capture it before the
         // denied op and assert the same authoritative value afterward.
         let controller = RoutedSpillController::new(InMemorySpillTarget::available());
-<<<<<<< HEAD
         let _receipt = controller.spill("first".to_string()).expect("first spill ok");
         assert_eq!(controller.spilled_count(), Ok(1));
-=======
-        controller.spill("first".to_string()).expect("first spill ok");
-        assert_eq!(controller.spilled_count::<String>().expect("count"), 1);
->>>>>>> codex/qmp130-upstream-hardening
 
         // The controller owns the target by value; take availability offline by
         // building a fresh offline controller representing the same transition path.
         // (RoutedSpillController moves the target, so we model the offline state on a
         // separate controller and assert the denied op is inert.)
         let offline = RoutedSpillController::new(InMemorySpillTarget::unavailable());
-        let count_before = offline.spilled_count::<String>().expect("count");
+        let count_before = offline.spilled_count();
         let denied = offline.spill("blocked".to_string());
         assert!(
             matches!(&denied, Err(failure) if matches!(failure.error(), MemoryError::Capacity(_))),
             "got {denied:?}"
         );
-<<<<<<< HEAD
         assert_eq!(denied.expect_err("offline").into_parts().1, "blocked");
-=======
->>>>>>> codex/qmp130-upstream-hardening
         assert_eq!(
-            offline.spilled_count::<String>().expect("count"),
+            offline.spilled_count(),
             count_before,
             "a denied spill must not advance target inventory"
         );
@@ -933,10 +663,7 @@ mod tests {
         target.set_available(false);
         let err = SpillTarget::accept(&target, 2u32).expect_err("accept while offline must fail");
         assert!(matches!(err.error(), MemoryError::Capacity(_)), "got {err:?}");
-<<<<<<< HEAD
         assert_eq!(err.into_parts().1, 2);
-=======
->>>>>>> codex/qmp130-upstream-hardening
         assert_eq!(target.accepted_count(), 1, "rejected accept must not increment count");
     }
 
@@ -1028,12 +755,8 @@ mod tests {
         let target = RetainingSpillTarget::<u32>::unavailable();
         let err = SpillTarget::accept(&target, 1u32).expect_err("offline accept rejected");
         assert!(matches!(err.error(), MemoryError::Capacity(_)), "got {err:?}");
-<<<<<<< HEAD
         assert_eq!(err.into_parts().1, 1);
         assert_eq!(target.retained_count(), Ok(0), "rejected accept retains nothing");
-=======
-        assert_eq!(target.retained_count(), 0, "rejected accept retains nothing");
->>>>>>> codex/qmp130-upstream-hardening
     }
 
     // ---- LSP: both SpillTarget impls honor the SAME offline-restore contract ----
@@ -1081,33 +804,18 @@ mod tests {
     #[test]
     fn routed_controller_spill_then_restore_balances_the_spilled_count() {
         let controller = RoutedSpillController::new(RetainingSpillTarget::available());
-<<<<<<< HEAD
         let _first = controller.spill("h1".to_string()).expect("spill 1");
         let _second = controller.spill("h2".to_string()).expect("spill 2");
         assert_eq!(controller.spilled_count(), Ok(2));
-=======
-        controller.spill("h1".to_string()).expect("spill 1");
-        controller.spill("h2".to_string()).expect("spill 2");
-        assert_eq!(controller.spilled_count::<String>().expect("count"), 2);
->>>>>>> codex/qmp130-upstream-hardening
 
         // Each restore pulls a handle back and changes canonical target inventory.
         assert_eq!(controller.restore().expect("restore 1"), Some("h1".to_string()));
-<<<<<<< HEAD
         assert_eq!(controller.spilled_count(), Ok(1));
         assert_eq!(controller.restore().expect("restore 2"), Some("h2".to_string()));
         assert_eq!(controller.spilled_count(), Ok(0));
         // Draining past empty is inert and never underflows the count.
         assert_eq!(controller.restore().expect("restore empty"), None);
         assert_eq!(controller.spilled_count(), Ok(0));
-=======
-        assert_eq!(controller.spilled_count::<String>().expect("count"), 1);
-        assert_eq!(controller.restore().expect("restore 2"), Some("h2".to_string()));
-        assert_eq!(controller.spilled_count::<String>().expect("count"), 0);
-        // Draining past empty is inert and never underflows the count.
-        assert_eq!(controller.restore().expect("restore empty"), None);
-        assert_eq!(controller.spilled_count::<String>().expect("count"), 0);
->>>>>>> codex/qmp130-upstream-hardening
     }
 
     #[test]
@@ -1131,35 +839,19 @@ mod tests {
             h.join().expect("thread panicked");
         }
         let total = u64::from(threads * per_thread);
-<<<<<<< HEAD
         assert_eq!(controller.spilled_count(), Ok(total), "every concurrent spill counted once");
-=======
-        assert_eq!(
-            controller.spilled_count::<String>().expect("count"),
-            total,
-            "every concurrent spill counted once"
-        );
->>>>>>> codex/qmp130-upstream-hardening
 
         let mut drained = 0u64;
         while controller.restore().expect("restore").is_some() {
             drained += 1;
         }
         assert_eq!(drained, total, "all spilled handles restored");
-<<<<<<< HEAD
         assert_eq!(controller.spilled_count(), Ok(0), "count balances to 0 after a full drain");
-=======
-        assert_eq!(
-            controller.spilled_count::<String>().expect("count"),
-            0,
-            "count balances to 0 after a full drain"
-        );
->>>>>>> codex/qmp130-upstream-hardening
     }
 
     #[test]
-    fn unavailable_controller_restore_is_none() {
-        let controller = UnavailableSpillController;
-        assert_eq!(SpillController::<u32>::restore(&controller).expect("empty restore"), None);
+    fn noop_controller_restore_is_none() {
+        let controller = NoopSpillController;
+        assert_eq!(SpillController::<u32>::restore(&controller).expect("noop restore"), None);
     }
 }

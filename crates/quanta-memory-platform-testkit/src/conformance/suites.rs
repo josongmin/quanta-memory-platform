@@ -1273,20 +1273,14 @@ fn spill_round_trip_verdict<T: SpillTarget<String>>(
     let spill_ok = online.spill("handle-a".to_string());
     // Capture inventory BETWEEN spill and restore: a target that drops the handle
     // would survive an "after == 0" check alone. The round-trip must go 1 -> 0.
-    let before_restore = online.spilled_count::<String>();
+    let before_restore = online.spilled_count();
     let restore = online.restore();
-    let after = online.spilled_count::<String>();
+    let after = online.spilled_count();
     spill.assert_that(
         spill_ok.is_ok()
-<<<<<<< HEAD
             && before_restore == Ok(1)
             && matches!(&restore, Ok(Some(handle)) if handle == "handle-a")
             && after == Ok(0),
-=======
-            && matches!(before_restore, Ok(1))
-            && matches!(&restore, Ok(Some(handle)) if handle == "handle-a")
-            && matches!(after, Ok(0)),
->>>>>>> codex/qmp130-upstream-hardening
         format!(
             "spill_ok={spill_ok:?} before_restore={before_restore:?} restore={restore:?} after={after:?}"
         ),
@@ -1305,22 +1299,14 @@ fn run_spill_slice() -> Vec<AssertionVerdict> {
 
     let offline = RoutedSpillController::new(InMemorySpillTarget::unavailable());
     let spill_denied = offline.spill("handle-b".to_string());
-    let offline_spilled_after = offline.spilled_count::<String>();
+    let offline_spilled_after = offline.spilled_count();
 
     vec![
         round_trip,
         fail_closed.assert_that(
-<<<<<<< HEAD
             matches!(&spill_denied, Err(failure) if matches!(failure.error(), MemoryError::Capacity(_)) && failure.handle() == "handle-b")
                 && offline_spilled_after == Ok(0),
             format!("spill_denied={spill_denied:?} offline_spilled_after={offline_spilled_after:?}",),
-=======
-            matches!(&spill_denied, Err(failure) if matches!(failure.error(), MemoryError::Capacity(_)))
-                && matches!(offline_spilled_after, Ok(0)),
-            format!(
-                "spill_denied={spill_denied:?} offline_spilled_after={offline_spilled_after:?}",
-            ),
->>>>>>> codex/qmp130-upstream-hardening
         ),
     ]
 }
@@ -1337,15 +1323,10 @@ mod tests {
         ResidencyPolicy, ResourceGroup, StoreBindingHandle,
     };
     use quanta_memory_platform_facade::MemoryPlatformBuilder;
-<<<<<<< HEAD
     use std::sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex,
     };
-=======
-    #[cfg(feature = "fixtures")]
-    use quanta_memory_platform_facade::{SpillOwnership, SpillReceiptV1, SpillTransferError};
->>>>>>> codex/qmp130-upstream-hardening
 
     fn all_held(verdicts: &[AssertionVerdict]) -> bool {
         verdicts.iter().all(AssertionVerdict::held)
@@ -2947,14 +2928,9 @@ mod tests {
 
     #[cfg(feature = "fixtures")]
     impl quanta_memory_platform_facade::SpillTarget<String> for DroppingSpillTarget {
-        fn ownership(&self) -> SpillOwnership {
-            SpillOwnership::InProcessRetained
-        }
-
         fn is_available(&self) -> bool {
             true
         }
-<<<<<<< HEAD
         fn accept(
             &self,
             _handle: String,
@@ -2963,15 +2939,6 @@ mod tests {
             quanta_memory_platform_facade::SpillFailure<String>,
         > {
             Ok(quanta_memory_platform_facade::SpillReceipt::InProcess { inventory_after: 0 })
-=======
-
-        fn accept(&self, _handle: String) -> Result<SpillReceiptV1, SpillTransferError<String>> {
-            Ok(SpillReceiptV1::new(SpillOwnership::InProcessRetained))
-        }
-
-        fn inventory_count(&self) -> MemoryResult<u64> {
-            Ok(0)
->>>>>>> codex/qmp130-upstream-hardening
         }
         // restore uses the trait default -> always Ok(None): nothing comes back.
     }

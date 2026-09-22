@@ -1,9 +1,7 @@
 //! Durable spill backing over `redb` (opt-in `spill-redb` feature).
 //!
 //! `RedbSpillBacking` is a durable [`SpillTarget`] for the spill slice: it stores
-//! spilled handles (opaque `Vec<u8>`) in a `redb` table. Raw restore fails
-//! closed until an accounting-aware reverse-transfer coordinator owns the
-//! destination admission and source removal transaction.
+//! spilled handles (opaque `Vec<u8>`) in a `redb` table and restores them FIFO.
 //! It is reached ONLY through the `SpillTarget` abstraction — the raw `redb`
 //! database handle and `redb`'s error/types never appear in the facade's public
 //! surface (boundary rule: no backing-specific nouns leak out of the slice).
@@ -15,16 +13,11 @@ use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use quanta_memory_platform_core::{MemoryError, MemoryResult};
 use redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition};
 
-<<<<<<< HEAD
 use crate::spill::service::ReconciledDurableSpillTarget;
 use crate::spill::{
     DurableCommitFailure, DurableRecordId, DurableRecordResolution, DurableRestoreCandidate,
     DurableRestorePhase, DurableRestoreRecovery, DurableRestoreTarget, DurableSpillTarget,
     DurableWriteFailure, SpillFailure, SpillInventory, SpillReceipt, SpillTarget,
-=======
-use crate::spill::{
-    DurableSpillTarget, SpillOwnership, SpillReceiptV1, SpillTarget, SpillTransferError,
->>>>>>> codex/qmp130-upstream-hardening
 };
 
 /// The single FIFO queue table: monotonic sequence -> opaque handle bytes.
@@ -219,17 +212,12 @@ impl RedbSpillBacking {
 }
 
 impl SpillTarget<Vec<u8>> for RedbSpillBacking {
-    fn ownership(&self) -> SpillOwnership {
-        SpillOwnership::DurableCommitted
-    }
-
     fn is_available(&self) -> bool {
         // A durable on-disk tier is always available within the process; per-op
         // backend errors surface as typed `Err` from accept/restore.
         true
     }
 
-<<<<<<< HEAD
     fn accept(&self, handle: Vec<u8>) -> Result<SpillReceipt, SpillFailure<Vec<u8>>> {
         Err(SpillFailure::new(
             MemoryError::Unsupported(
@@ -886,63 +874,8 @@ impl DurableRestoreTarget for RedbSpillBacking {
         Err(MemoryError::InvalidState(format!(
             "active restore {sequence} has neither queued nor recovery payload"
         )))
-=======
-    fn accept(&self, handle: Vec<u8>) -> Result<SpillReceiptV1, SpillTransferError<Vec<u8>>> {
-        let commit = (|| -> MemoryResult<()> {
-            let txn = self
-                .database
-                .begin_write()
-                .map_err(|e| MemoryError::report(format!("redb spill write txn failed: {e}")))?;
-            {
-                let mut table = txn.open_table(SPILL_QUEUE).map_err(|e| {
-                    MemoryError::report(format!("redb spill table open failed: {e}"))
-                })?;
-                // Derive the next FIFO key INSIDE the write transaction (redb serializes
-                // writers), so sequence assignment + insert are atomic: concurrent
-                // accepts stay strictly FIFO and a failed/rolled-back txn burns no key
-                // (the table itself is the single source of truth, also restart-safe).
-                let last_key = table
-                    .last()
-                    .map_err(|e| MemoryError::report(format!("redb spill scan failed: {e}")))?
-                    .map(|(k, _)| k.value());
-                // `checked_add` is the single guard: an exhausted keyspace (last key ==
-                // u64::MAX) would otherwise reuse the key and OVERWRITE a retained
-                // handle. Reject it fail-closed (astronomically unreachable) rather than
-                // losing a handle.
-                let next = match last_key {
-                    Some(k) => k.checked_add(1).ok_or_else(|| {
-                        MemoryError::capacity("redb spill queue key space exhausted (u64::MAX)")
-                    })?,
-                    None => 0,
-                };
-                table
-                    .insert(next, handle.as_slice())
-                    .map_err(|e| MemoryError::report(format!("redb spill insert failed: {e}")))?;
-            }
-            txn.commit()
-                .map_err(|e| MemoryError::report(format!("redb spill commit failed: {e}")))?;
-            Ok(())
-        })();
-        match commit {
-            Ok(()) => Ok(SpillReceiptV1::new(SpillOwnership::DurableCommitted)),
-            Err(error) => Err(SpillTransferError::new(error, handle)),
-        }
-    }
-
-    fn inventory_count(&self) -> MemoryResult<u64> {
-        self.retained_count()
-    }
-
-    fn restore(&self) -> MemoryResult<Option<Vec<u8>>> {
-        Err(MemoryError::InvalidState(
-            "durable restore requires an accounting-aware reverse-transfer coordinator".to_string(),
-        ))
->>>>>>> codex/qmp130-upstream-hardening
     }
 }
-
-impl DurableSpillTarget<Vec<u8>> for RedbSpillBacking {}
-impl crate::spill::service::sealed::DurableSpillTargetSealed for RedbSpillBacking {}
 
 #[cfg(test)]
 mod tests {
@@ -1024,7 +957,7 @@ mod tests {
     }
 
     #[test]
-    fn durable_spill_target_commits_without_exposing_unaccounted_restore() {
+    fn durable_spill_target_round_trips_fifo_through_the_trait() {
         let path = temp_db_path();
         let _ = std::fs::remove_file(&path);
         let backing = RedbSpillBacking::create(&path).expect("open");
@@ -1036,15 +969,10 @@ mod tests {
         assert_eq!(second, SpillReceipt::Durable { sequence: 1, inventory_after: 2 });
         assert_eq!(backing.retained_count().expect("len"), 2);
 
-<<<<<<< HEAD
         assert_eq!(restore_backing(&backing).expect("r1"), Some(b"first".to_vec()));
         assert_eq!(restore_backing(&backing).expect("r2"), Some(b"second".to_vec()));
         assert_eq!(restore_backing(&backing).expect("drained"), None);
         assert_eq!(backing.retained_count().expect("len"), 0);
-=======
-        assert!(matches!(SpillTarget::restore(&backing), Err(MemoryError::InvalidState(_))));
-        assert_eq!(backing.retained_count().expect("len"), 2);
->>>>>>> codex/qmp130-upstream-hardening
 
         let _ = std::fs::remove_file(&path);
     }
@@ -1059,7 +987,6 @@ mod tests {
         }
         // Reopen: the persisted handle survives and the sequence does not collide.
         let backing = RedbSpillBacking::create(&path).expect("open 2");
-<<<<<<< HEAD
         let receipt = spill_backing(&backing, b"after-restart").expect("accept again");
         assert_eq!(receipt, SpillReceipt::Durable { sequence: 1, inventory_after: 2 });
         assert_eq!(restore_backing(&backing).expect("r1"), Some(b"persisted".to_vec()));
@@ -1250,26 +1177,16 @@ mod tests {
         assert_eq!(failure.into_parts().1, b"only-copy");
         assert_eq!(backing.retained_count(), Ok(0));
 
-=======
-        SpillTarget::accept(&backing, b"after-restart".to_vec()).expect("accept again");
-        assert_eq!(backing.retained_count().expect("persisted inventory"), 2);
->>>>>>> codex/qmp130-upstream-hardening
         let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn reopened_redb_reconciles_controller_count_from_persisted_inventory() {
-<<<<<<< HEAD
-=======
-        use crate::spill::{RoutedSpillController, SpillController};
-
->>>>>>> codex/qmp130-upstream-hardening
         let path = temp_db_path();
         let _ = std::fs::remove_file(&path);
         {
             let controller =
                 RoutedSpillController::new(RedbSpillBacking::create(&path).expect("open 1"));
-<<<<<<< HEAD
             let first = spill_controller(&controller, b"first").expect("first");
             let second = spill_controller(&controller, b"second").expect("second");
             assert_eq!(first, SpillReceipt::Durable { sequence: 0, inventory_after: 1 });
@@ -1287,15 +1204,6 @@ mod tests {
         );
         assert_eq!(reopened.spilled_count(), Ok(0));
         drop(reopened);
-=======
-            controller.spill(b"persisted".to_vec()).expect("spill");
-            assert_eq!(controller.spilled_count::<Vec<u8>>().expect("count"), 1);
-        }
-        let reopened = RoutedSpillController::new(RedbSpillBacking::create(&path).expect("open 2"));
-        assert_eq!(reopened.spilled_count::<Vec<u8>>().expect("reconciled count"), 1);
-        assert!(matches!(reopened.restore(), Err(MemoryError::InvalidState(_))));
-        assert_eq!(reopened.spilled_count::<Vec<u8>>().expect("preserved count"), 1);
->>>>>>> codex/qmp130-upstream-hardening
         let _ = std::fs::remove_file(&path);
     }
 
@@ -1304,6 +1212,7 @@ mod tests {
     // duplicate. Drains every handle and asserts the exact multiset round-trips.
     #[test]
     fn concurrent_accepts_lose_no_handle_and_assign_distinct_keys() {
+        use std::collections::BTreeSet;
         use std::sync::Arc;
 
         let path = temp_db_path();
@@ -1329,7 +1238,6 @@ mod tests {
         let expected = (threads * per_thread) as u64;
         assert_eq!(backing.retained_count().expect("len"), expected, "no accept was lost");
 
-<<<<<<< HEAD
         // Drain everything; every handle is distinct (no key collision lost a write).
         let mut drained = BTreeSet::new();
         while let Some(h) = restore_backing(&backing).expect("restore") {
@@ -1337,10 +1245,6 @@ mod tests {
         }
         assert_eq!(drained.len() as u64, expected, "every accepted handle restored exactly once");
         assert_eq!(backing.retained_count().expect("len"), 0, "fully drained");
-=======
-        assert!(matches!(SpillTarget::restore(&*backing), Err(MemoryError::InvalidState(_))));
-        assert_eq!(backing.retained_count().expect("len"), expected);
->>>>>>> codex/qmp130-upstream-hardening
         let _ = std::fs::remove_file(&path);
     }
 
@@ -1353,7 +1257,6 @@ mod tests {
         let backing = RedbSpillBacking::create(&path).expect("open");
         backing.seed_key_for_test(u64::MAX, b"last").expect("seed max key");
 
-<<<<<<< HEAD
         let err = backing
             .reserve_record_id()
             .expect_err("reservation at an exhausted keyspace must be rejected");
@@ -1362,17 +1265,6 @@ mod tests {
         // The retained handle at u64::MAX was NOT overwritten or lost.
         assert_eq!(backing.retained_count().expect("len"), 1, "the seeded handle survives");
         assert_eq!(restore_backing(&backing).expect("restore"), Some(b"last".to_vec()));
-=======
-        let err = SpillTarget::accept(&backing, b"overflow".to_vec())
-            .expect_err("accept at an exhausted keyspace must be rejected");
-        assert!(matches!(err.error(), MemoryError::Capacity(_)), "got {err:?}");
-        let (_, recovered) = err.into_parts();
-        assert_eq!(recovered, b"overflow".to_vec(), "failed commit returns the source handle");
-
-        // The retained handle at u64::MAX was NOT overwritten or lost.
-        assert_eq!(backing.retained_count().expect("len"), 1, "the seeded handle survives");
-        assert!(matches!(SpillTarget::restore(&backing), Err(MemoryError::InvalidState(_))));
->>>>>>> codex/qmp130-upstream-hardening
         let _ = std::fs::remove_file(&path);
     }
 }

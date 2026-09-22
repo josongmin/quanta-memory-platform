@@ -186,10 +186,7 @@ use quanta_memory_platform_facade::{
     SessionTranscriptStore, SessionTranscriptStoreBuilder, SimpleSessionTranscriptStore,
     TranscriptAppendDispositionV1, TranscriptAppendErrorV1, TranscriptAppendIdentityV1,
     TranscriptAppendRequestV1, TranscriptRecordV1, TranscriptRetentionPolicyV2,
-<<<<<<< HEAD
     TranscriptRetentionReconfigureErrorV2, TranscriptRetentionStatsV2,
-=======
->>>>>>> codex/qmp130-upstream-hardening
 };
 
 /// Pins the `transcript` slice's public exports.
@@ -205,11 +202,8 @@ fn names_transcript_reexports() {
     type _Error = TranscriptAppendErrorV1;
     type _Disposition = TranscriptAppendDispositionV1;
     type _Retention = TranscriptRetentionPolicyV2;
-<<<<<<< HEAD
     type _RetentionStats = TranscriptRetentionStatsV2;
     type _RetentionReconfigureError = TranscriptRetentionReconfigureErrorV2;
-=======
->>>>>>> codex/qmp130-upstream-hardening
 }
 
 #[cfg(feature = "publish_pipeline")]
@@ -276,15 +270,10 @@ fn prepared_publication_builder_exposes_root_bound_resolution_contract() {
 use quanta_memory_platform_core::MemoryResult;
 #[cfg(feature = "spill")]
 use quanta_memory_platform_facade::{
-<<<<<<< HEAD
     DurableCommitFailure, DurableRestoreCandidate, DurableRestoreController, DurableRestoreOutcome,
     DurableRestoreTarget, DurableSpillController, DurableSpillTarget, InMemorySpillTarget,
     InProcessSpillController, InProcessSpillTarget, NoopSpillController, RetainingSpillTarget,
     RoutedSpillController, SpillController, SpillInventory, SpillReceipt, SpillTarget,
-=======
-    DiscardSpillController, InMemorySpillTarget, RetainingSpillTarget, RoutedSpillController,
-    SpillController, SpillOwnership, SpillTarget, UnavailableSpillController,
->>>>>>> codex/qmp130-upstream-hardening
 };
 
 /// Pins the `spill` slice's public exports, including the controller and target
@@ -294,8 +283,7 @@ use quanta_memory_platform_facade::{
 fn names_spill_reexports() {
     type _Controllers = (
         Box<dyn SpillController<u64>>,
-        UnavailableSpillController,
-        DiscardSpillController,
+        NoopSpillController,
         RoutedSpillController<InMemorySpillTarget<u64>>,
     );
     type _Targets =
@@ -656,15 +644,9 @@ fn transcript_builder_exposes_public_charged_path() {
 fn spill_controller_round_trips_a_handle_via_restore() {
     let controller = RoutedSpillController::new(InMemorySpillTarget::<u64>::available());
 
-<<<<<<< HEAD
     let spilled = controller.spill(42);
     assert!(spilled.is_ok(), "an available target must accept the spill: {spilled:?}");
     assert_eq!(controller.spilled_count(), Ok(1), "a successful spill increments inventory");
-=======
-    let spilled = controller.spill(42).expect("an available target must accept the spill");
-    assert_eq!(spilled.ownership(), SpillOwnership::InProcessRetained);
-    assert_eq!(controller.spilled_count::<u64>().expect("count"), 1);
->>>>>>> codex/qmp130-upstream-hardening
 
     let restored: MemoryResult<Option<u64>> = controller.restore();
     assert_eq!(
@@ -672,11 +654,7 @@ fn spill_controller_round_trips_a_handle_via_restore() {
         Some(42),
         "a retaining target restores the spilled handle"
     );
-<<<<<<< HEAD
     assert_eq!(controller.spilled_count(), Ok(0), "restoring a handle decrements inventory");
-=======
-    assert_eq!(controller.spilled_count::<u64>().expect("count"), 0);
->>>>>>> codex/qmp130-upstream-hardening
 }
 
 /// A routed controller over an UNAVAILABLE target fails closed on spill (it never
@@ -686,7 +664,6 @@ fn spill_controller_round_trips_a_handle_via_restore() {
 fn spill_controller_fails_closed_when_target_unavailable() {
     let controller = RoutedSpillController::new(InMemorySpillTarget::<u64>::unavailable());
     let result = controller.spill(7);
-<<<<<<< HEAD
     let failure = result.expect_err("an unavailable spill target must fail closed");
     assert!(matches!(failure.error(), quanta_memory_platform_core::MemoryError::Capacity(_)));
     assert_eq!(failure.into_parts().1, 7, "failed spill returns the only handle");
@@ -699,24 +676,10 @@ fn spill_controller_fails_closed_when_target_unavailable() {
 fn noop_spill_controller_rejects_and_restores_nothing() {
     let controller = NoopSpillController;
     let failure = SpillController::<u64>::spill(&controller, 1).expect_err("no target");
-=======
-    let (_, recovered) =
-        result.expect_err("an unavailable spill target must fail closed").into_parts();
-    assert_eq!(recovered, 7);
-    assert_eq!(controller.spilled_count::<u64>().expect("count"), 0);
-}
-
-/// An unconfigured controller fails and returns the original handle.
-#[cfg(feature = "spill")]
-#[test]
-fn unavailable_spill_controller_returns_source_authority() {
-    let controller = UnavailableSpillController;
-    let failure = SpillController::<u64>::spill(&controller, 1).expect_err("unavailable");
->>>>>>> codex/qmp130-upstream-hardening
     assert_eq!(failure.into_parts().1, 1);
     assert_eq!(
-        SpillController::<u64>::restore(&controller).expect("empty restore succeeds"),
+        SpillController::<u64>::restore(&controller).expect("noop restore succeeds"),
         None,
-        "the unavailable controller retains nothing"
+        "the noop controller retains nothing to restore"
     );
 }

@@ -34,8 +34,8 @@ CORE_FEATURES=(pressure scheduler live_control unbudgeted_pin telemetry)
 # backing alone (`--no-default-features --features spill-redb`) is the only way to
 # catch a backing module that fails to compile, leaks a symbol, or silently
 # assumes another slice is on; the bare leaf sweep never links the heavy dep. The
-# `full-backings` sweeps production semantic backings together. Experimental
-# indexes are checked only in their explicit leaf lanes.
+# `full-backings` aggregate is swept too, since it is the only combo that links
+# every backing at once (a cross-backing feature-unification break shows up there).
 # Names are taken verbatim from facade/Cargo.toml — no invented variants.
 FACADE_FEATURES=(
   core-live-accounting
@@ -47,11 +47,6 @@ FACADE_FEATURES=(
   publish_pipeline
   spill
   spill-redb
-<<<<<<< HEAD
-=======
-  experimental-revocable-moka-index
-  experimental-revocable-scc-index
->>>>>>> codex/qmp130-upstream-hardening
   full-backings
 )
 TESTKIT_FEATURES=(fixtures doctor conformance faults alloc_tracking)
