@@ -4,7 +4,6 @@ Source of truth: tools/pm/sources/**. Edit there, then run
 `python3 tools/pm/pm.py sync`.
 Hand edits are overwritten and will fail `pm lint`.
 -->
-
 # quanta-memory-platform — Agent Operating Guide
 
 ## Read First — Non-Negotiables
@@ -28,13 +27,14 @@ Hard rules:
   `PortableMemoryPresets`, and the store/pipeline builders — never raw broker
   constructors.
 - **Ledger is fail-closed:** every mutating accounting op fully succeeds or
-  leaves the ledger untouched; the 4 invariants always hold; allocator telemetry
-  is advisory and never mutates counters.
+  leaves the ledger untouched; the invariants defined in
+  `crates/quanta-memory-platform-core/src/domain/ledger.rs` always hold;
+  allocator telemetry is advisory and never mutates counters.
 - **Conformance must bite:** the testkit suite must REJECT a broken fake, not just
   accept honest ones.
 - **Agent guidance:** edit only `tools/pm/sources/**`, then run
-  `python3 tools/pm/pm.py sync`. Never hand-edit `AGENTS.md`, `CLAUDE.md`,
-  `.codex/*`, or `.cursorrules`.
+  `python3 tools/pm/pm.py sync`. Never hand-edit `AGENTS.md`, `CLAUDE.md`, or
+  `.cursorrules`.
 
 ## Where Things Live
 
@@ -43,22 +43,20 @@ Hard rules:
 | Repo overview + dependency direction | `README.md` |
 | Extraction checklist (split into own repo) | `EXTRACTION.md` |
 | Pure hexagonal kernel | `crates/quanta-memory-platform-core/src/{api,application,domain,ports,adapters}/` |
-| Accounting SSOT (invariants) | `core/src/domain/ledger.rs` |
-| Budget policy / presets / manifests | `core/src/domain/{policy,config}.rs` |
-| Public broker surface | `core/src/api/{broker,builder,control}.rs` |
+| Accounting SSOT (invariants) | `crates/quanta-memory-platform-core/src/domain/ledger.rs` |
+| Budget policy / presets / manifests | `crates/quanta-memory-platform-core/src/domain/{policy,config}.rs` |
+| Public broker surface | `crates/quanta-memory-platform-core/src/api/{broker,builder,control}.rs` |
 | Feature-sliced portable stores + pipelines | `crates/quanta-memory-platform-facade/src/<feature>/` |
-| Storage backings (feature-gated) | `facade/src/<feature>/backings/` |
+| Storage backings (feature-gated) | `crates/quanta-memory-platform-facade/src/<feature>/backings/` |
 | Conformance / chaos / alloc tooling | `crates/quanta-memory-platform-testkit/src/` |
-| Examples (compile vs real public API) | `facade/examples/{hello_world,effective_budget_report}.rs` |
+| Examples (compile vs real public API) | `crates/quanta-memory-platform-facade/examples/{hello_world,effective_budget_report}.rs` |
 | One-shot lint rail | `scripts/check-workspace.sh` |
-| Repo-local doctor rail | `scripts/memory-platform-doctor` |
-| Self-hosting scaffold assertion | `scripts/scaffold-external-repo.sh` |
 | Extraction bootstrap | `scripts/extract-to-standalone-repo.sh` |
 | Agent/operator instruction sources | `tools/pm/sources/**` |
-| Prompt manager | `tools/pm/pm.py`, `tools/pm/targets.yaml` |
+| Prompt manager | `tools/pm/pm.py`, `tools/pm/targets.json` |
 
-Generated docs (`AGENTS.md`, `CLAUDE.md`, `.codex/*`, `.cursorrules`) are produced
-from `tools/pm/sources/**`. Never hand-edit them.
+Generated docs (`AGENTS.md`, `CLAUDE.md`, `.cursorrules`) are produced from
+`tools/pm/sources/**`. Never hand-edit them.
 
 ## Working Rules
 
@@ -67,21 +65,22 @@ feature-sliced facade:
 
 | Layer | Location | Responsibility |
 | --- | --- | --- |
-| **Domain** | `core/src/domain/` | Pure budget/accounting logic: ledger, policy, config, context, stats. No I/O, no clocks. |
-| **Ports** | `core/src/ports/` | Trait definitions: pin, scratch, store, telemetry. No adapters. |
-| **Adapters** | `core/src/adapters/` | Port impls (hdrhistogram, metrics). Telemetry is advisory. |
-| **Application** | `core/src/application/` | Use-case services: pressure controller, scheduler. |
-| **API** | `core/src/api/` | Builder-first public broker surface. |
-| **Facade** | `facade/src/<feature>/` | Portable stores + pipelines; backings under `backings/`, feature-gated. |
-| **Testkit** | `testkit/src/` | Conformance / chaos / fixtures / doctor. Never a prod dep. |
+| **Domain** | `crates/quanta-memory-platform-core/src/domain/` | Pure budget/accounting logic: ledger, policy, config, context, stats. No I/O, no clocks. |
+| **Ports** | `crates/quanta-memory-platform-core/src/ports/` | Trait definitions: pin, scratch, store, telemetry. No adapters. |
+| **Adapters** | `crates/quanta-memory-platform-core/src/adapters/` | Port impls (hdrhistogram, metrics). Telemetry is advisory. |
+| **Application** | `crates/quanta-memory-platform-core/src/application/` | Use-case services: pressure controller, scheduler. |
+| **API** | `crates/quanta-memory-platform-core/src/api/` | Builder-first public broker surface. |
+| **Facade** | `crates/quanta-memory-platform-facade/src/<feature>/` | Portable stores + pipelines; backings under `backings/`, feature-gated. |
+| **Testkit** | `crates/quanta-memory-platform-testkit/src/` | Conformance / chaos / fixtures / doctor. Never a prod dep. |
 
 On any change:
 
-- **Ledger / accounting** → add `#[cfg(test)]` tests asserting the 4 invariants
-  still hold (class/owner balance, charge-kind partition, reserved≤soft≤hard,
-  no-write-during-rebuild), and that mutations are fail-closed.
+- **Ledger / accounting** → add `#[cfg(test)]` tests asserting the invariants
+  defined in `crates/quanta-memory-platform-core/src/domain/ledger.rs` and that
+  mutations are fail-closed.
 - **Policy / manifest / preset / residency** → add validation tests; update
-  `core/tests/wave1_policy_contracts.rs` if a cross-cutting contract changed.
+  `crates/quanta-memory-platform-core/tests/policy_contracts.rs` if a
+  cross-cutting contract changed.
 - **New port** → trait in `ports/`, impl in `adapters/` (or facade backing); keep
   `domain/` free of the impl.
 - **New facade store/pipeline** → service + builder in `shared/`, backings behind
@@ -112,14 +111,7 @@ Before closeout, run:
 ```bash
 # Regenerate agent docs if you edited tools/pm/sources/**
 python3 tools/pm/pm.py sync
-python3 tools/pm/pm.py lint
-
-cargo fmt --all --check
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo test --workspace --all-features
-cargo deny --all-features check
-scripts/check-workspace.sh          # one-shot rail, includes feature matrix
-scripts/memory-platform-doctor      # repo-local fmt/clippy/feature-matrix/check/test/examples/deny rail
+scripts/check-workspace.sh          # canonical static/test/feature/selector/PM/deny rail
 
 # if you changed any Cargo.toml or cross-crate use path:
 scripts/extract-to-standalone-repo.sh --dry-run /tmp/qmp-check
@@ -139,10 +131,8 @@ Changed:
 - ...
 
 Verified:
-- cargo clippy -D warnings / cargo test --all-features
-- pm lint
+- scripts/check-workspace.sh
 - extraction dry-run (if Cargo.toml/use paths changed)
-- repo-local doctor rail
 
 Not run:
 - ...
@@ -154,4 +144,3 @@ Known risk:
 Fail-closed principle: if `pm lint` fails, sync — do not patch generated files.
 If tests fail, fix behavior; do not weaken assertions to greenwash. Never invert
 the `core <- facade <- testkit` direction to make something compile.
-

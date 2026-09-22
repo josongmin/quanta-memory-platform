@@ -3,7 +3,8 @@
 A memory-accounting platform that **drops failures quietly** corrupts the ledger.
 Fail loudly and fail-closed.
 
-The single error type is `MemoryError` (`core/src/domain/errors.rs`):
+The single error type is `MemoryError`
+(`crates/quanta-memory-platform-core/src/domain/errors.rs`):
 
 ```text
 MemoryError = Build | Config | Capacity | InvalidState | Report | Unsupported

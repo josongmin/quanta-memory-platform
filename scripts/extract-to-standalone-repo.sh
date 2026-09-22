@@ -124,7 +124,7 @@ fi
 python3 scripts/lib/extraction_manifest.py paths --manifest "${tree_manifest}" > "${path_manifest}"
 
 echo "      pre-flight OK: core <- facade <- testkit, no escaping path deps"
-echo "      self-hosting OK: canonical extracted file set present, no tools/ci/gates in copy plan"
+echo "      self-hosting OK: canonical extracted file set present"
 echo "      frozen HEAD: ${source_head}"
 echo "      frozen tree: ${source_tree}"
 
@@ -135,9 +135,7 @@ echo "      frozen tree: ${source_tree}"
 echo "[1/5] creating destination ${dest}"
 run mkdir -p "${dest}"
 
-# The extracted repo carries its own scripts/docs/pm sources. We deliberately
-# EXCLUDE `tools/ci/gates/*`: those scripts are Semantica-monorepo rails, not
-# standalone repo authority.
+# The extracted repo carries its own scripts, docs, and prompt-manager sources.
 
 echo "[2/5] copying canonical files"
 if [[ "${dry_run}" -eq 0 ]]; then
@@ -169,14 +167,7 @@ if [[ "${dry_run}" -eq 0 ]]; then
     cd "${dest}"
     cargo metadata --locked --format-version 1 | \
       python3 scripts/lib/check-extracted-metadata.py "${dest}"
-    python3 -m unittest -v \
-      scripts/tests/test_extraction_metadata.py \
-      scripts/tests/test_extraction_manifest.py
-    scripts/tests/extraction-contracts.sh
-    scripts/scaffold-external-repo.sh
     scripts/check-workspace.sh
-    scripts/memory-platform-doctor
-    python3 tools/pm/pm.py lint
   )
   if [[ "$(python3 scripts/lib/extraction_manifest.py verify \
     --manifest "${tree_manifest}" --destination "${dest}")" != "${source_digest}" ]]; then
@@ -184,7 +175,7 @@ if [[ "${dry_run}" -eq 0 ]]; then
     exit 1
   fi
 else
-  echo "DRY-RUN: (cd ${dest} && metadata --locked + scaffold + check-workspace + doctor + pm lint)"
+  echo "DRY-RUN: (cd ${dest} && metadata --locked + check-workspace)"
 fi
 
 # ---------------------------------------------------------------------------
@@ -220,17 +211,19 @@ cat <<EOF
 Extraction complete. In the extracted repo, the standalone front doors are:
 
   scripts/check-workspace.sh
-  scripts/memory-platform-doctor
 
 Remaining MANUAL step (Semantica monorepo side):
 
-  In packages/analysis/quanta-v2/crates/quanta-memory-host/Cargo.toml, repoint
-  the path dependencies from the in-tree sibling checkout to the extracted repo
-  (path or git or registry). Dependency direction stays:
+  Keep quanta-memory-host as a workspace dependency consumer. Update BOTH
+  workspace dependency contracts (packages/analysis/quanta-v2/Cargo.toml and
+  top-level Cargo.toml), their matching quanta_memory_platform_contract
+  metadata, and the Semantica dependency-contract document together to point at
+  the extracted repo (path, pinned git revision, or registry). Dependency
+  direction stays:
 
       quanta-memory-host  ->  quanta-memory-platform-{core,facade}
 
-  After the rewire, optional Semantica monorepo gates:
-      tools/ci/gates/gate-memory-platform-doctor.sh
-      tools/ci/gates/gate-memory-platform-lint.sh
+  Then prove cargo metadata from both Semantica workspace roots resolves the
+  same QMP source and run the host's registered adoption suites against this
+  exact QMP revision.
 EOF

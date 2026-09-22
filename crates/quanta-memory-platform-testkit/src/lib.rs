@@ -17,8 +17,7 @@
 //!   behind the `alloc_tracking` feature so it can never enter a production
 //!   dependency graph.
 //! - `fixtures/*` — deterministic fixtures and the [`MemoryTestKit`] entry point.
-//! - `doctor/*` — a minimal diagnostic report shape (the doctor *shell* is
-//!   ticket 11 scope).
+//! - `doctor/*` — a minimal diagnostic report data model for host tooling.
 //!
 //! This crate is NEVER a mandatory production dependency.
 

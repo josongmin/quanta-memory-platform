@@ -213,7 +213,7 @@ impl PressureController for LadderPressureController {
     /// cached pressure here; this hook exists for telemetry export, and the
     /// SSOT remains [`Self::update_from_semantic`].
     fn observe_allocator_snapshot(&self, _snapshot: &AllocatorSnapshot) {
-        // No-op on semantic state by contract (invariant 6).
+        // No-op on semantic state by the advisory telemetry contract.
     }
 }
 

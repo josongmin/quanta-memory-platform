@@ -1,3 +1,5 @@
+//! Cross-cutting policy contracts at the public broker boundary.
+
 use quanta_memory_platform_core::{
     ExecutionBudget, MemoryBudgetManifest, MemoryClass, MemoryClassBudget, MemoryError,
     MemoryPreset, OwnerQuota, PressureState, ProcessMemoryBrokerBuilder, ReclaimPriority,

@@ -38,6 +38,27 @@ cp scripts/regression-guards.sh "${fixture}/scripts/regression-guards.sh"
 expect_failure "missing semgrep config" "${fixture}/scripts/regression-guards.sh"
 expect_failure "missing semgrep binary" env PATH=/usr/bin:/bin scripts/regression-guards.sh
 
+# The regression rules must bite on each historical bug shape and accept the
+# documented scoped exception mechanism.
+cat > "${fixture}/bad.rs" <<'EOF'
+fn bad(bytes: u64, a: u64, b: u64, c: u64, counter: &std::sync::atomic::AtomicU64) {
+    let _signed = bytes as i64;
+    let _ratio = a.saturating_mul(b) / c;
+    counter.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+}
+EOF
+expect_failure "semgrep historical bug fixtures" \
+  semgrep --config tools/semgrep/qmp-regressions.yml --error --strict --metrics=off \
+    "${fixture}/bad.rs"
+
+cat > "${fixture}/allowed.rs" <<'EOF'
+fn allowed(bytes: u64) {
+    let _signed = bytes as i64; // nosemgrep: qmp-magnitude-as-signed -- reason: fixture proves scoped suppression
+}
+EOF
+semgrep --config tools/semgrep/qmp-regressions.yml --error --strict --metrics=off \
+  "${fixture}/allowed.rs" >/dev/null
+
 # A changed manifest must never rewrite the extracted lockfile implicitly.
 mkdir -p "${fixture}/locked/src"
 printf 'fn main() {}\n' > "${fixture}/locked/src/main.rs"

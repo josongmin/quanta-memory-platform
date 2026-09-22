@@ -1,11 +1,10 @@
 ## Rule Cheatsheet (self-check before the gate)
 
-Every row is enforced fail-closed by `cargo clippy --workspace --all-targets
---all-features -- -D warnings`, `cargo deny`, `scripts/regression-guards.sh`
-(semgrep rules in `tools/semgrep/qmp-regressions.yml`, with a grep fallback), or
-`scripts/memory-platform-doctor`. Fix the code, or add a scoped
-`#[allow(<lint>)]` with a one-line `-- reason: <…>` on the same item (for a
-semgrep row, a trailing `// nosemgrep: <rule-id> -- reason: <…>`).
+The **Enforced by** column is the authority. Semgrep rows and compiler/Clippy
+rows are machine-enforced by `scripts/check-workspace.sh`; rows marked `review`
+are review contracts, not automated gates. Do not claim a review-only rule is
+fail-closed. A Semgrep exception requires a trailing
+`// nosemgrep: <rule-id> -- reason: <…>`.
 
 | Don't write this | Write this instead | Enforced by |
 | --- | --- | --- |
@@ -29,12 +28,12 @@ semgrep row, a trailing `// nosemgrep: <rule-id> -- reason: <…>`).
 | `std::fs` / `std::env` / `SystemTime::now` / `Instant::now` in `domain/` or `ports/` | route through a port + adapter; keep domain pure | review, architecture rule |
 | `crate::adapters` imported from `domain/` or `ports/` | depend on the port trait only | review (inward-only) |
 | `facade`/`testkit` named from `core` (or `testkit` from `facade`) | keep `core <- facade <- testkit` | extraction pre-flight, review |
-| Semantica nouns (`Semantica*`, `quanta_runtime`, `codegraph`) in public API | keep the library host-independent | doctor, review |
-| raw broker constructor backdoor in public code | go through the builder-first surface | doctor (raw-constructor residue) |
-| stale `V1`/`V2` / old renamed symbols | use the current names | doctor |
+| Semantica nouns (`Semantica*`, `quanta_runtime`, `codegraph`) in public API | keep the library host-independent | review + extraction contract |
+| raw broker constructor backdoor in public code | go through the builder-first surface | public API compile-fail tests |
+| stale `V1`/`V2` / old renamed symbols | use the current names | review |
 | allocator telemetry mutating ledger counters | telemetry is **advisory** — never writes counters | review (ledger invariant) |
 | mutating the ledger partway then erroring | validate first; fail-closed BEFORE any mutation | review (all-or-nothing) |
 | `assert!(true)` / `assert_eq!(x, x)` placeholder test | assert the real behavior / invariant | review |
 | `#[ignore]` without a reason | `#[ignore = "<reason>"]` | review |
 
-Clippy policy: `clippy.toml`. Run the full rail with `scripts/check-workspace.sh`.
+Run the full rail with `scripts/check-workspace.sh`.

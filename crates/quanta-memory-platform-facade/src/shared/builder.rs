@@ -630,12 +630,16 @@ impl<Payload, Mode> PreparedPublicationServiceBuilder<Payload, Mode> {
 }
 
 #[cfg(feature = "transcript")]
+type SessionTranscriptMarker<SessionId, MessageId, Message> =
+    PhantomData<fn() -> (SessionId, MessageId, Message)>;
+
+#[cfg(feature = "transcript")]
 #[derive(Clone, Debug)]
 pub struct SessionTranscriptStoreBuilder<SessionId, MessageId, Message, Mode> {
     binding: Option<StoreBindingHandle>,
     accounting: Mode,
     retention: TranscriptRetentionPolicyV2,
-    _marker: PhantomData<fn() -> (SessionId, MessageId, Message)>,
+    _marker: SessionTranscriptMarker<SessionId, MessageId, Message>,
 }
 
 #[cfg(feature = "transcript")]

@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# feature-matrix.sh
+# verify-feature-matrix.sh
 #
-# Per-feature build matrix for the portable memory platform. The one-shot rail
-# (scripts/check-workspace.sh) only exercises `--all-features`, which can hide a
+# Per-feature build matrix for the portable memory platform. A single
+# `--all-features` build can hide a
 # feature-sliced break: a slice that fails to compile (or whose backing leaks a
 # symbol) when ENABLED ALONE, or code that silently relies on another feature
 # being on. This script checks each crate across the meaningful feature axes so
@@ -12,44 +12,38 @@
 #   - default features                      (the consumer-default surface)
 #   - --no-default-features                 (the bare, slice-free surface)
 #   - --no-default-features --features <f>  (each individual feature, ALONE)
-#   - --all-features                        (everything on together)
 #   - --no-default-features --features full (the documented full feature set)
+#   - workspace --all-features              (everything on together)
 #
 # Fail-closed: `set -euo pipefail` means the FIRST failing combo aborts the run
 # with a non-zero exit. Each combo is echoed before it runs so the failing
 # combination is obvious in the log.
 set -euo pipefail
 
-repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${repo_root}"
 
-# Crate -> the individual features to check alone. The `full` aggregate and
-# `default` are handled separately below; list only the leaf slices here.
+# Cargo metadata is the feature-list authority. Every public feature except the
+# `default` and `full` aggregates is checked alone, so a new feature cannot be
+# added to a manifest without entering this matrix automatically.
 CORE_CRATE="quanta-memory-platform-core"
 FACADE_CRATE="quanta-memory-platform-facade"
 TESTKIT_CRATE="quanta-memory-platform-testkit"
 
-CORE_FEATURES=(pressure scheduler live_control unbudgeted_pin telemetry)
-# Facade leaf slices PLUS the durable/concurrent BACKING features. Building a
-# backing alone (`--no-default-features --features spill-redb`) is the only way to
-# catch a backing module that fails to compile, leaks a symbol, or silently
-# assumes another slice is on; the bare leaf sweep never links the heavy dep. The
-# `full-backings` aggregate is swept too, since it is the only combo that links
-# every backing at once (a cross-backing feature-unification break shows up there).
-# Names are taken verbatim from facade/Cargo.toml — no invented variants.
-FACADE_FEATURES=(
-  core-live-accounting
-  unbudgeted-stores
-  payload_store
-  retained_map
-  revocable_store
-  transcript
-  publish_pipeline
-  spill
-  spill-redb
-  full-backings
-)
-TESTKIT_FEATURES=(fixtures doctor conformance faults alloc_tracking)
+metadata="$(cargo metadata --locked --no-deps --format-version 1)"
+
+crate_features() {
+  local crate="$1"
+  python3 -c '
+import json, sys
+crate = sys.argv[1]
+metadata = json.load(sys.stdin)
+package = next((item for item in metadata["packages"] if item["name"] == crate), None)
+if package is None:
+    raise SystemExit(f"missing workspace package: {crate}")
+print("\n".join(sorted(name for name in package["features"] if name not in {"default", "full"})))
+' "${crate}" <<<"${metadata}"
+}
 
 # check_combo <crate> <human-label> <cargo args...>
 check_combo() {
@@ -64,8 +58,10 @@ check_combo() {
 # Runs the full per-crate axis sweep, fail-closed on the first failure.
 check_crate() {
   local crate="$1"
-  shift
-  local features=("$@")
+  local features=()
+  while IFS= read -r feature; do
+    [[ -n "${feature}" ]] && features+=("${feature}")
+  done < <(crate_features "${crate}")
 
   # 1. consumer-default surface.
   check_combo "${crate}" "default features"
@@ -84,15 +80,13 @@ check_crate() {
   check_combo "${crate}" "--no-default-features --features full" \
     --no-default-features --features full
 
-  # 5. everything on together (mirrors check-workspace.sh's surface).
-  check_combo "${crate}" "--all-features" --all-features
 }
 
 echo "feature-matrix: per-crate feature-slice build sweep (fail-closed)"
 
-check_crate "${CORE_CRATE}" "${CORE_FEATURES[@]}"
-check_crate "${FACADE_CRATE}" "${FACADE_FEATURES[@]}"
-check_crate "${TESTKIT_CRATE}" "${TESTKIT_FEATURES[@]}"
+check_crate "${CORE_CRATE}"
+check_crate "${FACADE_CRATE}"
+check_crate "${TESTKIT_CRATE}"
 
 # Facade's no-default graph must not activate core's default/live-control
 # surface through dependency defaults. Compilation alone cannot detect this
@@ -113,8 +107,9 @@ if rg -q 'quanta-memory-platform-facade feature "unbudgeted-stores"' <<<"${facad
   exit 1
 fi
 
-# Whole-workspace bookends: the two extremes must also resolve together, since a
-# cross-crate feature unification bug only shows up at the workspace level.
+# Whole-workspace bookends: the two extremes must resolve together. The
+# all-features workspace run subsumes redundant per-crate all-feature runs and
+# also catches cross-crate feature unification bugs.
 echo "==> [workspace] checking: --workspace --no-default-features"
 cargo clippy --locked --workspace --all-targets --no-default-features -- -D warnings
 echo "==> [workspace] checking: --workspace --all-features"

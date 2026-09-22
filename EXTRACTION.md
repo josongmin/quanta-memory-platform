@@ -16,7 +16,8 @@ dependency direction. Not prose: every step is a command or a verifiable gate.
 ## Inputs / Outputs
 
 - Input: this repo (`quanta-memory-platform/`) with committed `Cargo.lock`,
-  pinned `rust-toolchain.toml`, and installed `cargo-deny` and `semgrep`.
+  pinned `rust-toolchain.toml`, Python 3.9+, and installed `cargo-deny` and
+  `semgrep`.
 - Output: a standalone git repo at `<dest>` that builds in isolation with its
   own repo-local rails, plus a one-line manual rewire on the Semantica host
   adapter manifest.
@@ -35,8 +36,7 @@ dependency direction. Not prose: every step is a command or a verifiable gate.
    - `facade` has no upward dep on testkit,
    - no member has a path dep escaping the workspace,
    - `cargo metadata --locked` resolves without changing the lockfile,
-   - the self-hosting extracted file set is present in-source,
-   - the copy plan excludes `tools/ci/gates`.
+   - the self-hosting extracted file set is present in-source.
 
    If any check fails, STOP and resolve before extracting (the pre-flight is the
    cyclic-dependency / direction guard).
@@ -56,11 +56,9 @@ dependency direction. Not prose: every step is a command or a verifiable gate.
 
    ```bash
    scripts/check-workspace.sh
-   scripts/memory-platform-doctor
-   python3 tools/pm/pm.py lint
    ```
 
-   Both build rails require the lockfile, `semgrep`, and `cargo-deny`; missing
+   The canonical rail requires the lockfile, `semgrep`, and `cargo-deny`; missing
    tooling fails the extraction. After verification, the script commits the
    extracted tree and requires `git status --porcelain` to be empty. A failed
    verification leaves no success commit.
@@ -69,48 +67,34 @@ dependency direction. Not prose: every step is a command or a verifiable gate.
 
    ```bash
    cd /path/to/new/quanta-memory-platform
-   scripts/scaffold-external-repo.sh   # required self-hosting file set present, no copied gates
-   scripts/check-workspace.sh          # fmt + clippy -D warnings + check + examples + feature matrix + deny
-   scripts/memory-platform-doctor      # repo-local doctor rail, includes workspace tests, no tools/ci/gates dependency
-   scripts/tests/extraction-contracts.sh # negative release-rail contracts
-   python3 -m unittest -v scripts/tests/test_extraction_metadata.py scripts/tests/test_extraction_manifest.py # dependency/tree negative fixtures
-   python3 -m unittest -v scripts/tests/test_scaling_results.py # performance-gate negative fixtures
-   scripts/verify-feature-capabilities.sh # every advertised feature executes a non-zero runtime test
-   scripts/verify-doc-test-selectors.py # documented selectors resolve against cargo --list
+   scripts/check-workspace.sh          # canonical static, contract, test, feature, selector, PM, and deny rail
    scripts/run-scaling-bench.sh --smoke # public store/broker + allocator drift smoke
    cargo metadata --locked --format-version 1 # no re-resolution
    ```
 
-4. Rewire the Semantica host adapter (manual, one edit):
+4. Rewire the Semantica dependency contract (manual, coordinated change):
 
-   In `packages/analysis/quanta-v2/crates/quanta-memory-host/Cargo.toml`,
-   repoint:
+   Keep consumer manifests such as `quanta-memory-host/Cargo.toml` on
+   `workspace = true`. Update the `quanta-memory-platform-core` and
+   `quanta-memory-platform-facade` entries in **both** Semantica workspace
+   roots (`packages/analysis/quanta-v2/Cargo.toml` and the top-level
+   `Cargo.toml`), their matching
+   `[workspace.metadata.quanta_memory_platform_contract]` blocks, and the
+   Semantica dependency-contract document together. Change the two mirrored
+   entries to the chosen path, pinned Git revision, or published version. Do
+   NOT add a dependency from this extracted repo back to Semantica or move
+   dependency ownership into a consumer manifest.
 
-   ```toml
-   quanta-memory-platform-core   = { path = "../../../../../../quanta-memory-platform/crates/quanta-memory-platform-core" }
-   quanta-memory-platform-facade = { path = "../../../../../../quanta-memory-platform/crates/quanta-memory-platform-facade" }
-   ```
+5. Host integration proof is separate from extraction. After the rewire, use
+   `cargo metadata` from both Semantica workspace roots to prove that Cargo
+   resolves the intended identical QMP source. Then run the host's currently
+   registered adoption suites from its suite registry. Do not treat an
+   external-repository validation override as Cargo dependency resolution.
 
-   to the extracted location (path, git, or registry). Do NOT add a dependency
-   from the extracted repo back to Semantica — that would invert the direction.
+## Standalone extraction qualification
 
-5. Host integration proof is separate from extraction. After the rewire, first
-   prove that both Semantica workspace roots resolve the same QMP root/tree and
-   that the gate target matches Cargo resolution. Then run the registered
-   QMP-130 suite bundle from the Semantica root:
-
-   ```bash
-   just gate-qmp130-host-adoption
-   ```
-
-   Resolve the suite IDs from the host's current suite registry. Do not replace
-   the registered QBC receipts with raw Cargo commands or names copied from an
-   older Semantica snapshot.
-
-## Standalone extraction gate (QMP-120)
-
-- Extracted repo: `scripts/check-workspace.sh`, `scripts/memory-platform-doctor`,
-  `scripts/scaffold-external-repo.sh`, and PM lint all pass.
+- Extracted repo: `scripts/check-workspace.sh` passes. It includes static,
+  contract, test, feature, selector, prompt-manager, and dependency checks.
 - Source/extracted tree-bound canonical digests and file modes match, the source
   stays at the frozen clean `HEAD`, and the extracted git worktree is clean.
 - All Cargo resolution is locked; missing Semgrep or cargo-deny fails closed.
@@ -118,5 +102,5 @@ dependency direction. Not prose: every step is a command or a verifiable gate.
   frozen source checkout. This repository intentionally has no GitHub Actions
   workflow; a nonexistent remote job is not an acceptance dependency.
 
-Host adapter compilation and Semantica static guards are QMP-130 adoption
-proof, not evidence that this repo-local extraction rail passed.
+Host adapter compilation and Semantica static guards are host-adoption proof,
+not evidence that this repo-local extraction rail passed.

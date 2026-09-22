@@ -1,7 +1,5 @@
 import json
-import os
 from pathlib import Path
-import stat
 import subprocess
 import tempfile
 import unittest

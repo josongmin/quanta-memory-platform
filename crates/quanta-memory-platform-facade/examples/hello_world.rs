@@ -9,8 +9,7 @@
 //!
 //! It deliberately does NOT touch any low-level broker backdoor
 //! (`ProcessMemoryBrokerBuilder`, `LiveProcessMemoryBroker`, or raw ledger
-//! construction). The `memory-platform-doctor` rail
-//! treats those as raw-constructor residue.
+//! construction). The regression guard treats those as raw-constructor residue.
 //!
 //! Run with:
 //!

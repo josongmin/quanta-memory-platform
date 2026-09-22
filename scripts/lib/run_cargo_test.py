@@ -3,8 +3,6 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
 import re
 import subprocess
 import sys
@@ -58,7 +56,7 @@ def main(argv: list[str] | None = None) -> int:
     if args[:1] == ["--"]:
         args = args[1:]
     if not args:
-        print("usage: run-checked-cargo-test [cargo test arguments...]", file=sys.stderr)
+        print("usage: run_cargo_test.py [cargo test arguments...]", file=sys.stderr)
         return 2
 
     command = ["cargo", "test", *args]
@@ -69,41 +67,17 @@ def main(argv: list[str] | None = None) -> int:
         text=True,
     )
     sys.stdout.write(completed.stdout)
-    output_digest = hashlib.sha256(completed.stdout.encode("utf-8")).hexdigest()
     if completed.returncode != 0:
-        evidence = {
-            "schema": "qmp-cargo-test-evidence-v1",
-            "command": command,
-            "exit": completed.returncode,
-            "selected": None,
-            "output_sha256": output_digest,
-        }
-        print("QMP_TEST_EVIDENCE=" + json.dumps(evidence, separators=(",", ":")))
         return completed.returncode
 
     try:
         counts = parse_cargo_test_counts(completed.stdout)
     except CargoTestEvidenceError as exc:
-        evidence = {
-            "schema": "qmp-cargo-test-evidence-v1",
-            "command": command,
-            "exit": completed.returncode,
-            "selected": 0,
-            "output_sha256": output_digest,
-            "admission_error": str(exc),
-        }
-        print("QMP_TEST_EVIDENCE=" + json.dumps(evidence, separators=(",", ":")))
-        print(f"run-checked-cargo-test: FAIL: {exc}", file=sys.stderr)
+        print(f"run_cargo_test.py: FAIL: {exc}", file=sys.stderr)
         return 3
 
-    evidence = {
-        "schema": "qmp-cargo-test-evidence-v1",
-        "command": command,
-        "exit": completed.returncode,
-        **asdict(counts),
-        "output_sha256": output_digest,
-    }
-    print("QMP_TEST_EVIDENCE=" + json.dumps(evidence, separators=(",", ":")))
+    values = asdict(counts)
+    print("checked-cargo-test: " + " ".join(f"{key}={value}" for key, value in values.items()))
     return 0
 
 

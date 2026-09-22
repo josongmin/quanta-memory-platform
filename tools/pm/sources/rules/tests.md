@@ -7,15 +7,15 @@ Placement:
 
 | If it proves… | Put it in… |
 | --- | --- |
-| Ledger reserve/commit/release + the 4 invariants | `core/src/domain/ledger.rs` `#[cfg(test)]` |
-| Policy / manifest / preset / residency validation | `core/src/domain/{policy,config}.rs` `#[cfg(test)]` |
-| Pressure controller / scheduler behavior | `core/src/application/{controller,scheduler}.rs` `#[cfg(test)]` |
-| Public broker surface end-to-end (reserve→commit→snapshot→release→rebuild) | `core/src/api/control.rs` `#[cfg(test)]` |
-| Cross-cutting policy contracts | `core/tests/wave1_policy_contracts.rs` |
+| Ledger reserve/commit/release + its declared invariants | `crates/quanta-memory-platform-core/src/domain/ledger.rs` `#[cfg(test)]` |
+| Policy / manifest / preset / residency validation | `crates/quanta-memory-platform-core/src/domain/{policy,config}.rs` `#[cfg(test)]` |
+| Pressure controller / scheduler behavior | `crates/quanta-memory-platform-core/src/application/{controller,scheduler}.rs` `#[cfg(test)]` |
+| Public broker surface end-to-end (reserve→commit→snapshot→release→rebuild) | `crates/quanta-memory-platform-core/src/api/control.rs` `#[cfg(test)]` |
+| Cross-cutting policy contracts | `crates/quanta-memory-platform-core/tests/policy_contracts.rs` |
 | A facade store / pipeline behavior | that feature's `service.rs` `#[cfg(test)]` |
 | A storage backing (redb) round-trip | the backing module under its feature |
 | "the conformance suite actually bites" | `testkit` conformance + `self_tests` |
-| Deterministic fault/chaos scenarios | `testkit/src/faults/` |
+| Deterministic fault/chaos scenarios | `crates/quanta-memory-platform-testkit/src/faults/` |
 
 Conventions:
 
@@ -35,11 +35,7 @@ Conventions:
 Run before closeout:
 
 ```bash
-cargo test --workspace --all-features
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-scripts/regression-guards.sh          # semgrep regression guards (in check-workspace + doctor too)
 scripts/check-workspace.sh
-python3 -m pytest tools/pm/tests -q   # if you touched tools/pm
 ```
 
 Regression guards (`scripts/regression-guards.sh`, rules in

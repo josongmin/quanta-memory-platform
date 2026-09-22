@@ -10,7 +10,7 @@ if [[ -n "$(git status --porcelain --untracked-files=all)" ]]; then
 fi
 
 source_sha="$(git rev-parse HEAD)"
-source_tree="$(git rev-parse HEAD^{tree})"
+source_tree="$(git rev-parse 'HEAD^{tree}')"
 rustc_version="$(rustc --version)"
 cargo_version="$(cargo --version)"
 machine="$(uname -srm)"

@@ -5,8 +5,7 @@
 # lints are too noisy for this byte-accounting code); if a flagged use is provably
 # safe, justify it with a trailing `// nosemgrep: <rule-id> -- reason: <why>`.
 #
-# Run via `scripts/regression-guards.sh` (also wired into check-workspace.sh and
-# scripts/memory-platform-doctor).
+# Run via `scripts/regression-guards.sh` (wired into check-workspace.sh).
 rules:
   - id: qmp-magnitude-as-signed
     languages: [rust]

@@ -7,9 +7,9 @@ import unittest
 from pathlib import Path
 
 
-ROOT = Path(__file__).resolve().parents[3]
-CHECKER = ROOT / "tools/ci/check_workspace_lints.py"
-SPEC = importlib.util.spec_from_file_location("check_workspace_lints", CHECKER)
+ROOT = Path(__file__).resolve().parents[2]
+CHECKER = ROOT / "scripts/verify-workspace-policy.py"
+SPEC = importlib.util.spec_from_file_location("verify_workspace_policy", CHECKER)
 assert SPEC and SPEC.loader
 checker = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(checker)

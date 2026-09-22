@@ -4,13 +4,11 @@ Portable, host-independent memory-platform workspace. It is consumed by the
 Semantica monorepo through a dedicated host adapter (`quanta-memory-host`) and is
 designed to be extracted into its own repository without rewrites.
 
-> **Current qualification status (2026-09-22): NOT production-ready.** Local
-> standalone extraction, including committed HEAD/tree/blob/mode binding, has
-> passed; external host adoption remains unobserved on the current release
-> candidate. Standalone performance,
-> observability, extraction, and conformance rails are locally qualified; they
-> do not substitute for host-product GREEN. Passing a focused test or dry-run
-> does not supersede that status.
+> **Qualification boundary (2026-09-22): NOT production-ready.** Repo-local
+> static, test, conformance, performance, and standalone-extraction rails
+> establish only this library's behavior. Exact-source host adoption,
+> deployment, and activation are separate evidence; a focused test or dry-run
+> does not establish host-product GREEN.
 
 ## Packages and dependency direction
 
@@ -66,8 +64,8 @@ public:
   unset builder cannot `build()` or acquire a sink after construction.
 - `PublishPipelineBuilder` and its non-retaining `stage`/`commit` transition are
   legacy compatibility surfaces. New retaining publication code uses
-  `PreparedPublicationServiceBuilder`; the QMP publish-pipeline migration owns
-  removal of the legacy surface.
+  `PreparedPublicationServiceBuilder`; remove the legacy surface only through
+  an explicit public-API migration.
 - Prepared-publication orphan enumeration and GC require the caller's complete
   canonical-root token snapshot, stabilized against concurrent activation for
   the duration of the call. QMP validates and excludes referenced tokens; it
@@ -162,15 +160,8 @@ cargo run -p quanta-memory-host --example hello_host_adapter
 ## Baseline commands
 
 ```bash
-cargo check --workspace --all-features
-cargo build --examples --all-features
-cargo fmt --all --check
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo deny --all-features check
-# repo-local feature-sliced one-shot rail:
+# canonical repo-local verification rail:
 scripts/check-workspace.sh
-# repo-local doctor rail:
-scripts/memory-platform-doctor
 
 # source-bound smoke: repeated 1/2-thread distributions + allocator drift gate
 scripts/run-scaling-bench.sh --smoke
@@ -181,11 +172,6 @@ scripts/run-scaling-bench.sh
 # optional same-host baseline comparison
 QMP_SCALING_BASELINE=/path/to/baseline.jsonl scripts/run-scaling-bench.sh
 
-# non-zero runtime bite for every advertised facade feature path
-scripts/verify-feature-capabilities.sh
-
-# every test selector named by public verification docs must exist
-scripts/verify-doc-test-selectors.py
 ```
 
 The scaling rail exercises public budgeted store and broker paths and records
@@ -207,22 +193,18 @@ scripts/extract-to-standalone-repo.sh /path/to/dest             # copy + git ini
 ```
 
 The bootstrap runs a fail-closed pre-flight (member presence, dependency
-direction, no escaping path deps, self-hosting file-set presence, copied-set
-exclusion of `tools/ci/gates/*`, and `cargo metadata` resolution) BEFORE
-copying, so a cyclic / mis-directed split is rejected up front.
+direction, no escaping path deps, self-hosting file-set presence, and
+`cargo metadata` resolution) BEFORE copying, so a cyclic / mis-directed split
+is rejected up front.
 
 ## Repo-local rails
 
-This repo now carries its own verification front doors:
+This repo carries one authoritative verification front door:
 
-- `scripts/check-workspace.sh` — fmt + clippy `-D warnings` + workspace check +
-  example builds + per-feature compile matrix + advertised feature runtime
-  tests + documented-selector validation + `cargo deny`.
-- `scripts/memory-platform-doctor` — repo-local doctor: fmt + clippy `-D warnings`
-  + per-feature compile/runtime matrix + workspace check/tests + documented
-  selector validation + example builds + `cargo deny` when available.
-- `scripts/scaffold-external-repo.sh` — asserts the extracted self-hosting file
-  set is present in-source and that the copy plan excludes `tools/ci/gates`.
+- `scripts/check-workspace.sh` — fmt, workspace safety policy, Python and
+  extraction contracts, Semgrep regression guards, metadata-driven feature
+  matrix, workspace tests, isolated feature runtime tests, documented-selector
+  validation, prompt-manager tests/drift lint, and warning-free `cargo deny`.
 
-Semantica may run additional monorepo boundary gates around this repo, but the
-portable repo's own scripts no longer depend on `tools/ci/gates/*`.
+The rail requires Python 3.9+, Semgrep, and `cargo-deny`; missing tooling fails
+closed rather than silently skipping a check.

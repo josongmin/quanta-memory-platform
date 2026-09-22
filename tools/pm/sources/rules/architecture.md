@@ -55,18 +55,18 @@ Boundary rules (hexagonal direction is inward-only):
   only `tracking-allocator` integration) is feature-gated so it can never enter a
   production graph.
 
-Forbidden usages (fail-closed under `-D warnings` + repo-local doctor + deny):
+Forbidden usages (fail-closed under `-D warnings` + the repo-local rail + deny):
 
 - Semantica nouns in the public API (`Semantica*`, `quanta_runtime`, `codegraph`).
   The portable library carries none.
 - `core` depending on `facade`/`testkit`; `facade` depending on `testkit`.
 - A path dependency escaping the workspace (breaks extraction).
 - `crate::adapters` imported from `domain/` or `ports/`.
-- Raw constructor backdoors leaking past the builder-first surface; stale
-  `V1`/`V2` / renamed-symbol naming (the doctor rail flags both).
+- Raw constructor backdoors leaking past the builder-first surface; public API
+  compile-fail contracts and review own this boundary.
 
 Enforcement: `cargo clippy --workspace --all-targets --all-features -- -D warnings`,
-`cargo deny --all-features check`, `scripts/memory-platform-doctor`, and the
+`cargo deny --all-features check`, `scripts/check-workspace.sh`, and the
 extraction pre-flight in `scripts/extract-to-standalone-repo.sh` (member
 presence, dependency direction, no escaping path deps, self-hosting file set,
 and `cargo metadata` resolves). If a change needs a NEW crate edge, stop and

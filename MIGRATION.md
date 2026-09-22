@@ -49,7 +49,8 @@ unbudgeted or unbounded path.
   inherited `rust-version`.
 - The repository is internal-only: `UNLICENSED` and `publish = false` are
   intentional. A distributable release requires an explicit license decision,
-  crate metadata review, and a new ticket; changing only `publish` is invalid.
+  crate metadata review, and a deliberately reviewed release change; changing
+  only `publish` is invalid.
 
 ## Host qualification boundary
 

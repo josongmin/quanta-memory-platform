@@ -1,4 +1,4 @@
-//! QMP-040 lifecycle conformance must reject broken implementations, not just
+//! Lifecycle conformance must reject broken implementations, not just
 //! accept the five real broker-backed stores. Public accounting callbacks no
 //! longer exist, so faults are injected at the backend-neutral target seam.
 #![cfg(feature = "fixtures")]

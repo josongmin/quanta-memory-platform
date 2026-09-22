@@ -239,6 +239,9 @@ where
     ]
 }
 
+/// A loaded transcript row: sequence, message identity, and body.
+pub type TranscriptRow = (u64, Vec<u8>, Vec<u8>);
+
 /// Backend-neutral target for transcript append idempotency conformance.
 pub trait TranscriptAppendConformanceTarget {
     fn append(
@@ -248,7 +251,7 @@ pub trait TranscriptAppendConformanceTarget {
         message_id: &[u8],
         body: &[u8],
     ) -> Result<TranscriptAppendDispositionV1, TranscriptAppendErrorV1>;
-    fn load(&self, session_id: &[u8]) -> Result<Vec<(u64, Vec<u8>, Vec<u8>)>, MemoryError>;
+    fn load(&self, session_id: &[u8]) -> Result<Vec<TranscriptRow>, MemoryError>;
     fn truncate_to(&self, session_id: &[u8], max_messages: usize) -> Result<(), MemoryError>;
     fn retained_bytes(&self) -> Result<u64, MemoryError>;
 }
@@ -272,7 +275,7 @@ impl TranscriptAppendConformanceTarget
         )
     }
 
-    fn load(&self, session_id: &[u8]) -> Result<Vec<(u64, Vec<u8>, Vec<u8>)>, MemoryError> {
+    fn load(&self, session_id: &[u8]) -> Result<Vec<TranscriptRow>, MemoryError> {
         SessionTranscriptStore::load(self, &session_id.to_vec()).map(|rows| {
             rows.into_iter()
                 .map(|row| (row.sequence(), row.message_id().clone(), row.into_body()))
@@ -2229,7 +2232,7 @@ mod tests {
 
     #[derive(Debug, Default)]
     struct BrokenTranscriptTarget {
-        rows: std::sync::Mutex<Vec<(u64, Vec<u8>, Vec<u8>)>>,
+        rows: std::sync::Mutex<Vec<TranscriptRow>>,
     }
 
     impl TranscriptAppendConformanceTarget for BrokenTranscriptTarget {
@@ -2251,7 +2254,7 @@ mod tests {
             Ok(TranscriptAppendDispositionV1::Applied)
         }
 
-        fn load(&self, _session_id: &[u8]) -> Result<Vec<(u64, Vec<u8>, Vec<u8>)>, MemoryError> {
+        fn load(&self, _session_id: &[u8]) -> Result<Vec<TranscriptRow>, MemoryError> {
             self.rows
                 .lock()
                 .map(|rows| rows.clone())
@@ -2328,7 +2331,7 @@ mod tests {
             self.0.append(session_id, sequence, message_id, body)
         }
 
-        fn load(&self, session_id: &[u8]) -> Result<Vec<(u64, Vec<u8>, Vec<u8>)>, MemoryError> {
+        fn load(&self, session_id: &[u8]) -> Result<Vec<TranscriptRow>, MemoryError> {
             self.0.load(session_id)
         }
 

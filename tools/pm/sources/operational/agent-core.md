@@ -5,21 +5,22 @@ feature-sliced facade:
 
 | Layer | Location | Responsibility |
 | --- | --- | --- |
-| **Domain** | `core/src/domain/` | Pure budget/accounting logic: ledger, policy, config, context, stats. No I/O, no clocks. |
-| **Ports** | `core/src/ports/` | Trait definitions: pin, scratch, store, telemetry. No adapters. |
-| **Adapters** | `core/src/adapters/` | Port impls (hdrhistogram, metrics). Telemetry is advisory. |
-| **Application** | `core/src/application/` | Use-case services: pressure controller, scheduler. |
-| **API** | `core/src/api/` | Builder-first public broker surface. |
-| **Facade** | `facade/src/<feature>/` | Portable stores + pipelines; backings under `backings/`, feature-gated. |
-| **Testkit** | `testkit/src/` | Conformance / chaos / fixtures / doctor. Never a prod dep. |
+| **Domain** | `crates/quanta-memory-platform-core/src/domain/` | Pure budget/accounting logic: ledger, policy, config, context, stats. No I/O, no clocks. |
+| **Ports** | `crates/quanta-memory-platform-core/src/ports/` | Trait definitions: pin, scratch, store, telemetry. No adapters. |
+| **Adapters** | `crates/quanta-memory-platform-core/src/adapters/` | Port impls (hdrhistogram, metrics). Telemetry is advisory. |
+| **Application** | `crates/quanta-memory-platform-core/src/application/` | Use-case services: pressure controller, scheduler. |
+| **API** | `crates/quanta-memory-platform-core/src/api/` | Builder-first public broker surface. |
+| **Facade** | `crates/quanta-memory-platform-facade/src/<feature>/` | Portable stores + pipelines; backings under `backings/`, feature-gated. |
+| **Testkit** | `crates/quanta-memory-platform-testkit/src/` | Conformance / chaos / fixtures / doctor. Never a prod dep. |
 
 On any change:
 
-- **Ledger / accounting** → add `#[cfg(test)]` tests asserting the 4 invariants
-  still hold (class/owner balance, charge-kind partition, reserved≤soft≤hard,
-  no-write-during-rebuild), and that mutations are fail-closed.
+- **Ledger / accounting** → add `#[cfg(test)]` tests asserting the invariants
+  defined in `crates/quanta-memory-platform-core/src/domain/ledger.rs` and that
+  mutations are fail-closed.
 - **Policy / manifest / preset / residency** → add validation tests; update
-  `core/tests/wave1_policy_contracts.rs` if a cross-cutting contract changed.
+  `crates/quanta-memory-platform-core/tests/policy_contracts.rs` if a
+  cross-cutting contract changed.
 - **New port** → trait in `ports/`, impl in `adapters/` (or facade backing); keep
   `domain/` free of the impl.
 - **New facade store/pipeline** → service + builder in `shared/`, backings behind

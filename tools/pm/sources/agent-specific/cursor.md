@@ -3,14 +3,14 @@
 ### Generated rules
 
 - `.cursorrules` is **generated** from `tools/pm/sources/**`.
-- **Never** hand-edit `.cursorrules`, `AGENTS.md`, or `.codex/*`.
+- **Never** hand-edit `.cursorrules`, `AGENTS.md`, or `CLAUDE.md`.
 - After changing sources: `python3 tools/pm/pm.py sync` then `python3 tools/pm/pm.py lint`.
 
 ### Architecture is not negotiable
 
-Read **`cursor-architecture.md`** (included in this file) before every task.
-Cursor frequently violates boundaries when porting code from the Semantica
-monorepo — treat that section as a checklist, not background reading.
+Read the generated architecture, cheatsheet, build, test, determinism, error,
+and dependency rules in this file before every task. Treat them as a checklist,
+not background reading.
 
 **Stop and re-plan** if your diff:
 
@@ -26,12 +26,12 @@ monorepo — treat that section as a checklist, not background reading.
 
 | Task | Allowed touch set |
 | --- | --- |
-| Ledger / policy / config | `core/src/domain/**` + that module's tests |
-| Pressure / scheduler | `core/src/application/**` + tests |
-| New port / adapter | `core/src/ports/**` + `core/src/adapters/**` |
-| Public broker / builder | `core/src/api/**` + examples |
-| Facade store / pipeline | `facade/src/<feature>/**` (service + backing) |
-| Conformance / chaos tooling | `testkit/src/**` |
+| Ledger / policy / config | `crates/quanta-memory-platform-core/src/domain/**` + tests |
+| Pressure / scheduler | `crates/quanta-memory-platform-core/src/application/**` + tests |
+| New port / adapter | `crates/quanta-memory-platform-core/src/{ports,adapters}/**` |
+| Public broker / builder | `crates/quanta-memory-platform-core/src/api/**` + examples |
+| Facade store / pipeline | `crates/quanta-memory-platform-facade/src/<feature>/**` |
+| Conformance / chaos tooling | `crates/quanta-memory-platform-testkit/src/**` |
 
 Do **not** "drive-by" refactor unrelated crates.
 

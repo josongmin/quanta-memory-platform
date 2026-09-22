@@ -7,20 +7,17 @@ testkit conformance, extraction rails).
 This is a living checklist. Correctness scenarios are **tests** (not benchmarks);
 performance/allocation regressions are guarded separately (see *Test vs Bench*).
 
-## Status
+## Scope and evidence status
 
-Hard pass/fail counts go stale fast and are deliberately **not** pinned here —
-re-run the rail (see *How evidence was gathered / re-verify*) for the current
-numbers. Each scenario below cites the exact `#[test]` fn name and its file as
-its own evidence; trust the per-scenario citations over any aggregate count.
+This document is a source-level contract catalogue, not a release or deployment
+receipt. Hard pass/fail counts go stale fast and are deliberately **not** pinned
+here — re-run the rail (see *How evidence was gathered / re-verify*) for current
+results. Each scenario below cites the exact `#[test]` fn name and its file as
+its own evidence; trust those citations over aggregate counts.
 
-At last green, `cargo clippy --workspace --all-targets --all-features -- -D
-warnings` was clean, `cargo fmt --all --check` was clean, `cargo deny
---all-features check` passed, and the repo-local one-shot rail
-(`scripts/check-workspace.sh`, which includes `tools/ci/feature-matrix.sh`) was
-green.
-
-Built out via a parallel pass over disjoint files + central verification.
+Repo-local success establishes the portable library's source, feature, and
+standalone-extraction contracts only. Semantica host adoption, deployment, and
+activation require exact-source evidence outside this repository.
 
 ## Legend
 
@@ -160,13 +157,16 @@ choice documented in `facade/src/publish_pipeline/service.rs`, not a gap.
 
 ## H. Extraction / portability rails — ✅ (`scripts/`, root manifests)
 
-- ✅ existing: direction, no host nouns, dry-run pre-flight, standalone build.
-- ✅ **Per-feature build matrix** — `tools/ci/feature-matrix.sh` runs clippy
+- ✅ static preflight: dependency direction, host-noun boundary, clean-source
+  manifest binding, and an executable standalone extraction procedure.
+- ✅ **Per-feature build matrix** — `scripts/verify-feature-matrix.sh` runs clippy
   `-D warnings` across default, bare, every leaf feature, `full`, and
   all-features, and rejects facade no-default graphs that activate core
   `default`/`live_control` through dependency defaults.
 - ✅ **Public API surface snapshot** — re-export regression guard: `crates/quanta-memory-platform-core/tests/public_api_surface.rs`.
-- ✅ **Self-hosting extracted set** — `scripts/lib/self-hosting-manifest.sh`, `scripts/scaffold-external-repo.sh`, and `scripts/extract-to-standalone-repo.sh` assert the canonical extracted file set and reject copied `tools/ci/gates`.
+- ✅ **Self-hosting extracted set** — `scripts/lib/self-hosting-manifest.sh` and
+  `scripts/extract-to-standalone-repo.sh` assert the canonical extracted file
+  set before export and in the extracted destination.
 
 ## J. Concurrency 🧵 — ✅ (`LiveProcessMemoryBroker` = `Arc<Mutex>`, `Clone`)
 
@@ -204,7 +204,7 @@ choice documented in `facade/src/publish_pipeline/service.rs`, not a gap.
   concrete port implementation lives in `core/src/adapters/scratch.rs`, not in
   the port or API module.
 
-## R. Cross-cutting contracts — ✅ (`core/tests/wave1_policy_contracts.rs`)
+## R. Cross-cutting contracts — ✅ (`crates/quanta-memory-platform-core/tests/policy_contracts.rs`)
 
 New invariants promoted to the public API boundary:
 - ✅ `global_hard_limit_denies_reserve_through_public_broker_and_is_fail_closed`
@@ -223,12 +223,15 @@ New invariants promoted to the public API boundary:
 - Standalone implementation is locally covered by default/bare/leaf/full/all
   warning-free feature slices, non-zero runtime capability tests for every
   advertised facade feature path, runtime scratch owner tests, public surface
-  compile-fail tests, examples, performance gates, and actual extraction.
+  compile-fail tests, examples, and performance gates. Full standalone export
+  proof requires executing `scripts/extract-to-standalone-repo.sh <dest>` on
+  the exact clean source under qualification; `--dry-run` establishes only the
+  source-side preflight.
 - `scripts/verify-doc-test-selectors.py` resolves the selectors named by this
   document against `cargo test --workspace --all-features -- --list`; stale or
   zero-test documentation is a release-gate failure.
-- External Semantica host adoption and remote workflow observation remain
-  separate authorities. Do not infer those closures from this file.
+- External Semantica host adoption, deployment, and activation remain separate
+  authorities. Do not infer those closures from this file.
 - Charged facade mutations are now uniformly fail-closed: charge via `reserve_committed`,
   overwrite via `recharge`, and refund-bearing delete/reclaim/truncate paths via
   fallible refund-before-mutate APIs.
@@ -240,14 +243,7 @@ New invariants promoted to the public API boundary:
 ## How evidence was gathered / re-verify
 
 ```bash
-cargo test --workspace --all-features
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo fmt --all --check
-cargo deny --all-features check
-scripts/check-workspace.sh            # includes warning-free feature matrix + feature-leak guard
-scripts/memory-platform-doctor        # repo-local fmt/clippy/feature-matrix/check/test/examples/deny rail
-scripts/verify-feature-capabilities.sh # isolated runtime bite for advertised features
-scripts/verify-doc-test-selectors.py   # reject stale named test selectors
-# list the evidence test names per file:
-grep -rA1 '#\[test\]' crates --include='*.rs' | grep -oE 'fn [a-z0-9_]+'
+scripts/check-workspace.sh
+# inspect the evidence test names per file:
+rg -n '^\s*fn [a-z0-9_]+\(' crates --glob '*.rs'
 ```

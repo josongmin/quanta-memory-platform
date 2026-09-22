@@ -2,8 +2,8 @@
 //! commit / release, resource-group admission, pressure classification, and
 //! fail-closed live reconfiguration.
 //!
-//! This is the concrete control-plane surface for ticket 05. It wraps the
-//! semantic [`AccountingLedger`] (SSOT) behind a lock and composes the
+//! This is the concrete control-plane surface. It wraps the semantic
+//! [`AccountingLedger`] (SSOT) behind a lock and composes the
 //! application-layer scheduler and pressure controller. Allocator telemetry is
 //! observed only through the advisory lane and never mutates the ledger.
 
@@ -1281,7 +1281,7 @@ impl LiveProcessMemoryBroker {
 
     /// Observe an allocator snapshot. Advisory only: returns a comparison
     /// against semantic accounting and provably does NOT mutate the ledger
-    /// (invariant 6). The returned advisory carries the mismatch signal.
+    /// (the advisory telemetry contract). The returned advisory carries the mismatch signal.
     pub fn observe_allocator(
         &self,
         snapshot: &AllocatorSnapshot,

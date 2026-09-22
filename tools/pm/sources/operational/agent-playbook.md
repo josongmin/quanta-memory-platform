@@ -16,14 +16,7 @@ Before closeout, run:
 ```bash
 # Regenerate agent docs if you edited tools/pm/sources/**
 python3 tools/pm/pm.py sync
-python3 tools/pm/pm.py lint
-
-cargo fmt --all --check
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo test --workspace --all-features
-cargo deny --all-features check
-scripts/check-workspace.sh          # one-shot rail, includes feature matrix
-scripts/memory-platform-doctor      # repo-local fmt/clippy/feature-matrix/check/test/examples/deny rail
+scripts/check-workspace.sh          # canonical static/test/feature/selector/PM/deny rail
 
 # if you changed any Cargo.toml or cross-crate use path:
 scripts/extract-to-standalone-repo.sh --dry-run /tmp/qmp-check
@@ -43,10 +36,8 @@ Changed:
 - ...
 
 Verified:
-- cargo clippy -D warnings / cargo test --all-features
-- pm lint
+- scripts/check-workspace.sh
 - extraction dry-run (if Cargo.toml/use paths changed)
-- repo-local doctor rail
 
 Not run:
 - ...

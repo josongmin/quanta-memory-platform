@@ -12,16 +12,14 @@ private = { ignore = true }
 # Only licenses actually encountered in the full (`--all-features`) dependency
 # graph are listed, so the allow-list stays drift-free: an unencountered
 # allowance surfaces as a warning, and a newly introduced license fails closed.
-# MPL-2.0 (tracking-allocator, testkit `alloc_tracking` only) and
-# LGPL-2.1-or-later (r-efi, transitive) are file-/dynamic-scope copyleft and are
-# accepted for this internal library; revisit if either reaches a distributed
-# binary surface.
+# MPL-2.0 (tracking-allocator, testkit `alloc_tracking` only) is file-scope
+# copyleft and is accepted for this internal library; revisit if it reaches a
+# distributed binary surface.
 allow = [
     "0BSD",
     "Apache-2.0",
     "Apache-2.0 WITH LLVM-exception",
     "BSD-2-Clause",
-    "LGPL-2.1-or-later",
     "MIT",
     "MPL-2.0",
     "Unlicense",
@@ -29,4 +27,4 @@ allow = [
 ]
 
 [bans]
-multiple-versions = "allow"
+multiple-versions = "deny"

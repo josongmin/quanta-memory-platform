@@ -26,7 +26,6 @@ against `deny.toml`.
 - No dependency may introduce a path dep escaping the workspace (breaks
   extraction). Inter-member deps stay relative within `crates/`.
 
-`deny.toml` notes: private (unpublished) members are license-exempt
-(`license = "UNLICENSED"`); `multiple-versions = "allow"`. MPL-2.0
-(tracking-allocator) and LGPL-2.1-or-later (transitive) are accepted for this
-internal library — revisit if either reaches a distributed binary.
+`deny.toml` notes: private unpublished members are license-exempt and duplicate
+versions fail. MPL-2.0 is accepted only for the testkit tracking-allocator path.
+Revisit that allowance before any distributed binary release.

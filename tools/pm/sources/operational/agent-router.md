@@ -19,13 +19,14 @@ Hard rules:
   `PortableMemoryPresets`, and the store/pipeline builders — never raw broker
   constructors.
 - **Ledger is fail-closed:** every mutating accounting op fully succeeds or
-  leaves the ledger untouched; the 4 invariants always hold; allocator telemetry
-  is advisory and never mutates counters.
+  leaves the ledger untouched; the invariants defined in
+  `crates/quanta-memory-platform-core/src/domain/ledger.rs` always hold;
+  allocator telemetry is advisory and never mutates counters.
 - **Conformance must bite:** the testkit suite must REJECT a broken fake, not just
   accept honest ones.
 - **Agent guidance:** edit only `tools/pm/sources/**`, then run
-  `python3 tools/pm/pm.py sync`. Never hand-edit `AGENTS.md`, `CLAUDE.md`,
-  `.codex/*`, or `.cursorrules`.
+  `python3 tools/pm/pm.py sync`. Never hand-edit `AGENTS.md`, `CLAUDE.md`, or
+  `.cursorrules`.
 
 ## Where Things Live
 
@@ -34,19 +35,17 @@ Hard rules:
 | Repo overview + dependency direction | `README.md` |
 | Extraction checklist (split into own repo) | `EXTRACTION.md` |
 | Pure hexagonal kernel | `crates/quanta-memory-platform-core/src/{api,application,domain,ports,adapters}/` |
-| Accounting SSOT (invariants) | `core/src/domain/ledger.rs` |
-| Budget policy / presets / manifests | `core/src/domain/{policy,config}.rs` |
-| Public broker surface | `core/src/api/{broker,builder,control}.rs` |
+| Accounting SSOT (invariants) | `crates/quanta-memory-platform-core/src/domain/ledger.rs` |
+| Budget policy / presets / manifests | `crates/quanta-memory-platform-core/src/domain/{policy,config}.rs` |
+| Public broker surface | `crates/quanta-memory-platform-core/src/api/{broker,builder,control}.rs` |
 | Feature-sliced portable stores + pipelines | `crates/quanta-memory-platform-facade/src/<feature>/` |
-| Storage backings (feature-gated) | `facade/src/<feature>/backings/` |
+| Storage backings (feature-gated) | `crates/quanta-memory-platform-facade/src/<feature>/backings/` |
 | Conformance / chaos / alloc tooling | `crates/quanta-memory-platform-testkit/src/` |
-| Examples (compile vs real public API) | `facade/examples/{hello_world,effective_budget_report}.rs` |
+| Examples (compile vs real public API) | `crates/quanta-memory-platform-facade/examples/{hello_world,effective_budget_report}.rs` |
 | One-shot lint rail | `scripts/check-workspace.sh` |
-| Repo-local doctor rail | `scripts/memory-platform-doctor` |
-| Self-hosting scaffold assertion | `scripts/scaffold-external-repo.sh` |
 | Extraction bootstrap | `scripts/extract-to-standalone-repo.sh` |
 | Agent/operator instruction sources | `tools/pm/sources/**` |
-| Prompt manager | `tools/pm/pm.py`, `tools/pm/targets.yaml` |
+| Prompt manager | `tools/pm/pm.py`, `tools/pm/targets.json` |
 
-Generated docs (`AGENTS.md`, `CLAUDE.md`, `.codex/*`, `.cursorrules`) are produced
-from `tools/pm/sources/**`. Never hand-edit them.
+Generated docs (`AGENTS.md`, `CLAUDE.md`, `.cursorrules`) are produced from
+`tools/pm/sources/**`. Never hand-edit them.

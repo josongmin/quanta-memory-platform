@@ -1,0 +1,38 @@
+{
+  "targets": {
+    "agents": {
+      "output": "AGENTS.md",
+      "title": "quanta-memory-platform — Agent Operating Guide",
+      "sections": [
+        "sources/operational/agent-router.md",
+        "sources/operational/agent-core.md",
+        "sources/operational/agent-playbook.md"
+      ]
+    },
+    "claude": {
+      "output": "CLAUDE.md",
+      "title": "quanta-memory-platform — Claude Code Guide",
+      "sections": [
+        "sources/operational/agent-router.md",
+        "sources/operational/agent-core.md",
+        "sources/rules/cheatsheet.md",
+        "sources/operational/agent-playbook.md",
+        "sources/agent-specific/claude.md"
+      ]
+    },
+    "cursor_rules": {
+      "output": ".cursorrules",
+      "title": "quanta-memory-platform — Cursor Rules",
+      "sections": [
+        "sources/rules/architecture.md",
+        "sources/rules/cheatsheet.md",
+        "sources/rules/build.md",
+        "sources/rules/tests.md",
+        "sources/rules/determinism.md",
+        "sources/rules/error-handling.md",
+        "sources/rules/dependencies.md",
+        "sources/agent-specific/cursor.md"
+      ]
+    }
+  }
+}

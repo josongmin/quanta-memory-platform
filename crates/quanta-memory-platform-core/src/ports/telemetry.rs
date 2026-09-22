@@ -4,7 +4,7 @@
 //! **advisory only**: it is never the semantic accounting authority. The ledger
 //! ([`crate::domain::ledger::AccountingLedger`]) is the SSOT. This lane lets a
 //! host compare allocator truth against semantic truth and surface a mismatch
-//! signal WITHOUT mutating any semantic counter (invariant 6).
+//! signal WITHOUT mutating any semantic counter (the advisory telemetry contract).
 
 use crate::AllocatorSnapshot;
 
