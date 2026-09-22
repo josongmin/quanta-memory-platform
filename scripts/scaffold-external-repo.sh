@@ -9,4 +9,4 @@ source "${repo_root}/scripts/lib/self-hosting-manifest.sh"
 self_hosting_assert_source_set
 self_hosting_assert_copy_plan
 
-echo "external repo scaffold is self-hosting and excludes tools/ci/gates"
+echo "external repo scaffold is self-hosting, excludes tools/ci/gates, and excludes campaign ticket admission"

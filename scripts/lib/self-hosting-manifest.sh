@@ -29,6 +29,16 @@ SELF_HOSTING_COPY_PATHS=(
   "tools/tickets"
   "tools/ci/feature-matrix.sh"
   "docs"
+)
+
+# Campaign admission and its receipts are repository-local governance. They
+# must not become part of the extracted product repository. Keep the generic
+# Cargo evidence runner, which is used by the feature-capability rail, but
+# exclude the validator and all ticket evidence from extraction.
+SELF_HOSTING_EXCLUDED_PATHS=(
+  "scripts/verify-tickets.sh"
+  "tools/tickets/verify_tickets.py"
+  "tools/tickets/test_verify_tickets.py"
   "tickets"
 )
 
@@ -73,7 +83,6 @@ SELF_HOSTING_REQUIRED_PATHS=(
   "scripts/tests/test_scaling_results.py"
   "scripts/tests/test_doc_test_selectors.py"
   "scripts/regression-guards.sh"
-  "scripts/verify-tickets.sh"
   "scripts/run-ticket-test"
   "tools/pm/pm.py"
   "tools/pm/targets.yaml"
@@ -81,11 +90,8 @@ SELF_HOSTING_REQUIRED_PATHS=(
   "tools/pm/sources/operational/agent-core.md"
   "tools/ci/feature-matrix.sh"
   "tools/semgrep/qmp-regressions.yml"
-  "tools/tickets/verify_tickets.py"
-  "tools/tickets/test_verify_tickets.py"
   "tools/tickets/run_cargo_test.py"
   "docs/verification-scenarios.md"
-  "tickets/README.md"
 )
 
 SELF_HOSTING_FORBIDDEN_PATHS=(
@@ -162,6 +168,13 @@ self_hosting_assert_extracted_layout() {
   for path in "${SELF_HOSTING_FORBIDDEN_PATHS[@]}"; do
     if [[ -e "${dest}/${path}" ]]; then
       echo "forbidden extracted path present: ${path}" >&2
+      missing=1
+    fi
+  done
+
+  for path in "${SELF_HOSTING_EXCLUDED_PATHS[@]}"; do
+    if [[ -e "${dest}/${path}" ]]; then
+      echo "excluded campaign path present in extracted repo: ${path}" >&2
       missing=1
     fi
   done

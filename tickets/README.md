@@ -11,6 +11,21 @@
 - 루트 `AUDIT-2026-09-21.md`와 `SYSTEM-AUDIT-CHECKLIST.md`는 감사 산출물이며 ticket 상태 권위가 아니다.
 - source가 바뀌면 과거 receipt는 해당 SHA에만 유효하다. 현재 상태로 자동 승격하지 않는다.
 
+### Campaign boundary
+
+`scripts/verify-tickets.sh`와 `tools/tickets/{verify_tickets.py,test_verify_tickets.py}`
+는 이 source checkout의 캠페인 admission/증빙 검사기다. 제품 런타임이나
+standalone extraction의 의존성이 아니며, extraction manifest에서 의도적으로
+제외된다. `scripts/run-ticket-test`와 `tools/tickets/run_cargo_test.py`는
+feature-capability rail이 사용하는 generic zero-selection Cargo evidence runner라
+별도로 유지한다.
+
+현재 `main@2f945e2` 통합 후 QMP-020, -030, -060, -080, -090, -100, -110,
+-120의 마지막 terminal receipt는 source-path drift로 stale이다. 이 receipt는
+삭제하거나 HEAD를 수동 수정하지 않는다. 새 exact-source 실행 receipt가 생길
+때까지 해당 terminal proof를 QUALIFIED 근거로 사용하지 않는다. 상세 결과는
+[`MAIN-INTEGRATION-2026-09-22.md`](MAIN-INTEGRATION-2026-09-22.md)에 고정한다.
+
 ## 1. 동결 기준
 
 | 항목 | 값 |
@@ -195,8 +210,10 @@ QMP-140 SemVer/docs closeout waits for QMP-130
 
 Active claim은 [`CLAIM-TEMPLATE.md`](CLAIM-TEMPLATE.md)를 복사해
 `tickets/claims/<ticket-id>-<owner>.md`에 두며, claim 종료 시 제거한다.
-`scripts/verify-tickets.sh`는 inventory/dependency/finding/claim/receipt 체인을
-negative fixture와 실제 tree 양쪽에서 검증하는 canonical admission command다.
+`scripts/verify-tickets.sh`는 source checkout에서 inventory/dependency/finding/
+claim/receipt 체인을 negative fixture와 실제 tree 양쪽에서 검증하는 campaign
+admission command다. standalone extraction이나 product qualification의
+실행 의존성으로 해석하지 않는다.
 
 ## 8. Receipt evidence levels
 

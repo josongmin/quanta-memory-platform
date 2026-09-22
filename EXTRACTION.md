@@ -57,9 +57,12 @@ dependency direction. Not prose: every step is a command or a verifiable gate.
    ```bash
    scripts/check-workspace.sh
    scripts/memory-platform-doctor
-   scripts/verify-tickets.sh
    python3 tools/pm/pm.py lint
    ```
+
+   Campaign ticket admission (`scripts/verify-tickets.sh` and `tickets/**`)
+   remains source-checkout governance only and is intentionally excluded from
+   the standalone product extraction.
 
    Both build rails require the lockfile, `semgrep`, and `cargo-deny`; missing
    tooling fails the extraction. After verification, the script commits the
@@ -116,7 +119,9 @@ dependency direction. Not prose: every step is a command or a verifiable gate.
 ## Standalone extraction gate (QMP-120)
 
 - Extracted repo: `scripts/check-workspace.sh`, `scripts/memory-platform-doctor`,
-  `scripts/scaffold-external-repo.sh`, ticket validation, and PM lint all pass.
+  `scripts/scaffold-external-repo.sh`, and PM lint all pass. Campaign ticket
+  admission remains a source-checkout governance rail and is not an extracted
+  product dependency.
 - Source/extracted tree-bound canonical digests and file modes match, the source
   stays at the frozen clean `HEAD`, and the extracted git worktree is clean.
 - All Cargo resolution is locked; missing Semgrep or cargo-deny fails closed.

@@ -4,14 +4,16 @@ Portable, host-independent memory-platform workspace. It is consumed by the
 Semantica monorepo through a dedicated host adapter (`quanta-memory-host`) and is
 designed to be extracted into its own repository without rewrites.
 
-> **Current qualification status (2026-09-21): NOT production-ready.** Local
+> **Current qualification status (2026-09-22): NOT production-ready.** Local
 > standalone extraction, including committed HEAD/tree/blob/mode binding, has
 > passed; external host adoption remains unobserved on the current release
 > candidate. Standalone performance,
 > observability, extraction, and conformance rails are locally qualified; they
-> do not substitute for host-product GREEN. The authoritative
-> remediation inventory, status, dependencies, acceptance criteria, and receipts
-> live in [`tickets/README.md`](./tickets/README.md). Passing a focused test or
+> do not substitute for host-product GREEN. The authoritative remediation
+> inventory, status, dependencies, acceptance criteria, and receipts live in
+> [`tickets/README.md`](./tickets/README.md) in this source checkout. Ticket
+> admission and historical receipts are campaign governance; they are not
+> copied into a standalone product extraction. Passing a focused test or
 > dry-run does not supersede that status.
 
 ## Packages and dependency direction

@@ -31,6 +31,14 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${repo_root}"
 source "${repo_root}/scripts/lib/self-hosting-manifest.sh"
 
+# Keep campaign admission evidence in the source checkout. The standalone
+# product carries only the generic Cargo evidence runner used by feature
+# capability checks.
+SELF_HOSTING_EXTRACTION_PATHS=("${SELF_HOSTING_COPY_PATHS[@]}")
+for excluded_path in "${SELF_HOSTING_EXCLUDED_PATHS[@]}"; do
+  SELF_HOSTING_EXTRACTION_PATHS+=(":(exclude)${excluded_path}")
+done
+
 dest="$(python3 -c 'from pathlib import Path; import sys; print(Path(sys.argv[1]).resolve())' "${dest}")"
 if [[ "${dest}" == "${repo_root}" ]] || [[ "${dest}" == "${repo_root}/"* ]] || \
    [[ "${repo_root}" == "${dest}/"* ]]; then
@@ -109,10 +117,10 @@ tree_manifest="$(mktemp /tmp/qmp-extract-tree.XXXXXX)"
 path_manifest="$(mktemp /tmp/qmp-extract-paths.XXXXXX)"
 trap 'rm -f "${tree_manifest}" "${path_manifest}"' EXIT
 python3 scripts/lib/extraction_manifest.py assert-clean \
-  --repo "${repo_root}" --commit "${source_head}" "${SELF_HOSTING_COPY_PATHS[@]}"
+  --repo "${repo_root}" --commit "${source_head}" "${SELF_HOSTING_EXTRACTION_PATHS[@]}"
 manifest_output="$(python3 scripts/lib/extraction_manifest.py snapshot \
   --repo "${repo_root}" --revision "${source_head}" --output "${tree_manifest}" \
-  "${SELF_HOSTING_COPY_PATHS[@]}")"
+  "${SELF_HOSTING_EXTRACTION_PATHS[@]}")"
 source_digest="$(sed -n 's/^digest=//p' <<<"${manifest_output}")"
 if [[ -z "${source_digest}" ]]; then
   echo "FAIL: extraction manifest did not emit a canonical digest" >&2
@@ -138,7 +146,7 @@ run mkdir -p "${dest}"
 
 echo "[2/5] copying canonical files"
 if [[ "${dry_run}" -eq 0 ]]; then
-  git archive --format=tar "${source_head}" -- "${SELF_HOSTING_COPY_PATHS[@]}" | tar -xf - -C "${dest}"
+  git archive --format=tar "${source_head}" -- "${SELF_HOSTING_EXTRACTION_PATHS[@]}" | tar -xf - -C "${dest}"
 else
   echo "DRY-RUN: export frozen tree ${source_tree} from HEAD ${source_head}"
 fi
@@ -173,7 +181,6 @@ if [[ "${dry_run}" -eq 0 ]]; then
     scripts/scaffold-external-repo.sh
     scripts/check-workspace.sh
     scripts/memory-platform-doctor
-    scripts/verify-tickets.sh
     python3 tools/pm/pm.py lint
   )
   if [[ "$(python3 scripts/lib/extraction_manifest.py verify \
@@ -182,7 +189,7 @@ if [[ "${dry_run}" -eq 0 ]]; then
     exit 1
   fi
 else
-  echo "DRY-RUN: (cd ${dest} && metadata --locked + scaffold + check-workspace + doctor + tickets + pm lint)"
+  echo "DRY-RUN: (cd ${dest} && metadata --locked + scaffold + check-workspace + doctor + pm lint)"
 fi
 
 # ---------------------------------------------------------------------------
@@ -191,7 +198,7 @@ fi
 
 echo "[4/5] initializing verified git repo at ${dest}"
 python3 scripts/lib/extraction_manifest.py assert-clean \
-  --repo "${repo_root}" --commit "${source_head}" "${SELF_HOSTING_COPY_PATHS[@]}"
+  --repo "${repo_root}" --commit "${source_head}" "${SELF_HOSTING_EXTRACTION_PATHS[@]}"
 run git -C "${dest}" init -q
 run git -C "${dest}" add --pathspec-from-file="${path_manifest}" --pathspec-file-nul
 if [[ "${dry_run}" -eq 0 ]] && \
