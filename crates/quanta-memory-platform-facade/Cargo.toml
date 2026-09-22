@@ -22,7 +22,11 @@ payload_store = ["core-live-accounting"]
 retained_map = ["core-live-accounting", "dep:hashlink"]
 # Base store/pipeline slices are pure-Rust in-memory and carry NO third-party
 # (copyleft) backing deps. Durable/concurrent backings are opt-in via the
+<<<<<<< HEAD
 # `*-redb` features below, so a consumer that does not ask
+=======
+# production `spill-redb` or explicit experimental index features below, so a consumer that does not ask
+>>>>>>> codex/qmp130-upstream-hardening
 # for a heavy backing never links one (and `full` stays copyleft-free).
 revocable_store = ["core-live-accounting"]
 transcript = ["core-live-accounting", "dep:blake3"]
@@ -31,6 +35,11 @@ spill = []
 
 # Opt-in heavy backings (each pulls one third-party crate).
 spill-redb = ["spill", "dep:redb"]
+<<<<<<< HEAD
+=======
+experimental-revocable-moka-index = ["revocable_store", "dep:moka"]
+experimental-revocable-scc-index = ["revocable_store", "dep:scc"]
+>>>>>>> codex/qmp130-upstream-hardening
 
 # `full` = every in-memory slice, deliberately WITHOUT any backing dep, so it is
 # free of copyleft transitive dependencies while still including the facade's
@@ -44,9 +53,15 @@ full = [
     "publish_pipeline",
     "spill",
 ]
+<<<<<<< HEAD
 # `full-backings` = `full` plus every production backing. Compile-only
 # moka/scc indexes were removed because they never implemented the canonical
 # revocable-store contract.
+=======
+# `full-backings` includes only production semantic backings. The moka/scc
+# indexes are explicitly experimental because they do not own payload or
+# accounting-transfer callbacks.
+>>>>>>> codex/qmp130-upstream-hardening
 full-backings = ["full", "spill-redb"]
 
 [[example]]

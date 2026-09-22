@@ -31,6 +31,7 @@ struct RevocableEntry<Key, Value> {
     charge: Option<ManagedCharge>,
 }
 
+<<<<<<< HEAD
 /// In-process transfer authority. The value, its semantic cost, and the
 /// issuing broker lease move together; dropping an un-restored handle retires
 /// them together. This is not a durable serialization format.
@@ -48,6 +49,102 @@ impl<Key, Value> RevocableSpillHandle<Key, Value> {
     #[must_use]
     pub fn key(&self) -> &Key {
         &self.entry.as_ref().expect("live spill handle").key
+=======
+/// Detached revocable entry that still owns its original accounting lease.
+/// Moving this value to another in-process container keeps resident bytes
+/// charged. Dropping it is an explicit discard and releases the lease.
+#[derive(Debug)]
+pub struct ReclaimedEntry<Key, Value> {
+    binding: StoreBindingHandle,
+    source_capability: Arc<()>,
+    key: Key,
+    value: Value,
+    charged_bytes: u64,
+    charge: Option<ManagedCharge>,
+}
+
+impl<Key, Value> ReclaimedEntry<Key, Value> {
+    #[must_use]
+    pub fn binding(&self) -> &StoreBindingHandle {
+        &self.binding
+    }
+
+    #[must_use]
+    pub fn key(&self) -> &Key {
+        &self.key
+    }
+
+    #[must_use]
+    pub fn value(&self) -> &Value {
+        &self.value
+    }
+
+    #[must_use]
+    pub fn charged_bytes(&self) -> u64 {
+        self.charged_bytes
+    }
+
+    /// Explicitly discard the detached entry. A failed ledger release returns
+    /// the complete entry and live charge for source recovery or retry.
+    pub fn discard(mut self) -> Result<(Key, Value), ReclaimFinalizeError<Key, Value>> {
+        if let Some(charge) = self.charge.as_mut() {
+            if let Err(error) = charge.release() {
+                return Err(ReclaimFinalizeError { error, entry: Box::new(self) });
+            }
+        }
+        self.charge = None;
+        Ok((self.key, self.value))
+    }
+}
+
+#[derive(Debug)]
+pub struct ReclaimFinalizeError<Key, Value> {
+    error: MemoryError,
+    entry: Box<ReclaimedEntry<Key, Value>>,
+}
+
+impl<Key, Value> ReclaimFinalizeError<Key, Value> {
+    #[must_use]
+    pub fn error(&self) -> &MemoryError {
+        &self.error
+    }
+
+    #[must_use]
+    pub fn into_parts(self) -> (MemoryError, ReclaimedEntry<Key, Value>) {
+        (self.error, *self.entry)
+    }
+}
+
+#[derive(Debug)]
+pub struct RestoreReclaimedError<Key, Value> {
+    error: MemoryError,
+    entry: Box<ReclaimedEntry<Key, Value>>,
+}
+
+impl<Key, Value> RestoreReclaimedError<Key, Value> {
+    #[must_use]
+    pub fn new(error: MemoryError, entry: ReclaimedEntry<Key, Value>) -> Self {
+        Self { error, entry: Box::new(entry) }
+    }
+
+    #[must_use]
+    pub fn error(&self) -> &MemoryError {
+        &self.error
+    }
+
+    #[must_use]
+    pub fn into_parts(self) -> (MemoryError, ReclaimedEntry<Key, Value>) {
+        (self.error, *self.entry)
+    }
+}
+
+fn retire_entries<Key, Value>(entries: Vec<RevocableEntry<Key, Value>>) {
+    for entry in entries {
+        let RevocableEntry { key, value, charge, .. } = entry;
+        drop(charge);
+        retire_client_value(key);
+        retire_client_value(value);
+>>>>>>> codex/qmp130-upstream-hardening
     }
 
     #[must_use]
@@ -139,7 +236,12 @@ struct RevocableState<Key, Value> {
 /// ```
 #[derive(Debug)]
 pub struct SimpleRevocableStore<Key, Value, Mode> {
+<<<<<<< HEAD
     binding: Arc<StoreBindingHandle>,
+=======
+    binding: StoreBindingHandle,
+    source_capability: Arc<()>,
+>>>>>>> codex/qmp130-upstream-hardening
     accounting: StoreAccounting,
     lifecycle: StoreLifecycle,
     state: Mutex<RevocableState<Key, Value>>,
@@ -149,7 +251,12 @@ pub struct SimpleRevocableStore<Key, Value, Mode> {
 impl<Key, Value, Mode> SimpleRevocableStore<Key, Value, Mode> {
     fn with_accounting(binding: StoreBindingHandle, accounting: StoreAccounting) -> Self {
         Self {
+<<<<<<< HEAD
             binding: Arc::new(binding),
+=======
+            binding,
+            source_capability: Arc::new(()),
+>>>>>>> codex/qmp130-upstream-hardening
             accounting,
             lifecycle: StoreLifecycle::new("revocable store"),
             state: Mutex::new(RevocableState {
@@ -933,9 +1040,9 @@ where
         Ok(())
     }
 
-    fn reclaim_one(&self) -> MemoryResult<Option<(Key, Value)>> {
+    fn prepare_reclaim_one(&self) -> MemoryResult<Option<ReclaimedEntry<Key, Value>>> {
         let _mutation = self.lifecycle.begin_mutation()?;
-        let (mut entry, next_committed) = {
+        let (entry, next_committed) = {
             let mut state = self.lock_state()?;
             let Some(entry) = state.entries.front() else {
                 return Ok(None);
@@ -949,6 +1056,7 @@ where
                 })?;
             (state.entries.pop_front().expect("front entry was checked"), next_committed)
         };
+<<<<<<< HEAD
 
         let mut charges = entry.charge.take().into_iter().collect::<Vec<_>>();
         if let Err(error) = self.accounting.release_many(&mut charges) {
@@ -957,8 +1065,99 @@ where
             return Err(error);
         }
 
+=======
+>>>>>>> codex/qmp130-upstream-hardening
         self.lock_state_for_commit().committed_bytes = next_committed;
-        Ok(Some((entry.key, entry.value)))
+        Ok(Some(ReclaimedEntry {
+            binding: self.binding.clone(),
+            source_capability: Arc::clone(&self.source_capability),
+            key: entry.key,
+            value: entry.value,
+            charged_bytes: entry.charged_bytes,
+            charge: entry.charge,
+        }))
+    }
+
+    fn restore_reclaimed(
+        &self,
+        entry: ReclaimedEntry<Key, Value>,
+    ) -> Result<(), RestoreReclaimedError<Key, Value>> {
+        let _mutation = match self.lifecycle.begin_mutation() {
+            Ok(mutation) => mutation,
+            Err(error) => return Err(RestoreReclaimedError { error, entry: Box::new(entry) }),
+        };
+        if entry.binding != self.binding
+            || !Arc::ptr_eq(&entry.source_capability, &self.source_capability)
+        {
+            return Err(RestoreReclaimedError {
+                error: MemoryError::InvalidState(
+                    "reclaimed entry belongs to a different store binding".to_string(),
+                ),
+                entry: Box::new(entry),
+            });
+        }
+        match (self.accounting.broker().is_some(), entry.charge.is_some()) {
+            (true, false) => {
+                return Err(RestoreReclaimedError {
+                    error: MemoryError::InvalidState(
+                        "budgeted reclaimed entry has no managed charge".to_string(),
+                    ),
+                    entry: Box::new(entry),
+                });
+            }
+            (false, true) => {
+                return Err(RestoreReclaimedError {
+                    error: MemoryError::InvalidState(
+                        "unbudgeted reclaimed entry owns a managed charge".to_string(),
+                    ),
+                    entry: Box::new(entry),
+                });
+            }
+            _ => {}
+        }
+        let mut state = match self.lock_state() {
+            Ok(state) => state,
+            Err(error) => return Err(RestoreReclaimedError { error, entry: Box::new(entry) }),
+        };
+        let Some(next_committed) = state.committed_bytes.checked_add(entry.charged_bytes) else {
+            return Err(RestoreReclaimedError {
+                error: MemoryError::capacity("revocable restore byte accounting overflow"),
+                entry: Box::new(entry),
+            });
+        };
+        state.entries.insert(
+            0,
+            RevocableEntry {
+                key: entry.key,
+                value: entry.value,
+                charged_bytes: entry.charged_bytes,
+                charge: entry.charge,
+            },
+        );
+        state.committed_bytes = next_committed;
+        Ok(())
+    }
+
+    fn discard_one(&self) -> MemoryResult<Option<(Key, Value)>> {
+        let Some(entry) = self.prepare_reclaim_one()? else {
+            return Ok(None);
+        };
+        match entry.discard() {
+            Ok(parts) => Ok(Some(parts)),
+            Err(failure) => {
+                let (release_error, entry) = failure.into_parts();
+                match self.restore_reclaimed(entry) {
+                    Ok(()) => Err(release_error),
+                    Err(restore_failure) => {
+                        let (restore_error, entry) = restore_failure.into_parts();
+                        drop(entry);
+                        Err(MemoryError::InvalidState(format!(
+                            "destructive reclaim release failed ({release_error}); source restore also failed ({restore_error})"
+                        )))
+                    }
+                }
+            }
+        }
     }
 
     fn stats(&self) -> MemoryResult<StoreStats> {
@@ -1154,7 +1353,7 @@ mod tests {
     }
 
     #[test]
-    fn reclaim_one_is_fifo_and_releases_its_bytes() {
+    fn discard_one_is_fifo_and_releases_its_bytes() {
         let broker = live_broker(1_000_000);
         let store = store_with_broker(&broker);
         store.insert_checked("first".to_string(), vec![0; 4]).expect("first");
@@ -1163,7 +1362,7 @@ mod tests {
         assert_eq!(store.stats().expect("stats").estimated_bytes, expected);
         assert_eq!(broker.ledger_snapshot().expect("ledger").total_owner_bytes(), expected);
 
-        let (key, value) = store.reclaim_one().expect("reclaim").expect("entry");
+        let (key, value) = store.discard_one().expect("discard").expect("entry");
         assert_eq!((key.as_str(), value.len()), ("first", 4));
         assert_eq!(store.committed_bytes().expect("bytes"), expected_entry_cost("second", 6));
         assert_eq!(
@@ -1173,6 +1372,7 @@ mod tests {
     }
 
     #[test]
+<<<<<<< HEAD
     fn revocable_full_drain_uses_fifo_deque_without_front_shifts() {
         let source = include_str!("service.rs");
         assert!(
@@ -1184,11 +1384,43 @@ mod tests {
             !source.contains(&forbidden_front_shift),
             "front-shifting Vec removal reintroduces quadratic full drain"
         );
+=======
+    fn prepared_reclaim_preserves_charge_until_explicit_discard() {
+        let broker = live_broker(1_000_000);
+        let store = store_with_broker(&broker);
+        store.insert_checked("first".to_string(), vec![0; 4]).expect("insert");
+        let expected = expected_entry_cost("first", 4);
+
+        let prepared = store.prepare_reclaim_one().expect("prepare").expect("entry");
+        assert_eq!(prepared.charged_bytes(), expected);
+        assert_eq!(store.stats().expect("source stats"), StoreStats::default());
+        assert_eq!(broker.ledger_snapshot().expect("charge remains").total_owner_bytes(), expected);
+
+        let (key, value) = prepared.discard().expect("explicit discard");
+        assert_eq!((key.as_str(), value.len()), ("first", 4));
+        assert_eq!(broker.ledger_snapshot().expect("released").total_owner_bytes(), 0);
+    }
+
+    #[test]
+    fn failed_restore_to_same_binding_but_wrong_instance_returns_recovery_authority() {
+        let broker = live_broker(1_000_000);
+        let source = store_with_broker(&broker);
+        let wrong = store_with_broker(&broker);
+        source.insert_checked("first".to_string(), vec![0; 4]).expect("insert");
+        let prepared = source.prepare_reclaim_one().expect("prepare").expect("entry");
+
+        let failure = wrong.restore_reclaimed(prepared).expect_err("wrong source must reject");
+        let (error, prepared) = failure.into_parts();
+        assert!(matches!(error, MemoryError::InvalidState(_)));
+        source.restore_reclaimed(prepared).expect("restore exact source");
+        assert_eq!(source.stats().expect("restored").item_count, 1);
+>>>>>>> codex/qmp130-upstream-hardening
     }
 
     #[cfg(feature = "spill")]
     #[test]
     fn reclaim_to_in_memory_tier_keeps_bytes_charged() {
+<<<<<<< HEAD
         let broker = live_broker(1_000_000);
         let store = store_with_broker(&broker);
         store.insert_checked("first".into(), vec![1; 4]).expect("first");
@@ -1315,11 +1547,31 @@ mod tests {
             MemoryOutcome::Succeeded,
             None,
         )));
+=======
+        use crate::spill::{SpillController, SpillOwnership};
+        use crate::{RetainingSpillTarget, RoutedSpillController};
+
+        let broker = live_broker(1_000_000);
+        let source = store_with_broker(&broker);
+        source.insert_checked("first".to_string(), vec![0; 4]).expect("insert");
+        let expected = expected_entry_cost("first", 4);
+        let prepared = source.prepare_reclaim_one().expect("prepare").expect("entry");
+        let tier = RoutedSpillController::new(RetainingSpillTarget::available());
+
+        let receipt = tier.spill(prepared).expect("in-process transfer");
+        assert_eq!(receipt.ownership(), SpillOwnership::InProcessRetained);
+        assert_eq!(broker.ledger_snapshot().expect("charged tier").total_owner_bytes(), expected);
+        let restored = tier.restore().expect("restore tier").expect("entry");
+        source.restore_reclaimed(restored).expect("restore source");
+        assert_eq!(source.stats().expect("source").estimated_bytes, expected);
+        assert_eq!(broker.ledger_snapshot().expect("one charge").total_owner_bytes(), expected);
+>>>>>>> codex/qmp130-upstream-hardening
     }
 
     #[cfg(feature = "spill")]
     #[test]
     fn failed_destination_write_preserves_source_entry_and_charge() {
+<<<<<<< HEAD
         struct RejectingTarget;
         impl<Handle> crate::spill::service::sealed::InProcessSpillTarget<Handle> for RejectingTarget {}
         impl<Handle> SpillTarget<Handle> for RejectingTarget {
@@ -2109,8 +2361,68 @@ mod tests {
 
     #[test]
     fn reclaim_one_on_empty_returns_none() {
+=======
+        use crate::spill::SpillController;
+        use crate::{RetainingSpillTarget, RoutedSpillController};
+
+        let broker = live_broker(1_000_000);
+        let source = store_with_broker(&broker);
+        source.insert_checked("first".to_string(), vec![0; 4]).expect("insert");
+        let expected = expected_entry_cost("first", 4);
+        let prepared = source.prepare_reclaim_one().expect("prepare").expect("entry");
+        let offline = RoutedSpillController::new(RetainingSpillTarget::unavailable());
+
+        let failure = offline.spill(prepared).expect_err("offline destination");
+        let (_, prepared) = failure.into_parts();
+        assert_eq!(
+            broker.ledger_snapshot().expect("charge preserved").total_owner_bytes(),
+            expected
+        );
+        source.restore_reclaimed(prepared).expect("source recovery");
+        assert_eq!(source.stats().expect("restored").estimated_bytes, expected);
+    }
+
+    #[cfg(feature = "spill-redb")]
+    #[test]
+    fn durable_spill_releases_source_only_after_commit() {
+        use crate::spill::backings::redb::RedbSpillBacking;
+        use crate::spill::SpillOwnership;
+        use crate::RoutedSpillController;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "qmp-reclaimed-durable-transfer-{}-{}.redb",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_file(&path);
+        let broker = live_broker(1_000_000);
+        let source = store_with_broker(&broker);
+        source.insert_checked("first".to_string(), vec![1, 2, 3, 4]).expect("insert");
+        let prepared = source.prepare_reclaim_one().expect("prepare").expect("entry");
+        let controller = RoutedSpillController::new(RedbSpillBacking::create(&path).expect("open"));
+
+        let receipt = controller
+            .spill_reclaimed_durable(prepared, |key, value| {
+                let mut encoded = key.as_bytes().to_vec();
+                encoded.push(0);
+                encoded.extend_from_slice(value);
+                Ok(encoded)
+            })
+            .expect("durable commit");
+        assert_eq!(receipt.ownership(), SpillOwnership::DurableCommitted);
+        assert_eq!(broker.ledger_snapshot().expect("source released").total_owner_bytes(), 0);
+        assert_eq!(controller.spilled_count::<Vec<u8>>().expect("inventory"), 1);
+        drop(controller);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn discard_one_on_empty_returns_none() {
+>>>>>>> codex/qmp130-upstream-hardening
         let store = store();
-        assert!(store.reclaim_one().expect("empty").is_none());
+        assert!(store.discard_one().expect("empty").is_none());
         assert_eq!(store.committed_bytes().expect("bytes"), 0);
     }
 
@@ -2151,7 +2463,7 @@ mod tests {
             }
         );
         assert_eq!(store.stats().expect("stats").item_count, 1);
-        assert_eq!(store.reclaim_one().expect("last remains").expect("entry").0, "b");
+        assert_eq!(store.discard_one().expect("last remains").expect("entry").0, "b");
     }
 
     #[test]
@@ -2171,17 +2483,17 @@ mod tests {
     fn revoke_makes_entry_unretrievable_and_decrements_accounting() {
         let store = store();
         store.insert_checked("only".into(), vec![0; 9]).expect("insert");
-        let (key, value) = store.reclaim_one().expect("revoke").expect("entry");
+        let (key, value) = store.discard_one().expect("revoke").expect("entry");
         assert_eq!((key.as_str(), value.len()), ("only", 9));
         assert_eq!(store.committed_bytes().expect("bytes"), 0);
-        assert!(store.reclaim_one().expect("second revoke").is_none());
+        assert!(store.discard_one().expect("second revoke").is_none());
     }
 
     #[test]
     fn empty_reclaim_leaves_state_byte_for_byte_unchanged() {
         let store = store();
         let before = store.stats().expect("before");
-        assert!(store.reclaim_one().expect("empty").is_none());
+        assert!(store.discard_one().expect("empty").is_none());
         assert_eq!(store.stats().expect("after"), before);
     }
 
@@ -2236,7 +2548,7 @@ mod tests {
             broker.ledger_snapshot().expect("ledger").total_owner_bytes(),
             expected_entry_cost("a", 4) + expected_entry_cost("b", 6)
         );
-        store.reclaim_one().expect("one").expect("entry");
+        store.discard_one().expect("one").expect("entry");
         assert_eq!(
             broker.ledger_snapshot().expect("ledger").total_owner_bytes(),
             expected_entry_cost("b", 6)
@@ -2259,7 +2571,7 @@ mod tests {
             store.insert_checked("late".into(), vec![0; 1]),
             Err(MemoryError::Closed(_))
         ));
-        assert!(matches!(store.reclaim_one(), Err(MemoryError::Closed(_))));
+        assert!(matches!(store.discard_one(), Err(MemoryError::Closed(_))));
         assert_eq!(store.stats().expect("terminal stats"), StoreStats::default());
     }
 
@@ -2278,7 +2590,7 @@ mod tests {
         assert_eq!(broker.ledger_snapshot().expect("ledger").total_owner_bytes(), expected);
 
         broker.finish_rebuild().expect("finish rebuild");
-        assert_eq!(store.reclaim_one().expect("fifo").expect("entry").0, "a");
+        assert_eq!(store.discard_one().expect("fifo").expect("entry").0, "a");
         store.close().expect("retry close");
         assert_eq!(broker.ledger_snapshot().expect("ledger").total_owner_bytes(), 0);
     }
@@ -2297,7 +2609,7 @@ mod tests {
         assert_eq!(store.committed_bytes().expect("bytes"), expected);
         assert_eq!(broker.ledger_snapshot().expect("ledger").total_owner_bytes(), expected);
         broker.finish_rebuild().expect("finish rebuild");
-        assert_eq!(store.reclaim_one().expect("fifo").expect("entry").0, "a");
+        assert_eq!(store.discard_one().expect("fifo").expect("entry").0, "a");
     }
 
     #[test]
@@ -2307,7 +2619,7 @@ mod tests {
         store.insert_checked("a".into(), vec![0; 4]).expect("a");
         store.insert_checked("b".into(), vec![0; 6]).expect("b");
         broker.begin_rebuild().expect("begin rebuild");
-        assert!(matches!(store.reclaim_one(), Err(MemoryError::InvalidState(_))));
+        assert!(matches!(store.discard_one(), Err(MemoryError::InvalidState(_))));
         assert_eq!(store.stats().expect("stats").item_count, 2);
         let expected = expected_entry_cost("a", 4) + expected_entry_cost("b", 6);
         assert_eq!(store.committed_bytes().expect("bytes"), expected);
@@ -2489,7 +2801,7 @@ mod tests {
             store.reclaim_until(1).expect("reclaim"),
             SweepStats { reclaimed_items: 1, reclaimed_bytes: expected_entry_cost("oldest", 4) }
         );
-        assert_eq!(store.reclaim_one().expect("next").expect("entry").0, "middle");
+        assert_eq!(store.discard_one().expect("next").expect("entry").0, "middle");
     }
 
     #[cfg(feature = "unbudgeted-stores")]
