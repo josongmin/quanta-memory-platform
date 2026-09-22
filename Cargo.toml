@@ -10,7 +10,8 @@ resolver = "2"
 edition = "2021"
 license = "UNLICENSED"
 publish = false
-version = "0.1.0"
+rust-version = "1.92"
+version = "0.2.0"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
@@ -20,7 +21,7 @@ blake3 = "=1.5.3"
 hdrhistogram = "7.5.4"
 hashlink = "0.12.1"
 metrics = "0.24.2"
-moka = { version = "0.12.10", features = ["sync"] }
+loom = "0.7.2"
+proptest = "1.11.0"
 redb = "2.2.0"
-scc = "3.8.7"
 tracking-allocator = "0.4.0"

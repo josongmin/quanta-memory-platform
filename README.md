@@ -4,10 +4,12 @@ Portable, host-independent memory-platform workspace. It is consumed by the
 Semantica monorepo through a dedicated host adapter (`quanta-memory-host`) and is
 designed to be extracted into its own repository without rewrites.
 
-> **Current qualification status (2026-09-21): NOT production-ready and NOT
-> extraction-ready at audit base `e103771670da3143e2ffebb8950a5dfc7e3d4515`.**
-> Workspace rails pass, but the final audit confirmed accounting-authority and
-> lifecycle gaps, and actual standalone extraction fails. The authoritative
+> **Current qualification status (2026-09-21): NOT production-ready.** Local
+> standalone extraction, including committed HEAD/tree/blob/mode binding, has
+> passed; external host adoption remains unobserved on the current release
+> candidate. Standalone performance,
+> observability, extraction, and conformance rails are locally qualified; they
+> do not substitute for host-product GREEN. The authoritative
 > remediation inventory, status, dependencies, acceptance criteria, and receipts
 > live in [`tickets/README.md`](./tickets/README.md). Passing a focused test or
 > dry-run does not supersede that status.
@@ -34,6 +36,19 @@ quanta-memory-host (Semantica monorepo)  ->  quanta-memory-platform-{core,facade
 The host adapter never appears as a dependency of this repo; that would invert
 the direction. The portable library carries no Semantica nouns
 (`Semantica*`, `quanta_runtime`, `codegraph`) in its public API.
+
+## Version, compatibility, and distribution
+
+- `0.2.0` is a deliberate pre-1.0 breaking release. There is no deprecated
+  compatibility window for an alias that would reopen unbounded or unbudgeted
+  authority; internal consumers migrate atomically.
+- Rust 1.92 is the declared MSRV and pinned toolchain, matching the current
+  Semantica host toolchain.
+- The workspace is internal-only (`UNLICENSED`, `publish = false`). It is not a
+  crates.io release candidate.
+- Exact breaking changes and consumer actions are in
+  [MIGRATION.md](./MIGRATION.md); the release inventory is in
+  [CHANGELOG.md](./CHANGELOG.md).
 
 ## Builder-first usage (recommended public surface)
 
@@ -71,9 +86,63 @@ public:
   same-store reentry from client `Hash`/`Clone`/`CanonicalKey` callbacks;
   callers may retry after the in-flight operation. A successful `close()` is
   terminal and repeated close is idempotent; later writes return `Closed`.
+- Payload entries use collision-safe canonical/reference digest indexes and
+  stable reusable slots. `PayloadRef` must implement `Eq + Hash`; exact value
+  equality is still checked inside a digest bucket. `RetainedCostV1` charges
+  both retained digest-index slots, so this semantic cost is not allocator RSS.
+  Revocable entries use FIFO `VecDeque` ownership; rollback restores the front
+  and reclaim drains the front without repeatedly shifting all survivors.
+- Transcript idempotency evidence is finite by default. Configure
+  `TranscriptRetentionPolicyV2::fail_closed(count, bytes)` on the transcript
+  builder when the default 65,536-entry/64-MiB horizon is unsuitable. Exact
+  retries and identity conflicts remain deterministic at saturation; a new
+  identity returns typed `RetentionSaturated` without charging or mutation.
+  `retention_stats()` separates active, evidence, and session-key cost, and
+  `close()` explicitly terminates the process-lifetime replay horizon.
 - Runtime scratch obtained through `LiveMemoryPlatform::attach_runtime` is
   charged against the same broker ledger, execution-scratch cap, class cap,
   owner/group admission, and release lifecycle as direct broker charges.
+- Runtime policy fields are active, not report-only vocabulary:
+  - `reserved_bytes` protects each class axis and resource-group axis
+    independently. The axes may describe the same bytes, so their floors are
+    each checked against `global - headroom` and are not added together.
+  - `soft_cap_bytes` crossing emits one bounded reclaim request. Configure the
+    callback before construction with `MemoryPlatformBuilder::with_reclaimer`.
+    It runs without the broker mutex; callback-reported bytes are advisory and
+    the broker remeasures the ledger before admission.
+  - `hard_cap_bytes` remains the deny boundary after at most one reclaim retry.
+    Class borrowing is bounded by the shared pool. Group borrowing is bounded
+    by `min(shared_pool * burst_percent / 100, weighted_share)`, where weighted
+    shares use deterministic largest-remainder allocation so no pool byte is
+    silently stranded.
+  - reclaim candidates are ordered `Last`, then `Normal`, then protected
+    `First`, with stable class/group identity as the tie break.
+  - accepted live reconfiguration preserves legal class borrow and group burst,
+    applies the same headroom/floor postimage rules, increments
+    `policy_revision`, and records `RuntimeReconfigure` provenance atomically.
+
+## Observation and operational events
+
+- `LiveProcessMemoryBroker::observe()` is the authoritative observation API. It
+  returns a typed `Result<BrokerObservation, MemoryError>` containing one-lock
+  ledger, effective-policy revision/provenance, pressure, reclaim counters and
+  semantic bytes. Poison or an invalid snapshot is never converted to zero.
+- `ProcessMemoryBroker::effective_report()` remains an infallible compatibility
+  view of the last effective policy. It is not an accounting/control oracle;
+  callers that need availability and ledger truth must use `observe()`.
+- Public `LedgerSnapshot::checked_total_*` methods are the fallible surface for
+  externally constructed snapshots. The legacy `total_*` convenience methods
+  require an exact/representable snapshot and may panic when that precondition
+  is violated.
+- `MemoryError::Capacity` is caller-actionable by reducing demand or changing a
+  validated policy. `OperationInProgress` is retryable after the current
+  lifecycle transition. `Poisoned`, `InvalidState`, and `Report` require
+  operator/recovery handling and are never equivalent to empty state.
+- Install `MemoryEventSink` with `MemoryPlatformBuilder::with_event_sink`.
+  Operations and outcomes are closed enums; owner, runtime, key, session and
+  error strings cannot become metric labels. Events are advisory, emitted
+  outside broker/store data locks, and sink panics are contained. They never
+  mutate semantic ledger counters.
 
 Examples (compile against the real public APIs):
 
@@ -104,7 +173,30 @@ cargo deny --all-features check
 scripts/check-workspace.sh
 # repo-local doctor rail:
 scripts/memory-platform-doctor
+
+# source-bound smoke: repeated 1/2-thread distributions + allocator drift gate
+scripts/run-scaling-bench.sh --smoke
+
+# full 1/2/8/32-thread read/write/mixed matrix (five repetitions)
+scripts/run-scaling-bench.sh
+
+# optional same-host baseline comparison
+QMP_SCALING_BASELINE=/path/to/baseline.jsonl scripts/run-scaling-bench.sh
+
+# non-zero runtime bite for every advertised facade feature path
+scripts/verify-feature-capabilities.sh
+
+# every test selector named by public verification docs must exist
+scripts/verify-doc-test-selectors.py
 ```
+
+The scaling rail exercises public budgeted store and broker paths and records
+source SHA/tree, toolchain, machine, repeated p50/p95/p99, throughput, lifecycle
+busy retries, semantic bytes, allocator high-water and exact final drift. The
+verifier rejects missing matrix cells, insufficient repetitions, semantic or
+allocator drift, counter underflow and absolute latency regressions. A supplied
+same-host baseline also gates stable-lane throughput and p99 regressions. These
+wall-clock thresholds are host-local; they are not portable performance claims.
 
 ## Extraction into a standalone repo
 
@@ -126,10 +218,11 @@ copying, so a cyclic / mis-directed split is rejected up front.
 This repo now carries its own verification front doors:
 
 - `scripts/check-workspace.sh` — fmt + clippy `-D warnings` + workspace check +
-  example builds + per-feature matrix + `cargo deny`.
+  example builds + per-feature compile matrix + advertised feature runtime
+  tests + documented-selector validation + `cargo deny`.
 - `scripts/memory-platform-doctor` — repo-local doctor: fmt + clippy `-D warnings`
-  + per-feature matrix + workspace check + workspace tests + example builds +
-  `cargo deny` when available.
+  + per-feature compile/runtime matrix + workspace check/tests + documented
+  selector validation + example builds + `cargo deny` when available.
 - `scripts/memory-platform-{fix,report}` — mechanical fix/report helpers.
 - `scripts/scaffold-external-repo.sh` — asserts the extracted self-hosting file
   set is present in-source and that the copy plan excludes `tools/ci/gates`.

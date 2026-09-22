@@ -6,7 +6,6 @@ against `deny.toml`.
 
 **Shared versions** (pin in root `[workspace.dependencies]`, opt in per crate):
 
-- `moka`, `scc` — facade `revocable_store` backings
 - `redb` — facade `spill` backing
 - `hdrhistogram`, `metrics` — core `telemetry` adapters
 - `tracking-allocator` — testkit `alloc_tracking` ONLY

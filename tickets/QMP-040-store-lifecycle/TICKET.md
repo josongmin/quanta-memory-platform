@@ -110,12 +110,12 @@ Concurrency/failure:
 
 ## Acceptance
 
-- [ ] late attach API가 public surface에서 사라진다.
-- [ ] charged store가 종료된 뒤 ledger/group usage가 정확히 zero다.
-- [ ] close failure가 ticketless entry나 phantom refund를 만들지 않는다.
-- [ ] public dyn callback이 store mutex 아래서 호출되지 않는다.
-- [ ] all stores가 동일 lifecycle contract/conformance suite를 통과한다.
-- [ ] checked overflow와 poison truth가 trait level에 반영된다.
+- [x] late attach API가 public surface에서 사라진다.
+- [x] charged store가 종료된 뒤 ledger/group usage가 정확히 zero다.
+- [x] close failure가 ticketless entry나 phantom refund를 만들지 않는다.
+- [x] public dyn callback이 store mutex 아래서 호출되지 않는다.
+- [x] all stores가 동일 lifecycle contract/conformance suite를 통과한다.
+- [x] checked overflow와 poison truth가 trait level에 반영된다.
 
 ## Verification
 
@@ -316,8 +316,8 @@ numbers must be re-frozen with the final product SHA.
 
 The P0/P1 implementation blockers above were repaired at `85cbd81` and the
 internal acceptance/receipt gates passed on clean `eb58374`; see
-`receipts/2026-09-20T231633Z-eb58374.md`. QMP-040 is `IMPLEMENTED`, **not**
-`QUALIFIED` or production-ready. The P2 double-panic case is an explicit
+`receipts/2026-09-20T231633Z-eb58374.md`. At that historical checkpoint QMP-040
+was `IMPLEMENTED`, **not** `QUALIFIED` or production-ready. The P2 double-panic case is an explicit
 generic-key contract boundary: stable `Ord`, and no panicking key `Drop` during
 unwind. A blanket guarantee for arbitrary adversarial `Ord`+`Drop` requires
 index ownership redesign, not another catch shim. QMP-140 must carry this
@@ -353,4 +353,21 @@ At current product `b18e47d` (also present in `59f0c4f`), payload delete calls `
 
 Additional exception-boundary audit (STATIC, not an executed RED): `shared/lifecycle.rs:22-24` discards the `Err` from `catch_unwind` after catching a client destructor. Rust's `catch_unwind` documentation states that dropping the returned panic payload can itself panic; an already-unwinding outer caller or a second panicking owned field can then abort. The existing subprocesses use ordinary string panic payloads, not a payload with a panicking `Drop`. Add a child fixture using `panic_any` with a panicking payload destructor under outer unwind; decide a bounded payload-retirement policy (possibly intentionally forgetting an exceptional panic payload) without claiming that `catch_unwind` can intercept `panic=abort` or all foreign exceptions. Do not count this static candidate as a reproduced P1.
 
-The earlier P2 `Ord`+`Drop` double-panic limitation remains separate. A single callback panic causing poison is not evidence of accounting drift, whereas the old raw multi-field destructor paths aborted an isolated process. Prior tests of reentrant Busy responses do not test callback panic outcomes. Keep `IMPLEMENTED` as scoped implementation, not final qualification; a new product receipt must distinguish tested leaves, untested outer-unwind, and P2 policy.
+The earlier P2 `Ord`+`Drop` double-panic limitation remains separate. A single callback panic causing poison is not evidence of accounting drift, whereas the old raw multi-field destructor paths aborted an isolated process. Prior tests of reentrant Busy responses do not test callback panic outcomes.
+
+## Current-source qualification (2026-09-21)
+
+QMP-040 is locally `QUALIFIED` at
+`0c126a25aeab11f457e20c4a209fc7bb631ea859`; see
+[`receipts/2026-09-21T072928Z-0c126a2.md`](receipts/2026-09-21T072928Z-0c126a2.md).
+The final hostile-payload subprocess proves that the canonical retirement
+helper does not drop a caught panic payload whose destructor can panic during
+outer unwind. All five real store adapters pass the shared lifecycle oracle and
+the leak/state-loss/double-refund fakes are rejected. Repo-local doctor and an
+actual clean standalone extraction both pass at the same source.
+
+This qualification is scoped to the documented supported-client contract. It
+does not claim recovery from `panic=abort`, foreign exceptions, or arbitrary
+`Ord` panic plus a second panicking key destructor while a standard-library
+index owns that key. QMP-140 owns the public compatibility wording for that
+boundary; QMP-130 separately owns external host adoption.

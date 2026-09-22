@@ -13,7 +13,7 @@ Placement:
 | Public broker surface end-to-end (reserve→commit→snapshot→release→rebuild) | `core/src/api/control.rs` `#[cfg(test)]` |
 | Cross-cutting policy contracts | `core/tests/wave1_policy_contracts.rs` |
 | A facade store / pipeline behavior | that feature's `service.rs` `#[cfg(test)]` |
-| A storage backing (redb/moka/scc) round-trip | the backing module under its feature |
+| A storage backing (redb) round-trip | the backing module under its feature |
 | "the conformance suite actually bites" | `testkit` conformance + `self_tests` |
 | Deterministic fault/chaos scenarios | `testkit/src/faults/` |
 

@@ -83,13 +83,13 @@ Owner symbols:
 
 ## Acceptance
 
-- [ ] every public policy field has validation + runtime consumer + tests.
-- [ ] reserved/soft/hard가 서로 다른 observable behavior를 가진다.
-- [ ] reserve와 reconfigure가 동일 legal-state definition을 공유한다.
-- [ ] scheduler truth가 ledger ticket에서만 파생된다.
-- [ ] reclaim path가 실제 broker denial slow path에서 reachable하다.
-- [ ] no callback under broker mutex.
-- [ ] provenance가 active values와 일치한다.
+- [x] every public policy field has validation + runtime consumer + tests.
+- [x] reserved/soft/hard가 서로 다른 observable behavior를 가진다.
+- [x] reserve와 reconfigure가 동일 legal-state definition을 공유한다.
+- [x] scheduler truth가 ledger ticket에서만 파생된다.
+- [x] reclaim path가 실제 broker denial slow path에서 reachable하다.
+- [x] no callback under broker mutex.
+- [x] provenance가 active values와 일치한다.
 
 ## Verification
 
@@ -111,3 +111,34 @@ cargo clippy -p quanta-memory-platform-core --all-targets --all-features -- -D w
 - `core/src/api/control.rs`에는 원본 감사의 `record_group_usage` 공개 API가 없다. P2-03의 제거 작업 자체는 현재 소스에 재적용하지 않는다. 그러나 제거를 증명하는 public compile/API guard와 scheduler truth 검증은 terminal 조건이다.
 - Pre-fix `application/scheduler.rs:47-56,80-96`는 group usage/admission에 saturation을 사용했다. QMP-020 `59f0c4f`는 checked candidate 계산과 scheduler publish-after-ledger-success로 고쳤고 clean doctor 및 scoped receipt가 있다. QMP-080은 이를 중복 수리하지 않고 group overflow regression 및 policy runtime semantics를 검증한다. 현 상태는 `READY`; 변경 전 QMP-020 exactness negative tests를 regression guard로 재실행한다.
 - Integrated `domain/ledger.rs:413-420`은 Headroom까지 포함한 total을 non-Headroom reserve ceiling에 비교하며, `api/control.rs:899-908` reconfigure는 Headroom 사용량을 빼고 비교한다. 정적 predicate 불일치가 남지만 실행 RED/보호 대역 의미 판정은 미실시다. protected band의 의미를 하나로 명시한 뒤 reserve/reconfigure 양쪽에 동일 prospective predicate를 적용한다. 보수적 거부인지 실제 의미 버그인지는 RED와 설계 결정까지 확정하지 않는다.
+
+## Qualified implementation (2026-09-21; source `f9f6d15`)
+
+- `AccountingLedger::validate_policy_postimage`가 global/headroom/class
+  reserved/class hard+borrow/owner quota의 canonical postimage validator다.
+  reserve와 live reconfigure가 이 validator를 공유한다.
+- `WeightedResourceGroupScheduler::protected_floor_fits`가 group reserved floor의
+  canonical validator다. Fresh reserve, atomic recharge, live reconfigure가 같은
+  complete postimage를 검사한다. 최종 adversarial pass에서 발견한 recharge
+  우회를 `recharge_cannot_consume_peer_group_reserved_floor`로 재현하고 닫았다.
+- class/group/owner soft crossing은 사전 등록된 `MemoryReclaimer`에 bounded
+  request를 보낸다. callback은 broker mutex 밖에서 실행되며 hard denial은
+  한 번만 reclaim/remeasure/retry한 뒤 실제 capacity error로 끝난다.
+- class headroom은 non-headroom band와 중복 차감하지 않는다. Group burst는
+  `min(shared_pool * burst_percent / 100, Hamilton weighted share)`이고 모든
+  산술은 `u128` intermediate와 stable group-name tie break를 사용한다.
+- reclaim 후보는 `Last`, `Normal`, `First` 순서로 deterministic하게 정렬된다.
+  allocator telemetry와 callback-reported bytes는 advisory이며 ledger counters를
+  직접 변경하지 않는다.
+- accepted live reconfigure는 usage를 보존하면서 policy revision을 증가시키고
+  `RuntimeReconfigure` source/provenance를 같은 lock-protected postimage에
+  반영한다.
+- facade builder는 runtime construction 전 reclaimer를 설치한다. 제거된 public
+  scheduler mutation side channel은 compile-fail guard로 고정했다.
+
+Qualification receipt:
+[`receipts/2026-09-21T065923Z-f9f6d15.md`](receipts/2026-09-21T065923Z-f9f6d15.md).
+
+Repo-local runtime semantics는 `QUALIFIED`다. Metrics exporter/cardinality는
+QMP-110, external Semantica call-site enforcement와 adoption은 QMP-130,
+public API migration/release notes는 QMP-140의 독립 잔여 범위다.

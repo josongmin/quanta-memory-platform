@@ -1,11 +1,26 @@
+use crate::ports::telemetry::{MemoryEvent, MemoryEventSink};
+
 #[cfg(feature = "telemetry")]
 #[derive(Clone, Debug, Default)]
 pub struct MetricsEmitter;
 
 #[cfg(feature = "telemetry")]
-impl MetricsEmitter {
-    pub fn emit_gauge(&self, name: &str, value: f64) {
-        metrics::gauge!(name.to_owned()).set(value);
+impl MemoryEventSink for MetricsEmitter {
+    fn emit(&self, event: MemoryEvent) {
+        metrics::counter!(
+            "quanta_memory_operation_total",
+            "operation" => event.operation.label(),
+            "outcome" => event.outcome.label(),
+        )
+        .increment(1);
+        if let Some(bytes) = event.bytes {
+            metrics::histogram!(
+                "quanta_memory_operation_bytes",
+                "operation" => event.operation.label(),
+                "outcome" => event.outcome.label(),
+            )
+            .record(bytes as f64);
+        }
     }
 }
 
@@ -14,8 +29,8 @@ impl MetricsEmitter {
 pub struct MetricsEmitter;
 
 #[cfg(not(feature = "telemetry"))]
-impl MetricsEmitter {
-    pub fn emit_gauge(&self, _name: &str, _value: f64) {}
+impl MemoryEventSink for MetricsEmitter {
+    fn emit(&self, _event: MemoryEvent) {}
 }
 
 #[cfg(test)]
@@ -34,12 +49,17 @@ mod tests {
         // &self (shared) calls only: if emit could mutate accounting it would need
         // &mut self. Many emits via one shared reference is the proof of advisory.
         let by_ref: &MetricsEmitter = &emitter;
-        // The function returns the unit type — assigning to () compiles only if
-        // emit_gauge yields no counter the caller could feed back into the ledger.
-        let returned: () = by_ref.emit_gauge("memory.platform.resident_bytes", 1_024.0);
+        let returned: () = by_ref.emit(MemoryEvent::new(
+            crate::MemoryOperation::ObserveBroker,
+            crate::MemoryOutcome::Succeeded,
+            Some(1_024),
+        ));
         assert_eq!(returned, (), "emit is observation-only: it yields nothing to fold back");
-        by_ref.emit_gauge("memory.platform.resident_bytes", 2_048.0);
-        by_ref.emit_gauge("memory.platform.pressure", 0.0);
+        by_ref.emit(MemoryEvent::new(
+            crate::MemoryOperation::Pressure,
+            crate::MemoryOutcome::Succeeded,
+            Some(2_048),
+        ));
     }
 
     // scenario L: the emitter is freely cloneable and Default-constructible
@@ -51,7 +71,15 @@ mod tests {
         let cloned = emitter.clone();
         // Both can emit independently with shared refs; neither carries or shares
         // any mutable accounting counter.
-        emitter.emit_gauge("a", 1.0);
-        cloned.emit_gauge("b", 2.0);
+        emitter.emit(MemoryEvent::new(
+            crate::MemoryOperation::Reserve,
+            crate::MemoryOutcome::Succeeded,
+            Some(1),
+        ));
+        cloned.emit(MemoryEvent::new(
+            crate::MemoryOperation::Release,
+            crate::MemoryOutcome::Succeeded,
+            Some(2),
+        ));
     }
 }

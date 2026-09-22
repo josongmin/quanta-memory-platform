@@ -108,7 +108,7 @@ Owner structs/hot paths:
 ## RED/perf tests
 
 - source/behavior test: `payload_lookup_probe_count_is_n_independent`
-- `revocable_full_drain_has_linear_total_work`
+- `revocable_full_drain_uses_fifo_deque_without_front_shifts`
 - `feature_matrix_is_warning_free`
 - `ledger_release_work_is_bounded_by_affected_slots`, 10K/100K live owners; core overflow negative fixtures preserve exact denial before/after optimization
 - benchmark smoke가 실제 public builder/store path를 사용
@@ -116,21 +116,91 @@ Owner structs/hot paths:
 
 ## Acceptance
 
-- [ ] payload unique-fill이 O(N²) scan을 하지 않는다.
-- [ ] revocable full drain이 O(N²) shift를 하지 않는다.
-- [ ] public semantics/accounting invariants가 기존 conformance를 통과한다.
-- [ ] benchmark results가 source SHA/toolchain/hardware와 묶인다.
-- [ ] contention 및 memory drift scenario가 존재한다.
-- [ ] bare/single-feature matrix가 `-D warnings`로 clean하다.
-- [ ] docs의 performance claim이 실제 executable target과 일치한다.
+- [x] payload unique-fill이 O(N²) scan을 하지 않는다.
+- [x] revocable full drain이 O(N²) shift를 하지 않는다.
+- [x] public semantics/accounting invariants가 기존 conformance를 통과한다.
+- [x] benchmark results가 source SHA/toolchain/hardware와 묶인다.
+- [x] contention 및 memory drift scenario가 존재한다.
+- [x] bare/single-feature matrix가 `-D warnings`로 clean하다.
+- [x] docs의 performance claim이 실제 executable target과 일치한다.
 
 ## Verification
 
 ```bash
 cargo test -p quanta-memory-platform-facade --all-features
-cargo bench -p quanta-memory-platform-facade --all-features
+scripts/run-scaling-bench.sh --smoke
 tools/ci/feature-matrix.sh
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 ```
 
 PERF receipt가 없으면 코드가 빨라 보여도 ticket은 `QUALIFIED`가 아니다.
+
+## Implementation checkpoint (2026-09-21)
+
+At `0c126a25aeab11f457e20c4a209fc7bb631ea859`:
+
+- payload entries use stable `Vec<Option<Entry>>` slots plus collision-safe
+  canonical/reference digest buckets. Deleted slots are reused. Duplicate,
+  pin/count and delete operations inspect only the digest bucket and still
+  compare exact client values before acting.
+- revocable FIFO ownership uses `VecDeque`; normal append, rollback and drain
+  are `push_back`, `push_front` and `pop_front` respectively.
+- `benches/scaling.rs` exercises public budgeted builders for payload unique/
+  dedup and revocable fill/drain. `scripts/run-scaling-bench.sh --smoke` rejects
+  a dirty source and emits source SHA/tree, toolchain and machine metadata.
+- the executable smoke is part of the canonical standalone extraction file set.
+
+The local 1K/10K single-thread samples are recorded in
+[`receipts/2026-09-21T072928Z-0c126a2.md`](receipts/2026-09-21T072928Z-0c126a2.md).
+They are observation, not a portable threshold.
+
+At `6d082ee71226b687b2fb500e1cba767d48457f48`, QMP-100 is `QUALIFIED`:
+
+- ledger reserve/release uses exact aggregates and affected-slot preflight;
+  `single_release_preflight_is_bounded_by_affected_slots_at_10k_owners` pins
+  one class/owner/context probe each regardless of owner cardinality;
+- scheduler floor accounting is incremental and reserve/release/rollback/batch
+  no longer clone the complete scheduler state;
+- the v2 benchmark runs 1/2/8/32-thread read-heavy, write-heavy and mixed
+  distributions with five repetitions at 1K/10K, plus the public broker
+  owner-cardinality release lane;
+- each sample records p50/p95/p99, throughput, busy retries, semantic peak and
+  post-close bytes, allocator high-water, exact allocated/deallocated bytes,
+  residual live bytes and underflow state;
+- `scripts/verify-scaling-results.py` rejects incomplete matrices, fewer than
+  three repetitions, semantic/allocator drift, absolute p99 regressions and
+  supplied-baseline regressions. Negative fixtures prove every gate bites.
+
+The exact-source qualification receipt is
+[`receipts/2026-09-21T095245Z-6d082ee.md`](receipts/2026-09-21T095245Z-6d082ee.md).
+
+## Session-hardening checkpoint (2026-09-21)
+
+At `951ebe403783fd326ba59834ada860ec80e9650b`, a source audit found one
+remaining admission-cardinality defect that the earlier qualification did not
+measure: every `WeightedResourceGroupScheduler::admits` call recomputed total
+weight, allocated a remainder vector and sorted all groups. Hamilton allocation
+depends only on installed policy, so the scheduler now computes it once during
+construction/reconfiguration and performs cached lookups on admission. Public
+`record_usage`/`record_release` also reject unknown groups before they can grow
+the internal usage map.
+
+At `f2b74979b9d0aa4d2cd957d4d86f13d18865ae23`, the Rust 1.92 performance
+rail was repaired after reproducing two independent proof defects: a false
+64-byte residual from the tracking allocator's own process state and a TLS
+allocator abort at the first contention lane. The benchmark now uses an
+allocation-free atomic `GlobalAlloc` wrapper, creates and retires all measured
+objects inside each epoch, and includes a required scheduler group-cardinality
+lane. The verifier rejects a missing scheduler lane. The current smoke contains
+33 samples; every sample has zero semantic and allocator residual bytes.
+
+Current receipt:
+[`receipts/2026-09-21T131415Z-557213b.md`](receipts/2026-09-21T131415Z-557213b.md).
+
+At `557213b01ed93a20c1a45d3c69b2dae20ab90e70`, the scheduler-cardinality
+lane also snapshots allocator counters immediately before the admission loop
+and fails on any allocation or deallocation inside it. This closes the proof
+gap where an implementation could rebuild and free the Hamilton table per
+request while still ending with zero residual bytes. Qualification was rerun
+from a fresh Cargo target after a stale optimized artifact was detected; the
+stale run is not accepted as evidence.

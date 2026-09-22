@@ -19,7 +19,8 @@ Blocks: every implementation ticket
 ## Write set
 
 - `tickets/**`
-- 필요 시 ticket 검증 전용 `scripts/verify-tickets.sh` 또는 `tools/tickets/**`
+- ticket 검증 전용 `scripts/verify-tickets.sh`, `scripts/run-ticket-test`,
+  `tools/tickets/**`, standalone self-hosting manifest entry
 
 금지:
 
@@ -89,3 +90,55 @@ python3 tools/pm/pm.py lint
 
 - Validator implementation commits: `fd4fdf08c362131193856898a4d7aeb539f59d53`, `dc2e7d0373911ec4fa943a5c0129ebf680ca0817`, `b91044e4972a550a8d56c781df1e5721c6429172`
 - Receipt: [`receipts/2026-09-20T183609Z-b91044e.md`](receipts/2026-09-20T183609Z-b91044e.md)
+- Proof-integrity hardening receipt: [`receipts/2026-09-21T035450Z-6f01f67.md`](receipts/2026-09-21T035450Z-6f01f67.md)
+
+## Reopened proof-integrity gap — a GREEN command may execute zero tests
+
+Final audit at `dfb58a68ff2a859e829e18e4649a8da80ddd262c` executed three documented
+verification selectors. All returned exit 0 while selecting zero tests:
+
+- QMP-080 `reserved_floor_protects_class_from_peer_consumption`;
+- QMP-070 `spill_transfer_preserves_total_charge_until_source_release`;
+- QMP-070 `redb_reopen_reconciles_controller_count`.
+
+The corresponding behaviors have tests under different names in some cases,
+but a command that reports `0 passed` is not evidence. The validator currently
+checks ticket topology and receipt fields only; it does not verify allowed state
+vocabulary, claim/status correspondence, receipt identity, filename SHA, command
+exit/count, or whether named selectors resolve.
+
+Required governance hardening:
+
+1. [x] Represent receipt commands and results in machine-validated
+   `qmp-receipt-v1` verification rows.
+2. [x] Require every focused row to record `selected > 0`; `0 tests` is RED even
+   when Cargo exits 0.
+3. [x] Validate allowed states and `IN_PROGRESS iff exactly one matching claim`.
+4. [x] Match receipt `ticket`, directory, timestamp, filename SHA prefix, and full `HEAD`; verify
+   both commits exist.
+5. [x] Require the latest transition receipt, not any historical receipt, for
+   `IMPLEMENTED`/terminal states.
+6. [x] Recompute the committed mode/blob/path source digest and terminal
+   owned-path drift instead of trusting only the literal source-change field.
+7. [x] Add negative fixtures for zero-test selection, mismatched receipt identity,
+   invalid status, orphan claim, missing claim, stale transition receipt, and
+   command/source drift.
+
+`scripts/run-ticket-test` is the canonical Cargo selector front door. It parses
+all Cargo test-result lines, sums actually executed pass/fail counts across
+targets, emits `qmp-cargo-test-evidence-v1` JSON with an output digest, and exits
+3 when Cargo itself exits 0 but selected count is zero.
+
+Implemented at `6f01f673972a01553500e5f27b9809e235e581ed`. A validator GREEN is
+admission evidence for receipt structure and committed source identity; it does
+not replace product behavior evidence. Exact-head workspace and extraction
+reruns remain required before `QUALIFIED`.
+
+## Current-source qualification (2026-09-21)
+
+The complete ticket tree, all 28 validator fixtures, PM lint, full standalone
+doctor, and actual extraction pass at committed source
+`f1d45c9bb28982f2c5ee3fcaac4a5d8ce4329be9`. The extracted tree also runs
+`verify-tickets: OK`, so the admission authority is self-hosting rather than a
+source-worktree-only check. See
+[`receipts/2026-09-21T105625Z-f1d45c9.md`](receipts/2026-09-21T105625Z-f1d45c9.md).

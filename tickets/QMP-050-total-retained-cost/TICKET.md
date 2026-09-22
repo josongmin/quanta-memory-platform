@@ -111,8 +111,8 @@ Property tests:
 - [x] tested zero-value large-key/identity 경로는 cap을 우회하지 못한다.
 - [x] tested transcript/prepared tombstone/index byte가 stats와 ledger에서 사라지지 않는다.
 - [x] QMP-050 semantic component/lease arithmetic은 checked이며 saturation으로 cost drift를 숨기지 않는다. **Core ledger 전축 exactness는 별도 QMP-020**의 통합 proof를 요구한다.
-- [ ] formula V1은 명명됐으나 public compatibility/migration policy는 QMP-140에서 확정해야 한다.
-- [ ] prepared/transcript에 independent literal oracle과 underbilling fake RED가 있다. 전체 facade store state-machine oracle은 QMP-090에서 확장한다.
+- [x] formula V1, `PayloadRef: Eq + Hash`, 89→121 fixture delta, and shared spill-binding identity are recorded as a pre-1.0 breaking migration in `MIGRATION.md`/`CHANGELOG.md` with package version `0.2.0`.
+- [x] prepared/transcript에 independent literal oracle과 underbilling fake RED가 있다. 전체 facade store state-machine oracle은 QMP-090에서 확장한다.
 
 ## Verification
 
@@ -205,3 +205,40 @@ later denial after an earlier successful recharge splits the batch. Allocate
 separate lifetime leases at ingress and use existing atomic `release_many` for
 the active component. Any alternate delta design needs one atomic managed
 batch operation with a QMP-020 owner receipt.
+
+## Final-audit retained-cost delta — in-process spill identity clone
+
+`RevocableSpillHandle` stores a cloned `StoreBindingHandle` per transferred
+entry, while the retained-cost formula charges only the original key, value and
+entry overhead. Large owner/runtime identifiers can therefore be deep-cloned
+into many in-process tier handles without a corresponding delta charge.
+
+QMP-050 owns the cost decision and QMP-070 owns the transfer implementation:
+
+- make binding identity shared/interned (`Arc`-style) so transfer does not add a
+  per-entry deep allocation, or
+- include the destination identity delta in the transfer receipt and charge it
+  before source publication is finalized.
+
+Hellgate: many entries with large owner/runtime identifiers move to the in-
+process tier and `ledger == source retained cost + destination-only delta`
+after every move, restore, source close and tier drop.
+
+## Current-source refresh (2026-09-21)
+
+The indexed payload store retains a canonical-digest index and a reference-
+digest index. `PayloadRef` therefore requires `Eq + Hash`, and the portable
+semantic cost charges two retained digest slots. For the existing 32-byte
+fixture the independent literal changes from 89 to 121 bytes. This is a real
+public bound/cost-model migration and must be recorded by QMP-140 rather than
+hidden behind compatibility prose.
+
+The independent transcript/prepared underbilling fakes remain covered by the
+workspace doctor. At `aeeffe3588561398dcc1ad8c12332fe740f5f655`, the
+in-process spill handle reuses the store binding through `Arc` identity rather
+than deep-cloning large owner/runtime strings. A 128-entry hellgate checks
+pointer identity, exact strong-owner count, exact ledger cost after every
+spill/restore, source close, and tier drop. `MIGRATION.md` and `CHANGELOG.md`
+record the public `0.2.0` cost/bound changes. QMP-050 is therefore locally
+`QUALIFIED`; see
+[`receipts/2026-09-21T104013Z-aeeffe3.md`](receipts/2026-09-21T104013Z-aeeffe3.md).

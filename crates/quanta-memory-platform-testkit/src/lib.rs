@@ -29,6 +29,8 @@ pub mod fake;
 pub mod faults;
 #[cfg(feature = "fixtures")]
 pub mod fixtures;
+#[cfg(all(test, feature = "loom"))]
+mod loom_models;
 
 #[cfg(feature = "alloc_tracking")]
 pub mod alloc_tracking;

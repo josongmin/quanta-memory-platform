@@ -13,9 +13,15 @@ remediation으로 바뀐 public authority를 compatibility 정책에 맞게 노�
 
 - 최초 감사에서 raw ledger/basic broker/simple store constructors가 public tests에 pin되고 builder-first 주장과 public backdoors가 모순됐다. QMP-030/040 이후 API가 이동했으므로 이를 **현재의 미수정 결함으로 재주장하지 않는다**. 최종 re-export/feature census와 외부 compile-fail로 남은 노출을 판정한다.
 - `docs/verification-scenarios.md`는 benchmark가 없는데 benchmark 비율/gate를 주장한다.
-- 최초 감사 시 actual extraction failure와 standalone green/no known limitation 주장이 충돌했다. QMP-120은 local extraction을 수리했으나 remote CI와 최종 product SHA의 extraction은 아직 별도 증거가 필요하다.
+- 최초 감사 시 actual extraction failure와 standalone green/no known limitation 주장이 충돌했다. QMP-120은 local extraction을 수리했다. 최종 product SHA의 repo-local actual extraction은 별도 증거가 필요하지만, 운영하지 않는 GitHub Actions workflow는 acceptance가 아니다.
 - moka/scc/bumpalo feature 이름이 실제 semantic capability보다 강하게 보인다.
 - packages는 `rust-version` 미지정, `UNLICENSED`, `publish=false`다.
+- QMP-060 removes the misleading unbounded `TranscriptRetentionPolicyV1`
+  surface in favor of bounded `TranscriptRetentionPolicyV2`, adds typed
+  saturation/reconfigure/stats contracts, and adds a required trait method.
+  This is a deliberate pre-1.0 breaking change that needs final migration and
+  semver reporting in this ticket; do not reintroduce a compatibility alias
+  that restores unbounded behavior.
 
 ## Canonical write set
 
@@ -78,14 +84,16 @@ Generated agent guidance를 수정해야 할 경우 `tools/pm/sources/**`만 수
 
 ## Acceptance
 
-- [ ] no public API claim contradicts visibility/runtime behavior.
-- [ ] all breaking changes have migration notes and version decision.
-- [ ] every feature name maps to reachable tested capability.
-- [ ] README example proves enforcement, not report generation only.
-- [ ] docs contain no nonexistent benchmark/gate/test claim.
+- [x] no public API claim contradicts visibility/runtime behavior.
+- [x] all breaking changes have migration notes and version decision.
+- [x] every feature name maps to reachable tested capability.
+- [x] README example proves enforcement, not report generation only.
+- [x] docs contain no nonexistent benchmark/gate/test claim.
 - [ ] workspace, extraction, host, performance receipts share declared exact revisions.
 - [ ] all P1/P2 crosswalk entries are closed.
-- [ ] final `tickets/README.md` lifecycle is internally consistent.
+- [x] final `tickets/README.md` lifecycle is internally consistent for the current local/external proof boundary.
+- [x] every documented named test selects at least one test; zero-test GREEN is rejected.
+- [x] ticket/receipt schema enforces state, claim, identity, SHA and selected-count truth.
 
 ## Verification
 
@@ -103,7 +111,72 @@ scripts/verify-tickets.sh
 
 그리고 QMP-120 actual extraction, QMP-130 host, QMP-100 perf receipts가 필수다.
 
+### Current migration items from QMP-100
+
+- `SimplePayloadStore` and `PayloadStoreBuilder` now require
+  `PayloadRef: Eq + Hash` so canonical/reference digest buckets can validate
+  collisions without a whole-store scan. This is a public generic-bound change.
+- `RetainedCostV1` for payload entries now charges two retained digest-index
+  slots. The 32-byte conformance fixture changes from 89 to 121 semantic bytes.
+- document these as a pre-1.0 breaking change (or choose and enforce another
+  version policy); do not present the cost change as allocator/RSS truth.
+
 ## Non-goals
 
 - 새로운 product feature 추가
 - receipt 없이 “SOTA”, “production-ready”, “no known limitation” 선언
+
+## Final-audit documentation/proof drift
+
+- `docs/verification-scenarios.md` still describes saturating ledger totals and
+  names a removed saturation test, while current code uses checked aggregation
+  and a different overflow-denial oracle.
+- `EXTRACTION.md` names host test targets absent from the current Semantica tree.
+- The feature matrix compiles and clippy-checks leaf features but does not execute runtime
+  capability tests; this cannot qualify advertised moka/scc backings.
+- `README.md` historically described extraction failure at the audit base
+  without clearly distinguishing later local extraction passes. This is now
+  resolved by the exact workflow-free QMP-120 receipt and HEAD-binding gate.
+
+Add a docs/test-selector linter that resolves every command against `cargo test
+-- --list` or the host suite registry, a runtime bite test for every advertised
+leaf feature, and machine-readable receipt validation from QMP-000. Remove or
+quarantine features whose canonical builder path is not reachable.
+
+## Local closeout checkpoint (2026-09-21)
+
+Implemented and reverified at product source
+`2dfb7bcf7b4cd34234dbde8cd941dbe62b17c021`:
+
+- package version `0.2.0`, MSRV 1.92 aligned with the current Semantica host,
+  internal-only `UNLICENSED`/`publish=false`
+  policy, `CHANGELOG.md`, and a breaking-change `MIGRATION.md`;
+- runtime bite tests for ten reachable feature compositions;
+- a docs selector validator resolving 166 named selectors and rejecting stale
+  commands;
+- corrected extraction/host documentation and explicit separation of portable
+  local qualification from host qualification;
+- focused Miri evidence recorded in ticket receipts.
+
+The local product proof was refreshed at
+`cdbf94f8c409ecb60493eac5c222712f7010bbf9`: the Rust 1.92 doctor passes
+639 tests, the fresh-target performance smoke passes all 33 required samples,
+and actual standalone extraction produces canonical digest `75355851`, clean
+bootstrap commit `5bd3f743`, and the same complete standalone rails. Local
+workspace/extraction/performance proof is therefore exact-current for that
+product source.
+
+QMP-130 is now exact-head `QUALIFIED`: clean pushed host branch
+`codex/qmp130-main-hardening` at
+`986d59b6455028bbf423797ba8b745e46e0cad83` resolves exact Git QMP
+`4d0857923b20df75520b28d8700198f51c4159e4`. Its dependency identity verifier
+passes 9/9, and the registered production-composition, host-full-wiring and
+execution-budget QBC suites pass 2/2 + 1/1 + 1/1 with one unchanged source
+digest. This closes the former Cargo-resolution and missing-receipt gaps.
+
+This ticket remains `BLOCKED` because the qualified host branch is not merged
+or activated on host main, and the final campaign-wide exact-source receipt has
+not been cut after that integration. QMP-120 uses repo-local actual extraction
+as its terminal authority; the intentionally absent GitHub Actions workflow is
+not a remaining gap. Branch qualification is not deployment or campaign
+`DONE`.

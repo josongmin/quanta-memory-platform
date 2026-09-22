@@ -2,8 +2,8 @@
 //!
 //! Only things used by more than one slice live here: the builder-first happy
 //! path ([`builder`]) and the domain-neutral byte-measurement contract
-//! ([`measure`]). Slice-local backing integrations (`scc` / `redb` /
-//! `moka`) must never be promoted into this module.
+//! ([`measure`]). Slice-local backing integrations such as `redb` must never be
+//! promoted into this module.
 
 pub mod accounting;
 pub mod builder;

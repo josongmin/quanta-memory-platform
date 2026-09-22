@@ -82,6 +82,8 @@ pub use retained_map::{
     BoundRetainedMapStoreBuilder, RetainedMapInsertOrExistingV1, RetainedMapInsertOutcomeV1,
     RetainedMapStore, RetainedMapStoreBuilder, SimpleRetainedMapStore,
 };
+#[cfg(all(feature = "revocable_store", feature = "spill"))]
+pub use revocable_store::RevocableSpillHandle;
 #[cfg(feature = "revocable_store")]
 pub use revocable_store::{RevocableStore, RevocableStoreBuilder, SimpleRevocableStore};
 #[cfg(feature = "publish_pipeline")]
@@ -90,13 +92,17 @@ pub use shared::builder::PreparedPublicationServiceBuilder;
 pub use shared::builder::SessionTranscriptStoreBuilder;
 #[cfg(feature = "spill")]
 pub use spill::{
-    InMemorySpillTarget, NoopSpillController, RetainingSpillTarget, RoutedSpillController,
-    SpillController, SpillTarget,
+    DurableCommitFailure, DurableRecordId, DurableRecordResolution, DurableRestoreCandidate,
+    DurableRestoreController, DurableRestoreOutcome, DurableRestorePhase, DurableRestoreRecovery,
+    DurableRestoreTarget, DurableSpillController, DurableSpillTarget, DurableWriteFailure,
+    InMemorySpillTarget, InProcessSpillController, InProcessSpillTarget, NoopSpillController,
+    ReconciledDurableSpillController, RetainingSpillTarget, RoutedSpillController, SpillController,
+    SpillFailure, SpillInventory, SpillReceipt, SpillTarget,
 };
 #[cfg(feature = "transcript")]
 pub use transcript_store::{
     SessionTranscriptStore, SimpleSessionTranscriptStore, TranscriptAppendDispositionV1,
     TranscriptAppendErrorV1, TranscriptAppendIdentityV1, TranscriptAppendRequestV1,
-    TranscriptRecordV1, TranscriptRetainDispositionV1, TranscriptRetentionPolicyV1,
-    TranscriptSnapshotV1,
+    TranscriptRecordV1, TranscriptRetainDispositionV1, TranscriptRetentionPolicyV2,
+    TranscriptRetentionReconfigureErrorV2, TranscriptRetentionStatsV2, TranscriptSnapshotV1,
 };

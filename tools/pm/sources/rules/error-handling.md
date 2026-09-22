@@ -21,7 +21,7 @@ Principles:
 - **Fail-closed before mutation.** An over-budget reserve, an invalid policy, or a
   write during rebuild returns the appropriate `MemoryError` BEFORE touching the
   ledger — never half-apply then error.
-- **Preserve the source.** When wrapping a backing error (redb/moka/scc), include
+- **Preserve the source.** When wrapping a backing error (redb), include
   it: `format!("spill write failed: {e}")`. Never `map_err(|_| …)`.
 - **Pick the right variant.** Over-budget → `Capacity`; bad manifest/policy →
   `Config`; builder misuse → `Build`; operation illegal in current state (e.g.

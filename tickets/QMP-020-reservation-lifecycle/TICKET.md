@@ -100,6 +100,8 @@ Owner symbols:
 - [x] 테스트한 class/owner/context/kind/group admission/release/recharge/rollback에서 overflow는 mutation 전 거부되고 snapshot은 exact하다 (`59f0c4f` clean doctor PASS). 전체 transition의 모델 오라클은 QMP-090, 최종 extraction·host compatibility는 별도 게이트다.
 - [x] public store가 raw clone ticket에 의존하지 않도록 migration path가 문서화된다.
 - [x] existing recharge fail-closed semantics가 유지된다.
+- [x] external safe API가 clone 가능한 raw `ReservationTicket`을 발급하지 않는다.
+- [x] poisoned commit+rollback exceptional path도 pending authority를 잃지 않는다.
 
 ## Verification
 
@@ -127,6 +129,8 @@ DataFusion reservation과 Tokio owned permit처럼 capacity authority를 owner l
 - Receipt: [`receipts/2026-09-20T184809Z-783d0bb.md`](receipts/2026-09-20T184809Z-783d0bb.md)
 - Historical receipt는 당시 reservation typestate 및 focused tests에만 유효하다. P1-D01의 RED로 ticket을 재개방했고, 격리 수정 `4533146`을 `59f0c4f`에 통합했다. QMP-040/050의 과거 receipt를 파기하지 않지만 QMP-020 및 의존 ticket의 terminal qualification은 fresh integrated proof 전 금지한다.
 - P1-D01 scoped implementation receipt: [`receipts/2026-09-21T001438Z-59f0c4f.md`](receipts/2026-09-21T001438Z-59f0c4f.md). Isolated core 177+7+14+11 GREEN, main integration and clean integrated doctor complete. QMP-120's later integrated `2a827af` local actual extraction also passed; external host migration, remote CI and terminal cross-ticket model remain separate gates. Status `IMPLEMENTED`, not `QUALIFIED`.
+- P1-F01/P2-F01 static implementation receipt: [`receipts/2026-09-21T040430Z-9da681a.md`](receipts/2026-09-21T040430Z-9da681a.md). Raw public authority is removed and the poisoned commit owner is preserved; exact-head runtime tests and doctests remain deferred, so this is `IMPLEMENTED`, not `QUALIFIED`.
+- Current-source qualification: [`receipts/2026-09-21T104013Z-aeeffe3.md`](receipts/2026-09-21T104013Z-aeeffe3.md). Duplicate commit rejection, pending-drop exact rollback, all 14 cross-cutting policy/lifecycle contracts, focused Miri, and the 638-test doctor pass at one committed source. QMP-130 host adoption remains a separate consumer gate and does not downgrade the portable lifecycle primitive.
 
 ## Reopened P1-D01 — saturating admission loses a live ticket (2026-09-21)
 
@@ -142,3 +146,55 @@ Owner-level repair, in order:
 4. Record the observed isolated RED→GREEN owner proof and fresh integrated core/workspace/extraction delta receipt before restoring `IMPLEMENTED`; no original receipt is an overflow qualification. Public scheduler `record_usage`/`record_release` now return `MemoryResult<u64>`; QMP-140 owns SemVer notes and QMP-130 owns external host compile. The full-snapshot validation in hot-path release is a QMP-100 measured performance follow-up, not permission to reintroduce saturation.
 
 Public observation compatibility: `LedgerSnapshot` fields remain constructible by callers, while its infallible `total_*` getters now use `checked_add(...).expect(...)` (`ledger.rs:229-268`) and panic on a forged unrepresentable snapshot instead of saturating. Broker-produced snapshots call `validate_exact()` first and return typed `InvalidState`; those two claims are different. QMP-110/140 must decide whether to add a fallible public snapshot observation API or explicitly document the precondition/breaking panic behavior; add an external forged-snapshot test. This is a compatibility/observation contract gap, not evidence that a valid broker ledger panics.
+
+## Reopened P1-F01/P2-F01 — raw-ticket Drop leak and poison rollback loss
+
+At final audit source `dfb58a6`, `ReservationTicket` remains `Clone` and is
+re-exported from the crate root. Public `LiveProcessMemoryBroker::{reserve,
+reserve_committed,commit,release,release_many}` expose the raw lifecycle. Dropping
+the result of `reserve_committed` has no RAII owner and leaves ledger and resource-
+group usage live indefinitely. An external probe observed
+`raw_ticket_drop_owner_bytes=100`. The owned APIs are sound on the tested healthy
+path, but their existence does not make the raw safe API fail-closed.
+
+The poison exceptional path also loses authority: `PendingReservation::commit`
+takes its ticket before calling commit; if commit and the subsequent normal
+rollback both fail on the poisoned mutex, `self.ticket` is empty and `Drop`
+cannot invoke the emergency rollback path.
+
+Required repair:
+
+1. Make raw reserve/commit/release and `ReservationTicket` crate-private, or put
+   them behind an explicitly unsupported/deprecated advanced feature.
+2. Make `reserve_committed` return only non-clone `CommittedCharge`/
+   `ManagedCharge` ownership.
+3. Replace the public-surface test that pins `ReservationTicket` with compile-fail
+   absence tests for every raw lifecycle entry point.
+4. On failed `PendingReservation::commit`, restore the ticket into `self` until
+   rollback succeeds or return a typed recovery owner containing the exact ticket.
+5. Hellgates: raw authority drop drains all axes/group to zero; poisoned commit
+   followed by object drop drains the recovered inner state to zero; original
+   commit and rollback errors remain distinguishable.
+
+Implementation checkpoint (runtime qualification deferred):
+
+- `ReservationTicket`, raw recharge types, and discardable `CommittedCharge`
+  are crate-private; raw broker mutations are no longer callable by an external
+  safe consumer.
+- `PendingReservation::commit` returns a broker-bound `ManagedCharge`, so both
+  the pending and committed success paths have exact Drop cleanup authority.
+- A failed commit keeps the ticket in `PendingReservation` until normal rollback
+  succeeds. On lock poison, the consuming method's Drop path recovers the mutex
+  and performs the exact pending rollback before returning the original commit
+  error.
+- The portable conformance adapter now owns an internal `Pending -> Committed ->
+  Released` state machine over public RAII types instead of depending on the raw
+  ticket escape hatch.
+- Static evidence: workspace all-target/all-feature `cargo check`, fmt, and
+  clippy `-D warnings` pass. The poison test and compile-fail doctests are present
+  but intentionally not executed in this checkpoint.
+- QMP-070's feature-matrix static sweep found the newly private ticket/recharge
+  types compiled but unused under core `--no-default-features`, causing
+  `-D warnings` failure. The owner types/module are now gated by `live_control`;
+  this is a feature-closure repair only and does not upgrade QMP-020 runtime
+  qualification.

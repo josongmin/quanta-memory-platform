@@ -8,6 +8,132 @@
 
 use crate::AllocatorSnapshot;
 
+/// Fixed operation vocabulary for operational events. Variants, rather than
+/// caller strings, are the cardinality boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MemoryOperation {
+    Reserve,
+    Release,
+    Close,
+    Recharge,
+    Reclaim,
+    SpillInProcess,
+    SpillDurable,
+    RestoreDurable,
+    TombstoneSaturation,
+    Pressure,
+    Reconfigure,
+    ObserveAllocator,
+    ObserveBroker,
+}
+
+impl MemoryOperation {
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Reserve => "reserve",
+            Self::Release => "release",
+            Self::Close => "close",
+            Self::Recharge => "recharge",
+            Self::Reclaim => "reclaim",
+            Self::SpillInProcess => "spill_in_process",
+            Self::SpillDurable => "spill_durable",
+            Self::RestoreDurable => "restore_durable",
+            Self::TombstoneSaturation => "tombstone_saturation",
+            Self::Pressure => "pressure",
+            Self::Reconfigure => "reconfigure",
+            Self::ObserveAllocator => "observe_allocator",
+            Self::ObserveBroker => "observe_broker",
+        }
+    }
+}
+
+/// Fixed result vocabulary. No owner, runtime, key, session or free-form error
+/// text can enter a metric label through this type.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MemoryOutcome {
+    Succeeded,
+    CapacityDenied,
+    Busy,
+    Closed,
+    Poisoned,
+    InvalidState,
+    ConfigRejected,
+    Unsupported,
+    AllocatorMismatch,
+    ObservationFailed,
+    CallbackFailed,
+}
+
+impl MemoryOutcome {
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Succeeded => "succeeded",
+            Self::CapacityDenied => "capacity_denied",
+            Self::Busy => "busy",
+            Self::Closed => "closed",
+            Self::Poisoned => "poisoned",
+            Self::InvalidState => "invalid_state",
+            Self::ConfigRejected => "config_rejected",
+            Self::Unsupported => "unsupported",
+            Self::AllocatorMismatch => "allocator_mismatch",
+            Self::ObservationFailed => "observation_failed",
+            Self::CallbackFailed => "callback_failed",
+        }
+    }
+
+    /// Map the public typed error taxonomy into a bounded observation label.
+    /// No message text is parsed or exposed as a label.
+    #[must_use]
+    pub const fn from_error(error: &crate::MemoryError) -> Self {
+        match error {
+            crate::MemoryError::Capacity(_) => Self::CapacityDenied,
+            crate::MemoryError::Closed(_) => Self::Closed,
+            crate::MemoryError::OperationInProgress(_) => Self::Busy,
+            crate::MemoryError::Config(_) | crate::MemoryError::Build(_) => Self::ConfigRejected,
+            crate::MemoryError::Unsupported(_) => Self::Unsupported,
+            crate::MemoryError::Poisoned(_) => Self::Poisoned,
+            crate::MemoryError::InvalidState(_) => Self::InvalidState,
+            crate::MemoryError::Report(_) => Self::ObservationFailed,
+        }
+    }
+}
+
+/// One bounded-cardinality operational observation. `bytes` is a numeric
+/// measurement, never a label or accounting mutation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MemoryEvent {
+    pub operation: MemoryOperation,
+    pub outcome: MemoryOutcome,
+    pub bytes: Option<u64>,
+}
+
+impl MemoryEvent {
+    #[must_use]
+    pub const fn new(
+        operation: MemoryOperation,
+        outcome: MemoryOutcome,
+        bytes: Option<u64>,
+    ) -> Self {
+        Self { operation, outcome, bytes }
+    }
+}
+
+/// Advisory event sink. Implementations must not own or mutate semantic
+/// accounting state. Broker implementations invoke this only after releasing
+/// their internal mutex and contain callback panics.
+pub trait MemoryEventSink: Send + Sync {
+    fn emit(&self, event: MemoryEvent);
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NoopMemoryEventSink;
+
+impl MemoryEventSink for NoopMemoryEventSink {
+    fn emit(&self, _event: MemoryEvent) {}
+}
+
 /// Reads an advisory allocator snapshot.
 pub trait AllocatorTelemetry {
     fn snapshot(&self) -> AllocatorSnapshot;
@@ -69,6 +195,42 @@ impl AllocatorAdvisory {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn operational_labels_are_closed_bounded_sets() {
+        let operations = [
+            MemoryOperation::Reserve,
+            MemoryOperation::Release,
+            MemoryOperation::Close,
+            MemoryOperation::Recharge,
+            MemoryOperation::Reclaim,
+            MemoryOperation::SpillInProcess,
+            MemoryOperation::SpillDurable,
+            MemoryOperation::RestoreDurable,
+            MemoryOperation::TombstoneSaturation,
+            MemoryOperation::Pressure,
+            MemoryOperation::Reconfigure,
+            MemoryOperation::ObserveAllocator,
+            MemoryOperation::ObserveBroker,
+        ];
+        let outcomes = [
+            MemoryOutcome::Succeeded,
+            MemoryOutcome::CapacityDenied,
+            MemoryOutcome::Busy,
+            MemoryOutcome::Closed,
+            MemoryOutcome::Poisoned,
+            MemoryOutcome::InvalidState,
+            MemoryOutcome::ConfigRejected,
+            MemoryOutcome::Unsupported,
+            MemoryOutcome::AllocatorMismatch,
+            MemoryOutcome::ObservationFailed,
+            MemoryOutcome::CallbackFailed,
+        ];
+        assert_eq!(operations.map(MemoryOperation::label).len(), 13);
+        assert_eq!(outcomes.map(MemoryOutcome::label).len(), 11);
+        assert!(operations.iter().all(|operation| !operation.label().is_empty()));
+        assert!(outcomes.iter().all(|outcome| !outcome.label().is_empty()));
+    }
 
     #[test]
     fn advisory_flags_mismatch_and_reports_semantic_as_authority() {

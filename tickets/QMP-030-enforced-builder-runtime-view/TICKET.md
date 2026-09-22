@@ -5,6 +5,9 @@ Lifecycle authority: `tickets/README.md`
 Depends on: QMP-010, QMP-020  
 Blocks: QMP-040, QMP-080, QMP-110, QMP-130, QMP-140
 
+Status: `QUALIFIED` locally at `f3b5a13d2f75a6a0010ce078a04ee8b1c3af5579`.
+See [`receipts/2026-09-21T061817Z-f3b5a13.md`](receipts/2026-09-21T061817Z-f3b5a13.md).
+
 ## Objective
 
 권장/default public path가 실제 live accounting authority를 만들도록 하고, runtime scratch가 동일 ledger를 통과하게 한다. report-only/unbudgeted 경로는 이름과 type에서 위험이 드러나야 한다.
@@ -121,7 +124,10 @@ report 출력만 하는 예제는 `effective_budget_report`로 분리한다.
 - [x] README 권장 happy path가 실제 enforcement를 증명한다.
 - [x] live runtime view에서 uncharged scratch path가 없다.
 - [x] report-only와 enforced product가 같은 type/name으로 혼동되지 않는다.
-- [x] raw authority가 external safe API에서 제거된다.
+- [x] raw authority가 external safe API에서 제거된다. `ReservationTicket`,
+  `AccountingLedger`, raw reserve/commit/release, basic broker/runtime/scratch,
+  unrestricted bumpalo paths are external compile failures; public mutation
+  authority is broker-bound RAII.
 - [x] override layer가 default build에서 무시되지 않는다.
 - [x] all public API/compile-fail tests가 새 surface를 고정한다.
 
@@ -136,7 +142,9 @@ cargo run -p quanta-memory-platform-facade --example effective_budget_report --a
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 ```
 
-Public/Cargo use path 변경이므로 QMP-120 actual extraction과 QMP-130 host compile/adoption receipt가 terminal 조건이다.
+Public/Cargo use path 변경이므로 local qualification requires QMP-120 actual
+extraction. External host compile/adoption remains the separate QMP-130 gate and
+is not implied by this ticket.
 
 ## Receipt
 
@@ -145,3 +153,13 @@ Public/Cargo use path 변경이므로 QMP-120 actual extraction과 QMP-130 host 
   [`receipts/2026-09-20T192334Z-cde6e0a.md`](receipts/2026-09-20T192334Z-cde6e0a.md)
 - Lifecycle: `BLOCKED -> IMPLEMENTED`. QMP-120 actual extraction과 QMP-130
   host adoption 전에는 `QUALIFIED`/`DONE`으로 승격하지 않는다.
+
+## Final-audit correction — resolved by `9da681a`, refreshed at `f3b5a13`
+
+The final audit correctly found this bypass at `dfb58a6`. QMP-020 subsequently
+made raw tickets/ledger methods crate-private and introduced broker-bound owned
+authorities at `9da681a`. Current root compile-fail doctests reject raw ticket,
+raw reserve, raw ledger/basic broker/scratch, and facade bumpalo access. Public
+surface/runtime/example/extraction evidence is refreshed in the current receipt.
+QMP-140 still owns the breaking-change migration statement; QMP-130 owns the
+external host rewire.

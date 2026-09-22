@@ -1,9 +1,10 @@
-pub mod backings;
 pub mod service;
 
 use quanta_memory_platform_core::{MemoryResult, StoreBindingHandle, StoreStats, StoreWriteError};
 
 pub use crate::shared::builder::RevocableStoreBuilder;
+#[cfg(feature = "spill")]
+pub use service::RevocableSpillHandle;
 pub use service::SimpleRevocableStore;
 
 pub trait RevocableStore<Key, Value> {

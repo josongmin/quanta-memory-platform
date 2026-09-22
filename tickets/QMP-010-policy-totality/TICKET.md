@@ -125,4 +125,4 @@ Cargo/public use path가 바뀌면 QMP-120 actual extraction receipt도 요구�
 
 - Product implementation commit: `10af630512aa809ca5fe8b69d9e15d6e636d7462`
 - Receipt: [`receipts/2026-09-20T183204Z-10af630.md`](receipts/2026-09-20T183204Z-10af630.md)
-- Lifecycle remains `IMPLEMENTED`, not `QUALIFIED`: actual standalone extraction exposed the existing QMP-120 missing-semgrep-rule defect.
+- Current-source qualification: [`receipts/2026-09-21T104013Z-aeeffe3.md`](receipts/2026-09-21T104013Z-aeeffe3.md). Mandatory-class rejection, unconfigured-class fail-closed reserve, all 14 policy contracts, and the 638-test doctor pass at the same committed source. The historical QMP-120 defect is fixed and is no longer a blocker for this ticket.

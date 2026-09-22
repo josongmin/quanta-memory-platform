@@ -37,6 +37,40 @@
 //! ```compile_fail
 //! use quanta_memory_platform_core::BasicPinRegistry;
 //! ```
+//!
+//! Raw ledger tickets and discardable committed authorities are not part of the
+//! external safe API:
+//!
+//! ```compile_fail
+//! use quanta_memory_platform_core::ReservationTicket;
+//! ```
+//!
+//! ```compile_fail
+//! use quanta_memory_platform_core::CommittedCharge;
+//! ```
+//!
+//! ```compile_fail
+//! # use quanta_memory_platform_core::{ChargeKind, LiveProcessMemoryBroker, MemoryClass, MemoryContextKind};
+//! # fn raw_reserve(broker: &LiveProcessMemoryBroker) {
+//! let ticket = broker.reserve(
+//!     MemoryClass::ArtifactCache,
+//!     "owner".to_string(),
+//!     MemoryContextKind::Request,
+//!     ChargeKind::RetainedPayload,
+//!     1,
+//! );
+//! # }
+//! ```
+//!
+//! Resource-group usage is derived only from owned ticket transitions; there is
+//! no public side channel that can mutate scheduler counters:
+//!
+//! ```compile_fail
+//! # use quanta_memory_platform_core::LiveProcessMemoryBroker;
+//! # fn side_channel(broker: &LiveProcessMemoryBroker) {
+//! broker.record_group_usage("group", 1);
+//! # }
+//! ```
 
 pub mod adapters;
 pub mod api;
@@ -50,7 +84,6 @@ pub use api::broker::{ProcessMemoryBroker, RuntimeMemoryView};
 pub use api::builder::ProcessMemoryBrokerBuilder;
 #[cfg(feature = "live_control")]
 pub use api::control::{
-    ChargeRechargeError, ChargeRechargeRecovery, ChargeReleaseError, CommittedCharge,
     LiveProcessMemoryBroker, ManagedCharge, ManagedChargeRechargeError,
     ManagedChargeRechargeRecovery, PendingReservation,
 };
@@ -71,18 +104,28 @@ pub use domain::errors::{
     CapacityError, MemoryError, MemoryResult, PinError, PublishError, StoreDeleteError,
     StoreWriteError,
 };
-pub use domain::ledger::{ChargeKind, LedgerSnapshot, ReservationTicket, UsageBreakdown};
+pub use domain::ledger::{ChargeKind, LedgerSnapshot, UsageBreakdown};
 pub use domain::policy::{
     ExecutionBudget, MemoryBudgetManifest, MemoryClass, MemoryClassBudget, MemoryPreset,
     OwnerQuota, ReclaimPriority, ResidencyPolicy, ResourceGroup,
 };
-pub use domain::recharge::{RechargeError, RechargeRecoveryV1};
-pub use domain::stats::{AllocatorSnapshot, EffectiveMemoryBudgetReport, PressureState};
+pub use domain::stats::{
+    AllocatorSnapshot, BrokerObservation, EffectiveMemoryBudgetReport, PressureState,
+    ReclaimRuntimeStats,
+};
 #[cfg(feature = "unbudgeted_pin")]
 pub use ports::pin::{InvalidationOutcome, PayloadPinLease, PinRegistry};
+#[cfg(feature = "live_control")]
+pub use ports::reclaim::{
+    MemoryReclaimer, ReclaimCandidate, ReclaimGroupCandidate, ReclaimOutcome, ReclaimRequest,
+    ReclaimTrigger,
+};
 pub use ports::scratch::{ScratchAllocator, ScratchRequest, ScratchReservation};
 pub use ports::store::{
     PublishedPayload, RetainedEnvelope, StagedHandle, StoreBindingHandle, StoreStats, SweepHint,
     SweepStats,
 };
-pub use ports::telemetry::{AllocatorAdvisory, AllocatorTelemetry, StaticAllocatorTelemetry};
+pub use ports::telemetry::{
+    AllocatorAdvisory, AllocatorTelemetry, MemoryEvent, MemoryEventSink, MemoryOperation,
+    MemoryOutcome, NoopMemoryEventSink, StaticAllocatorTelemetry,
+};

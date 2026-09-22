@@ -5,17 +5,14 @@ Lifecycle authority: `tickets/README.md`
 Depends on: QMP-000  
 Blocks: QMP-130, QMP-140
 
-Status: `IMPLEMENTED`. `e6f69c340239784a2d5af7d685ba8894c47ee0c1`
-is the isolated proof branch, not the current main product SHA. The extraction
-implementation was cherry-picked onto main in `4169a20` and `c03b16c`;
-`47021d3` records that integration. Local exact-content extraction and offline
-checks passed on the isolated source, but the new CI workflow has not yet
-produced an observed remote run and later main source needs its own receipt. See
-[`receipts/2026-09-20T233523Z-e6f69c3.md`](receipts/2026-09-20T233523Z-e6f69c3.md).
-An integrated post-QMP-020/QMP-050 fresh actual extraction at `2a827af`
-also passed locally with clean extracted git; see
-[`receipts/2026-09-21T003556Z-2a827af.md`](receipts/2026-09-21T003556Z-2a827af.md).
-Remote CI, external host rewire, and exact later ticket-doc SHA are still open.
+Status: `QUALIFIED`. The local isolated source at `4fdac520` freezes the exact
+committed HEAD/tree, derives the copy manifest from Git tree objects, binds each
+path to mode/blob/content identity, rejects tracked/index/mode drift, and passed
+a fresh actual extraction with clean destination commit. See
+[`receipts/2026-09-21T055538Z-4fdac52.md`](receipts/2026-09-21T055538Z-4fdac52.md).
+The repository does not use GitHub Actions as extraction authority. A fresh
+repo-local actual extraction of the workflow-free canonical set is the terminal
+qualification rail; the current receipt below passes it.
 
 ## Objective
 
@@ -53,7 +50,7 @@ the currently integrated implementation remains `READY` or still fails.
 - `tools/semgrep/**`
 - `tools/ci/feature-matrix.sh`
 - root `Cargo.lock`, `.cargo/**`, toolchain/MSRV config as decided
-- extraction tests/CI
+- extraction tests and repo-local qualification scripts
 
 ## Required implementation
 
@@ -68,7 +65,8 @@ the currently integrated implementation remains `READY` or still fails.
 9. final `git status --porcelain`이 empty인지 검사한다.
 10. cargo-deny/tool absence를 release lane에서 skip하지 않는다.
 11. feature matrix는 each feature alone + `-D warnings`를 적용한다.
-12. temp destination을 사용한 actual extraction을 CI에서 실행한다.
+12. clean/frozen source에서 temp destination을 사용한 actual extraction을
+    qualification front door로 실행한다.
 
 ## RED tests/scenarios
 
@@ -92,9 +90,35 @@ the currently integrated implementation remains `READY` or still fails.
 - [x] no Semantica host noun/path dependency introduced.
 - [x] failure path가 invalid success commit을 만들지 않는다.
 - [x] release receipt에 rustc/cargo/cargo-deny/semgrep versions가 기록된다.
+- [x] extraction input가 declared `HEAD` tree/mode와 동일함을 검증한다.
+- [x] dirty tracked source와 executable-bit drift negative fixtures가 RED다.
 
-Remote `.github/workflows/standalone-extraction.yml` execution remains
-unobserved; keep `IMPLEMENTED`, not `QUALIFIED` or `DONE`.
+Current-source refresh: actual extraction of
+`f1d45c9bb28982f2c5ee3fcaac4a5d8ce4329be9` passed the complete 638-test
+doctor, feature-runtime lanes, selector validator, PM lint, deny and clean Git
+postcondition. See
+[`receipts/2026-09-21T105625Z-f1d45c9.md`](receipts/2026-09-21T105625Z-f1d45c9.md).
+
+Current-source session-hardening refresh: actual extraction of
+`557213b01ed93a20c1a45d3c69b2dae20ab90e70` produced canonical digest
+`da315e42ec3d2c8a028119db9c26082130f763bd2256c269f099012dcb0fc8c3`,
+bootstrap commit `6f744cac4e36d9dae5439c832d5a0a41f7809199`, and a clean extracted
+worktree after the complete 639-test doctor, ticket validator and PM lint.
+See
+[`receipts/2026-09-21T131415Z-557213b.md`](receipts/2026-09-21T131415Z-557213b.md).
+
+Policy correction (2026-09-22): `.github/workflows/standalone-extraction.yml`
+was not an operational rail and is removed from the repository and canonical
+copy set. Historical receipts that recorded it as unobserved remain immutable
+history; they are not a current acceptance requirement. QMP-120 closes from an
+exact-source repo-local actual extraction receipt.
+
+Qualification: workflow-free source
+`cdbf94f8c409ecb60493eac5c222712f7010bbf9` passed the complete repo-local
+doctor and actual extraction. The canonical digest is `75355851`, extracted
+bootstrap commit is `5bd3f743`, `.github` is absent, and final Git status is
+clean. See
+[`receipts/2026-09-21T161832Z-cdbf94f.md`](receipts/2026-09-21T161832Z-cdbf94f.md).
 
 ## Verification
 
@@ -111,3 +135,32 @@ cargo metadata --locked --format-version 1 --manifest-path "${qmp_extract_dir}/C
 
 - Semantica rewire: QMP-130
 - crates.io publish decision: QMP-140
+
+## Final-audit P1-F03 — resolved locally at `4fdac520`
+
+The prior extractor built its file list with `git ls-files` but copied bytes from
+the working tree. It neither rejected tracked dirtiness nor compared copied
+blobs and modes with `HEAD`. The digest covered path/content but not executable
+mode, so a receipt could name `HEAD=X` while extracting different bytes.
+
+Implemented repair:
+
+1. Freeze source `HEAD` and tree ID; reject relevant tracked/index dirtiness at
+   both start and end, or extract directly from the frozen tree object.
+2. Derive the manifest from `git ls-tree -r HEAD` and bind mode, blob ID, path,
+   content digest, and destination mode.
+3. Emit the frozen tree ID and canonical manifest digest in the receipt.
+4. Add dirty-tracked, staged-only, executable-bit and repeated-extraction
+   fixtures; retain the existing omitted-source and pre-commit failure contracts.
+5. Two extractions from the same tree must produce the same canonical manifest
+   digest; a different tree may never reuse the prior receipt.
+
+Local checkpoint:
+
+```text
+source HEAD: 4fdac520e877e56a1c3a51dcd8ee715d1f73d18b
+source tree: af7d81b6d1b04360680584ec5fb0cf2870f76277
+canonical manifest SHA-256: 53bc8aebf3cb77fd31d71aa157538c7c2b0a50a54c47265bbfc81165a3ef1847
+extracted bootstrap commit: 9eadc03104c894fbc21a34414eba48abe66af22b
+extracted git status: clean
+```

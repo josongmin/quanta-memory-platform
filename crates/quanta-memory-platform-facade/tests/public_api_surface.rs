@@ -66,7 +66,8 @@ fn names_always_on_reexports() {
 }
 
 /// Live accounting exposes one sealed platform factory and its broker view, not
-/// a user-implemented callback or a detachable sink.
+/// a user-implemented accounting callback or a detachable sink. The separate
+/// reclaim port may request eviction but cannot mutate counters directly.
 #[cfg(feature = "core-live-accounting")]
 #[test]
 fn live_broker_bridge_is_present_only_with_core_live_accounting() {
@@ -184,7 +185,8 @@ fn names_revocable_store_reexports() {
 use quanta_memory_platform_facade::{
     SessionTranscriptStore, SessionTranscriptStoreBuilder, SimpleSessionTranscriptStore,
     TranscriptAppendDispositionV1, TranscriptAppendErrorV1, TranscriptAppendIdentityV1,
-    TranscriptAppendRequestV1, TranscriptRecordV1, TranscriptRetentionPolicyV1,
+    TranscriptAppendRequestV1, TranscriptRecordV1, TranscriptRetentionPolicyV2,
+    TranscriptRetentionReconfigureErrorV2, TranscriptRetentionStatsV2,
 };
 
 /// Pins the `transcript` slice's public exports.
@@ -199,7 +201,9 @@ fn names_transcript_reexports() {
     type _Record = TranscriptRecordV1<String, String>;
     type _Error = TranscriptAppendErrorV1;
     type _Disposition = TranscriptAppendDispositionV1;
-    type _Retention = TranscriptRetentionPolicyV1;
+    type _Retention = TranscriptRetentionPolicyV2;
+    type _RetentionStats = TranscriptRetentionStatsV2;
+    type _RetentionReconfigureError = TranscriptRetentionReconfigureErrorV2;
 }
 
 #[cfg(feature = "publish_pipeline")]
@@ -266,8 +270,10 @@ fn prepared_publication_builder_exposes_root_bound_resolution_contract() {
 use quanta_memory_platform_core::MemoryResult;
 #[cfg(feature = "spill")]
 use quanta_memory_platform_facade::{
-    InMemorySpillTarget, NoopSpillController, RetainingSpillTarget, RoutedSpillController,
-    SpillController, SpillTarget,
+    DurableCommitFailure, DurableRestoreCandidate, DurableRestoreController, DurableRestoreOutcome,
+    DurableRestoreTarget, DurableSpillController, DurableSpillTarget, InMemorySpillTarget,
+    InProcessSpillController, InProcessSpillTarget, NoopSpillController, RetainingSpillTarget,
+    RoutedSpillController, SpillController, SpillInventory, SpillReceipt, SpillTarget,
 };
 
 /// Pins the `spill` slice's public exports, including the controller and target
@@ -282,6 +288,18 @@ fn names_spill_reexports() {
     );
     type _Targets =
         (Box<dyn SpillTarget<u64>>, InMemorySpillTarget<u64>, RetainingSpillTarget<u64>);
+    type _Inventory = Box<dyn SpillInventory>;
+    type _InProcess = (Box<dyn InProcessSpillController<u64>>, Box<dyn InProcessSpillTarget<u64>>);
+    type _Durable = (
+        Box<dyn DurableSpillController<Vec<u8>>>,
+        Box<dyn DurableRestoreController>,
+        Box<dyn DurableSpillTarget<Vec<u8>>>,
+        Box<dyn DurableRestoreTarget>,
+        SpillReceipt,
+        DurableRestoreCandidate,
+        DurableRestoreOutcome,
+        DurableCommitFailure,
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -443,6 +461,28 @@ fn default_builder_and_report_only_share_override_resolution() {
     );
 }
 
+#[cfg(feature = "core-live-accounting")]
+#[test]
+fn platform_builder_installs_reclaimer_before_live_construction() {
+    use quanta_memory_platform_core::{
+        MemoryReclaimer, MemoryResult, ReclaimOutcome, ReclaimRequest,
+    };
+
+    struct NoopReclaimer;
+    impl MemoryReclaimer for NoopReclaimer {
+        fn reclaim(&self, _request: &ReclaimRequest) -> MemoryResult<ReclaimOutcome> {
+            Ok(ReclaimOutcome::default())
+        }
+    }
+
+    let platform = MemoryPlatformBuilder::new()
+        .with_preset(MemoryPreset::Ci)
+        .with_reclaimer(std::sync::Arc::new(NoopReclaimer))
+        .build()
+        .expect("builder accepts the reclaim port before construction");
+    assert_eq!(platform.broker().reclaim_runtime_stats().expect("stats").attempts, 0);
+}
+
 /// The `payload_store` builder yields a `SimplePayloadStore`, and a fresh store
 /// reports zero charged bytes — pinning that the builder is wired to a real,
 /// queryable store (not a presence-only re-export).
@@ -576,7 +616,7 @@ fn transcript_builder_exposes_public_charged_path() {
     let store: SimpleSessionTranscriptStore<String, String, String, Budgeted> = platform
         .transcript_store_builder::<String, String, String>()
         .bind(binding)
-        .with_retention_policy(TranscriptRetentionPolicyV1::process_lifetime())
+        .with_retention_policy(TranscriptRetentionPolicyV2::default())
         .build()
         .expect("budgeted transcript builder must build");
 
@@ -589,6 +629,10 @@ fn transcript_builder_exposes_public_charged_path() {
     assert_eq!(disposition, TranscriptAppendDispositionV1::Applied);
     assert_eq!(store.load(&"s".to_string()).expect("load").len(), 1);
     assert_eq!(store.stats().expect("checked transcript stats").estimated_bytes, 236);
+    let retention = store.retention_stats().expect("retention stats");
+    assert_eq!(retention.active_row_count, 1);
+    assert_eq!(retention.evidence_count, 1);
+    assert_eq!(retention.total_retained_bytes, 236);
     assert_eq!(platform.broker().ledger_snapshot().expect("snap").total_owner_bytes(), 236);
 }
 
@@ -600,9 +644,9 @@ fn transcript_builder_exposes_public_charged_path() {
 fn spill_controller_round_trips_a_handle_via_restore() {
     let controller = RoutedSpillController::new(InMemorySpillTarget::<u64>::available());
 
-    let spilled: MemoryResult<()> = controller.spill(42);
+    let spilled = controller.spill(42);
     assert!(spilled.is_ok(), "an available target must accept the spill: {spilled:?}");
-    assert_eq!(controller.spilled_count(), 1, "a successful spill increments the count");
+    assert_eq!(controller.spilled_count(), Ok(1), "a successful spill increments inventory");
 
     let restored: MemoryResult<Option<u64>> = controller.restore();
     assert_eq!(
@@ -610,7 +654,7 @@ fn spill_controller_round_trips_a_handle_via_restore() {
         Some(42),
         "a retaining target restores the spilled handle"
     );
-    assert_eq!(controller.spilled_count(), 0, "restoring a handle decrements the spilled count");
+    assert_eq!(controller.spilled_count(), Ok(0), "restoring a handle decrements inventory");
 }
 
 /// A routed controller over an UNAVAILABLE target fails closed on spill (it never
@@ -619,18 +663,20 @@ fn spill_controller_round_trips_a_handle_via_restore() {
 #[test]
 fn spill_controller_fails_closed_when_target_unavailable() {
     let controller = RoutedSpillController::new(InMemorySpillTarget::<u64>::unavailable());
-    let result: MemoryResult<()> = controller.spill(7);
-    assert!(result.is_err(), "an unavailable spill target must fail closed, got Ok");
-    assert_eq!(controller.spilled_count(), 0, "a failed spill must not increment the count");
+    let result = controller.spill(7);
+    let failure = result.expect_err("an unavailable spill target must fail closed");
+    assert!(matches!(failure.error(), quanta_memory_platform_core::MemoryError::Capacity(_)));
+    assert_eq!(failure.into_parts().1, 7, "failed spill returns the only handle");
+    assert_eq!(controller.spilled_count(), Ok(0), "a failed spill must not increment inventory");
 }
 
-/// The `NoopSpillController` always succeeds and never retains — the documented
-/// no-op contract for hosts without a configured spill backend.
+/// No configured target must not certify a destructive discard as persistence.
 #[cfg(feature = "spill")]
 #[test]
-fn noop_spill_controller_succeeds_and_restores_nothing() {
+fn noop_spill_controller_rejects_and_restores_nothing() {
     let controller = NoopSpillController;
-    assert!(SpillController::<u64>::spill(&controller, 1).is_ok(), "noop spill always succeeds");
+    let failure = SpillController::<u64>::spill(&controller, 1).expect_err("no target");
+    assert_eq!(failure.into_parts().1, 1);
     assert_eq!(
         SpillController::<u64>::restore(&controller).expect("noop restore succeeds"),
         None,

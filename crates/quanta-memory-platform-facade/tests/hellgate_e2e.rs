@@ -15,9 +15,9 @@
 use std::sync::Arc;
 
 use quanta_memory_platform_core::{
-    ChargeKind, ExecutionBudget, LedgerSnapshot, MemoryBudgetManifest, MemoryClass,
-    MemoryClassBudget, MemoryContextKind, MemoryError, MemoryPreset, ReclaimPriority,
-    ResidencyPolicy, StoreBindingHandle,
+    ChargeKind, ExecutionBudget, LedgerSnapshot, ManagedCharge, ManagedChargeRechargeRecovery,
+    MemoryBudgetManifest, MemoryClass, MemoryClassBudget, MemoryContextKind, MemoryError,
+    MemoryPreset, ReclaimPriority, ResidencyPolicy, StoreBindingHandle,
 };
 use quanta_memory_platform_facade::{
     Budgeted, LiveMemoryPlatform, MemoryPlatformBuilder, RetainedMapStore, SimpleRetainedMapStore,
@@ -184,9 +184,11 @@ fn e2e_spill_tier_round_trips_fifo_and_never_touches_the_ledger() {
     assert_eq!(ledger_before, map_cost("resident", 500));
 
     let controller = RoutedSpillController::new(RetainingSpillTarget::available());
-    controller.spill("h1".to_string()).expect("spill 1");
-    controller.spill("h2".to_string()).expect("spill 2");
-    assert_eq!(controller.spilled_count(), 2);
+    let first = controller.spill("h1".to_string()).expect("spill 1");
+    let second = controller.spill("h2".to_string()).expect("spill 2");
+    assert_eq!(first.inventory_after(), 1);
+    assert_eq!(second.inventory_after(), 2);
+    assert_eq!(controller.spilled_count(), Ok(2));
     // Accounting-neutral: routing handles to the spill tier moves no broker bytes.
     assert_eq!(b.broker().ledger_snapshot().expect("snap").total_owner_bytes(), ledger_before);
 
@@ -194,7 +196,7 @@ fn e2e_spill_tier_round_trips_fifo_and_never_touches_the_ledger() {
     assert_eq!(controller.restore().expect("r1"), Some("h1".to_string()));
     assert_eq!(controller.restore().expect("r2"), Some("h2".to_string()));
     assert_eq!(controller.restore().expect("drained"), None);
-    assert_eq!(controller.spilled_count(), 0);
+    assert_eq!(controller.spilled_count(), Ok(0));
     assert_eq!(
         b.broker().ledger_snapshot().expect("snap").total_owner_bytes(),
         ledger_before,
@@ -408,14 +410,13 @@ fn double_remove_does_not_double_refund_the_ledger() {
     assert_balanced(&snap);
 }
 
-// 8) Direct broker recharge preserves the old charge and original ticket when
-//    the replacement is denied.
+// 8) Managed broker recharge preserves the old charge when replacement is denied.
 #[test]
-fn broker_recharge_denied_preserves_old_ticket() {
+fn broker_recharge_denied_preserves_managed_authority() {
     let b = broker(10_000_000, 1_000);
-    let old = b
+    let mut old = b
         .broker()
-        .reserve_committed(
+        .reserve_managed_charge(
             MemoryClass::MemoResidency,
             OWNER.to_string(),
             MemoryContextKind::Request,
@@ -423,10 +424,8 @@ fn broker_recharge_denied_preserves_old_ticket() {
             800,
         )
         .expect("charge 800 of 1000");
-    let err = b
-        .broker()
+    let err = old
         .recharge(
-            &old,
             MemoryClass::MemoResidency,
             OWNER.to_string(),
             MemoryContextKind::Request,
@@ -435,22 +434,22 @@ fn broker_recharge_denied_preserves_old_ticket() {
         )
         .expect_err("over-cap recharge denied");
     assert!(matches!(err.error, MemoryError::Capacity(_)));
-    assert_eq!(err.recovery, quanta_memory_platform_core::RechargeRecoveryV1::OldChargePreserved);
+    assert_eq!(err.recovery, ManagedChargeRechargeRecovery::ChargePreserved);
     assert_eq!(
         b.broker().ledger_snapshot().expect("snap").total_owner_bytes(),
         800,
         "old charge preserved"
     );
-    b.broker().release(&old).expect("preserved ticket releases the old bytes");
+    old.release().expect("preserved lease releases the old bytes");
     assert_eq!(b.broker().ledger_snapshot().expect("snap").total_owner_bytes(), 0);
 }
 
-// --- batch release (release_many) atomicity + idempotency at the public surface ---
+// --- managed batch release atomicity + idempotency at the public surface ---
 // (the charged stores' sweep/truncate refund through this; audit findings [1]/[16])
 
-fn committed(b: &LiveMemoryPlatform, bytes: u64) -> quanta_memory_platform_core::ReservationTicket {
+fn committed(b: &LiveMemoryPlatform, bytes: u64) -> ManagedCharge {
     b.broker()
-        .reserve_committed(
+        .reserve_managed_charge(
             MemoryClass::MemoResidency,
             OWNER.to_string(),
             MemoryContextKind::Request,
@@ -463,73 +462,61 @@ fn committed(b: &LiveMemoryPlatform, bytes: u64) -> quanta_memory_platform_core:
 #[test]
 fn release_many_drains_a_batch_atomically() {
     let b = broker(10_000_000, 1_000_000);
-    let t1 = committed(&b, 100);
-    let t2 = committed(&b, 200);
-    let t3 = committed(&b, 300);
+    let mut charges = [committed(&b, 100), committed(&b, 200), committed(&b, 300)];
     assert_eq!(b.broker().ledger_snapshot().expect("snap").total_owner_bytes(), 600);
 
-    b.broker().release_many(&[t1, t2, t3]).expect("batch release drains all");
+    b.broker().release_managed_many(&mut charges).expect("batch release drains all");
+    assert!(charges.iter().all(|charge| !charge.is_active()));
     let snap = b.broker().ledger_snapshot().expect("snap");
     assert_eq!(snap.total_owner_bytes(), 0, "batch release returns every ticket's bytes");
     assert_balanced(&snap);
 }
 
 #[test]
-fn release_many_with_a_duplicate_is_fail_closed() {
+fn dropping_managed_charges_releases_each_exact_authority() {
     let b = broker(10_000_000, 1_000_000);
-    let t1 = committed(&b, 100);
-    let t2 = committed(&b, 200);
-    let before = b.broker().ledger_snapshot().expect("snap");
-
-    // A duplicate ticket in one batch is rejected BEFORE any counter moves.
-    let denied = b.broker().release_many(&[t1.clone(), t1.clone(), t2.clone()]);
-    assert!(
-        matches!(denied, Err(MemoryError::InvalidState(_))),
-        "a duplicate in the batch must be rejected, got {denied:?}"
-    );
-    assert_eq!(
-        b.broker().ledger_snapshot().expect("snap"),
-        before,
-        "a rejected batch must leave every ticket charged (all-or-none)"
-    );
-    // The batch is still releasable cleanly once de-duplicated.
-    b.broker().release_many(&[t1, t2]).expect("de-duplicated batch releases");
+    let first = committed(&b, 100);
+    let second = committed(&b, 200);
+    assert_ne!(first.id(), second.id(), "each lease owns one exact authority");
+    drop(first);
+    assert_eq!(b.broker().ledger_snapshot().expect("snap").total_owner_bytes(), 200);
+    drop(second);
     assert_eq!(b.broker().ledger_snapshot().expect("snap").total_owner_bytes(), 0);
 }
 
 #[test]
 fn release_many_with_an_already_released_ticket_is_fail_closed() {
     let b = broker(10_000_000, 1_000_000);
-    let t1 = committed(&b, 100);
-    let t2 = committed(&b, 200);
-    b.broker().release(&t1).expect("release t1 individually");
+    let mut charges = [committed(&b, 100), committed(&b, 200)];
+    charges[0].release().expect("release first lease individually");
     let before = b.broker().ledger_snapshot().expect("snap");
     assert_eq!(before.total_owner_bytes(), 200, "only t2 remains charged");
 
     // Batch containing the already-released t1 must fail closed, NOT partially
     // refund t2 (which would strand/lose accounting).
-    let denied = b.broker().release_many(&[t1, t2.clone()]);
+    let denied = b.broker().release_managed_many(&mut charges);
     assert!(
         matches!(denied, Err(MemoryError::InvalidState(_))),
-        "a batch with an already-released ticket must be rejected, got {denied:?}"
+        "a batch with an inactive lease must be rejected, got {denied:?}"
     );
     assert_eq!(
         b.broker().ledger_snapshot().expect("snap"),
         before,
         "the still-live ticket must not be partially refunded by a rejected batch"
     );
-    b.broker().release(&t2).expect("t2 still releasable on its own");
+    assert!(!charges[0].is_active());
+    assert!(charges[1].is_active());
+    charges[1].release().expect("second lease still releasable on its own");
     assert_eq!(b.broker().ledger_snapshot().expect("snap").total_owner_bytes(), 0);
 }
 
 #[test]
 fn release_many_during_rebuild_is_fail_closed() {
     let b = broker(10_000_000, 1_000_000);
-    let t1 = committed(&b, 100);
-    let t2 = committed(&b, 200);
+    let mut charges = [committed(&b, 100), committed(&b, 200)];
     b.broker().begin_rebuild().expect("begin rebuild");
     let before = b.broker().ledger_snapshot().expect("snap");
-    let denied = b.broker().release_many(&[t1, t2]);
+    let denied = b.broker().release_managed_many(&mut charges);
     assert!(
         matches!(denied, Err(MemoryError::InvalidState(_))),
         "batch release during rebuild is rejected, got {denied:?}"
@@ -539,6 +526,10 @@ fn release_many_during_rebuild_is_fail_closed() {
         before,
         "a rebuild-rejected batch strands nothing",
     );
+    assert!(charges.iter().all(ManagedCharge::is_active));
+    b.broker().finish_rebuild().expect("finish rebuild");
+    b.broker().release_managed_many(&mut charges).expect("retry exact batch release");
+    assert_eq!(b.broker().ledger_snapshot().expect("snap").total_owner_bytes(), 0);
 }
 
 // --- charged payload store full-stack: dedup, pin discipline, refund (F#3) ---
@@ -572,13 +563,14 @@ mod payload_e2e {
         let first = store
             .put_canonical(RetainedEnvelope::new(vec![7u8; 32]))
             .expect("first put charges the ledger");
-        // 32 body + retained reference "payload-0" (9) + digest 32 + state 16.
-        assert_eq!(ledger(&b), 89, "full payload retention flows through the broker ledger");
+        // 32 body + retained reference "payload-0" (9) + two 32-byte semantic
+        // index slots (canonical digest and reference lookup) + state 16.
+        assert_eq!(ledger(&b), 121, "full payload retention flows through the broker ledger");
 
         // Canonical dedup: the identical payload re-uses the entry, one live charge.
         let second = store.put_canonical(RetainedEnvelope::new(vec![7u8; 32])).expect("dedup put");
         assert_eq!(second.payload_ref(), first.payload_ref(), "dedup returns the same ref");
-        assert_eq!(ledger(&b), 89, "dedup does not double-charge the ledger");
+        assert_eq!(ledger(&b), 121, "dedup does not double-charge the ledger");
 
         // Pin discipline: a pinned payload cannot be deleted; the ledger is intact.
         store.pin(first.payload_ref()).expect("pin");
@@ -587,7 +579,7 @@ mod payload_e2e {
             matches!(pinned_delete, Err(MemoryError::InvalidState(_))),
             "deleting a pinned payload must be rejected, got {pinned_delete:?}"
         );
-        assert_eq!(ledger(&b), 89, "a refused pinned delete leaves the ledger charged");
+        assert_eq!(ledger(&b), 121, "a refused pinned delete leaves the ledger charged");
 
         // Unpin, then delete refunds the ledger to zero.
         store.unpin(first.payload_ref()).expect("unpin");

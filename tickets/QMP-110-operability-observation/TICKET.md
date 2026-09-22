@@ -5,6 +5,10 @@ Lifecycle authority: `tickets/README.md`
 Depends on: QMP-030, QMP-040, QMP-080  
 Blocks: QMP-130, QMP-140
 
+Status: `QUALIFIED`; current-source refresh at product source
+`aeeffe3588561398dcc1ad8c12332fe740f5f655` is recorded in
+[`receipts/2026-09-21T104013Z-aeeffe3.md`](receipts/2026-09-21T104013Z-aeeffe3.md).
+
 ## Objective
 
 corrupted/unavailable state를 empty/zero로 위장하지 않고, memory admission/reclaim/spill/reconfigure 결과를 bounded-cardinality telemetry로 관측 가능하게 한다.
@@ -12,11 +16,16 @@ corrupted/unavailable state를 empty/zero로 위장하지 않고, memory admissi
 ## Confirmed evidence
 
 - payload/revocable/transcript store `stats`는 QMP-040 이후 `MemoryResult<StoreStats>`로 변경됐다 (`payload_store/mod.rs:18`, `revocable_store/mod.rs:15`, `transcript_store/mod.rs:231`). 이 세 zero-on-poison 결함은 **historical baseline**이며, 아래 테스트는 regression guards다.
-- 두 public in-memory/Noop spill target의 retained count는 아직 poison을 zero로 바꾼다: `spill/service.rs:164-165,237-238`. redb observation은 이미 fallible이다.
+- public in-memory spill targets의 `retained_count`는 현재
+  `MemoryResult<u64>`이며 poisoned mutex를 typed `InvalidState`로 반환한다
+  (`spill/service.rs`). 과거 zero-on-poison finding은 현행 결함이 아니다.
 - core의 `effective_report()` trait는 infallible (`core/src/api/broker.rs:26`); live 구현은 poisoned guard의 실제 report를 복구하지만 poison 상태 자체를 드러내지 않는다 (`api/control.rs:1033-1045`). 이를 fabricated zero로 서술하지 말고 typed observation 계약을 결정한다.
 - QMP-020 후 공개 `LedgerSnapshot`의 `total_*` getters는 수동 구성한 unrepresentable snapshot에서 `checked_add(...).expect(...)`로 panic한다 (`core/src/domain/ledger.rs:229-268`). Broker snapshot은 먼저 `validate_exact()`로 typed error를 반환한다. 이 둘의 public contract/compatibility를 QMP-140과 함께 결정한다.
 - metrics/hdr adapters는 존재하지만 broker/store production call site가 없다.
-- reconfigure report provenance는 active value와 stale해질 수 있다.
+- QMP-080 이후 accepted reconfigure는 residency, `policy_revision`,
+  `active_policy_source`, override source/provenance를 같은 broker lock 아래
+  갱신하고 exact postimage tests를 가진다. Historical stale-provenance
+  finding은 닫혔고 regression guard만 이 ticket에 남는다.
 
 ## Canonical write set
 
@@ -85,19 +94,19 @@ bounded enum labels로 최소 다음을 집계한다.
 
 ## Acceptance
 
-- [ ] control/admission code가 infallible zero-on-error stats를 사용하지 않는다.
-- [ ] poison과 empty가 모든 public authority에서 구분된다.
-- [ ] major operational outcomes에 emission call site가 있다.
-- [ ] labels가 bounded set임을 test가 고정한다.
-- [ ] semantic counters와 telemetry가 단방향 observation 관계를 유지한다.
-- [ ] snapshot values와 provenance revision이 일치한다.
+- [x] control/admission code가 infallible zero-on-error stats를 사용하지 않는다.
+- [x] poison과 empty가 모든 public authority에서 구분된다.
+- [x] major operational outcomes에 emission call site가 있다.
+- [x] labels가 bounded set임을 test가 고정한다.
+- [x] semantic counters와 telemetry가 단방향 observation 관계를 유지한다.
+- [x] snapshot values와 provenance revision이 일치한다.
 
 ## Verification
 
 ```bash
 cargo test -p quanta-memory-platform-core --all-features observation
 cargo test -p quanta-memory-platform-facade --all-features poisoned
-cargo test -p quanta-memory-platform-testkit --all-features observation_error
+cargo test -p quanta-memory-platform-testkit --all-features snapshot_error_is_failed_verdict_not_zero
 cargo test --workspace --all-features
 ```
 

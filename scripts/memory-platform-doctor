@@ -22,11 +22,18 @@ scripts/regression-guards.sh
 echo "[doctor] feature-matrix"
 tools/ci/feature-matrix.sh
 
+echo "[doctor] advertised feature runtime capabilities"
+scripts/verify-feature-capabilities.sh
+
 echo "[doctor] cargo check --workspace --all-features"
 cargo check --locked --workspace --all-features
 
 echo "[doctor] cargo test --workspace --all-features"
 cargo test --locked --workspace --all-features
+
+echo "[doctor] documented test selectors"
+python3 -m unittest -v scripts/tests/test_doc_test_selectors.py
+scripts/verify-doc-test-selectors.py
 
 echo "[doctor] cargo build --examples --all-features"
 cargo build --locked --examples --all-features

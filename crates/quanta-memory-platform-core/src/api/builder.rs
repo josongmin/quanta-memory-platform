@@ -4,12 +4,49 @@ use crate::domain::config::EffectiveBudgetResolver;
 use crate::domain::config::{BudgetOverrideLayer, OverrideSource};
 use crate::domain::policy::MemoryBudgetManifest;
 use crate::domain::stats::EffectiveMemoryBudgetReport;
+#[cfg(feature = "live_control")]
+use crate::ports::reclaim::MemoryReclaimer;
+#[cfg(feature = "live_control")]
+use crate::ports::telemetry::{MemoryEventSink, NoopMemoryEventSink};
 use crate::{MemoryError, MemoryPreset, MemoryResult};
+#[cfg(feature = "live_control")]
+use std::sync::Arc;
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone)]
+#[cfg_attr(not(feature = "live_control"), derive(Default))]
 pub struct ProcessMemoryBrokerBuilder {
     manifest: Option<MemoryBudgetManifest>,
     layers: Vec<(OverrideSource, BudgetOverrideLayer)>,
+    #[cfg(feature = "live_control")]
+    reclaimer: Option<Arc<dyn MemoryReclaimer>>,
+    #[cfg(feature = "live_control")]
+    event_sink: Arc<dyn MemoryEventSink>,
+}
+
+#[cfg(feature = "live_control")]
+impl Default for ProcessMemoryBrokerBuilder {
+    fn default() -> Self {
+        Self {
+            manifest: None,
+            layers: Vec::new(),
+            #[cfg(feature = "live_control")]
+            reclaimer: None,
+            #[cfg(feature = "live_control")]
+            event_sink: Arc::new(NoopMemoryEventSink),
+        }
+    }
+}
+
+impl std::fmt::Debug for ProcessMemoryBrokerBuilder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut debug = f.debug_struct("ProcessMemoryBrokerBuilder");
+        debug.field("manifest", &self.manifest).field("layers", &self.layers);
+        #[cfg(feature = "live_control")]
+        debug.field("has_reclaimer", &self.reclaimer.is_some());
+        #[cfg(feature = "live_control")]
+        debug.field("event_sink", &"bounded MemoryEventSink");
+        debug.finish()
+    }
 }
 
 impl ProcessMemoryBrokerBuilder {
@@ -34,6 +71,24 @@ impl ProcessMemoryBrokerBuilder {
         self
     }
 
+    /// Install the bounded reclaim callback used by soft-threshold and hard
+    /// denial slow paths. The callback is invoked without the broker mutex.
+    #[cfg(feature = "live_control")]
+    #[must_use]
+    pub fn with_reclaimer(mut self, reclaimer: Arc<dyn MemoryReclaimer>) -> Self {
+        self.reclaimer = Some(reclaimer);
+        self
+    }
+
+    /// Install an advisory, bounded-cardinality operational event sink. The
+    /// broker invokes it outside its mutex and contains callback panics.
+    #[cfg(feature = "live_control")]
+    #[must_use]
+    pub fn with_event_sink(mut self, event_sink: Arc<dyn MemoryEventSink>) -> Self {
+        self.event_sink = event_sink;
+        self
+    }
+
     /// Resolve config precedence and build the enforced accounting-backed broker.
     ///
     /// This runs the full effective-budget resolution (manifest + override
@@ -43,8 +98,12 @@ impl ProcessMemoryBrokerBuilder {
     /// policy is invalid.
     #[cfg(feature = "live_control")]
     pub fn build(self) -> MemoryResult<LiveProcessMemoryBroker> {
+        let reclaimer = self.reclaimer.clone();
+        let event_sink = Arc::clone(&self.event_sink);
         let report = self.resolve_report()?;
-        LiveProcessMemoryBroker::from_report(report)
+        LiveProcessMemoryBroker::from_report_with_reclaimer_and_events(
+            report, reclaimer, event_sink,
+        )
     }
 
     /// Compatibility alias for callers migrating to the enforced default.

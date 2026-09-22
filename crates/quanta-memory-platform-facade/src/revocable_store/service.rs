@@ -1,9 +1,12 @@
+#[cfg(feature = "spill")]
+use std::collections::BTreeMap;
+use std::collections::VecDeque;
 use std::marker::PhantomData;
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use quanta_memory_platform_core::{
     ChargeKind, LiveProcessMemoryBroker, ManagedCharge, MemoryContextKind, MemoryError,
-    MemoryResult, StoreBindingHandle, StoreStats, StoreWriteError, SweepStats,
+    MemoryOperation, MemoryResult, StoreBindingHandle, StoreStats, StoreWriteError, SweepStats,
 };
 
 use crate::revocable_store::RevocableStore;
@@ -12,6 +15,12 @@ use crate::shared::accounting::Unbudgeted;
 use crate::shared::accounting::{Budgeted, StoreAccounting};
 use crate::shared::lifecycle::{retire_client_value, BeginClose, StoreLifecycle};
 use crate::shared::measure::{semantic_cost_v1, ByteSized, RetainedCostV1};
+#[cfg(feature = "spill")]
+use crate::spill::{
+    DurableCommitFailure, DurableRecordId, DurableRecordResolution, DurableRestoreController,
+    DurableRestoreOutcome, DurableRestorePhase, DurableWriteFailure, InProcessSpillController,
+    ReconciledDurableSpillController, SpillFailure, SpillReceipt,
+};
 
 #[derive(Debug)]
 struct RevocableEntry<Key, Value> {
@@ -22,18 +31,89 @@ struct RevocableEntry<Key, Value> {
     charge: Option<ManagedCharge>,
 }
 
-fn retire_entries<Key, Value>(entries: Vec<RevocableEntry<Key, Value>>) {
-    for entry in entries {
-        let RevocableEntry { key, value, charge, .. } = entry;
-        drop(charge);
-        retire_client_value(key);
-        retire_client_value(value);
+/// In-process transfer authority. The value, its semantic cost, and the
+/// issuing broker lease move together; dropping an un-restored handle retires
+/// them together. This is not a durable serialization format.
+#[cfg(feature = "spill")]
+#[derive(Debug)]
+pub struct RevocableSpillHandle<Key, Value> {
+    /// Shared store identity. Moving many entries into an in-process tier must
+    /// not deep-clone caller-controlled owner/runtime strings per handle.
+    binding: Arc<StoreBindingHandle>,
+    entry: Option<RevocableEntry<Key, Value>>,
+}
+
+#[cfg(feature = "spill")]
+impl<Key, Value> RevocableSpillHandle<Key, Value> {
+    #[must_use]
+    pub fn key(&self) -> &Key {
+        &self.entry.as_ref().expect("live spill handle").key
     }
+
+    #[must_use]
+    pub fn value(&self) -> &Value {
+        &self.entry.as_ref().expect("live spill handle").value
+    }
+
+    #[must_use]
+    pub fn charged_bytes(&self) -> u64 {
+        self.entry.as_ref().expect("live spill handle").charged_bytes
+    }
+
+    fn into_entry(mut self) -> RevocableEntry<Key, Value> {
+        self.entry.take().expect("live spill handle")
+    }
+}
+
+#[cfg(feature = "spill")]
+impl<Key, Value> Drop for RevocableSpillHandle<Key, Value> {
+    fn drop(&mut self) {
+        if let Some(entry) = self.entry.take() {
+            retire_entry(entry);
+        }
+    }
+}
+
+fn retire_entry<Key, Value>(entry: RevocableEntry<Key, Value>) {
+    let RevocableEntry { key, value, charge, .. } = entry;
+    drop(charge);
+    retire_client_value(key);
+    retire_client_value(value);
+}
+
+fn retire_entries<Key, Value>(entries: VecDeque<RevocableEntry<Key, Value>>) {
+    for entry in entries {
+        retire_entry(entry);
+    }
+}
+
+fn revocable_entry_cost<Key: ByteSized, Value: ByteSized>(
+    key: &Key,
+    value: &Value,
+) -> MemoryResult<u64> {
+    RetainedCostV1 {
+        payload_bytes: value.byte_size(),
+        key_identity_bytes: key.byte_size(),
+        index_bytes: semantic_cost_v1::FIFO_INDEX_BYTES,
+        fixed_overhead_bytes: semantic_cost_v1::ENTRY_STATE_BYTES,
+        ..RetainedCostV1::default()
+    }
+    .total()
 }
 
 #[derive(Debug)]
 struct RevocableState<Key, Value> {
-    entries: Vec<RevocableEntry<Key, Value>>,
+    entries: VecDeque<RevocableEntry<Key, Value>>,
+    /// Source entries fenced while a durable commit acknowledgement is unknown.
+    /// Their managed charges remain live until record reconciliation chooses the
+    /// durable or resident authority.
+    #[cfg(feature = "spill")]
+    pending_spills: BTreeMap<DurableRecordId, RevocableEntry<Key, Value>>,
+    /// Provisional resident entries fenced while a durable delete
+    /// acknowledgement is unknown. They are charged but not readable until
+    /// reconciliation proves that the durable record is absent.
+    #[cfg(feature = "spill")]
+    pending_restores: BTreeMap<DurableRecordId, RevocableEntry<Key, Value>>,
     committed_bytes: u64,
 }
 
@@ -59,7 +139,7 @@ struct RevocableState<Key, Value> {
 /// ```
 #[derive(Debug)]
 pub struct SimpleRevocableStore<Key, Value, Mode> {
-    binding: StoreBindingHandle,
+    binding: Arc<StoreBindingHandle>,
     accounting: StoreAccounting,
     lifecycle: StoreLifecycle,
     state: Mutex<RevocableState<Key, Value>>,
@@ -69,10 +149,17 @@ pub struct SimpleRevocableStore<Key, Value, Mode> {
 impl<Key, Value, Mode> SimpleRevocableStore<Key, Value, Mode> {
     fn with_accounting(binding: StoreBindingHandle, accounting: StoreAccounting) -> Self {
         Self {
-            binding,
+            binding: Arc::new(binding),
             accounting,
             lifecycle: StoreLifecycle::new("revocable store"),
-            state: Mutex::new(RevocableState { entries: Vec::new(), committed_bytes: 0 }),
+            state: Mutex::new(RevocableState {
+                entries: VecDeque::new(),
+                #[cfg(feature = "spill")]
+                pending_spills: BTreeMap::new(),
+                #[cfg(feature = "spill")]
+                pending_restores: BTreeMap::new(),
+                committed_bytes: 0,
+            }),
             _mode: PhantomData,
         }
     }
@@ -170,6 +257,12 @@ impl<Key, Value, Mode> SimpleRevocableStore<Key, Value, Mode> {
 
     /// Atomically release every entry and enter the terminal closed state.
     pub fn close(&self) -> MemoryResult<()> {
+        let result = self.close_inner();
+        self.accounting.emit_result(MemoryOperation::Close, None, &result);
+        result
+    }
+
+    fn close_inner(&self) -> MemoryResult<()> {
         let close = match self.lifecycle.begin_close()? {
             BeginClose::AlreadyClosed => return Ok(()),
             BeginClose::Acquired(close) => close,
@@ -177,6 +270,12 @@ impl<Key, Value, Mode> SimpleRevocableStore<Key, Value, Mode> {
 
         let mut plan = {
             let mut state = self.lock_state()?;
+            #[cfg(feature = "spill")]
+            if !state.pending_spills.is_empty() || !state.pending_restores.is_empty() {
+                return Err(MemoryError::OperationInProgress(
+                    "cannot close revocable store with unresolved durable transfers".into(),
+                ));
+            }
             for entry in &state.entries {
                 self.require_charge_shape(entry, "close")?;
             }
@@ -210,6 +309,592 @@ impl<Key, Value> SimpleRevocableStore<Key, Value, Budgeted> {
     }
 }
 
+#[cfg(feature = "spill")]
+impl<Key, Value> SimpleRevocableStore<Key, Value, Budgeted> {
+    /// Transfer the oldest entry to an in-process tier without refunding its
+    /// process-resident charge. A failed destination returns the exact handle,
+    /// which is restored at its original FIFO position before the error escapes.
+    pub fn spill_one_into<C>(&self, controller: &C) -> MemoryResult<bool>
+    where
+        C: InProcessSpillController<RevocableSpillHandle<Key, Value>>,
+    {
+        let result = self.spill_one_into_inner(controller);
+        self.accounting.emit_result(MemoryOperation::SpillInProcess, None, &result);
+        result
+    }
+
+    fn spill_one_into_inner<C>(&self, controller: &C) -> MemoryResult<bool>
+    where
+        C: InProcessSpillController<RevocableSpillHandle<Key, Value>>,
+    {
+        let _mutation = self.lifecycle.begin_mutation()?;
+        let (entry, next_committed) = {
+            let mut state = self.lock_state()?;
+            let Some(entry) = state.entries.front() else {
+                return Ok(false);
+            };
+            self.require_charge_shape(entry, "spill transfer")?;
+            let next_committed =
+                state.committed_bytes.checked_sub(entry.charged_bytes).ok_or_else(|| {
+                    MemoryError::InvalidState(
+                        "revocable committed bytes are smaller than transferred entry".into(),
+                    )
+                })?;
+            (state.entries.pop_front().expect("front entry was checked"), next_committed)
+        };
+
+        let handle = RevocableSpillHandle { binding: self.binding.clone(), entry: Some(entry) };
+        match controller.spill(handle) {
+            Ok(_) => {
+                self.lock_state_for_commit().committed_bytes = next_committed;
+                Ok(true)
+            }
+            Err(failure) => {
+                let (error, handle) = failure.into_parts();
+                self.lock_state_for_commit().entries.push_front(handle.into_entry());
+                Err(error)
+            }
+        }
+    }
+
+    /// Encode and commit the oldest entry to a durable tier. The source entry
+    /// and its live charge remain authoritative until the destination returns a
+    /// durable commit receipt. Encoder errors, encoder panics, and ordinary
+    /// destination errors restore the original FIFO entry before propagating.
+    pub fn spill_one_durable<C, Encode>(
+        &self,
+        controller: &C,
+        encode: Encode,
+    ) -> MemoryResult<Option<SpillReceipt>>
+    where
+        C: ReconciledDurableSpillController,
+        Encode: FnOnce(&Key, &Value) -> MemoryResult<Vec<u8>>,
+    {
+        let result = self.spill_one_durable_inner(controller, encode);
+        self.accounting.emit_result(MemoryOperation::SpillDurable, None, &result);
+        result
+    }
+
+    fn spill_one_durable_inner<C, Encode>(
+        &self,
+        controller: &C,
+        encode: Encode,
+    ) -> MemoryResult<Option<SpillReceipt>>
+    where
+        C: ReconciledDurableSpillController,
+        Encode: FnOnce(&Key, &Value) -> MemoryResult<Vec<u8>>,
+    {
+        let _mutation = self.lifecycle.begin_mutation()?;
+        let bytes = {
+            let state = self.lock_state()?;
+            if !state.pending_spills.is_empty() {
+                return Err(MemoryError::OperationInProgress(
+                    "durable spill reconciliation is required before another spill".into(),
+                ));
+            }
+            let Some(entry) = state.entries.front() else {
+                return Ok(None);
+            };
+            self.require_charge_shape(entry, "durable spill transfer")?;
+            let encoded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                encode(&entry.key, &entry.value)
+            }));
+            drop(state);
+            match encoded {
+                Ok(result) => result?,
+                Err(panic) => std::panic::resume_unwind(panic),
+            }
+        };
+
+        let record_id = controller.reserve_record_id()?;
+        let committed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            controller.commit_spill(record_id, &bytes)
+        }));
+        let result = match committed {
+            Ok(result) => result,
+            Err(panic) => std::panic::resume_unwind(panic),
+        };
+
+        match result {
+            Ok(receipt @ SpillReceipt::Durable { sequence, .. }) if sequence == record_id.get() => {
+                let entry = {
+                    let mut state = self.lock_state_for_commit();
+                    let entry = state.entries.pop_front().expect("front entry was checked");
+                    state.committed_bytes = state
+                        .committed_bytes
+                        .checked_sub(entry.charged_bytes)
+                        .expect("validated committed bytes cover first entry");
+                    entry
+                };
+                retire_entry(entry);
+                Ok(Some(receipt))
+            }
+            Ok(receipt) => {
+                let mut state = self.lock_state_for_commit();
+                let entry = state.entries.pop_front().expect("front entry was checked");
+                state.pending_spills.insert(record_id, entry);
+                Err(MemoryError::OperationInProgress(format!(
+                    "durable spill returned mismatched receipt {receipt:?}; record {} requires reconciliation",
+                    record_id.get()
+                )))
+            }
+            Err(DurableWriteFailure::NotCommitted(error)) => Err(*error),
+            Err(DurableWriteFailure::RecoveryRequired { record_id, commit_error, probe_error }) => {
+                let mut state = self.lock_state_for_commit();
+                let entry = state.entries.pop_front().expect("front entry was checked");
+                state.pending_spills.insert(record_id, entry);
+                Err(MemoryError::OperationInProgress(format!(
+                    "durable record {} requires reconciliation after commit error ({commit_error}) and probe error ({probe_error})",
+                    record_id.get()
+                )))
+            }
+        }
+    }
+
+    /// IDs whose source entries are fenced after an unresolved durable commit.
+    pub fn pending_durable_spills(&self) -> MemoryResult<Vec<DurableRecordId>> {
+        Ok(self.lock_read()?.pending_spills.keys().copied().collect())
+    }
+
+    /// Resolve one fenced durable write. A present record becomes authoritative
+    /// and releases the source charge exactly once; an absent record restores
+    /// the original FIFO source entry without changing its charge.
+    pub fn reconcile_durable_spill<C>(
+        &self,
+        controller: &C,
+        record_id: DurableRecordId,
+    ) -> MemoryResult<DurableRecordResolution>
+    where
+        C: ReconciledDurableSpillController,
+    {
+        let _mutation = self.lifecycle.begin_mutation()?;
+        let resolution = controller.resolve_record(record_id)?;
+        let mut state = self.lock_state()?;
+        let entry_bytes = state
+            .pending_spills
+            .get(&record_id)
+            .ok_or_else(|| {
+                MemoryError::InvalidState(format!(
+                    "durable record {} has no fenced source authority",
+                    record_id.get()
+                ))
+            })?
+            .charged_bytes;
+        match resolution {
+            DurableRecordResolution::Present { .. } | DurableRecordResolution::Finalized => {
+                let next_committed =
+                    state.committed_bytes.checked_sub(entry_bytes).ok_or_else(|| {
+                        MemoryError::InvalidState(
+                            "revocable committed bytes are smaller than reconciled spill".into(),
+                        )
+                    })?;
+                let entry = state
+                    .pending_spills
+                    .remove(&record_id)
+                    .expect("pending spill was checked under the mutation permit");
+                state.committed_bytes = next_committed;
+                drop(state);
+                retire_entry(entry);
+            }
+            DurableRecordResolution::Absent => {
+                let entry = state
+                    .pending_spills
+                    .remove(&record_id)
+                    .expect("pending spill was checked under the mutation permit");
+                state.entries.push_front(entry);
+            }
+        }
+        Ok(resolution)
+    }
+
+    /// Restore the oldest durable record without a transient unowned window.
+    /// The destination is first claimed and read non-destructively; the source
+    /// charge is established before the exact durable sequence is deleted, then
+    /// the entry is published locally. Decode failure or admission denial aborts
+    /// the claim and leaves the durable record authoritative and unchanged.
+    pub fn restore_one_durable<C, Decode>(
+        &self,
+        controller: &C,
+        decode: Decode,
+    ) -> MemoryResult<DurableRestoreOutcome>
+    where
+        C: DurableRestoreController,
+        Decode: FnOnce(&[u8]) -> MemoryResult<(Key, Value)>,
+        Key: ByteSized,
+        Value: ByteSized,
+    {
+        let result = self.restore_one_durable_inner(controller, decode);
+        self.accounting.emit_result(MemoryOperation::RestoreDurable, None, &result);
+        result
+    }
+
+    fn restore_one_durable_inner<C, Decode>(
+        &self,
+        controller: &C,
+        decode: Decode,
+    ) -> MemoryResult<DurableRestoreOutcome>
+    where
+        C: DurableRestoreController,
+        Decode: FnOnce(&[u8]) -> MemoryResult<(Key, Value)>,
+        Key: ByteSized,
+        Value: ByteSized,
+    {
+        let _mutation = self.lifecycle.begin_mutation()?;
+        if !self.lock_state()?.pending_restores.is_empty() {
+            return Err(MemoryError::OperationInProgress(
+                "durable restore reconciliation is required before another restore".into(),
+            ));
+        }
+        let Some(candidate) = controller.prepare_restore()? else {
+            return Ok(DurableRestoreOutcome::Empty);
+        };
+        self.restore_durable_candidate(controller, candidate, DurableRestorePhase::Prepared, decode)
+    }
+
+    /// Resume the single persisted restore claim after process restart. This is
+    /// deliberately separate from ordinary FIFO restore: callers must invoke it
+    /// only after the previous volatile owner is gone. The redb file lock and
+    /// exclusive persisted claim prevent another ordinary restore from passing.
+    pub fn recover_active_durable_restore<C, Decode>(
+        &self,
+        controller: &C,
+        decode: Decode,
+    ) -> MemoryResult<DurableRestoreOutcome>
+    where
+        C: DurableRestoreController,
+        Decode: FnOnce(&[u8]) -> MemoryResult<(Key, Value)>,
+        Key: ByteSized,
+        Value: ByteSized,
+    {
+        let result = self.recover_active_durable_restore_inner(controller, decode);
+        self.accounting.emit_result(MemoryOperation::RestoreDurable, None, &result);
+        result
+    }
+
+    fn recover_active_durable_restore_inner<C, Decode>(
+        &self,
+        controller: &C,
+        decode: Decode,
+    ) -> MemoryResult<DurableRestoreOutcome>
+    where
+        C: DurableRestoreController,
+        Decode: FnOnce(&[u8]) -> MemoryResult<(Key, Value)>,
+        Key: ByteSized,
+        Value: ByteSized,
+    {
+        let _mutation = self.lifecycle.begin_mutation()?;
+        if !self.lock_state()?.pending_restores.is_empty() {
+            return Err(MemoryError::OperationInProgress(
+                "the live store already owns a fenced durable restore; reconcile it instead".into(),
+            ));
+        }
+        let Some(recovery) = controller.recover_active_restore()? else {
+            return Ok(DurableRestoreOutcome::Empty);
+        };
+        self.restore_durable_candidate(controller, recovery.candidate, recovery.phase, decode)
+    }
+
+    fn restore_durable_candidate<C, Decode>(
+        &self,
+        controller: &C,
+        candidate: crate::spill::DurableRestoreCandidate,
+        phase: DurableRestorePhase,
+        decode: Decode,
+    ) -> MemoryResult<DurableRestoreOutcome>
+    where
+        C: DurableRestoreController,
+        Decode: FnOnce(&[u8]) -> MemoryResult<(Key, Value)>,
+        Key: ByteSized,
+        Value: ByteSized,
+    {
+        let decoded =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| decode(&candidate.bytes)));
+        let (key, value) = match decoded {
+            Ok(Ok(decoded)) => decoded,
+            Ok(Err(error)) => {
+                return self.finish_failed_restore_prepare(controller, &candidate, phase, error)
+            }
+            Err(panic) => {
+                if phase == DurableRestorePhase::Prepared {
+                    let _ = controller.abort_restore(candidate.sequence);
+                }
+                std::panic::resume_unwind(panic)
+            }
+        };
+        let charged_bytes = match revocable_entry_cost(&key, &value) {
+            Ok(charged_bytes) => charged_bytes,
+            Err(error) => {
+                retire_client_value(key);
+                retire_client_value(value);
+                return self.finish_failed_restore_prepare(controller, &candidate, phase, error);
+            }
+        };
+        let next_committed = match self.lock_state()?.committed_bytes.checked_add(charged_bytes) {
+            Some(next_committed) => next_committed,
+            None => {
+                retire_client_value(key);
+                retire_client_value(value);
+                let error = MemoryError::capacity("revocable restore byte accounting overflow");
+                return self.finish_failed_restore_prepare(controller, &candidate, phase, error);
+            }
+        };
+        let charge = match self.accounting.charge(
+            self.binding.class.clone(),
+            self.binding.owner.clone(),
+            MemoryContextKind::Runtime,
+            ChargeKind::LiveScratch,
+            charged_bytes,
+        ) {
+            Ok(charge) => charge,
+            Err(error) => {
+                retire_client_value(key);
+                retire_client_value(value);
+                return self.finish_failed_restore_prepare(controller, &candidate, phase, error);
+            }
+        };
+
+        if phase == DurableRestorePhase::Prepared {
+            match controller.commit_restore(candidate.sequence) {
+                Ok(()) => {}
+                Err(DurableCommitFailure::Retained(error)) => {
+                    drop(charge);
+                    retire_client_value(key);
+                    retire_client_value(value);
+                    return match controller.abort_restore(candidate.sequence) {
+                        Ok(()) => Err(*error),
+                        Err(abort_error) => Err(MemoryError::OperationInProgress(format!(
+                            "durable delete retained record after error ({error}) but restore {} claim abort failed ({abort_error})",
+                            candidate.sequence
+                        ))),
+                    };
+                }
+                Err(DurableCommitFailure::Ambiguous(commit_error)) => {
+                    self.fence_durable_restore(
+                        DurableRecordId::new(candidate.sequence),
+                        RevocableEntry { key, value, charged_bytes, charge },
+                        next_committed,
+                    );
+                    return Ok(DurableRestoreOutcome::RecoveryRequired {
+                        sequence: candidate.sequence,
+                        commit_error,
+                    });
+                }
+            }
+        }
+
+        // Publish into the store state before deleting the durable recovery
+        // payload. The mutation permit keeps readers out until finalize returns,
+        // so there is no visible double owner and no delete-before-publication
+        // crash window.
+        {
+            let mut state = self.lock_state_for_commit();
+            state.entries.push_back(RevocableEntry { key, value, charged_bytes, charge });
+            state.committed_bytes = next_committed;
+        }
+        let finalized = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            controller.finalize_restore(candidate.sequence)
+        }));
+        match finalized {
+            Ok(Ok(())) => Ok(DurableRestoreOutcome::Restored { sequence: candidate.sequence }),
+            Ok(Err(finalize_error)) => {
+                self.fence_published_restore(candidate.sequence);
+                Ok(DurableRestoreOutcome::RecoveryRequired {
+                    sequence: candidate.sequence,
+                    commit_error: Box::new(finalize_error),
+                })
+            }
+            Err(panic) => {
+                self.fence_published_restore(candidate.sequence);
+                std::panic::resume_unwind(panic)
+            }
+        }
+    }
+
+    fn finish_failed_restore_prepare<C>(
+        &self,
+        controller: &C,
+        candidate: &crate::spill::DurableRestoreCandidate,
+        phase: DurableRestorePhase,
+        error: MemoryError,
+    ) -> MemoryResult<DurableRestoreOutcome>
+    where
+        C: DurableRestoreController,
+    {
+        if phase == DurableRestorePhase::Committed {
+            return Err(MemoryError::OperationInProgress(format!(
+                "durable restore {} is committed to recovery but resident preparation failed ({error}); retry recovery",
+                candidate.sequence
+            )));
+        }
+        match controller.abort_restore(candidate.sequence) {
+            Ok(()) => Err(error),
+            Err(abort_error) => Err(MemoryError::OperationInProgress(format!(
+                "resident preparation failed ({error}) and durable restore {} claim abort failed ({abort_error})",
+                candidate.sequence
+            ))),
+        }
+    }
+
+    fn fence_durable_restore(
+        &self,
+        record_id: DurableRecordId,
+        entry: RevocableEntry<Key, Value>,
+        next_committed: u64,
+    ) {
+        let mut state = self.lock_state_for_commit();
+        let replaced = state.pending_restores.insert(record_id, entry);
+        debug_assert!(replaced.is_none(), "mutation permit prevents duplicate restore fencing");
+        state.committed_bytes = next_committed;
+    }
+
+    fn fence_published_restore(&self, sequence: u64) {
+        let mut state = self.lock_state_for_commit();
+        let entry =
+            state.entries.pop_back().expect("restore entry was published before finalization");
+        let replaced = state.pending_restores.insert(DurableRecordId::new(sequence), entry);
+        debug_assert!(replaced.is_none(), "mutation permit prevents duplicate restore fencing");
+    }
+
+    /// IDs whose provisional resident copies are fenced after an unresolved
+    /// durable delete. Fenced copies remain charged but are not readable.
+    pub fn pending_durable_restores(&self) -> MemoryResult<Vec<DurableRecordId>> {
+        Ok(self.lock_read()?.pending_restores.keys().copied().collect())
+    }
+
+    /// Resolve one fenced durable restore. If the durable record is absent, the
+    /// charged resident copy becomes authoritative. If it is still present, the
+    /// provisional resident copy and its charge are retired exactly once.
+    pub fn reconcile_durable_restore<C>(
+        &self,
+        controller: &C,
+        record_id: DurableRecordId,
+    ) -> MemoryResult<DurableRecordResolution>
+    where
+        C: DurableRestoreController,
+    {
+        let _mutation = self.lifecycle.begin_mutation()?;
+        {
+            let state = self.lock_state()?;
+            if !state.pending_restores.contains_key(&record_id) {
+                return Err(MemoryError::InvalidState(format!(
+                    "durable record {} has no fenced restore authority",
+                    record_id.get()
+                )));
+            }
+        }
+        let resolution = controller.reconcile_restore(record_id.get())?;
+        let mut state = self.lock_state_for_commit();
+        match resolution {
+            DurableRecordResolution::Present { .. } => {
+                let charged_bytes = state
+                    .pending_restores
+                    .get(&record_id)
+                    .expect("pending restore was checked under the mutation permit")
+                    .charged_bytes;
+                let next_committed =
+                    state.committed_bytes.checked_sub(charged_bytes).ok_or_else(|| {
+                        MemoryError::InvalidState(
+                            "revocable committed bytes are smaller than fenced restore".into(),
+                        )
+                    })?;
+                let entry = state
+                    .pending_restores
+                    .remove(&record_id)
+                    .expect("pending restore was checked under the mutation permit");
+                state.committed_bytes = next_committed;
+                drop(state);
+                retire_entry(entry);
+            }
+            DurableRecordResolution::Finalized => {
+                let entry = state
+                    .pending_restores
+                    .remove(&record_id)
+                    .expect("pending restore was checked under the mutation permit");
+                state.entries.push_back(entry);
+                drop(state);
+                let finalized = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    controller.finalize_restore(record_id.get())
+                }));
+                match finalized {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
+                        self.fence_published_restore(record_id.get());
+                        return Err(error);
+                    }
+                    Err(panic) => {
+                        self.fence_published_restore(record_id.get());
+                        std::panic::resume_unwind(panic);
+                    }
+                }
+            }
+            DurableRecordResolution::Absent => {
+                return Err(MemoryError::InvalidState(format!(
+                    "durable restore {} resolved absent without a finalized claim",
+                    record_id.get()
+                )))
+            }
+        }
+        Ok(resolution)
+    }
+
+    /// Reattach an in-process tier handle to its original broker/binding. If
+    /// admission fails, the caller receives the still-charged handle back and
+    /// can retry or explicitly retire it; no hidden release occurs on `Err`.
+    pub fn accept_restored(
+        &self,
+        handle: RevocableSpillHandle<Key, Value>,
+    ) -> Result<(), SpillFailure<RevocableSpillHandle<Key, Value>>> {
+        let _mutation = match self.lifecycle.begin_mutation() {
+            Ok(permit) => permit,
+            Err(error) => return Err(SpillFailure::new(error, handle)),
+        };
+        if handle.binding != self.binding {
+            return Err(SpillFailure::new(
+                MemoryError::InvalidState("restored handle has a foreign store binding".into()),
+                handle,
+            ));
+        }
+        let (charged_bytes, valid_charge) = {
+            let entry = handle.entry.as_ref().expect("live spill handle");
+            let charge = entry.charge.as_ref().expect("budgeted spill handle owns a charge");
+            let broker = self.accounting.broker().expect("budgeted store owns a broker");
+            (
+                entry.charged_bytes,
+                charge.belongs_to(broker)
+                    && charge.bytes() == Some(entry.charged_bytes)
+                    && charge.class() == Some(&self.binding.class)
+                    && charge.owner() == Some(&self.binding.owner)
+                    && charge.context() == Some(MemoryContextKind::Runtime)
+                    && charge.kind() == Some(ChargeKind::LiveScratch),
+            )
+        };
+        if !valid_charge {
+            return Err(SpillFailure::new(
+                MemoryError::InvalidState(
+                    "restored handle carries foreign charge authority".into(),
+                ),
+                handle,
+            ));
+        }
+        let mut state = match self.lock_state() {
+            Ok(state) => state,
+            Err(error) => return Err(SpillFailure::new(error, handle)),
+        };
+        let next_committed = match state.committed_bytes.checked_add(charged_bytes) {
+            Some(total) => total,
+            None => {
+                return Err(SpillFailure::new(
+                    MemoryError::capacity("restored revocable byte total exceeds u64"),
+                    handle,
+                ));
+            }
+        };
+        state.entries.push_back(handle.into_entry());
+        state.committed_bytes = next_committed;
+        Ok(())
+    }
+}
+
 #[cfg(feature = "unbudgeted-stores")]
 impl<Key, Value> SimpleRevocableStore<Key, Value, Unbudgeted> {
     pub(crate) fn new_unbudgeted(binding: StoreBindingHandle) -> Self {
@@ -223,19 +908,12 @@ where
     Value: ByteSized,
 {
     fn binding(&self) -> &StoreBindingHandle {
-        &self.binding
+        self.binding.as_ref()
     }
 
     fn insert_checked(&self, key: Key, value: Value) -> Result<(), StoreWriteError> {
         let _mutation = self.lifecycle.begin_mutation()?;
-        let charged_bytes = RetainedCostV1 {
-            payload_bytes: value.byte_size(),
-            key_identity_bytes: key.byte_size(),
-            index_bytes: semantic_cost_v1::FIFO_INDEX_BYTES,
-            fixed_overhead_bytes: semantic_cost_v1::ENTRY_STATE_BYTES,
-            ..RetainedCostV1::default()
-        }
-        .total()?;
+        let charged_bytes = revocable_entry_cost(&key, &value)?;
         let next_committed =
             self.lock_state()?.committed_bytes.checked_add(charged_bytes).ok_or_else(|| {
                 MemoryError::capacity("revocable committed byte accounting overflow")
@@ -250,7 +928,7 @@ where
         )?;
 
         let mut state = self.lock_state()?;
-        state.entries.push(RevocableEntry { key, value, charged_bytes, charge });
+        state.entries.push_back(RevocableEntry { key, value, charged_bytes, charge });
         state.committed_bytes = next_committed;
         Ok(())
     }
@@ -259,7 +937,7 @@ where
         let _mutation = self.lifecycle.begin_mutation()?;
         let (mut entry, next_committed) = {
             let mut state = self.lock_state()?;
-            let Some(entry) = state.entries.first() else {
+            let Some(entry) = state.entries.front() else {
                 return Ok(None);
             };
             self.require_charge_shape(entry, "single reclaim")?;
@@ -269,13 +947,13 @@ where
                         "revocable committed bytes are smaller than reclaimed entry".to_string(),
                     )
                 })?;
-            (state.entries.remove(0), next_committed)
+            (state.entries.pop_front().expect("front entry was checked"), next_committed)
         };
 
         let mut charges = entry.charge.take().into_iter().collect::<Vec<_>>();
         if let Err(error) = self.accounting.release_many(&mut charges) {
             entry.charge = charges.pop();
-            self.lock_state_for_commit().entries.insert(0, entry);
+            self.lock_state_for_commit().entries.push_front(entry);
             return Err(error);
         }
 
@@ -285,7 +963,10 @@ where
 
     fn stats(&self) -> MemoryResult<StoreStats> {
         let state = self.lock_read()?;
-        Ok(StoreStats { item_count: state.entries.len(), estimated_bytes: state.committed_bytes })
+        let item_count = state.entries.len();
+        #[cfg(feature = "spill")]
+        let item_count = item_count + state.pending_spills.len() + state.pending_restores.len();
+        Ok(StoreStats { item_count, estimated_bytes: state.committed_bytes })
     }
 
     fn close(&self) -> MemoryResult<()> {
@@ -298,23 +979,36 @@ impl<Key, Value, Mode> Drop for SimpleRevocableStore<Key, Value, Mode> {
         let _ = self.lifecycle.transition_to_closed_for_drop();
         let state = self.state.get_mut().unwrap_or_else(PoisonError::into_inner);
         let entries = std::mem::take(&mut state.entries);
+        #[cfg(feature = "spill")]
+        let pending = std::mem::take(&mut state.pending_spills).into_values().collect();
+        #[cfg(feature = "spill")]
+        let pending_restores = std::mem::take(&mut state.pending_restores).into_values().collect();
         state.committed_bytes = 0;
         retire_entries(entries);
+        #[cfg(feature = "spill")]
+        retire_entries(pending);
+        #[cfg(feature = "spill")]
+        retire_entries(pending_restores);
     }
 }
 
 fn extract_entries<Key, Value>(
-    entries: &mut Vec<RevocableEntry<Key, Value>>,
+    entries: &mut VecDeque<RevocableEntry<Key, Value>>,
     indices: &[usize],
 ) -> Vec<(usize, RevocableEntry<Key, Value>)> {
-    let mut plan =
-        indices.iter().rev().map(|index| (*index, entries.remove(*index))).collect::<Vec<_>>();
+    let mut plan = indices
+        .iter()
+        .rev()
+        .map(|index| {
+            (*index, entries.remove(*index).expect("selected revocable index must remain present"))
+        })
+        .collect::<Vec<_>>();
     plan.reverse();
     plan
 }
 
 fn restore_entries<Key, Value>(
-    entries: &mut Vec<RevocableEntry<Key, Value>>,
+    entries: &mut VecDeque<RevocableEntry<Key, Value>>,
     plan: Vec<(usize, RevocableEntry<Key, Value>)>,
 ) {
     for (index, entry) in plan {
@@ -349,15 +1043,35 @@ fn restore_charges<Key, Value>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use quanta_memory_platform_core::{
-        ExecutionBudget, MemoryBudgetManifest, MemoryClass, MemoryClassBudget, MemoryPreset,
-        ProcessMemoryBrokerBuilder, ReclaimPriority, ResidencyPolicy,
+    #[cfg(feature = "spill")]
+    use crate::spill::{
+        DurableRestoreCandidate, DurableRestoreTarget, DurableSpillTarget, InMemorySpillTarget,
+        InProcessSpillTarget, NoopSpillController, RoutedSpillController, SpillController,
+        SpillInventory, SpillReceipt, SpillTarget,
     };
+    #[cfg(feature = "spill")]
+    use quanta_memory_platform_core::MemoryOutcome;
+    use quanta_memory_platform_core::{
+        ExecutionBudget, MemoryBudgetManifest, MemoryClass, MemoryClassBudget, MemoryEvent,
+        MemoryEventSink, MemoryPreset, ProcessMemoryBrokerBuilder, ReclaimPriority,
+        ResidencyPolicy,
+    };
+    #[cfg(feature = "spill")]
+    use std::sync::atomic::AtomicBool;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Arc, Barrier};
+    use std::sync::Barrier;
     use std::thread;
 
     type Store = SimpleRevocableStore<String, Vec<u8>, Budgeted>;
+
+    #[derive(Default)]
+    struct RecordingEvents(Mutex<Vec<MemoryEvent>>);
+
+    impl MemoryEventSink for RecordingEvents {
+        fn emit(&self, event: MemoryEvent) {
+            self.0.lock().expect("event recorder").push(event);
+        }
+    }
 
     fn expected_entry_cost(key: &str, payload_bytes: u64) -> u64 {
         u64::try_from(key.len()).expect("test key fits") + payload_bytes + 16 + 16
@@ -372,6 +1086,13 @@ mod tests {
     }
 
     fn live_broker(class_hard: u64) -> LiveProcessMemoryBroker {
+        live_broker_with_events(class_hard, Arc::new(RecordingEvents::default()))
+    }
+
+    fn live_broker_with_events(
+        class_hard: u64,
+        events: Arc<dyn MemoryEventSink>,
+    ) -> LiveProcessMemoryBroker {
         let residency = ResidencyPolicy::new(10_000_000).with_class_budget(
             MemoryClass::ExecutionScratchRevocable,
             MemoryClassBudget {
@@ -388,6 +1109,7 @@ mod tests {
                 ExecutionBudget::default(),
                 residency,
             ))
+            .with_event_sink(events)
             .build()
             .expect("valid broker")
     }
@@ -448,6 +1170,941 @@ mod tests {
             broker.ledger_snapshot().expect("ledger").total_owner_bytes(),
             expected_entry_cost("second", 6)
         );
+    }
+
+    #[test]
+    fn revocable_full_drain_uses_fifo_deque_without_front_shifts() {
+        let source = include_str!("service.rs");
+        assert!(
+            source.contains("entries: VecDeque<RevocableEntry"),
+            "the canonical queue must provide O(1) amortized front removal"
+        );
+        let forbidden_front_shift = ["entries", ".remove(0)"].concat();
+        assert!(
+            !source.contains(&forbidden_front_shift),
+            "front-shifting Vec removal reintroduces quadratic full drain"
+        );
+    }
+
+    #[cfg(feature = "spill")]
+    #[test]
+    fn reclaim_to_in_memory_tier_keeps_bytes_charged() {
+        let broker = live_broker(1_000_000);
+        let store = store_with_broker(&broker);
+        store.insert_checked("first".into(), vec![1; 4]).expect("first");
+        store.insert_checked("second".into(), vec![2; 6]).expect("second");
+        let total = expected_entry_cost("first", 4) + expected_entry_cost("second", 6);
+        let controller = RoutedSpillController::new(InMemorySpillTarget::available());
+
+        assert!(store.spill_one_into(&controller).expect("transfer"));
+        assert_eq!(store.stats().expect("source stats").item_count, 1);
+        assert_eq!(
+            store.committed_bytes().expect("source bytes"),
+            expected_entry_cost("second", 6)
+        );
+        assert_eq!(controller.spilled_count(), Ok(1));
+        assert_eq!(
+            broker.ledger_snapshot().expect("retained tier charge").total_owner_bytes(),
+            total
+        );
+
+        let handle = controller.restore().expect("restore").expect("retained handle");
+        assert_eq!(handle.key(), "first");
+        assert_eq!(handle.value(), &vec![1; 4]);
+        assert_eq!(handle.charged_bytes(), expected_entry_cost("first", 4));
+        assert_eq!(controller.spilled_count(), Ok(0));
+        store.accept_restored(handle).expect("reattach original authority");
+        assert_eq!(store.stats().expect("restored stats").item_count, 2);
+        assert_eq!(broker.ledger_snapshot().expect("restored ledger").total_owner_bytes(), total);
+        assert_eq!(store.reclaim_one().expect("remaining FIFO").expect("entry").0, "second");
+        assert_eq!(store.reclaim_one().expect("restored entry").expect("entry").0, "first");
+        assert_eq!(broker.ledger_snapshot().expect("drained ledger").total_owner_bytes(), 0);
+    }
+
+    #[cfg(feature = "spill")]
+    #[test]
+    fn many_spills_share_large_binding_identity_without_unbilled_clones() {
+        const ENTRY_COUNT: usize = 128;
+        let broker = live_broker(10_000_000);
+        let large_owner = "owner-".to_string() + &"o".repeat(64 * 1024);
+        let large_runtime = "runtime-".to_string() + &"r".repeat(64 * 1024);
+        let store = SimpleRevocableStore::new_budgeted(
+            StoreBindingHandle::new(
+                MemoryClass::ExecutionScratchRevocable,
+                large_owner,
+                Some(large_runtime),
+            ),
+            broker.clone(),
+        );
+        let controller = RoutedSpillController::new(InMemorySpillTarget::available());
+
+        let mut expected_total = 0u64;
+        for index in 0..ENTRY_COUNT {
+            let key = format!("key-{index}");
+            expected_total += expected_entry_cost(&key, 1);
+            store.insert_checked(key, vec![index as u8]).expect("insert");
+        }
+        assert_eq!(
+            broker.ledger_snapshot().expect("initial ledger").total_owner_bytes(),
+            expected_total
+        );
+
+        for spilled in 1..=ENTRY_COUNT {
+            assert!(store.spill_one_into(&controller).expect("spill"));
+            assert_eq!(controller.spilled_count(), Ok(spilled as u64));
+            assert_eq!(
+                broker.ledger_snapshot().expect("spill ledger").total_owner_bytes(),
+                expected_total,
+                "in-process transfer must preserve the exact semantic charge"
+            );
+        }
+        assert_eq!(store.committed_bytes(), Ok(0));
+
+        let mut handles = Vec::with_capacity(ENTRY_COUNT);
+        while let Some(handle) = controller.restore().expect("restore from tier") {
+            assert!(
+                Arc::ptr_eq(&handle.binding, &store.binding),
+                "every spill handle must share the store identity allocation"
+            );
+            handles.push(handle);
+        }
+        assert_eq!(handles.len(), ENTRY_COUNT);
+        assert_eq!(Arc::strong_count(&store.binding), ENTRY_COUNT + 1);
+        assert_eq!(
+            broker.ledger_snapshot().expect("restored handles ledger").total_owner_bytes(),
+            expected_total
+        );
+
+        for handle in handles {
+            store.accept_restored(handle).expect("reattach shared binding handle");
+            assert_eq!(
+                broker.ledger_snapshot().expect("reattach ledger").total_owner_bytes(),
+                expected_total
+            );
+        }
+        assert_eq!(Arc::strong_count(&store.binding), 1);
+        drop(controller);
+        assert_eq!(
+            broker.ledger_snapshot().expect("empty tier drop ledger").total_owner_bytes(),
+            expected_total
+        );
+        store.close().expect("close restored source");
+        assert_eq!(broker.ledger_snapshot().expect("closed ledger").total_owner_bytes(), 0);
+    }
+
+    #[cfg(feature = "spill")]
+    #[test]
+    fn spill_and_close_emit_bounded_facade_events() {
+        let events = Arc::new(RecordingEvents::default());
+        let broker = live_broker_with_events(1_000_000, events.clone());
+        let store = store_with_broker(&broker);
+        store.insert_checked("first".into(), vec![1; 4]).expect("insert");
+        let controller = RoutedSpillController::new(InMemorySpillTarget::available());
+
+        assert!(store.spill_one_into(&controller).expect("spill"));
+        store.close().expect("close empty source");
+
+        let recorded = events.0.lock().expect("events").clone();
+        assert!(recorded.contains(&MemoryEvent::new(
+            MemoryOperation::SpillInProcess,
+            MemoryOutcome::Succeeded,
+            None,
+        )));
+        assert!(recorded.contains(&MemoryEvent::new(
+            MemoryOperation::Close,
+            MemoryOutcome::Succeeded,
+            None,
+        )));
+    }
+
+    #[cfg(feature = "spill")]
+    #[test]
+    fn failed_destination_write_preserves_source_entry_and_charge() {
+        struct RejectingTarget;
+        impl<Handle> crate::spill::service::sealed::InProcessSpillTarget<Handle> for RejectingTarget {}
+        impl<Handle> SpillTarget<Handle> for RejectingTarget {
+            fn is_available(&self) -> bool {
+                true
+            }
+            fn accept(&self, handle: Handle) -> Result<SpillReceipt, SpillFailure<Handle>> {
+                Err(SpillFailure::new(MemoryError::capacity("injected write failure"), handle))
+            }
+        }
+        impl crate::spill::SpillInventory for RejectingTarget {
+            fn retained_count(&self) -> MemoryResult<u64> {
+                Ok(0)
+            }
+        }
+        impl<Handle> InProcessSpillTarget<Handle> for RejectingTarget {}
+        let broker = live_broker(1_000_000);
+        let store = store_with_broker(&broker);
+        store.insert_checked("first".into(), vec![1; 4]).expect("first");
+        store.insert_checked("second".into(), vec![2; 6]).expect("second");
+        let total = store.committed_bytes().expect("before");
+        let controller = RoutedSpillController::new(RejectingTarget);
+
+        assert!(matches!(store.spill_one_into(&controller), Err(MemoryError::Capacity(_))));
+        assert_eq!(controller.spilled_count(), Ok(0));
+        assert_eq!(store.committed_bytes().expect("unchanged"), total);
+        assert_eq!(store.stats().expect("source stats").item_count, 2);
+        assert_eq!(broker.ledger_snapshot().expect("unchanged ledger").total_owner_bytes(), total);
+        assert_eq!(store.reclaim_one().expect("FIFO").expect("first").0, "first");
+    }
+
+    #[cfg(feature = "spill")]
+    #[test]
+    fn noop_spill_does_not_discard_source() {
+        let broker = live_broker(1_000_000);
+        let store = store_with_broker(&broker);
+        store.insert_checked("first".into(), vec![1; 4]).expect("insert");
+        let total = store.committed_bytes().expect("before");
+        assert!(matches!(
+            store.spill_one_into(&NoopSpillController),
+            Err(MemoryError::Capacity(_))
+        ));
+        assert_eq!(store.stats().expect("after").item_count, 1);
+        assert_eq!(broker.ledger_snapshot().expect("after").total_owner_bytes(), total);
+        assert_eq!(store.reclaim_one().expect("source").expect("entry").0, "first");
+    }
+
+    #[cfg(feature = "spill")]
+    #[test]
+    fn foreign_store_cannot_adopt_spill_charge() {
+        let broker = live_broker(1_000_000);
+        let source = store_with_broker(&broker);
+        let foreign = store_with_broker(&live_broker(1_000_000));
+        source.insert_checked("first".into(), vec![1; 4]).expect("insert");
+        let total = source.committed_bytes().expect("before");
+        let controller = RoutedSpillController::new(InMemorySpillTarget::available());
+        assert!(source.spill_one_into(&controller).expect("spill"));
+
+        let handle = controller.restore().expect("restore").expect("entry");
+        let (error, handle) =
+            foreign.accept_restored(handle).expect_err("foreign broker must reject").into_parts();
+        assert!(matches!(error, MemoryError::InvalidState(_)));
+        assert_eq!(broker.ledger_snapshot().expect("original charge").total_owner_bytes(), total);
+        source.accept_restored(handle).expect("original owner can restore");
+        assert_eq!(source.stats().expect("source").item_count, 1);
+        assert_eq!(broker.ledger_snapshot().expect("charge").total_owner_bytes(), total);
+    }
+
+    #[cfg(feature = "spill")]
+    #[test]
+    fn source_close_does_not_refund_live_in_process_tier() {
+        let broker = live_broker(1_000_000);
+        let store = store_with_broker(&broker);
+        store.insert_checked("first".into(), vec![1; 4]).expect("insert");
+        let total = store.committed_bytes().expect("before");
+        let controller = RoutedSpillController::new(InMemorySpillTarget::available());
+
+        assert!(store.spill_one_into(&controller).expect("spill"));
+        store.close().expect("close source");
+        assert_eq!(broker.ledger_snapshot().expect("tier authority").total_owner_bytes(), total);
+        drop(controller);
+        assert_eq!(broker.ledger_snapshot().expect("tier retired").total_owner_bytes(), 0);
+    }
+
+    #[cfg(feature = "spill")]
+    #[test]
+    fn durable_spill_releases_source_only_after_commit() {
+        struct ObservingDurableTarget {
+            broker: LiveProcessMemoryBroker,
+            expected_live: u64,
+            retained: Mutex<Vec<Vec<u8>>>,
+        }
+        impl crate::spill::service::sealed::DurableSpillTarget<Vec<u8>> for ObservingDurableTarget {}
+        impl SpillInventory for ObservingDurableTarget {
+            fn retained_count(&self) -> MemoryResult<u64> {
+                Ok(self.retained.lock().expect("retained").len() as u64)
+            }
+        }
+        impl SpillTarget<Vec<u8>> for ObservingDurableTarget {
+            fn is_available(&self) -> bool {
+                true
+            }
+            fn accept(&self, handle: Vec<u8>) -> Result<SpillReceipt, SpillFailure<Vec<u8>>> {
+                assert_eq!(
+                    self.broker.ledger_snapshot().expect("pre-commit ledger").total_owner_bytes(),
+                    self.expected_live,
+                    "source charge must remain live until durable accept commits"
+                );
+                let mut retained = self.retained.lock().expect("retained");
+                retained.push(handle);
+                Ok(SpillReceipt::Durable { sequence: 7, inventory_after: retained.len() as u64 })
+            }
+        }
+        impl DurableSpillTarget<Vec<u8>> for ObservingDurableTarget {}
+        impl crate::spill::service::ReconciledDurableSpillTarget for ObservingDurableTarget {
+            fn reserve_record_id(&self) -> MemoryResult<DurableRecordId> {
+                Ok(DurableRecordId::new(7))
+            }
+
+            fn commit_spill(
+                &self,
+                record_id: DurableRecordId,
+                bytes: &[u8],
+            ) -> Result<SpillReceipt, DurableWriteFailure> {
+                assert_eq!(record_id.get(), 7);
+                assert_eq!(
+                    self.broker.ledger_snapshot().expect("pre-commit ledger").total_owner_bytes(),
+                    self.expected_live,
+                    "source charge must remain live until durable accept commits"
+                );
+                let mut retained = self.retained.lock().expect("retained");
+                retained.push(bytes.to_vec());
+                Ok(SpillReceipt::Durable {
+                    sequence: record_id.get(),
+                    inventory_after: retained.len() as u64,
+                })
+            }
+
+            fn resolve_record(
+                &self,
+                _record_id: DurableRecordId,
+            ) -> MemoryResult<DurableRecordResolution> {
+                Ok(DurableRecordResolution::Present {
+                    inventory_after: self.retained.lock().expect("retained").len() as u64,
+                })
+            }
+        }
+
+        let broker = live_broker(1_000_000);
+        let store = store_with_broker(&broker);
+        store.insert_checked("first".into(), vec![1; 4]).expect("insert");
+        let total = store.committed_bytes().expect("before");
+        let controller = RoutedSpillController::new(ObservingDurableTarget {
+            broker: broker.clone(),
+            expected_live: total,
+            retained: Mutex::new(Vec::new()),
+        });
+
+        let receipt = store
+            .spill_one_durable(&controller, |key, value| {
+                let mut bytes = key.as_bytes().to_vec();
+                bytes.extend(value);
+                Ok(bytes)
+            })
+            .expect("spill")
+            .expect("entry");
+        assert_eq!(receipt, SpillReceipt::Durable { sequence: 7, inventory_after: 1 });
+        assert_eq!(store.stats().expect("source empty"), StoreStats::default());
+        assert_eq!(broker.ledger_snapshot().expect("released after commit").total_owner_bytes(), 0);
+        assert_eq!(controller.spilled_count(), Ok(1));
+    }
+
+    #[cfg(feature = "spill")]
+    #[test]
+    fn failed_durable_write_and_encoder_error_restore_source_fifo_and_charge() {
+        struct RejectingDurableTarget;
+        impl crate::spill::service::sealed::DurableSpillTarget<Vec<u8>> for RejectingDurableTarget {}
+        impl SpillInventory for RejectingDurableTarget {
+            fn retained_count(&self) -> MemoryResult<u64> {
+                Ok(0)
+            }
+        }
+        impl SpillTarget<Vec<u8>> for RejectingDurableTarget {
+            fn is_available(&self) -> bool {
+                true
+            }
+            fn accept(&self, handle: Vec<u8>) -> Result<SpillReceipt, SpillFailure<Vec<u8>>> {
+                Err(SpillFailure::new(MemoryError::capacity("injected durable failure"), handle))
+            }
+        }
+        impl DurableSpillTarget<Vec<u8>> for RejectingDurableTarget {}
+        impl crate::spill::service::ReconciledDurableSpillTarget for RejectingDurableTarget {
+            fn reserve_record_id(&self) -> MemoryResult<DurableRecordId> {
+                Ok(DurableRecordId::new(1))
+            }
+
+            fn commit_spill(
+                &self,
+                _record_id: DurableRecordId,
+                _bytes: &[u8],
+            ) -> Result<SpillReceipt, DurableWriteFailure> {
+                Err(DurableWriteFailure::NotCommitted(Box::new(MemoryError::capacity(
+                    "injected durable failure",
+                ))))
+            }
+
+            fn resolve_record(
+                &self,
+                _record_id: DurableRecordId,
+            ) -> MemoryResult<DurableRecordResolution> {
+                Ok(DurableRecordResolution::Absent)
+            }
+        }
+
+        let broker = live_broker(1_000_000);
+        let store = store_with_broker(&broker);
+        store.insert_checked("first".into(), vec![1; 4]).expect("first");
+        store.insert_checked("second".into(), vec![2; 6]).expect("second");
+        let total = store.committed_bytes().expect("before");
+        let controller = RoutedSpillController::new(RejectingDurableTarget);
+
+        assert!(matches!(
+            store.spill_one_durable(&controller, |_, _| Ok(vec![9])),
+            Err(MemoryError::Capacity(_))
+        ));
+        assert_eq!(store.committed_bytes().expect("write failure restored"), total);
+        assert_eq!(
+            broker.ledger_snapshot().expect("write failure ledger").total_owner_bytes(),
+            total
+        );
+
+        assert!(matches!(
+            store.spill_one_durable(&controller, |_, _| Err(MemoryError::report("encode failed"))),
+            Err(MemoryError::Report(_))
+        ));
+        assert_eq!(store.committed_bytes().expect("encoder failure restored"), total);
+        assert_eq!(store.reclaim_one().expect("FIFO").expect("first").0, "first");
+    }
+
+    #[cfg(feature = "spill")]
+    #[test]
+    fn panicking_durable_encoder_restores_source_before_unwind() {
+        struct DurableSink;
+        impl crate::spill::service::sealed::DurableSpillTarget<Vec<u8>> for DurableSink {}
+        impl SpillInventory for DurableSink {
+            fn retained_count(&self) -> MemoryResult<u64> {
+                Ok(0)
+            }
+        }
+        impl SpillTarget<Vec<u8>> for DurableSink {
+            fn is_available(&self) -> bool {
+                true
+            }
+            fn accept(&self, _handle: Vec<u8>) -> Result<SpillReceipt, SpillFailure<Vec<u8>>> {
+                Ok(SpillReceipt::Durable { sequence: 0, inventory_after: 1 })
+            }
+        }
+        impl DurableSpillTarget<Vec<u8>> for DurableSink {}
+        impl crate::spill::service::ReconciledDurableSpillTarget for DurableSink {
+            fn reserve_record_id(&self) -> MemoryResult<DurableRecordId> {
+                Ok(DurableRecordId::new(0))
+            }
+
+            fn commit_spill(
+                &self,
+                record_id: DurableRecordId,
+                _bytes: &[u8],
+            ) -> Result<SpillReceipt, DurableWriteFailure> {
+                Ok(SpillReceipt::Durable { sequence: record_id.get(), inventory_after: 1 })
+            }
+
+            fn resolve_record(
+                &self,
+                _record_id: DurableRecordId,
+            ) -> MemoryResult<DurableRecordResolution> {
+                Ok(DurableRecordResolution::Present { inventory_after: 1 })
+            }
+        }
+
+        let broker = live_broker(1_000_000);
+        let store = store_with_broker(&broker);
+        store.insert_checked("first".into(), vec![1; 4]).expect("insert");
+        let total = store.committed_bytes().expect("before");
+        let controller = RoutedSpillController::new(DurableSink);
+
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = store.spill_one_durable(&controller, |_, _| -> MemoryResult<Vec<u8>> {
+                panic!("encoder panic")
+            });
+        }));
+        assert!(panic.is_err());
+        assert_eq!(store.committed_bytes().expect("restored"), total);
+        assert_eq!(broker.ledger_snapshot().expect("ledger").total_owner_bytes(), total);
+        assert_eq!(store.reclaim_one().expect("source").expect("entry").0, "first");
+    }
+
+    #[cfg(feature = "spill-redb")]
+    #[test]
+    fn durable_redb_round_trip_transfers_charge_exactly_once() {
+        use crate::spill::backings::redb::RedbSpillBacking;
+        static DB_SEQ: AtomicUsize = AtomicUsize::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "qmp-revocable-roundtrip-{}-{}.redb",
+            std::process::id(),
+            DB_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_file(&path);
+        let broker = live_broker(1_000_000);
+        let store = store_with_broker(&broker);
+        store.insert_checked("first".into(), vec![1, 2, 3, 4]).expect("insert");
+        let total = store.committed_bytes().expect("before");
+        let controller = RoutedSpillController::new(RedbSpillBacking::create(&path).expect("redb"));
+
+        let receipt = store
+            .spill_one_durable(&controller, |key, value| {
+                let mut encoded = key.as_bytes().to_vec();
+                encoded.push(0);
+                encoded.extend(value);
+                Ok(encoded)
+            })
+            .expect("spill")
+            .expect("entry");
+        assert_eq!(receipt, SpillReceipt::Durable { sequence: 0, inventory_after: 1 });
+        assert_eq!(broker.ledger_snapshot().expect("off-process").total_owner_bytes(), 0);
+        assert_eq!(controller.spilled_count(), Ok(1));
+
+        let restore = store
+            .restore_one_durable(&controller, |bytes| {
+                let separator = bytes
+                    .iter()
+                    .position(|byte| *byte == 0)
+                    .ok_or_else(|| MemoryError::report("missing durable record separator"))?;
+                let key = String::from_utf8(bytes[..separator].to_vec())
+                    .map_err(|error| MemoryError::report(format!("invalid key: {error}")))?;
+                Ok((key, bytes[separator + 1..].to_vec()))
+            })
+            .expect("restore");
+        assert!(matches!(restore, DurableRestoreOutcome::Restored { sequence: 0 }));
+        assert_eq!(controller.spilled_count(), Ok(0));
+        assert_eq!(store.committed_bytes().expect("restored bytes"), total);
+        assert_eq!(broker.ledger_snapshot().expect("restored charge").total_owner_bytes(), total);
+        assert_eq!(store.reclaim_one().expect("entry").expect("restored").0, "first");
+        drop(controller);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(feature = "spill-redb")]
+    #[test]
+    fn durable_redb_committed_restore_recovers_after_process_restart() {
+        use crate::spill::backings::redb::RedbSpillBacking;
+        static DB_SEQ: AtomicUsize = AtomicUsize::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "qmp-revocable-crash-recovery-{}-{}.redb",
+            std::process::id(),
+            DB_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_file(&path);
+        {
+            let controller =
+                RoutedSpillController::new(RedbSpillBacking::create(&path).expect("redb 1"));
+            let record_id = controller.reserve_record_id().expect("reserve");
+            let _receipt =
+                controller.commit_spill(record_id, b"recovered\0payload").expect("seed durable");
+            let candidate = controller.prepare_restore().expect("prepare").expect("candidate");
+            controller
+                .commit_restore(candidate.sequence)
+                .expect("persist recovery payload before simulated crash");
+            assert_eq!(controller.active_restore(), Ok(Some(record_id)));
+            // No finalize: dropping this controller simulates a process that
+            // dies after durable delete but before resident acknowledgement.
+        }
+
+        let broker = live_broker(1_000_000);
+        let store = store_with_broker(&broker);
+        let controller =
+            RoutedSpillController::new(RedbSpillBacking::create(&path).expect("redb 2"));
+        let outcome = store
+            .recover_active_durable_restore(&controller, |bytes| {
+                let separator = bytes
+                    .iter()
+                    .position(|byte| *byte == 0)
+                    .ok_or_else(|| MemoryError::report("missing separator"))?;
+                Ok((
+                    String::from_utf8(bytes[..separator].to_vec())
+                        .map_err(|error| MemoryError::report(format!("invalid key: {error}")))?,
+                    bytes[separator + 1..].to_vec(),
+                ))
+            })
+            .expect("restart recovery");
+        assert!(matches!(outcome, DurableRestoreOutcome::Restored { sequence: 0 }));
+        assert_eq!(controller.active_restore(), Ok(None));
+        assert_eq!(controller.spilled_count(), Ok(0));
+        assert_eq!(store.reclaim_one().expect("read recovered").expect("entry").0, "recovered");
+        assert_eq!(broker.ledger_snapshot().expect("drained ledger").total_owner_bytes(), 0);
+
+        drop(controller);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(feature = "spill-redb")]
+    #[test]
+    fn durable_redb_prepared_restore_recovers_after_process_restart() {
+        use crate::spill::backings::redb::RedbSpillBacking;
+        static DB_SEQ: AtomicUsize = AtomicUsize::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "qmp-revocable-prepared-recovery-{}-{}.redb",
+            std::process::id(),
+            DB_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_file(&path);
+        {
+            let controller =
+                RoutedSpillController::new(RedbSpillBacking::create(&path).expect("redb 1"));
+            let record_id = controller.reserve_record_id().expect("reserve");
+            let _receipt =
+                controller.commit_spill(record_id, b"prepared\0payload").expect("seed durable");
+            let candidate = controller.prepare_restore().expect("prepare").expect("candidate");
+            assert_eq!(candidate.sequence, record_id.get());
+            // No commit: the durable queue plus persisted claim must survive.
+        }
+
+        let broker = live_broker(1_000_000);
+        let store = store_with_broker(&broker);
+        let controller =
+            RoutedSpillController::new(RedbSpillBacking::create(&path).expect("redb 2"));
+        let outcome = store
+            .recover_active_durable_restore(&controller, |bytes| {
+                let separator = bytes
+                    .iter()
+                    .position(|byte| *byte == 0)
+                    .ok_or_else(|| MemoryError::report("missing separator"))?;
+                Ok((
+                    String::from_utf8(bytes[..separator].to_vec())
+                        .map_err(|error| MemoryError::report(format!("invalid key: {error}")))?,
+                    bytes[separator + 1..].to_vec(),
+                ))
+            })
+            .expect("restart recovery");
+        assert!(matches!(outcome, DurableRestoreOutcome::Restored { sequence: 0 }));
+        assert_eq!(controller.active_restore(), Ok(None));
+        assert_eq!(controller.spilled_count(), Ok(0));
+        assert_eq!(store.reclaim_one().expect("read recovered").expect("entry").0, "prepared");
+        assert_eq!(broker.ledger_snapshot().expect("drained ledger").total_owner_bytes(), 0);
+
+        drop(controller);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(feature = "spill-redb")]
+    #[test]
+    fn denied_durable_restore_leaves_redb_record_authoritative() {
+        use crate::spill::backings::redb::RedbSpillBacking;
+        static DB_SEQ: AtomicUsize = AtomicUsize::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "qmp-revocable-denied-{}-{}.redb",
+            std::process::id(),
+            DB_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_file(&path);
+        let controller = RoutedSpillController::new(RedbSpillBacking::create(&path).expect("redb"));
+        let record_id = controller.reserve_record_id().expect("reserve durable record");
+        let receipt = controller.commit_spill(record_id, b"large\0payload").expect("seed durable");
+        assert!(matches!(receipt, SpillReceipt::Durable { .. }));
+        let tiny_broker = live_broker(5);
+        let store = store_with_broker(&tiny_broker);
+
+        assert!(matches!(
+            store.restore_one_durable(&controller, |_| { Ok(("large".to_string(), vec![0; 100])) }),
+            Err(MemoryError::Capacity(_))
+        ));
+        assert_eq!(controller.spilled_count(), Ok(1));
+        assert_eq!(store.stats().expect("source unchanged"), StoreStats::default());
+        assert_eq!(tiny_broker.ledger_snapshot().expect("ledger unchanged").total_owner_bytes(), 0);
+        drop(controller);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(feature = "spill")]
+    #[test]
+    fn failed_durable_delete_rolls_back_provisional_source_charge() {
+        struct DeleteFailTarget;
+        impl crate::spill::service::sealed::DurableSpillTarget<Vec<u8>> for DeleteFailTarget {}
+        impl SpillInventory for DeleteFailTarget {
+            fn retained_count(&self) -> MemoryResult<u64> {
+                Ok(1)
+            }
+        }
+        impl SpillTarget<Vec<u8>> for DeleteFailTarget {
+            fn is_available(&self) -> bool {
+                true
+            }
+            fn accept(&self, _handle: Vec<u8>) -> Result<SpillReceipt, SpillFailure<Vec<u8>>> {
+                unreachable!("restore test does not spill")
+            }
+        }
+        impl DurableSpillTarget<Vec<u8>> for DeleteFailTarget {}
+        impl DurableRestoreTarget for DeleteFailTarget {
+            fn prepare_restore(&self) -> MemoryResult<Option<DurableRestoreCandidate>> {
+                Ok(Some(DurableRestoreCandidate { sequence: 9, bytes: b"first\0payload".to_vec() }))
+            }
+            fn commit_restore(
+                &self,
+                sequence: u64,
+            ) -> Result<(), crate::spill::DurableCommitFailure> {
+                assert_eq!(sequence, 9);
+                Err(crate::spill::DurableCommitFailure::retained(MemoryError::report(
+                    "injected durable delete failure",
+                )))
+            }
+
+            fn finalize_restore(&self, _sequence: u64) -> MemoryResult<()> {
+                Ok(())
+            }
+
+            fn abort_restore(&self, _sequence: u64) -> MemoryResult<()> {
+                Ok(())
+            }
+
+            fn reconcile_restore(&self, _sequence: u64) -> MemoryResult<DurableRecordResolution> {
+                Ok(DurableRecordResolution::Present { inventory_after: 1 })
+            }
+
+            fn active_restore(&self) -> MemoryResult<Option<DurableRecordId>> {
+                Ok(Some(DurableRecordId::new(9)))
+            }
+
+            fn recover_active_restore(
+                &self,
+            ) -> MemoryResult<Option<crate::spill::DurableRestoreRecovery>> {
+                Ok(None)
+            }
+        }
+
+        let broker = live_broker(1_000_000);
+        let store = store_with_broker(&broker);
+        let controller = RoutedSpillController::new(DeleteFailTarget);
+        assert!(matches!(
+            store.restore_one_durable(&controller, |_| {
+                Ok(("first".to_string(), b"payload".to_vec()))
+            }),
+            Err(MemoryError::Report(_))
+        ));
+        assert_eq!(controller.spilled_count(), Ok(1));
+        assert_eq!(store.stats().expect("not published"), StoreStats::default());
+        assert_eq!(broker.ledger_snapshot().expect("charge rolled back").total_owner_bytes(), 0);
+    }
+
+    #[cfg(feature = "spill")]
+    #[test]
+    fn ambiguous_durable_delete_fences_source_until_absence_is_reconciled() {
+        struct AmbiguousDeleteTarget {
+            present: Arc<AtomicBool>,
+        }
+        impl crate::spill::service::sealed::DurableSpillTarget<Vec<u8>> for AmbiguousDeleteTarget {}
+        impl SpillInventory for AmbiguousDeleteTarget {
+            fn retained_count(&self) -> MemoryResult<u64> {
+                Ok(u64::from(self.present.load(Ordering::SeqCst)))
+            }
+        }
+        impl SpillTarget<Vec<u8>> for AmbiguousDeleteTarget {
+            fn is_available(&self) -> bool {
+                true
+            }
+            fn accept(&self, _handle: Vec<u8>) -> Result<SpillReceipt, SpillFailure<Vec<u8>>> {
+                unreachable!("restore test does not spill")
+            }
+        }
+        impl DurableSpillTarget<Vec<u8>> for AmbiguousDeleteTarget {}
+        impl crate::spill::service::ReconciledDurableSpillTarget for AmbiguousDeleteTarget {
+            fn reserve_record_id(&self) -> MemoryResult<DurableRecordId> {
+                unreachable!("restore test does not spill")
+            }
+
+            fn commit_spill(
+                &self,
+                _record_id: DurableRecordId,
+                _bytes: &[u8],
+            ) -> Result<SpillReceipt, DurableWriteFailure> {
+                unreachable!("restore test does not spill")
+            }
+
+            fn resolve_record(
+                &self,
+                _record_id: DurableRecordId,
+            ) -> MemoryResult<DurableRecordResolution> {
+                if self.present.load(Ordering::SeqCst) {
+                    Ok(DurableRecordResolution::Present { inventory_after: 1 })
+                } else {
+                    Ok(DurableRecordResolution::Absent)
+                }
+            }
+        }
+        impl DurableRestoreTarget for AmbiguousDeleteTarget {
+            fn prepare_restore(&self) -> MemoryResult<Option<DurableRestoreCandidate>> {
+                Ok(Some(DurableRestoreCandidate { sequence: 11, bytes: b"record".to_vec() }))
+            }
+            fn commit_restore(
+                &self,
+                _sequence: u64,
+            ) -> Result<(), crate::spill::DurableCommitFailure> {
+                Err(crate::spill::DurableCommitFailure::ambiguous(MemoryError::report(
+                    "commit acknowledgement lost",
+                )))
+            }
+
+            fn finalize_restore(&self, _sequence: u64) -> MemoryResult<()> {
+                Ok(())
+            }
+
+            fn abort_restore(&self, _sequence: u64) -> MemoryResult<()> {
+                Ok(())
+            }
+
+            fn reconcile_restore(&self, _sequence: u64) -> MemoryResult<DurableRecordResolution> {
+                if self.present.load(Ordering::SeqCst) {
+                    Ok(DurableRecordResolution::Present { inventory_after: 1 })
+                } else {
+                    Ok(DurableRecordResolution::Finalized)
+                }
+            }
+
+            fn active_restore(&self) -> MemoryResult<Option<DurableRecordId>> {
+                Ok(Some(DurableRecordId::new(11)))
+            }
+
+            fn recover_active_restore(
+                &self,
+            ) -> MemoryResult<Option<crate::spill::DurableRestoreRecovery>> {
+                Ok(None)
+            }
+        }
+
+        let broker = live_broker(1_000_000);
+        let store = store_with_broker(&broker);
+        let present = Arc::new(AtomicBool::new(true));
+        let controller =
+            RoutedSpillController::new(AmbiguousDeleteTarget { present: Arc::clone(&present) });
+        let outcome = store
+            .restore_one_durable(&controller, |_| Ok(("restored".to_string(), b"payload".to_vec())))
+            .expect("ambiguity is a typed recovery outcome");
+        assert!(matches!(outcome, DurableRestoreOutcome::RecoveryRequired { sequence: 11, .. }));
+        assert_eq!(
+            store.pending_durable_restores().expect("fenced IDs"),
+            vec![DurableRecordId::new(11)]
+        );
+        assert!(store.reclaim_one().expect("fenced source is not readable").is_none());
+        assert!(broker.ledger_snapshot().expect("source charged").total_owner_bytes() > 0);
+        assert_eq!(controller.spilled_count(), Ok(1), "target state is intentionally uncertain");
+
+        present.store(false, Ordering::SeqCst);
+        assert_eq!(
+            store
+                .reconcile_durable_restore(&controller, DurableRecordId::new(11))
+                .expect("absent durable record publishes resident source"),
+            DurableRecordResolution::Finalized
+        );
+        assert!(store.pending_durable_restores().expect("resolved IDs").is_empty());
+        assert_eq!(store.reclaim_one().expect("published source").expect("entry").0, "restored");
+        assert_eq!(broker.ledger_snapshot().expect("released source").total_owner_bytes(), 0);
+    }
+
+    #[cfg(feature = "spill")]
+    #[test]
+    fn panicking_finalize_fences_published_source_until_reconciliation() {
+        struct PanickingFinalizeTarget {
+            finalize_calls: AtomicUsize,
+        }
+
+        impl crate::spill::service::sealed::DurableSpillTarget<Vec<u8>> for PanickingFinalizeTarget {}
+        impl SpillInventory for PanickingFinalizeTarget {
+            fn retained_count(&self) -> MemoryResult<u64> {
+                Ok(1)
+            }
+        }
+        impl SpillTarget<Vec<u8>> for PanickingFinalizeTarget {
+            fn is_available(&self) -> bool {
+                true
+            }
+
+            fn accept(&self, _handle: Vec<u8>) -> Result<SpillReceipt, SpillFailure<Vec<u8>>> {
+                unreachable!("restore test does not spill")
+            }
+        }
+        impl DurableSpillTarget<Vec<u8>> for PanickingFinalizeTarget {}
+        impl DurableRestoreTarget for PanickingFinalizeTarget {
+            fn prepare_restore(&self) -> MemoryResult<Option<DurableRestoreCandidate>> {
+                Ok(Some(DurableRestoreCandidate {
+                    sequence: 13,
+                    bytes: b"restored\0payload".to_vec(),
+                }))
+            }
+
+            fn commit_restore(
+                &self,
+                sequence: u64,
+            ) -> Result<(), crate::spill::DurableCommitFailure> {
+                assert_eq!(sequence, 13);
+                Ok(())
+            }
+
+            fn finalize_restore(&self, sequence: u64) -> MemoryResult<()> {
+                assert_eq!(sequence, 13);
+                if self.finalize_calls.fetch_add(1, Ordering::SeqCst) < 2 {
+                    panic!("injected finalize panic");
+                }
+                Ok(())
+            }
+
+            fn abort_restore(&self, _sequence: u64) -> MemoryResult<()> {
+                Ok(())
+            }
+
+            fn reconcile_restore(&self, sequence: u64) -> MemoryResult<DurableRecordResolution> {
+                assert_eq!(sequence, 13);
+                Ok(DurableRecordResolution::Finalized)
+            }
+
+            fn active_restore(&self) -> MemoryResult<Option<DurableRecordId>> {
+                Ok(Some(DurableRecordId::new(13)))
+            }
+
+            fn recover_active_restore(
+                &self,
+            ) -> MemoryResult<Option<crate::spill::DurableRestoreRecovery>> {
+                Ok(Some(crate::spill::DurableRestoreRecovery {
+                    candidate: DurableRestoreCandidate {
+                        sequence: 13,
+                        bytes: b"restored\0payload".to_vec(),
+                    },
+                    phase: crate::spill::DurableRestorePhase::Committed,
+                }))
+            }
+        }
+
+        let broker = live_broker(1_000_000);
+        let store = store_with_broker(&broker);
+        let controller = RoutedSpillController::new(PanickingFinalizeTarget {
+            finalize_calls: AtomicUsize::new(0),
+        });
+
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = store
+                .restore_one_durable(&controller, |bytes| {
+                    let separator = bytes
+                        .iter()
+                        .position(|byte| *byte == 0)
+                        .ok_or_else(|| MemoryError::report("missing separator"))?;
+                    Ok((
+                        String::from_utf8(bytes[..separator].to_vec()).map_err(|error| {
+                            MemoryError::report(format!("invalid key: {error}"))
+                        })?,
+                        bytes[separator + 1..].to_vec(),
+                    ))
+                })
+                .expect("finalize panic occurs after resident preparation");
+        }));
+        assert!(panic.is_err());
+        assert_eq!(
+            store.pending_durable_restores().expect("fenced restore"),
+            vec![DurableRecordId::new(13)]
+        );
+        assert!(store.reclaim_one().expect("fenced source is not readable").is_none());
+        assert!(broker.ledger_snapshot().expect("source remains charged").total_owner_bytes() > 0);
+
+        let reconcile_panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = store
+                .reconcile_durable_restore(&controller, DurableRecordId::new(13))
+                .expect("second finalize panic occurs after provisional publication");
+        }));
+        assert!(reconcile_panic.is_err());
+        assert_eq!(
+            store.pending_durable_restores().expect("refenced restore"),
+            vec![DurableRecordId::new(13)]
+        );
+        assert!(store.reclaim_one().expect("refenced source is not readable").is_none());
+
+        assert_eq!(
+            store
+                .reconcile_durable_restore(&controller, DurableRecordId::new(13))
+                .expect("retry publishes and acknowledges the resident copy"),
+            DurableRecordResolution::Finalized
+        );
+        assert!(store.pending_durable_restores().expect("resolved IDs").is_empty());
+        assert_eq!(store.reclaim_one().expect("published source").expect("entry").0, "restored");
+        assert_eq!(broker.ledger_snapshot().expect("released source").total_owner_bytes(), 0);
     }
 
     #[test]
@@ -793,7 +2450,7 @@ mod tests {
         .join()
         .is_err());
 
-        assert!(matches!(store.stats(), Err(MemoryError::InvalidState(_))));
+        assert!(matches!(store.stats(), Err(MemoryError::Poisoned(_))));
         drop(store);
         assert_eq!(broker.ledger_snapshot().expect("ledger").total_owner_bytes(), 0);
     }

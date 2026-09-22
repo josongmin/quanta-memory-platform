@@ -87,8 +87,8 @@ impl BrokerConformanceTarget for DummyTarget {
         &["a", "b"]
     }
 
-    fn view(&self) -> AccountingView {
-        AccountingView::default()
+    fn view(&self) -> Result<AccountingView, String> {
+        Ok(AccountingView::default())
     }
 
     fn observe_allocator(

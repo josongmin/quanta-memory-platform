@@ -5,7 +5,7 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use quanta_memory_platform_core::{
     ChargeKind, LiveProcessMemoryBroker, ManagedCharge, MemoryContextKind, MemoryError,
-    MemoryResult, StoreBindingHandle, StoreStats,
+    MemoryEvent, MemoryOperation, MemoryOutcome, MemoryResult, StoreBindingHandle, StoreStats,
 };
 
 #[cfg(feature = "unbudgeted-stores")]
@@ -16,7 +16,8 @@ use crate::shared::measure::{semantic_cost_v1, ByteSized, CanonicalKey, Retained
 use crate::transcript_store::{
     SessionTranscriptStore, TranscriptAppendDispositionV1, TranscriptAppendErrorV1,
     TranscriptAppendRequestV1, TranscriptRecordV1, TranscriptRetainDispositionV1,
-    TranscriptRetentionPolicyV1, TranscriptSnapshotV1,
+    TranscriptRetentionPolicyV2, TranscriptRetentionReconfigureErrorV2, TranscriptRetentionStatsV2,
+    TranscriptSnapshotV1,
 };
 
 const BODY_DIGEST_DOMAIN: &[u8] = b"qmp.transcript-body.v1\0";
@@ -109,6 +110,12 @@ impl<MessageId, Message> Default for SessionState<MessageId, Message> {
 #[derive(Debug)]
 struct TranscriptState<SessionId, MessageId, Message> {
     sessions: BTreeMap<SessionId, SessionState<MessageId, Message>>,
+    retention: TranscriptRetentionPolicyV2,
+    active_row_count: usize,
+    active_bytes: u64,
+    evidence_count: usize,
+    evidence_bytes: u64,
+    session_key_bytes: u64,
     retained_bytes: u64,
 }
 
@@ -127,12 +134,81 @@ fn semantic_session_bytes<MessageId, Message>(
     })
 }
 
-/// Portable process-lifetime transcript store with caller-owned append identity.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct TranscriptComponentTotals {
+    active_row_count: usize,
+    active_bytes: u64,
+    evidence_count: usize,
+    evidence_bytes: u64,
+    session_key_bytes: u64,
+    retained_bytes: u64,
+}
+
+fn checked_component_totals<SessionId, MessageId, Message>(
+    state: &TranscriptState<SessionId, MessageId, Message>,
+) -> MemoryResult<TranscriptComponentTotals> {
+    let mut totals = TranscriptComponentTotals::default();
+    for session in state.sessions.values() {
+        totals.session_key_bytes = totals
+            .session_key_bytes
+            .checked_add(session.key_bytes)
+            .ok_or_else(|| MemoryError::capacity("transcript session-key sum overflow"))?;
+        totals.active_row_count = totals
+            .active_row_count
+            .checked_add(session.rows.len())
+            .ok_or_else(|| MemoryError::capacity("transcript active-row count overflow"))?;
+        totals.evidence_count = totals
+            .evidence_count
+            .checked_add(session.sequence_evidence.len())
+            .ok_or_else(|| MemoryError::capacity("transcript evidence count overflow"))?;
+        for row in session.rows.values() {
+            totals.active_bytes = totals
+                .active_bytes
+                .checked_add(row.active_bytes)
+                .ok_or_else(|| MemoryError::capacity("transcript active-byte sum overflow"))?;
+        }
+        for evidence in session.sequence_evidence.values() {
+            totals.evidence_bytes = totals
+                .evidence_bytes
+                .checked_add(evidence.evidence_bytes)
+                .ok_or_else(|| MemoryError::capacity("transcript evidence-byte sum overflow"))?;
+        }
+    }
+    totals.retained_bytes = totals
+        .active_bytes
+        .checked_add(totals.evidence_bytes)
+        .and_then(|sum| sum.checked_add(totals.session_key_bytes))
+        .ok_or_else(|| MemoryError::capacity("transcript retained-byte sum overflow"))?;
+    Ok(totals)
+}
+
+fn validate_component_counters<SessionId, MessageId, Message>(
+    state: &TranscriptState<SessionId, MessageId, Message>,
+) -> MemoryResult<()> {
+    let checked = checked_component_totals(state)?;
+    let recorded = TranscriptComponentTotals {
+        active_row_count: state.active_row_count,
+        active_bytes: state.active_bytes,
+        evidence_count: state.evidence_count,
+        evidence_bytes: state.evidence_bytes,
+        session_key_bytes: state.session_key_bytes,
+        retained_bytes: state.retained_bytes,
+    };
+    if checked == recorded {
+        Ok(())
+    } else {
+        Err(MemoryError::InvalidState(format!(
+            "transcript component counters disagree with owned state: recorded={recorded:?}, checked={checked:?}"
+        )))
+    }
+}
+
+/// Portable bounded transcript store with caller-owned append identity.
 ///
 /// One mutex owns rows, both identity indexes, body evidence, retained-byte
 /// accounting, and non-clone charge leases. Every append either commits all of
 /// them or none. Truncation evicts active rows and refunds only their leases;
-/// identity evidence and the session key remain charged until close/Drop.
+/// admitted identity evidence and the session key remain charged until close/Drop.
 /// This in-memory implementation makes no
 /// restart-durability claim.
 ///
@@ -145,11 +221,11 @@ fn semantic_session_bytes<MessageId, Message>(
 /// ```
 ///
 /// ```compile_fail
-/// # use quanta_memory_platform_facade::{Budgeted, SimpleSessionTranscriptStore, TranscriptRetentionPolicyV1};
+/// # use quanta_memory_platform_facade::{Budgeted, SimpleSessionTranscriptStore, TranscriptRetentionPolicyV2};
 /// # use quanta_memory_platform_core::{MemoryClass, StoreBindingHandle};
 /// let binding = StoreBindingHandle::new(MemoryClass::SessionTranscript, "owner".into(), None);
 /// let _ = SimpleSessionTranscriptStore::<String, String, String, Budgeted>::new(
-///     binding, TranscriptRetentionPolicyV1::process_lifetime()
+///     binding, TranscriptRetentionPolicyV2::default()
 /// );
 /// ```
 ///
@@ -164,7 +240,6 @@ pub struct SimpleSessionTranscriptStore<SessionId, MessageId, Message, Mode> {
     binding: StoreBindingHandle,
     accounting: StoreAccounting,
     lifecycle: StoreLifecycle,
-    retention: TranscriptRetentionPolicyV1,
     state: Mutex<TranscriptState<SessionId, MessageId, Message>>,
     _mode: PhantomData<fn() -> Mode>,
 }
@@ -174,7 +249,7 @@ impl<SessionId, MessageId, Message>
 {
     pub(crate) fn new_budgeted(
         binding: StoreBindingHandle,
-        retention: TranscriptRetentionPolicyV1,
+        retention: TranscriptRetentionPolicyV2,
         broker: LiveProcessMemoryBroker,
     ) -> Self {
         Self::with_accounting(binding, retention, StoreAccounting::Budgeted(broker))
@@ -187,7 +262,7 @@ impl<SessionId, MessageId, Message>
 {
     pub(crate) fn new_unbudgeted(
         binding: StoreBindingHandle,
-        retention: TranscriptRetentionPolicyV1,
+        retention: TranscriptRetentionPolicyV2,
     ) -> Self {
         Self::with_accounting(binding, retention, StoreAccounting::Unbudgeted)
     }
@@ -198,23 +273,29 @@ impl<SessionId, MessageId, Message, Mode>
 {
     fn with_accounting(
         binding: StoreBindingHandle,
-        retention: TranscriptRetentionPolicyV1,
+        retention: TranscriptRetentionPolicyV2,
         accounting: StoreAccounting,
     ) -> Self {
-        debug_assert!(retention.retains_process_lifetime_tombstones());
         Self {
             binding,
             accounting,
             lifecycle: StoreLifecycle::new("transcript store"),
-            retention,
-            state: Mutex::new(TranscriptState { sessions: BTreeMap::new(), retained_bytes: 0 }),
+            state: Mutex::new(TranscriptState {
+                sessions: BTreeMap::new(),
+                retention,
+                active_row_count: 0,
+                active_bytes: 0,
+                evidence_count: 0,
+                evidence_bytes: 0,
+                session_key_bytes: 0,
+                retained_bytes: 0,
+            }),
             _mode: PhantomData,
         }
     }
 
-    #[must_use]
-    pub fn retention_policy(&self) -> TranscriptRetentionPolicyV1 {
-        self.retention
+    pub fn retention_policy(&self) -> MemoryResult<TranscriptRetentionPolicyV2> {
+        Ok(self.lock_read()?.retention)
     }
 
     fn lock_state(
@@ -236,6 +317,44 @@ impl<SessionId, MessageId, Message, Mode>
 
     pub fn retained_bytes(&self) -> MemoryResult<u64> {
         Ok(self.lock_read()?.retained_bytes)
+    }
+
+    pub fn retention_stats(&self) -> MemoryResult<TranscriptRetentionStatsV2> {
+        let state = self.lock_read()?;
+        validate_component_counters(&state)?;
+        Ok(TranscriptRetentionStatsV2 {
+            active_row_count: state.active_row_count,
+            active_bytes: state.active_bytes,
+            evidence_count: state.evidence_count,
+            evidence_bytes: state.evidence_bytes,
+            session_count: state.sessions.len(),
+            session_key_bytes: state.session_key_bytes,
+            total_retained_bytes: state.retained_bytes,
+        })
+    }
+
+    pub fn try_reconfigure_retention(
+        &self,
+        retention: TranscriptRetentionPolicyV2,
+    ) -> Result<(), TranscriptRetentionReconfigureErrorV2> {
+        let _mutation = self
+            .lifecycle
+            .begin_mutation()
+            .map_err(TranscriptRetentionReconfigureErrorV2::Storage)?;
+        let mut state =
+            self.lock_state().map_err(TranscriptRetentionReconfigureErrorV2::Storage)?;
+        if state.evidence_count > retention.max_evidence_count()
+            || state.evidence_bytes > retention.max_evidence_bytes()
+        {
+            return Err(TranscriptRetentionReconfigureErrorV2::BelowLiveEvidence {
+                live_evidence_count: state.evidence_count,
+                requested_max_evidence_count: retention.max_evidence_count(),
+                live_evidence_bytes: state.evidence_bytes,
+                requested_max_evidence_bytes: retention.max_evidence_bytes(),
+            });
+        }
+        state.retention = retention;
+        Ok(())
     }
 
     fn require_charge_shape(
@@ -264,6 +383,7 @@ impl<SessionId, MessageId, Message, Mode>
 
         let mut sessions = {
             let mut state = self.lock_state()?;
+            validate_component_counters(&state)?;
             let mut checked_total = 0u64;
             for session in state.sessions.values() {
                 let checked_session = semantic_session_bytes(session)?;
@@ -300,7 +420,14 @@ impl<SessionId, MessageId, Message, Mode>
             return Err(error);
         }
 
-        self.state.lock().unwrap_or_else(PoisonError::into_inner).retained_bytes = 0;
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state.active_row_count = 0;
+        state.active_bytes = 0;
+        state.evidence_count = 0;
+        state.evidence_bytes = 0;
+        state.session_key_bytes = 0;
+        state.retained_bytes = 0;
+        drop(state);
         close.commit();
         // User message destructors run after both store and ledger reach the
         // terminal postimage.
@@ -319,7 +446,7 @@ impl<SessionId, MessageId, Message>
 {
     fn new_test_unbudgeted(
         binding: StoreBindingHandle,
-        retention: TranscriptRetentionPolicyV1,
+        retention: TranscriptRetentionPolicyV2,
     ) -> Self {
         Self::with_accounting(binding, retention, StoreAccounting::Unbudgeted)
     }
@@ -344,12 +471,8 @@ where
 
     pub fn checked_stats(&self) -> MemoryResult<StoreStats> {
         let state = self.lock_read()?;
-        let item_count = state.sessions.values().try_fold(0usize, |total, session| {
-            total
-                .checked_add(session.rows.len())
-                .ok_or_else(|| MemoryError::capacity("transcript item counter overflow"))
-        })?;
-        Ok(StoreStats { item_count, estimated_bytes: state.retained_bytes })
+        validate_component_counters(&state)?;
+        Ok(StoreStats { item_count: state.active_row_count, estimated_bytes: state.retained_bytes })
     }
 
     fn retain_sequences_owned(
@@ -364,7 +487,15 @@ where
             ));
         }
 
-        let (mut dropped, session_ordinal, next_version, next_retained_bytes, next_session_bytes) = {
+        let (
+            mut dropped,
+            session_ordinal,
+            next_version,
+            next_retained_bytes,
+            next_session_bytes,
+            next_active_row_count,
+            next_active_bytes,
+        ) = {
             let mut state = self.lock_state()?;
             // Find the canonical session before detaching any row or charge.
             // Later recovery/publication must not compare a client-supplied
@@ -426,6 +557,16 @@ where
                 session.retained_bytes.checked_sub(dropped_bytes).ok_or_else(|| {
                     MemoryError::InvalidState("transcript session-byte underflow".to_string())
                 })?;
+            let next_active_row_count =
+                state.active_row_count.checked_sub(drop_sequences.len()).ok_or_else(|| {
+                    MemoryError::InvalidState("transcript active-row count underflow".to_string())
+                })?;
+            let next_active_bytes =
+                state.active_bytes.checked_sub(dropped_bytes).ok_or_else(|| {
+                    MemoryError::InvalidState(
+                        "transcript active-byte counter underflow".to_string(),
+                    )
+                })?;
             let session =
                 state.sessions.values_mut().nth(session_ordinal).expect(
                     "validated transcript session ordinal remains present under state mutex",
@@ -440,7 +581,15 @@ where
                     (sequence, entry)
                 })
                 .collect::<Vec<_>>();
-            (dropped, session_ordinal, next_version, next_retained_bytes, next_session_bytes)
+            (
+                dropped,
+                session_ordinal,
+                next_version,
+                next_retained_bytes,
+                next_session_bytes,
+                next_active_row_count,
+                next_active_bytes,
+            )
         };
 
         let (charge_slots, mut charges) = take_entry_charges(&mut dropped);
@@ -460,8 +609,10 @@ where
         );
         session.version = next_version;
         session.retained_bytes = next_session_bytes;
-        // sequence_evidence and message_evidence intentionally survive as
-        // process-lifetime tombstones. They are the late-retry safety owner.
+        // sequence_evidence and message_evidence intentionally survive inside
+        // the bounded fail-closed horizon. They are the late-retry safety owner.
+        state.active_row_count = next_active_row_count;
+        state.active_bytes = next_active_bytes;
         state.retained_bytes = next_retained_bytes;
         drop(state);
         retire_rows(dropped.into_iter().map(|(_, row)| row));
@@ -551,7 +702,17 @@ where
             .map_err(TranscriptAppendErrorV1::Accounting)?;
         let key_bytes = session_key_cost(session_id.byte_size())
             .map_err(TranscriptAppendErrorV1::Accounting)?;
-        let (next_total, next_session_bytes, next_version, new_session) = {
+        let (
+            next_total,
+            next_session_bytes,
+            next_version,
+            new_session,
+            next_active_row_count,
+            next_active_bytes,
+            next_evidence_count,
+            next_evidence_bytes,
+            next_session_key_bytes,
+        ) = {
             let state = self.lock_state().map_err(TranscriptAppendErrorV1::Storage)?;
             let existing = state.sessions.get(&session_id);
             if let Some(session) = existing {
@@ -579,6 +740,36 @@ where
                         "message-id index exists without sequence evidence".to_string(),
                     )));
                 }
+            }
+
+            let next_evidence_count = state.evidence_count.checked_add(1).ok_or_else(|| {
+                TranscriptAppendErrorV1::Accounting(MemoryError::capacity(
+                    "transcript evidence count overflow",
+                ))
+            })?;
+            let next_evidence_bytes =
+                state.evidence_bytes.checked_add(evidence_bytes).ok_or_else(|| {
+                    TranscriptAppendErrorV1::Accounting(MemoryError::capacity(
+                        "transcript evidence-byte counter overflow",
+                    ))
+                })?;
+            if next_evidence_count > state.retention.max_evidence_count()
+                || next_evidence_bytes > state.retention.max_evidence_bytes()
+            {
+                let error = TranscriptAppendErrorV1::RetentionSaturated {
+                    evidence_count: state.evidence_count,
+                    max_evidence_count: state.retention.max_evidence_count(),
+                    evidence_bytes: state.evidence_bytes,
+                    requested_evidence_bytes: evidence_bytes,
+                    max_evidence_bytes: state.retention.max_evidence_bytes(),
+                };
+                drop(state);
+                self.accounting.emit(MemoryEvent::new(
+                    MemoryOperation::TombstoneSaturation,
+                    MemoryOutcome::CapacityDenied,
+                    None,
+                ));
+                return Err(error);
             }
 
             let new_session = existing.is_none();
@@ -610,7 +801,36 @@ where
                     ))
                 })
             })?;
-            (next_total, next_session_bytes, next_version, new_session)
+            let next_active_row_count = state.active_row_count.checked_add(1).ok_or_else(|| {
+                TranscriptAppendErrorV1::Accounting(MemoryError::capacity(
+                    "transcript active-row count overflow",
+                ))
+            })?;
+            let next_active_bytes =
+                state.active_bytes.checked_add(active_bytes).ok_or_else(|| {
+                    TranscriptAppendErrorV1::Accounting(MemoryError::capacity(
+                        "transcript active-byte counter overflow",
+                    ))
+                })?;
+            let next_session_key_bytes = state
+                .session_key_bytes
+                .checked_add(if new_session { key_bytes } else { 0 })
+                .ok_or_else(|| {
+                    TranscriptAppendErrorV1::Accounting(MemoryError::capacity(
+                        "transcript session-key counter overflow",
+                    ))
+                })?;
+            (
+                next_total,
+                next_session_bytes,
+                next_version,
+                new_session,
+                next_active_row_count,
+                next_active_bytes,
+                next_evidence_count,
+                next_evidence_bytes,
+                next_session_key_bytes,
+            )
         };
 
         // Client Clone may panic or reenter. Complete both copies before
@@ -730,6 +950,11 @@ where
                     session_slot.insert(session);
                 }
             }
+            state.active_row_count = next_active_row_count;
+            state.active_bytes = next_active_bytes;
+            state.evidence_count = next_evidence_count;
+            state.evidence_bytes = next_evidence_bytes;
+            state.session_key_bytes = next_session_key_bytes;
             state.retained_bytes = next_total;
             Ok(TranscriptAppendDispositionV1::Applied)
         }));
@@ -794,6 +1019,10 @@ where
 
     fn stats(&self) -> MemoryResult<StoreStats> {
         self.checked_stats()
+    }
+
+    fn retention_stats(&self) -> MemoryResult<TranscriptRetentionStatsV2> {
+        SimpleSessionTranscriptStore::retention_stats(self)
     }
 
     fn close(&self) -> MemoryResult<()> {
@@ -949,6 +1178,11 @@ impl<SessionId, MessageId, Message, Mode> Drop
         }
         let state = self.state.get_mut().unwrap_or_else(PoisonError::into_inner);
         let sessions = std::mem::take(&mut state.sessions);
+        state.active_row_count = 0;
+        state.active_bytes = 0;
+        state.evidence_count = 0;
+        state.evidence_bytes = 0;
+        state.session_key_bytes = 0;
         state.retained_bytes = 0;
         // ManagedCharge drops perform exact release, or defer through the
         // issuing broker while its rebuild fence is active.
@@ -968,7 +1202,7 @@ fn canonical_body_digest(key: &[u8]) -> [u8; 32] {
 mod tests {
     use super::*;
     use crate::transcript_store::{
-        TranscriptAppendIdentityV1, TranscriptAppendRequestV1, TranscriptRetentionPolicyV1,
+        TranscriptAppendIdentityV1, TranscriptAppendRequestV1, TranscriptRetentionPolicyV2,
     };
     use quanta_memory_platform_core::{MemoryClass, StoreBindingHandle};
     use std::sync::{Arc, Barrier};
@@ -1055,7 +1289,7 @@ mod tests {
             .expect("broker");
         let store = Arc::new(ReentrantStore::new_budgeted(
             StoreBindingHandle::new(MemoryClass::SessionTranscript, "clone-owner".into(), None),
-            TranscriptRetentionPolicyV1::process_lifetime(),
+            TranscriptRetentionPolicyV2::default(),
             broker.clone(),
         ));
         let armed = Arc::new(AtomicBool::new(false));
@@ -1090,13 +1324,17 @@ mod tests {
     }
 
     fn store() -> Store {
+        store_with_policy(TranscriptRetentionPolicyV2::default())
+    }
+
+    fn store_with_policy(retention: TranscriptRetentionPolicyV2) -> Store {
         Store::new_test_unbudgeted(
             StoreBindingHandle::new(
                 MemoryClass::SessionTranscript,
                 "transcript-idempotency-tests".to_string(),
                 None,
             ),
-            TranscriptRetentionPolicyV1::process_lifetime(),
+            retention,
         )
     }
 
@@ -1131,6 +1369,127 @@ mod tests {
         );
         assert_eq!(store.load(&"s".to_string()).expect("load").len(), 1);
         assert_eq!(store.retained_bytes().expect("bytes"), cost("s", &[("m0", "body", true)]));
+    }
+
+    #[test]
+    fn append_truncate_cycles_cannot_grow_past_fail_closed_evidence_bound() {
+        let store = store_with_policy(TranscriptRetentionPolicyV2::fail_closed(2, u64::MAX));
+        for sequence in 0..2 {
+            store
+                .append(request("s", sequence, &format!("m{sequence}"), "body"))
+                .expect("inside horizon");
+            store.truncate_to(&"s".to_string(), 0).expect("truncate active body");
+        }
+        let before = store.retention_stats().expect("bounded stats");
+        let error = store.append(request("s", 2, "m2", "body")).expect_err("saturated");
+        assert!(matches!(
+            error,
+            TranscriptAppendErrorV1::RetentionSaturated {
+                evidence_count: 2,
+                max_evidence_count: 2,
+                ..
+            }
+        ));
+        assert_eq!(store.retention_stats().expect("unchanged stats"), before);
+        assert!(store.load(&"s".to_string()).expect("no active rows").is_empty());
+    }
+
+    #[test]
+    fn exact_retry_and_conflicts_remain_deterministic_at_saturation() {
+        let store = store_with_policy(TranscriptRetentionPolicyV2::fail_closed(1, u64::MAX));
+        store.append(request("s", 7, "m0", "body")).expect("seed");
+        store.truncate_to(&"s".to_string(), 0).expect("truncate");
+        let before = store.retention_stats().expect("before retry");
+        assert_eq!(
+            store.append(request("s", 7, "m0", "body")).expect("exact replay"),
+            TranscriptAppendDispositionV1::Replayed
+        );
+        assert!(matches!(
+            store.append(request("s", 7, "m1", "body")),
+            Err(TranscriptAppendErrorV1::SequenceConflict { sequence: 7 })
+        ));
+        assert!(matches!(
+            store.append(request("s", 8, "m0", "body")),
+            Err(TranscriptAppendErrorV1::MessageIdConflict)
+        ));
+        assert_eq!(store.retention_stats().expect("after retry"), before);
+    }
+
+    #[test]
+    fn tombstone_byte_limit_counts_large_message_ids() {
+        let first_evidence = identity_evidence_cost(2).expect("oracle setup");
+        let store =
+            store_with_policy(TranscriptRetentionPolicyV2::fail_closed(usize::MAX, first_evidence));
+        store.append(request("s", 0, "m0", "body")).expect("fits exact byte cap");
+        let before = store.retention_stats().expect("before saturation");
+        let error = store
+            .append(request("s", 1, "message-id-that-exceeds-the-cap", "body"))
+            .expect_err("large identity must exceed byte horizon");
+        assert!(matches!(
+            error,
+            TranscriptAppendErrorV1::RetentionSaturated {
+                evidence_count: 1,
+                evidence_bytes,
+                max_evidence_bytes,
+                ..
+            } if evidence_bytes == first_evidence && max_evidence_bytes == first_evidence
+        ));
+        assert_eq!(store.retention_stats().expect("unchanged stats"), before);
+    }
+
+    #[test]
+    fn retention_reconfigure_below_live_evidence_is_rejected() {
+        let store = store();
+        store.append(request("s", 0, "m0", "body")).expect("seed");
+        let live = store.retention_stats().expect("live stats");
+        let original = store.retention_policy().expect("original policy");
+        let error = store
+            .try_reconfigure_retention(TranscriptRetentionPolicyV2::fail_closed(
+                0,
+                live.evidence_bytes,
+            ))
+            .expect_err("count downgrade below live evidence");
+        assert!(matches!(
+            error,
+            TranscriptRetentionReconfigureErrorV2::BelowLiveEvidence {
+                live_evidence_count: 1,
+                requested_max_evidence_count: 0,
+                ..
+            }
+        ));
+        assert_eq!(store.retention_policy().expect("policy unchanged"), original);
+
+        let exact_live = TranscriptRetentionPolicyV2::fail_closed(1, live.evidence_bytes);
+        store.try_reconfigure_retention(exact_live).expect("exact live bound is valid");
+        assert_eq!(store.retention_policy().expect("updated policy"), exact_live);
+        assert!(matches!(
+            store.append(request("s", 1, "m1", "body")),
+            Err(TranscriptAppendErrorV1::RetentionSaturated { .. })
+        ));
+    }
+
+    #[test]
+    fn retention_stats_separate_active_evidence_and_session_costs() {
+        let store = store();
+        store.append(request("s", 0, "m0", "body")).expect("seed");
+        let active = store.retention_stats().expect("active stats");
+        assert_eq!(active.active_row_count, 1);
+        assert_eq!(active.evidence_count, 1);
+        assert!(active.active_bytes > 0);
+        assert!(active.evidence_bytes > 0);
+        assert!(active.session_key_bytes > 0);
+        assert_eq!(
+            active.total_retained_bytes,
+            active.active_bytes + active.evidence_bytes + active.session_key_bytes
+        );
+
+        store.truncate_to(&"s".to_string(), 0).expect("truncate body");
+        let truncated = store.retention_stats().expect("truncated stats");
+        assert_eq!(truncated.active_row_count, 0);
+        assert_eq!(truncated.active_bytes, 0);
+        assert_eq!(truncated.evidence_count, 1);
+        assert_eq!(truncated.evidence_bytes, active.evidence_bytes);
+        assert_eq!(truncated.session_key_bytes, active.session_key_bytes);
     }
 
     #[test]
@@ -1403,8 +1762,8 @@ mod tests {
             panic!("deterministic poison");
         })
         .join();
-        assert!(matches!(store.load(&"s".to_string()), Err(MemoryError::InvalidState(_))));
-        assert!(matches!(store.stats(), Err(MemoryError::InvalidState(_))));
+        assert!(matches!(store.load(&"s".to_string()), Err(MemoryError::Poisoned(_))));
+        assert!(matches!(store.stats(), Err(MemoryError::Poisoned(_))));
     }
 
     #[test]
@@ -1421,7 +1780,7 @@ mod tests {
         use super::*;
         use quanta_memory_platform_core::{
             ExecutionBudget, LiveProcessMemoryBroker, MemoryBudgetManifest, MemoryClassBudget,
-            MemoryPreset, ReclaimPriority, ResidencyPolicy,
+            MemoryEventSink, MemoryPreset, NoopMemoryEventSink, ReclaimPriority, ResidencyPolicy,
         };
         use std::cmp::Ordering;
         use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
@@ -1591,7 +1950,7 @@ mod tests {
                     "transcript-append-callback-test".to_string(),
                     None,
                 ),
-                TranscriptRetentionPolicyV1::process_lifetime(),
+                TranscriptRetentionPolicyV2::default(),
                 broker.clone(),
             )
         }
@@ -1662,7 +2021,7 @@ mod tests {
                     "transcript-append-reentry-test".to_string(),
                     None,
                 ),
-                TranscriptRetentionPolicyV1::process_lifetime(),
+                TranscriptRetentionPolicyV2::default(),
                 broker.clone(),
             ));
             let owner = Arc::new(OnceLock::new());
@@ -1833,7 +2192,7 @@ mod tests {
                     "transcript-new-session-order-panic".to_string(),
                     None,
                 ),
-                TranscriptRetentionPolicyV1::process_lifetime(),
+                TranscriptRetentionPolicyV2::default(),
                 broker.clone(),
             );
             let old_id = OrderedSessionId { name: "old", trap: Arc::clone(&trap) };
@@ -1956,6 +2315,13 @@ mod tests {
         }
 
         fn broker(class_hard: u64) -> LiveProcessMemoryBroker {
+            broker_with_events(class_hard, Arc::new(NoopMemoryEventSink))
+        }
+
+        fn broker_with_events(
+            class_hard: u64,
+            events: Arc<dyn MemoryEventSink>,
+        ) -> LiveProcessMemoryBroker {
             let residency = ResidencyPolicy::new(1_000_000).with_class_budget(
                 MemoryClass::SessionTranscript,
                 MemoryClassBudget {
@@ -1972,6 +2338,7 @@ mod tests {
                     ExecutionBudget::default(),
                     residency,
                 ))
+                .with_event_sink(events)
                 .build()
                 .expect("valid broker")
         }
@@ -1979,13 +2346,20 @@ mod tests {
         fn charged(
             broker: &LiveProcessMemoryBroker,
         ) -> SimpleSessionTranscriptStore<String, String, String, Budgeted> {
+            charged_with_policy(broker, TranscriptRetentionPolicyV2::default())
+        }
+
+        fn charged_with_policy(
+            broker: &LiveProcessMemoryBroker,
+            retention: TranscriptRetentionPolicyV2,
+        ) -> SimpleSessionTranscriptStore<String, String, String, Budgeted> {
             SimpleSessionTranscriptStore::new_budgeted(
                 StoreBindingHandle::new(
                     MemoryClass::SessionTranscript,
                     "transcript-idempotency-tests".to_string(),
                     None,
                 ),
-                TranscriptRetentionPolicyV1::process_lifetime(),
+                retention,
                 broker.clone(),
             )
         }
@@ -2012,7 +2386,7 @@ mod tests {
                         "overflow".into(),
                         None,
                     ),
-                    TranscriptRetentionPolicyV1::process_lifetime(),
+                    TranscriptRetentionPolicyV2::default(),
                     broker.clone(),
                 );
             for (session_bytes, message_bytes) in [(u64::MAX, 1), (1, u64::MAX)] {
@@ -2074,7 +2448,7 @@ mod tests {
                     "transcript-ordinal-test".to_string(),
                     None,
                 ),
-                TranscriptRetentionPolicyV1::process_lifetime(),
+                TranscriptRetentionPolicyV2::default(),
                 broker.clone(),
             );
             for (sequence, body) in [(0, "one"), (1, "four")] {
@@ -2132,7 +2506,7 @@ mod tests {
                     "transcript-order-panic-test".to_string(),
                     None,
                 ),
-                TranscriptRetentionPolicyV1::process_lifetime(),
+                TranscriptRetentionPolicyV2::default(),
                 broker.clone(),
             );
             for (sequence, body) in [(0, "one"), (1, "four")] {
@@ -2190,7 +2564,7 @@ mod tests {
                         "transcript-drop-panic-test".to_string(),
                         None,
                     ),
-                    TranscriptRetentionPolicyV1::process_lifetime(),
+                    TranscriptRetentionPolicyV2::default(),
                     broker.clone(),
                 );
                 for sequence in 0..2 {
@@ -2245,7 +2619,7 @@ mod tests {
                     "transcript-retain-panic-test".to_string(),
                     None,
                 ),
-                TranscriptRetentionPolicyV1::process_lifetime(),
+                TranscriptRetentionPolicyV2::default(),
                 broker.clone(),
             );
             for sequence in 0..3 {
@@ -2305,6 +2679,62 @@ mod tests {
             assert_eq!(
                 store.append(request("s", 0, "m0", "ok")).expect("no index residue"),
                 TranscriptAppendDispositionV1::Applied
+            );
+        }
+
+        #[test]
+        fn retention_saturation_denies_before_any_new_ledger_charge() {
+            let broker = broker(1_000_000);
+            let store =
+                charged_with_policy(&broker, TranscriptRetentionPolicyV2::fail_closed(1, u64::MAX));
+            store.append(request("s", 0, "m0", "one")).expect("seed");
+            store.truncate_to(&"s".to_string(), 0).expect("retain evidence only");
+            let before_stats = store.retention_stats().expect("before stats");
+            let before_ledger = broker.ledger_snapshot().expect("before ledger");
+
+            assert!(matches!(
+                store.append(request("s", 1, "m1", "two")),
+                Err(TranscriptAppendErrorV1::RetentionSaturated { .. })
+            ));
+            assert_eq!(store.retention_stats().expect("after stats"), before_stats);
+            assert_eq!(broker.ledger_snapshot().expect("after ledger"), before_ledger);
+        }
+
+        #[test]
+        fn retention_saturation_emits_one_bounded_tombstone_event() {
+            #[derive(Default)]
+            struct Events(std::sync::Mutex<Vec<MemoryEvent>>);
+            impl MemoryEventSink for Events {
+                fn emit(&self, event: MemoryEvent) {
+                    self.0.lock().expect("events").push(event);
+                }
+            }
+
+            let events = Arc::new(Events::default());
+            let broker = broker_with_events(1_000_000, events.clone());
+            let store =
+                charged_with_policy(&broker, TranscriptRetentionPolicyV2::fail_closed(1, u64::MAX));
+            store.append(request("s", 0, "m0", "one")).expect("seed");
+
+            assert!(matches!(
+                store.append(request("s", 1, "m1", "two")),
+                Err(TranscriptAppendErrorV1::RetentionSaturated { .. })
+            ));
+            let tombstones = events
+                .0
+                .lock()
+                .expect("events")
+                .iter()
+                .filter(|event| event.operation == MemoryOperation::TombstoneSaturation)
+                .copied()
+                .collect::<Vec<_>>();
+            assert_eq!(
+                tombstones,
+                vec![MemoryEvent::new(
+                    MemoryOperation::TombstoneSaturation,
+                    MemoryOutcome::CapacityDenied,
+                    None,
+                )]
             );
         }
 
@@ -2447,8 +2877,8 @@ mod tests {
                 panic!("poison store after committed charge");
             })
             .join();
-            assert!(matches!(store.close(), Err(MemoryError::InvalidState(_))));
-            assert!(matches!(store.stats(), Err(MemoryError::InvalidState(_))));
+            assert!(matches!(store.close(), Err(MemoryError::Poisoned(_))));
+            assert!(matches!(store.stats(), Err(MemoryError::Poisoned(_))));
             assert_eq!(
                 broker.ledger_snapshot().expect("charged").total_owner_bytes(),
                 cost("a", &[("m0", "one", true)]) + cost("b", &[("m1", "four", true)])

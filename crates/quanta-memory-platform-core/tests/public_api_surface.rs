@@ -50,10 +50,8 @@ use quanta_memory_platform_core::{
     PublishError,
     // ports::store
     PublishedPayload,
-    RechargeError,
-    RechargeRecoveryV1,
     ReclaimPriority,
-    ReservationTicket,
+    ReclaimRuntimeStats,
     ResidencyPolicy,
     ResolvedBudget,
     ResourceGroup,
@@ -83,9 +81,10 @@ use quanta_memory_platform_core::{
 
 #[cfg(feature = "live_control")]
 use quanta_memory_platform_core::{
-    ChargeRechargeError, ChargeRechargeRecovery, ChargeReleaseError, CommittedCharge,
-    LadderPressureController, LiveProcessMemoryBroker, PendingReservation, PressureController,
-    PressureThresholds, ReclaimRung, ResourceGroupScheduler, WeightedResourceGroupScheduler,
+    LadderPressureController, LiveProcessMemoryBroker, ManagedCharge, MemoryReclaimer,
+    PendingReservation, PressureController, PressureThresholds, ReclaimCandidate,
+    ReclaimGroupCandidate, ReclaimOutcome, ReclaimRequest, ReclaimRung, ReclaimTrigger,
+    ResourceGroupScheduler, WeightedResourceGroupScheduler,
 };
 
 /// Names EVERY public re-export from the crate root in type position. Never
@@ -127,15 +126,17 @@ fn names_every_public_reexport() {
         StoreDeleteError,
         StoreWriteError,
     );
-    type _Ledger = (ChargeKind, LedgerSnapshot, ReservationTicket, UsageBreakdown);
-    type _Recharge = (RechargeError, RechargeRecoveryV1);
+    type _Ledger = (ChargeKind, LedgerSnapshot, UsageBreakdown);
     #[cfg(feature = "live_control")]
-    type _OwnedAuthority = (
-        PendingReservation,
-        CommittedCharge,
-        ChargeReleaseError,
-        ChargeRechargeError,
-        ChargeRechargeRecovery,
+    type _OwnedAuthority = (PendingReservation, ManagedCharge);
+    #[cfg(feature = "live_control")]
+    type _Reclaim = (
+        Box<dyn MemoryReclaimer>,
+        ReclaimCandidate,
+        ReclaimGroupCandidate,
+        ReclaimOutcome,
+        ReclaimRequest,
+        ReclaimTrigger,
     );
     type _Policy = (
         ExecutionBudget,
@@ -148,7 +149,8 @@ fn names_every_public_reexport() {
         ResidencyPolicy,
         ResourceGroup,
     );
-    type _Stats = (AllocatorSnapshot, EffectiveMemoryBudgetReport, PressureState);
+    type _Stats =
+        (AllocatorSnapshot, EffectiveMemoryBudgetReport, PressureState, ReclaimRuntimeStats);
     #[cfg(feature = "unbudgeted_pin")]
     type _UnbudgetedPin = (
         UnbudgetedPinRegistry,
@@ -171,21 +173,23 @@ fn names_every_public_reexport() {
 
 /// All eight `MemoryError` variants remain constructible. The single error type is
 /// a public contract
-/// (Build|Config|Capacity|Closed|OperationInProgress|InvalidState|Report|Unsupported);
+/// (Build|Config|Capacity|Closed|OperationInProgress|Poisoned|InvalidState|Report|Unsupported);
 /// removing or renaming a variant breaks this exhaustive match.
 #[test]
-fn memory_error_has_exactly_the_eight_documented_variants() {
+fn memory_error_has_exactly_the_nine_documented_variants() {
     let variants = [
         MemoryError::Build("b".to_string()),
         MemoryError::Config("c".to_string()),
         MemoryError::Capacity("cap".to_string()),
         MemoryError::Closed("closed-store".to_string()),
         MemoryError::OperationInProgress("busy-store".to_string()),
+        MemoryError::Poisoned("poisoned-store".to_string()),
         MemoryError::InvalidState("s".to_string()),
         MemoryError::Report("r".to_string()),
         MemoryError::Unsupported("u".to_string()),
     ];
-    // Exhaustive match: a 7th variant added without updating the snapshot fails
+    assert_eq!(variants.len(), 9);
+    // Exhaustive match: a variant added without updating the snapshot fails
     // to compile here; a removed variant fails to construct above.
     for v in &variants {
         let _classified = match v {
@@ -194,6 +198,7 @@ fn memory_error_has_exactly_the_eight_documented_variants() {
             MemoryError::Capacity(_) => "capacity",
             MemoryError::Closed(_) => "closed",
             MemoryError::OperationInProgress(_) => "operation_in_progress",
+            MemoryError::Poisoned(_) => "poisoned",
             MemoryError::InvalidState(_) => "invalid_state",
             MemoryError::Report(_) => "report",
             MemoryError::Unsupported(_) => "unsupported",

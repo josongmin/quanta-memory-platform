@@ -10,10 +10,14 @@
 //! fake into this suite and asserts the verdict is `Failed`.
 
 use crate::conformance::invariants::{AssertionVerdict, ContractFamily, InvariantAssertion};
-use crate::conformance::target::{AllocatorObservation, BrokerConformanceTarget, ChargeAxis};
+use crate::conformance::target::{
+    AccountingView, AllocatorObservation, BrokerConformanceTarget, ChargeAxis,
+};
 #[cfg(feature = "fixtures")]
 use crate::fixtures::{MemoryFixture, MemoryTestKit};
 use quanta_memory_platform_core::MemoryError;
+#[cfg(test)]
+use quanta_memory_platform_facade::TranscriptRetentionPolicyV2;
 use quanta_memory_platform_facade::{
     AbortDispositionV1, Budgeted, PrepareDispositionV1, PreparedPublicationErrorV1,
     PreparedPublicationIdentityV1, PreparedPublicationRequestV1, PreparedPublicationService,
@@ -285,8 +289,8 @@ impl TranscriptAppendConformanceTarget
     }
 }
 
-/// Exercise exact replay, all three collision axes, ordered load, and a
-/// truncate-late-retry tombstone against any transcript target.
+/// Exercise exact replay, all three collision axes, truncate-late-retry, and
+/// fail-closed saturation against a target configured for two evidence entries.
 pub fn run_transcript_append_suite<T>(target: &T) -> Vec<AssertionVerdict>
 where
     T: TranscriptAppendConformanceTarget,
@@ -310,6 +314,10 @@ where
         ContractFamily::ReclaimAccounting,
         "transcript_truncate_preserves_retry_tombstone",
     );
+    let saturation = InvariantAssertion::new(
+        ContractFamily::ReserveFailClosed,
+        "transcript_new_identity_fails_closed_at_retention_bound",
+    );
 
     let first = target.append(b"s", 0, b"m0", b"one");
     let replayed = target.append(b"s", 0, b"m0", b"one");
@@ -324,6 +332,9 @@ where
     let late_retry = target.append(b"s", 1, b"m1", b"four");
     let rows_after_late_retry = target.load(b"s");
     let bytes_after_late_retry = target.retained_bytes();
+    let saturated = target.append(b"s", 2, b"m2", b"five");
+    let rows_after_saturation = target.load(b"s");
+    let bytes_after_saturation = target.retained_bytes();
 
     vec![
         replay.assert_that(
@@ -360,6 +371,20 @@ where
                 "second={second:?} truncate={truncate:?} late={late_retry:?} rows={rows_after_late_retry:?} bytes={bytes_after_late_retry:?}"
             ),
         ),
+        saturation.assert_that(
+            matches!(
+                saturated,
+                Err(TranscriptAppendErrorV1::RetentionSaturated {
+                    evidence_count: 2,
+                    max_evidence_count: 2,
+                    ..
+                })
+            ) && rows_after_saturation == rows_after_late_retry
+                && bytes_after_saturation == bytes_after_late_retry,
+            format!(
+                "saturated={saturated:?} rows_before={rows_after_late_retry:?} rows_after={rows_after_saturation:?} bytes_before={bytes_after_late_retry:?} bytes_after={bytes_after_saturation:?}"
+            ),
+        ),
     ]
 }
 
@@ -374,19 +399,11 @@ where
     T: BrokerConformanceTarget,
 {
     let mut verdicts = Vec::new();
-
-    // --- Workload: charge two owners across two classes and kinds. The exact
-    // totals are NOT hardcoded as the oracle; the oracle is the *relationship*
-    // (class==owner, owner==partition) read back from the target's own view.
     let owner_a = "owner:conformance-a";
     let owner_b = "owner:conformance-b";
-
     let t1 = target.do_reserve(0, owner_a, ChargeAxis::RetainedPayload, 1_000);
     let t2 = target.do_reserve(1, owner_a, ChargeAxis::RetainedMetadata, 250);
     let t3 = target.do_reserve(0, owner_b, ChargeAxis::LiveScratch, 500);
-
-    // Commit whatever reserved successfully; a target that fails an in-cap
-    // reserve is itself a violation, recorded below.
     let reserve_ok = t1.is_ok() && t2.is_ok() && t3.is_ok();
     let reserve_assert =
         InvariantAssertion::new(ContractFamily::ReserveFailClosed, "in_cap_reserves_succeed");
@@ -399,41 +416,69 @@ where
             t3.as_ref().map(|_| "ok").map_err(|e| e.clone()),
         ),
     ));
+    let commits = match (&t1, &t2, &t3) {
+        (Ok(t1), Ok(t2), Ok(t3)) => {
+            [target.do_commit(t1), target.do_commit(t2), target.do_commit(t3)]
+        }
+        _ => [
+            Err("reserve failed".into()),
+            Err("reserve failed".into()),
+            Err("reserve failed".into()),
+        ],
+    };
+    let lifecycle =
+        InvariantAssertion::new(ContractFamily::TicketLifecycle, "every_commit_result_checked");
+    verdicts.push(
+        lifecycle
+            .assert_that(commits.iter().all(Result::is_ok), format!("commit_results={commits:?}")),
+    );
 
-    if let Ok(t) = &t1 {
-        let _ = target.do_commit(t);
-    }
-    if let Ok(t) = &t2 {
-        let _ = target.do_commit(t);
-    }
-    if let Ok(t) = &t3 {
-        let _ = target.do_commit(t);
-    }
-
-    // --- Invariant 1: class total == owner total.
-    let view = target.view();
-    let balance = InvariantAssertion::new(ContractFamily::ClassOwnerBalance, "class_equals_owner");
-    verdicts.push(balance.assert_eq_bytes(
-        "class_total_vs_owner_total",
-        view.total_class_bytes,
-        view.total_owner_bytes,
+    let expected_live = AccountingView {
+        total_class_bytes: 1_750,
+        total_owner_bytes: 1_750,
+        total_context_bytes: 1_750,
+        context_axis_bytes: [1_750, 0, 0, 0, 0],
+        class_axis_bytes: [1_500, 250],
+        owner_axis_bytes: [1_250, 500],
+        group_axis_bytes: [0, 0],
+        live_ticket_count: 3,
+        total_retained_payload_bytes: 1_000,
+        total_retained_metadata_bytes: 250,
+        total_live_scratch_bytes: 500,
+        rebuild_in_progress: false,
+    };
+    let observed_live = target.view();
+    let exact = InvariantAssertion::new(
+        ContractFamily::OwnerPartition,
+        "independent_exact_accounting_model",
+    );
+    verdicts.push(exact.assert_that(
+        observed_live.as_ref() == Ok(&expected_live),
+        format!("expected={expected_live:?} observed={observed_live:?}"),
+    ));
+    let balance =
+        InvariantAssertion::new(ContractFamily::ClassOwnerBalance, "observed_class_equals_owner");
+    verdicts.push(balance.assert_that(
+        matches!(&observed_live, Ok(view) if view.total_class_bytes == view.total_owner_bytes),
+        format!("observed={observed_live:?}"),
+    ));
+    let partition =
+        InvariantAssertion::new(ContractFamily::OwnerPartition, "observed_owner_partitions");
+    verdicts.push(partition.assert_that(
+        matches!(&observed_live, Ok(view) if Some(view.total_owner_bytes) == view.checked_partition_sum() && view.total_owner_bytes == view.total_context_bytes && Some(view.total_context_bytes) == view.checked_context_sum()),
+        format!("observed={observed_live:?}"),
     ));
 
-    // --- Invariant 2: owner total == payload + metadata + live scratch.
-    let partition = InvariantAssertion::new(ContractFamily::OwnerPartition, "owner_partitions");
-    verdicts.push(partition.assert_eq_bytes(
-        "owner_total_vs_partition_sum",
-        view.total_owner_bytes,
-        view.partition_sum(),
+    let duplicate_commit = t1.as_ref().ok().map(|ticket| target.do_commit(ticket));
+    verdicts.push(lifecycle.assert_that(
+        matches!(duplicate_commit, Some(Err(_))),
+        format!("second commit must reject: {duplicate_commit:?}"),
     ));
 
-    // --- Invariant 4: rebuild window fences live writes.
     let fence = InvariantAssertion::new(ContractFamily::RebuildWriteFence, "rebuild_fences_writes");
-    if target.do_begin_rebuild().is_ok() {
-        // Fail-closed evidence: capture accounting BEFORE the denied write so we
-        // can prove the denial was byte-for-byte inert, not merely an `Err`. A
-        // target that returns `Err` *after* mutating its counters is just as
-        // broken as one that admits the write, and must be caught here.
+    let begin = target.do_begin_rebuild();
+    verdicts.push(fence.assert_that(begin.is_ok(), format!("begin_rebuild={begin:?}")));
+    if begin.is_ok() {
         let before_denied = target.view();
         let during = target.do_reserve(0, owner_a, ChargeAxis::RetainedPayload, 1);
         verdicts.push(fence.assert_that(
@@ -454,48 +499,44 @@ where
                 "denied reserve during rebuild mutated accounting: before={before_denied:?} after={after_denied:?}"
             ),
         ));
-        let _ = target.do_finish_rebuild();
-        // Positive pair: after the window closes, a reserve is accepted again.
+        let finish = target.do_finish_rebuild();
+        verdicts.push(fence.assert_that(finish.is_ok(), format!("finish_rebuild={finish:?}")));
         let after = target.do_reserve(0, owner_a, ChargeAxis::RetainedPayload, 1);
         let after_ok = after.is_ok();
-        if let Ok(t) = &after {
-            let _ = target.do_release(t);
-        }
+        let release_after = after.as_ref().map_or_else(
+            |_| Err("post-rebuild reserve failed".into()),
+            |ticket| target.do_release(ticket),
+        );
         verdicts.push(
             fence.assert_that(after_ok, "reserve after rebuild window closes must be accepted"),
+        );
+        verdicts.push(
+            lifecycle.assert_that(
+                release_after.is_ok(),
+                format!("post-rebuild release={release_after:?}"),
+            ),
         );
     } else {
         verdicts.push(fence.assert_that(false, "target failed to enter rebuild window"));
     }
 
-    // --- Reserve fail-closed: re-read accounting; the suite's own bookkeeping
-    // must still balance after the rebuild excursion (no torn state).
-    let post = target.view();
-    let post_balance =
-        InvariantAssertion::new(ContractFamily::ClassOwnerBalance, "post_excursion_balance");
-    verdicts.push(post_balance.assert_eq_bytes(
-        "post_class_total_vs_owner_total",
-        post.total_class_bytes,
-        post.total_owner_bytes,
-    ));
-
-    // --- Invariant 6: allocator observation is advisory only.
     let advisory = InvariantAssertion::new(
         ContractFamily::AllocatorAdvisory,
         "allocator_observation_is_inert",
     );
     let before_advisory = target.view();
+    let semantic_bytes = before_advisory.as_ref().map(|view| view.total_owner_bytes);
     let mismatch = target.observe_allocator(&AllocatorObservation {
-        resident_bytes: Some(before_advisory.total_owner_bytes.saturating_add(7)),
+        resident_bytes: semantic_bytes.ok().and_then(|bytes| bytes.checked_add(7)),
     });
     let after_mismatch = target.view();
     verdicts.push(advisory.assert_that(
         matches!(
-            &mismatch,
-            Ok(view)
-                if view.semantic_bytes == before_advisory.total_owner_bytes
+            (&semantic_bytes, &mismatch),
+            (Ok(bytes), Ok(view))
+                if view.semantic_bytes == *bytes
                     && view.allocator_resident_bytes
-                        == Some(before_advisory.total_owner_bytes.saturating_add(7))
+                        == bytes.checked_add(7)
                     && view.mismatch
                     && view.drift_bytes == Some(7)
         ) && before_advisory == after_mismatch,
@@ -507,9 +548,9 @@ where
     let after_absent = target.view();
     verdicts.push(advisory.assert_that(
         matches!(
-            &absent,
-            Ok(view)
-                if view.semantic_bytes == before_advisory.total_owner_bytes
+            (&semantic_bytes, &absent),
+            (Ok(bytes), Ok(view))
+                if view.semantic_bytes == *bytes
                     && view.allocator_resident_bytes.is_none()
                     && !view.mismatch
                     && view.drift_bytes.is_none()
@@ -517,6 +558,31 @@ where
         format!(
             "absent={absent:?} before_advisory={before_advisory:?} after_absent={after_absent:?}"
         ),
+    ));
+
+    let releases = match (&t1, &t2, &t3) {
+        (Ok(t1), Ok(t2), Ok(t3)) => {
+            [target.do_release(t1), target.do_release(t2), target.do_release(t3)]
+        }
+        _ => [
+            Err("reserve failed".into()),
+            Err("reserve failed".into()),
+            Err("reserve failed".into()),
+        ],
+    };
+    verdicts.push(lifecycle.assert_that(
+        releases.iter().all(Result::is_ok),
+        format!("terminal_releases={releases:?}"),
+    ));
+    let duplicate_release = t1.as_ref().ok().map(|ticket| target.do_release(ticket));
+    verdicts.push(lifecycle.assert_that(
+        matches!(duplicate_release, Some(Err(_))),
+        format!("second release must reject: {duplicate_release:?}"),
+    ));
+    let final_view = target.view();
+    verdicts.push(lifecycle.assert_that(
+        final_view.as_ref() == Ok(&AccountingView::default()),
+        format!("final exact zero expected, observed={final_view:?}"),
     ));
 
     verdicts
@@ -905,9 +971,10 @@ fn run_all_store_lifecycle_suites(kit: &MemoryTestKit) -> Vec<AssertionVerdict> 
 
 #[cfg(feature = "fixtures")]
 fn run_payload_store_slice(kit: &MemoryTestKit) -> Vec<AssertionVerdict> {
-    // 32 body + the retained "payload-0" reference (9) + digest (32) +
-    // entry state (16). This is independent of the store's calculator.
-    let expected_entry_bytes = 32 + 9 + 32 + 16;
+    // 32 body + the retained "payload-0" reference (9) + two semantic index
+    // slots (canonical digest and reference lookup, 32 each) + entry state
+    // (16). This is independent of the store's calculator.
+    let expected_entry_bytes = 32 + 9 + 64 + 16;
     let accounting =
         InvariantAssertion::new(ContractFamily::ReclaimAccounting, "payload_dedup_refund");
     let pin_discipline = InvariantAssertion::new(ContractFamily::PinDiscipline, "pin_safe_delete");
@@ -1197,25 +1264,25 @@ fn run_transcript_slice(kit: &MemoryTestKit) -> Vec<AssertionVerdict> {
 /// The SpillRouting round-trip verdict over an INJECTED controller, so the suite
 /// can be driven against a broken (handle-dropping) target and proven to BITE —
 /// not merely accept the honest in-memory target. A spill then restore must hand
-/// back the same handle (1 -> 0 on the counter).
+/// back the same handle (canonical target inventory 1 -> 0).
 #[cfg(feature = "fixtures")]
 fn spill_round_trip_verdict<T: SpillTarget<String>>(
     online: &RoutedSpillController<T>,
 ) -> AssertionVerdict {
     let spill = InvariantAssertion::new(ContractFamily::SpillRouting, "spill_round_trip");
     let spill_ok = online.spill("handle-a".to_string());
-    // Capture the count BETWEEN spill and restore: a broken counter stuck at 0
+    // Capture inventory BETWEEN spill and restore: a target that drops the handle
     // would survive an "after == 0" check alone. The round-trip must go 1 -> 0.
     let before_restore = online.spilled_count();
     let restore = online.restore();
     let after = online.spilled_count();
     spill.assert_that(
         spill_ok.is_ok()
-            && before_restore == 1
+            && before_restore == Ok(1)
             && matches!(&restore, Ok(Some(handle)) if handle == "handle-a")
-            && after == 0,
+            && after == Ok(0),
         format!(
-            "spill_ok={spill_ok:?} before_restore={before_restore} restore={restore:?} after={after}"
+            "spill_ok={spill_ok:?} before_restore={before_restore:?} restore={restore:?} after={after:?}"
         ),
     )
 }
@@ -1237,8 +1304,9 @@ fn run_spill_slice() -> Vec<AssertionVerdict> {
     vec![
         round_trip,
         fail_closed.assert_that(
-            matches!(&spill_denied, Err(MemoryError::Capacity(_))) && offline_spilled_after == 0,
-            format!("spill_denied={spill_denied:?} offline_spilled_after={offline_spilled_after}",),
+            matches!(&spill_denied, Err(failure) if matches!(failure.error(), MemoryError::Capacity(_)) && failure.handle() == "handle-b")
+                && offline_spilled_after == Ok(0),
+            format!("spill_denied={spill_denied:?} offline_spilled_after={offline_spilled_after:?}",),
         ),
     ]
 }
@@ -1247,14 +1315,18 @@ fn run_spill_slice() -> Vec<AssertionVerdict> {
 mod tests {
     use super::*;
     use crate::conformance::target::{AccountingView, AllocatorAdvisoryView};
-    use crate::fake::{AccountingFidelity, FakeProcessBroker};
-    #[cfg(feature = "fixtures")]
-    use quanta_memory_platform_core::MemoryResult;
+    use crate::fake::{AccountingFidelity, FakeProcessBroker, FakeReservation};
+    use proptest::prelude::*;
     use quanta_memory_platform_core::{
-        LiveProcessMemoryBroker, MemoryBudgetManifest, MemoryClass, MemoryClassBudget,
-        MemoryPreset, ReclaimPriority, ResidencyPolicy, StoreBindingHandle,
+        ChargeKind, LiveProcessMemoryBroker, MemoryBudgetManifest, MemoryClass, MemoryClassBudget,
+        MemoryContextKind, MemoryEvent, MemoryEventSink, MemoryPreset, ReclaimPriority,
+        ResidencyPolicy, ResourceGroup, StoreBindingHandle,
     };
     use quanta_memory_platform_facade::MemoryPlatformBuilder;
+    use std::sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc, Mutex,
+    };
 
     fn all_held(verdicts: &[AssertionVerdict]) -> bool {
         verdicts.iter().all(AssertionVerdict::held)
@@ -1269,6 +1341,628 @@ mod tests {
             }
         }
         out
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum BrokerFault {
+        BlackHoleAccounting,
+        CommitSwallowing,
+        ReleaseSwallowing,
+        DuplicateCommitAccepting,
+        WrongContextAxis,
+        WrongChargeKindAxis,
+        StaleTicketAccepting,
+        ObservationError,
+        TransferDoubleOwner,
+    }
+
+    struct BrokenBrokerTarget {
+        inner: FakeProcessBroker,
+        fault: BrokerFault,
+    }
+
+    impl BrokenBrokerTarget {
+        fn new(fault: BrokerFault) -> Self {
+            Self { inner: FakeProcessBroker::honest(), fault }
+        }
+    }
+
+    impl BrokerConformanceTarget for BrokenBrokerTarget {
+        type Ticket = FakeReservation;
+
+        fn do_reserve(
+            &mut self,
+            class_axis: usize,
+            owner: &str,
+            kind: ChargeAxis,
+            bytes: u64,
+        ) -> Result<Self::Ticket, String> {
+            BrokerConformanceTarget::do_reserve(&mut self.inner, class_axis, owner, kind, bytes)
+        }
+
+        fn do_commit(&mut self, ticket: &Self::Ticket) -> Result<(), String> {
+            match self.fault {
+                BrokerFault::CommitSwallowing => Ok(()),
+                BrokerFault::DuplicateCommitAccepting => {
+                    BrokerConformanceTarget::do_commit(&mut self.inner, ticket).or(Ok(()))
+                }
+                _ => BrokerConformanceTarget::do_commit(&mut self.inner, ticket),
+            }
+        }
+
+        fn do_release(&mut self, ticket: &Self::Ticket) -> Result<(), String> {
+            match self.fault {
+                BrokerFault::ReleaseSwallowing => Ok(()),
+                BrokerFault::StaleTicketAccepting => {
+                    BrokerConformanceTarget::do_release(&mut self.inner, ticket).or(Ok(()))
+                }
+                _ => BrokerConformanceTarget::do_release(&mut self.inner, ticket),
+            }
+        }
+
+        fn do_begin_rebuild(&mut self) -> Result<(), String> {
+            BrokerConformanceTarget::do_begin_rebuild(&mut self.inner)
+        }
+
+        fn do_finish_rebuild(&mut self) -> Result<(), String> {
+            BrokerConformanceTarget::do_finish_rebuild(&mut self.inner)
+        }
+
+        fn view(&self) -> Result<AccountingView, String> {
+            if matches!(self.fault, BrokerFault::ObservationError) {
+                return Err("injected snapshot failure".into());
+            }
+            if matches!(self.fault, BrokerFault::BlackHoleAccounting) {
+                return Ok(AccountingView::default());
+            }
+            let mut view = BrokerConformanceTarget::view(&self.inner)?;
+            match self.fault {
+                BrokerFault::WrongContextAxis => {
+                    view.context_axis_bytes = [0, view.total_context_bytes, 0, 0, 0];
+                }
+                BrokerFault::WrongChargeKindAxis => {
+                    view.total_retained_metadata_bytes = view
+                        .total_retained_metadata_bytes
+                        .saturating_add(view.total_retained_payload_bytes);
+                    view.total_retained_payload_bytes = 0;
+                }
+                BrokerFault::TransferDoubleOwner => {
+                    view.total_owner_bytes = view.total_owner_bytes.saturating_add(1_000);
+                    view.owner_axis_bytes[1] = view.owner_axis_bytes[1].saturating_add(1_000);
+                }
+                _ => {}
+            }
+            Ok(view)
+        }
+
+        fn observe_allocator(
+            &self,
+            observation: &AllocatorObservation,
+        ) -> Result<AllocatorAdvisoryView, String> {
+            BrokerConformanceTarget::observe_allocator(&self.inner, observation)
+        }
+    }
+
+    fn assert_broken_target_rejected(fault: BrokerFault, exact_families: &[ContractFamily]) {
+        let mut target = BrokenBrokerTarget::new(fault);
+        let verdicts = run_broker_accounting_suite(&mut target);
+        assert!(!all_held(&verdicts), "{fault:?} must be rejected");
+        assert_eq!(
+            violated(&verdicts),
+            exact_families,
+            "{fault:?} must localize to its exact expected family set: {verdicts:?}"
+        );
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum ModelTicketState {
+        Pending,
+        Committed,
+        Released,
+    }
+
+    struct ModelTicket<T> {
+        target: T,
+        class_axis: usize,
+        owner_axis: usize,
+        kind: ChargeAxis,
+        bytes: u64,
+        state: ModelTicketState,
+    }
+
+    #[derive(Default)]
+    struct IndependentAccountingModel {
+        class_axis_bytes: [u64; 2],
+        owner_axis_bytes: [u64; 2],
+        group_axis_bytes: [u64; 2],
+        kind_bytes: [u64; 3],
+        live_ticket_count: usize,
+        rebuild_in_progress: bool,
+        grouped: bool,
+    }
+
+    impl IndependentAccountingModel {
+        fn grouped() -> Self {
+            Self { grouped: true, ..Self::default() }
+        }
+
+        fn apply_reserve(
+            &mut self,
+            class_axis: usize,
+            owner_axis: usize,
+            kind: ChargeAxis,
+            bytes: u64,
+        ) {
+            self.class_axis_bytes[class_axis] += bytes;
+            self.owner_axis_bytes[owner_axis] += bytes;
+            if self.grouped {
+                self.group_axis_bytes[owner_axis] += bytes;
+            }
+            self.kind_bytes[kind_index(kind)] += bytes;
+            self.live_ticket_count += 1;
+        }
+
+        fn apply_release<T>(&mut self, ticket: &ModelTicket<T>) {
+            self.class_axis_bytes[ticket.class_axis] -= ticket.bytes;
+            self.owner_axis_bytes[ticket.owner_axis] -= ticket.bytes;
+            if self.grouped {
+                self.group_axis_bytes[ticket.owner_axis] -= ticket.bytes;
+            }
+            self.kind_bytes[kind_index(ticket.kind)] -= ticket.bytes;
+            self.live_ticket_count -= 1;
+        }
+
+        fn view(&self) -> AccountingView {
+            let total = self.owner_axis_bytes.iter().sum();
+            AccountingView {
+                total_class_bytes: self.class_axis_bytes.iter().sum(),
+                total_owner_bytes: total,
+                total_context_bytes: total,
+                context_axis_bytes: [total, 0, 0, 0, 0],
+                class_axis_bytes: self.class_axis_bytes,
+                owner_axis_bytes: self.owner_axis_bytes,
+                group_axis_bytes: self.group_axis_bytes,
+                live_ticket_count: self.live_ticket_count,
+                total_retained_payload_bytes: self.kind_bytes[0],
+                total_retained_metadata_bytes: self.kind_bytes[1],
+                total_live_scratch_bytes: self.kind_bytes[2],
+                rebuild_in_progress: self.rebuild_in_progress,
+            }
+        }
+    }
+
+    fn kind_index(kind: ChargeAxis) -> usize {
+        match kind {
+            ChargeAxis::RetainedPayload => 0,
+            ChargeAxis::RetainedMetadata => 1,
+            ChargeAxis::LiveScratch => 2,
+        }
+    }
+
+    fn run_independent_trace<T: BrokerConformanceTarget>(target: &mut T) {
+        let owners = ["owner:conformance-a", "owner:conformance-b"];
+        let kinds =
+            [ChargeAxis::RetainedPayload, ChargeAxis::RetainedMetadata, ChargeAxis::LiveScratch];
+        let mut model = IndependentAccountingModel::default();
+        let mut tickets: Vec<ModelTicket<T::Ticket>> = Vec::new();
+        let mut seed = 0x9e37_79b9_u64;
+
+        for step in 0..256u64 {
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            let live =
+                tickets.iter().filter(|ticket| ticket.state != ModelTicketState::Released).count();
+            let action = if live < 8 { seed % 5 } else { 2 };
+            match action {
+                0 | 4 => {
+                    let class_axis = ((seed >> 8) & 1) as usize;
+                    let owner_axis = ((seed >> 9) & 1) as usize;
+                    let kind = kinds[((seed >> 10) % 3) as usize];
+                    let bytes = 1 + ((seed >> 16) % 31);
+                    let ticket = target
+                        .do_reserve(class_axis, owners[owner_axis], kind, bytes)
+                        .unwrap_or_else(|error| panic!("step {step} reserve failed: {error}"));
+                    model.apply_reserve(class_axis, owner_axis, kind, bytes);
+                    tickets.push(ModelTicket {
+                        target: ticket,
+                        class_axis,
+                        owner_axis,
+                        kind,
+                        bytes,
+                        state: ModelTicketState::Pending,
+                    });
+                }
+                1 => {
+                    if let Some(ticket) =
+                        tickets.iter_mut().find(|ticket| ticket.state == ModelTicketState::Pending)
+                    {
+                        target.do_commit(&ticket.target).expect("first commit");
+                        ticket.state = ModelTicketState::Committed;
+                        assert!(
+                            target.do_commit(&ticket.target).is_err(),
+                            "duplicate commit accepted"
+                        );
+                    }
+                }
+                2 | 3 => {
+                    if let Some(index) =
+                        tickets.iter().position(|ticket| ticket.state != ModelTicketState::Released)
+                    {
+                        target.do_release(&tickets[index].target).expect("terminal release");
+                        model.apply_release(&tickets[index]);
+                        tickets[index].state = ModelTicketState::Released;
+                        assert!(
+                            target.do_release(&tickets[index].target).is_err(),
+                            "stale release accepted"
+                        );
+                    }
+                }
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                target.view(),
+                Ok(model.view()),
+                "independent model divergence after trace step {step}"
+            );
+        }
+
+        for ticket in &mut tickets {
+            if ticket.state != ModelTicketState::Released {
+                target.do_release(&ticket.target).expect("final drain");
+                model.apply_release(ticket);
+                ticket.state = ModelTicketState::Released;
+            }
+        }
+        assert_eq!(model.view(), AccountingView::default());
+        assert_eq!(target.view(), Ok(AccountingView::default()));
+    }
+
+    #[test]
+    fn deterministic_trace_matches_independent_model() {
+        run_independent_trace(&mut FakeProcessBroker::honest());
+        run_independent_trace(&mut live_broker());
+    }
+
+    #[derive(Clone, Debug)]
+    enum ModelOperation {
+        Reserve { class_axis: usize, owner_axis: usize, kind: ChargeAxis, bytes: u64 },
+        Commit(usize),
+        Release(usize),
+        BeginRebuild,
+        FinishRebuild,
+        Observe(Option<u64>),
+    }
+
+    fn model_operation() -> impl Strategy<Value = ModelOperation> {
+        let kind = prop_oneof![
+            Just(ChargeAxis::RetainedPayload),
+            Just(ChargeAxis::RetainedMetadata),
+            Just(ChargeAxis::LiveScratch),
+        ];
+        prop_oneof![
+            5 => (0usize..2, 0usize..2, kind, 0u64..=63).prop_map(
+                |(class_axis, owner_axis, kind, bytes)| ModelOperation::Reserve {
+                    class_axis,
+                    owner_axis,
+                    kind,
+                    bytes,
+                }
+            ),
+            1 => Just(ModelOperation::Reserve {
+                class_axis: 0,
+                owner_axis: 0,
+                kind: ChargeAxis::RetainedPayload,
+                bytes: u64::MAX,
+            }),
+            2 => (0usize..96).prop_map(ModelOperation::Commit),
+            3 => (0usize..96).prop_map(ModelOperation::Release),
+            1 => Just(ModelOperation::BeginRebuild),
+            1 => Just(ModelOperation::FinishRebuild),
+            2 => prop::option::of(0u64..=8_192).prop_map(ModelOperation::Observe),
+        ]
+    }
+
+    fn run_generated_trace<T: BrokerConformanceTarget>(
+        target: &mut T,
+        operations: &[ModelOperation],
+    ) {
+        let owners = ["owner:conformance-a", "owner:conformance-b"];
+        let mut model = IndependentAccountingModel::grouped();
+        let mut tickets: Vec<ModelTicket<T::Ticket>> = Vec::new();
+
+        for (step, operation) in operations.iter().enumerate() {
+            match *operation {
+                ModelOperation::Reserve { class_axis, owner_axis, kind, bytes } => {
+                    let before = target.view().expect("pre-reserve observation");
+                    let result = target.do_reserve(class_axis, owners[owner_axis], kind, bytes);
+                    if model.rebuild_in_progress || bytes == u64::MAX {
+                        assert!(result.is_err(), "step {step}: denied reserve unexpectedly passed");
+                        assert_eq!(target.view(), Ok(before), "step {step}: denial mutated state");
+                    } else {
+                        let ticket = result.unwrap_or_else(|error| {
+                            panic!("step {step}: admissible reserve failed: {error}")
+                        });
+                        model.apply_reserve(class_axis, owner_axis, kind, bytes);
+                        tickets.push(ModelTicket {
+                            target: ticket,
+                            class_axis,
+                            owner_axis,
+                            kind,
+                            bytes,
+                            state: ModelTicketState::Pending,
+                        });
+                    }
+                }
+                ModelOperation::Commit(slot)
+                    if !model.rebuild_in_progress && !tickets.is_empty() =>
+                {
+                    let index = slot % tickets.len();
+                    let ticket = &mut tickets[index];
+                    let result = target.do_commit(&ticket.target);
+                    if ticket.state == ModelTicketState::Pending {
+                        result.unwrap_or_else(|error| {
+                            panic!("step {step}: first commit failed: {error}")
+                        });
+                        ticket.state = ModelTicketState::Committed;
+                    } else {
+                        assert!(result.is_err(), "step {step}: non-pending commit passed");
+                    }
+                }
+                ModelOperation::Release(slot)
+                    if !model.rebuild_in_progress && !tickets.is_empty() =>
+                {
+                    let index = slot % tickets.len();
+                    let result = target.do_release(&tickets[index].target);
+                    if tickets[index].state == ModelTicketState::Released {
+                        assert!(result.is_err(), "step {step}: stale release passed");
+                    } else {
+                        result.unwrap_or_else(|error| {
+                            panic!("step {step}: terminal release failed: {error}")
+                        });
+                        model.apply_release(&tickets[index]);
+                        tickets[index].state = ModelTicketState::Released;
+                    }
+                }
+                ModelOperation::BeginRebuild if !model.rebuild_in_progress => {
+                    target
+                        .do_begin_rebuild()
+                        .unwrap_or_else(|error| panic!("step {step}: begin failed: {error}"));
+                    model.rebuild_in_progress = true;
+                }
+                ModelOperation::FinishRebuild if model.rebuild_in_progress => {
+                    target
+                        .do_finish_rebuild()
+                        .unwrap_or_else(|error| panic!("step {step}: finish failed: {error}"));
+                    model.rebuild_in_progress = false;
+                }
+                ModelOperation::Observe(resident_bytes) => {
+                    let advisory = target
+                        .observe_allocator(&AllocatorObservation { resident_bytes })
+                        .unwrap_or_else(|error| panic!("step {step}: observation failed: {error}"));
+                    assert_eq!(advisory.semantic_bytes, model.view().total_owner_bytes);
+                    assert_eq!(advisory.allocator_resident_bytes, resident_bytes);
+                }
+                _ => {}
+            }
+            assert_eq!(
+                target.view(),
+                Ok(model.view()),
+                "independent model divergence after generated step {step}: {operation:?}"
+            );
+        }
+
+        if model.rebuild_in_progress {
+            target.do_finish_rebuild().expect("final rebuild close");
+            model.rebuild_in_progress = false;
+        }
+        for ticket in &mut tickets {
+            if ticket.state != ModelTicketState::Released {
+                target.do_release(&ticket.target).expect("generated trace final drain");
+                model.apply_release(ticket);
+                ticket.state = ModelTicketState::Released;
+            }
+        }
+        assert_eq!(model.view(), AccountingView::default());
+        assert_eq!(target.view(), Ok(AccountingView::default()));
+    }
+
+    fn grouped_fake() -> FakeProcessBroker {
+        FakeProcessBroker::honest()
+            .with_resource_group(
+                "conformance-group-a",
+                6_000,
+                vec!["owner:conformance-a".to_string()],
+            )
+            .with_resource_group(
+                "conformance-group-b",
+                6_000,
+                vec!["owner:conformance-b".to_string()],
+            )
+    }
+
+    fn grouped_live_broker() -> LiveProcessMemoryBroker {
+        let group = ResourceGroup {
+            reserved_bytes: 0,
+            soft_cap_bytes: 4_000,
+            hard_cap_bytes: 6_000,
+            burst_percent: 0,
+            reclaim_priority: ReclaimPriority::Normal,
+            admission_weight: 1,
+        };
+        let residency = ResidencyPolicy::new(10_000_000)
+            .with_class_budget(
+                MemoryClass::ArtifactCache,
+                MemoryClassBudget {
+                    reserved_bytes: 0,
+                    soft_cap_bytes: 4_000,
+                    hard_cap_bytes: 6_000,
+                    borrow_from_shared_pool: false,
+                    reclaim_priority: ReclaimPriority::Normal,
+                },
+            )
+            .with_class_budget(
+                MemoryClass::EvidenceCache,
+                MemoryClassBudget {
+                    reserved_bytes: 0,
+                    soft_cap_bytes: 4_000,
+                    hard_cap_bytes: 6_000,
+                    borrow_from_shared_pool: false,
+                    reclaim_priority: ReclaimPriority::Normal,
+                },
+            )
+            .with_resource_group("conformance-group-a", group.clone())
+            .with_resource_group("conformance-group-b", group)
+            .with_owner_group("owner:conformance-a", "conformance-group-a")
+            .with_owner_group("owner:conformance-b", "conformance-group-b");
+        quanta_memory_platform_core::ProcessMemoryBrokerBuilder::new()
+            .with_manifest(MemoryBudgetManifest::new(
+                MemoryPreset::Ci,
+                quanta_memory_platform_core::ExecutionBudget::default(),
+                residency,
+            ))
+            .build()
+            .expect("valid grouped residency")
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 128,
+            max_shrink_iters: 8_192,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn property_trace_matches_independent_model(
+            operations in prop::collection::vec(model_operation(), 1..96)
+        ) {
+            run_generated_trace(&mut grouped_fake(), &operations);
+            run_generated_trace(&mut grouped_live_broker(), &operations);
+        }
+    }
+
+    #[derive(Default)]
+    struct ReentrantSink {
+        broker: Mutex<Option<LiveProcessMemoryBroker>>,
+        entered: AtomicBool,
+        reentries: AtomicUsize,
+    }
+
+    impl MemoryEventSink for ReentrantSink {
+        fn emit(&self, _event: MemoryEvent) {
+            if self.entered.swap(true, Ordering::AcqRel) {
+                return;
+            }
+            if let Some(broker) = self.broker.lock().expect("sink broker lock").clone() {
+                broker.observe().expect("reentrant observation must not deadlock");
+                self.reentries.fetch_add(1, Ordering::Release);
+            }
+        }
+    }
+
+    #[test]
+    fn reentrant_sink_is_contained_outside_owner_lock() {
+        let sink = Arc::new(ReentrantSink::default());
+        let broker = quanta_memory_platform_core::ProcessMemoryBrokerBuilder::new()
+            .with_preset(MemoryPreset::Development)
+            .with_event_sink(sink.clone())
+            .build()
+            .expect("broker");
+        *sink.broker.lock().expect("install broker") = Some(broker.clone());
+
+        let charge = broker
+            .reserve_managed_charge(
+                MemoryClass::ArtifactCache,
+                "reentrant-sink".into(),
+                MemoryContextKind::Request,
+                ChargeKind::RetainedPayload,
+                8,
+            )
+            .expect("reserve must survive reentrant advisory sink");
+        assert_eq!(sink.reentries.load(Ordering::Acquire), 1);
+        assert_eq!(broker.observe().expect("observation").semantic_bytes, 8);
+        drop(charge);
+        assert_eq!(broker.observe().expect("final observation").semantic_bytes, 0);
+    }
+
+    #[test]
+    fn suite_rejects_black_hole_accounting() {
+        assert_broken_target_rejected(
+            BrokerFault::BlackHoleAccounting,
+            &[ContractFamily::OwnerPartition, ContractFamily::AllocatorAdvisory],
+        );
+    }
+
+    #[test]
+    fn suite_rejects_commit_swallowing_target() {
+        assert_broken_target_rejected(
+            BrokerFault::CommitSwallowing,
+            &[ContractFamily::TicketLifecycle],
+        );
+    }
+
+    #[test]
+    fn suite_rejects_release_swallowing_target() {
+        assert_broken_target_rejected(
+            BrokerFault::ReleaseSwallowing,
+            &[ContractFamily::TicketLifecycle],
+        );
+    }
+
+    #[test]
+    fn suite_rejects_duplicate_commit_accepting_target() {
+        assert_broken_target_rejected(
+            BrokerFault::DuplicateCommitAccepting,
+            &[ContractFamily::TicketLifecycle],
+        );
+    }
+
+    #[test]
+    fn suite_rejects_wrong_context_axis() {
+        assert_broken_target_rejected(
+            BrokerFault::WrongContextAxis,
+            &[ContractFamily::OwnerPartition],
+        );
+    }
+
+    #[test]
+    fn suite_rejects_wrong_charge_kind_axis() {
+        assert_broken_target_rejected(
+            BrokerFault::WrongChargeKindAxis,
+            &[ContractFamily::OwnerPartition],
+        );
+    }
+
+    #[test]
+    fn suite_rejects_stale_ticket_accepting_target() {
+        assert_broken_target_rejected(
+            BrokerFault::StaleTicketAccepting,
+            &[ContractFamily::TicketLifecycle],
+        );
+    }
+
+    #[test]
+    fn snapshot_error_is_failed_verdict_not_zero() {
+        assert_broken_target_rejected(
+            BrokerFault::ObservationError,
+            &[
+                ContractFamily::OwnerPartition,
+                ContractFamily::ClassOwnerBalance,
+                ContractFamily::AllocatorAdvisory,
+                ContractFamily::TicketLifecycle,
+            ],
+        );
+    }
+
+    #[test]
+    fn suite_rejects_transfer_double_owner() {
+        assert_broken_target_rejected(
+            BrokerFault::TransferDoubleOwner,
+            &[
+                ContractFamily::OwnerPartition,
+                ContractFamily::ClassOwnerBalance,
+                ContractFamily::AllocatorAdvisory,
+                ContractFamily::TicketLifecycle,
+            ],
+        );
     }
 
     #[test]
@@ -1526,6 +2220,7 @@ mod tests {
                 "transcript-conformance".to_string(),
                 None,
             ))
+            .with_retention_policy(TranscriptRetentionPolicyV2::fail_closed(2, u64::MAX))
             .build()
             .expect("bound transcript builder");
         let verdicts = run_transcript_append_suite(&store);
@@ -1589,6 +2284,35 @@ mod tests {
         );
     }
 
+    #[test]
+    fn transcript_suite_rejects_target_that_ignores_declared_horizon() {
+        let platform = MemoryPlatformBuilder::new()
+            .with_preset(MemoryPreset::Development)
+            .build()
+            .expect("platform");
+        let wrong_horizon = platform
+            .transcript_store_builder::<Vec<u8>, Vec<u8>, Vec<u8>>()
+            .bind(StoreBindingHandle::new(
+                MemoryClass::SessionTranscript,
+                "wrong-horizon-transcript".to_string(),
+                None,
+            ))
+            .with_retention_policy(TranscriptRetentionPolicyV2::fail_closed(3, u64::MAX))
+            .build()
+            .expect("target with wrong horizon");
+        let verdicts = run_transcript_append_suite(&wrong_horizon);
+        assert!(verdicts.iter().any(|verdict| {
+            verdict.name == "transcript_new_identity_fails_closed_at_retention_bound"
+                && !verdict.held()
+        }));
+        assert!(verdicts
+            .iter()
+            .filter(|verdict| {
+                verdict.name != "transcript_new_identity_fails_closed_at_retention_bound"
+            })
+            .all(AssertionVerdict::held));
+    }
+
     struct UnderbillingTranscriptTarget<'a, T>(&'a T);
 
     impl<T: TranscriptAppendConformanceTarget> TranscriptAppendConformanceTarget
@@ -1630,6 +2354,7 @@ mod tests {
                 "underbilling-transcript".to_string(),
                 None,
             ))
+            .with_retention_policy(TranscriptRetentionPolicyV2::fail_closed(2, u64::MAX))
             .build()
             .expect("store");
         let verdicts = run_transcript_append_suite(&UnderbillingTranscriptTarget(&store));
@@ -1855,15 +2580,21 @@ mod tests {
             &["a", "b"]
         }
 
-        fn view(&self) -> AccountingView {
-            AccountingView {
+        fn view(&self) -> Result<AccountingView, String> {
+            Ok(AccountingView {
                 total_class_bytes: self.class_payload_bytes,
                 total_owner_bytes: self.owner_payload_bytes,
+                total_context_bytes: self.owner_payload_bytes,
+                context_axis_bytes: [self.owner_payload_bytes, 0, 0, 0, 0],
+                class_axis_bytes: [self.class_payload_bytes, 0],
+                owner_axis_bytes: [self.owner_payload_bytes, 0],
+                group_axis_bytes: [0, 0],
+                live_ticket_count: 0,
                 total_retained_payload_bytes: self.owner_payload_bytes,
                 total_retained_metadata_bytes: 0,
                 total_live_scratch_bytes: 0,
                 rebuild_in_progress: self.rebuild,
-            }
+            })
         }
 
         fn observe_allocator(
@@ -1963,16 +2694,22 @@ mod tests {
             &["a", "b"]
         }
 
-        fn view(&self) -> AccountingView {
+        fn view(&self) -> Result<AccountingView, String> {
             let bytes = self.0.get();
-            AccountingView {
+            Ok(AccountingView {
                 total_class_bytes: bytes,
                 total_owner_bytes: bytes,
+                total_context_bytes: bytes,
+                context_axis_bytes: [bytes, 0, 0, 0, 0],
+                class_axis_bytes: [bytes, 0],
+                owner_axis_bytes: [bytes, 0],
+                group_axis_bytes: [0, 0],
+                live_ticket_count: 0,
                 total_retained_payload_bytes: bytes,
                 total_retained_metadata_bytes: 0,
                 total_live_scratch_bytes: 0,
                 rebuild_in_progress: false,
-            }
+            })
         }
 
         fn observe_allocator(
@@ -2019,13 +2756,17 @@ mod tests {
             .expect("in-budget reserve succeeds");
         fake.do_commit(&t).expect("commit succeeds");
 
-        let mid = fake.view();
+        let mid = fake.view().expect("view");
         assert_eq!(mid.total_owner_bytes, 4_096, "committed bytes are accounted");
         assert_eq!(mid.total_class_bytes, mid.total_owner_bytes, "invariant 1 after commit");
-        assert_eq!(mid.partition_sum(), mid.total_owner_bytes, "invariant 2 after commit");
+        assert_eq!(
+            mid.checked_partition_sum(),
+            Some(mid.total_owner_bytes),
+            "invariant 2 after commit"
+        );
 
         fake.do_release(&t).expect("release succeeds");
-        let end = fake.view();
+        let end = fake.view().expect("view");
         assert_eq!(end.total_owner_bytes, 0, "release returns owner usage to zero");
         assert_eq!(end.total_class_bytes, 0, "release returns class usage to zero");
         assert_eq!(end, AccountingView::default(), "balance fully zeroed after release");
@@ -2041,13 +2782,17 @@ mod tests {
             .do_reserve(0, owner, ChargeAxis::RetainedPayload, 4_096)
             .expect("in-budget reserve succeeds");
         broker.do_commit(&t).expect("commit succeeds");
-        assert_eq!(broker.view().total_owner_bytes, 4_096);
+        assert_eq!(broker.view().expect("view").total_owner_bytes, 4_096);
 
         broker.do_release(&t).expect("release succeeds");
-        let end = broker.view();
+        let end = broker.view().expect("view");
         assert_eq!(end.total_owner_bytes, 0, "release zeroes owner usage on the real broker");
         assert_eq!(end.total_class_bytes, end.total_owner_bytes, "invariant 1 holds at zero");
-        assert_eq!(end.partition_sum(), end.total_owner_bytes, "invariant 2 holds at zero");
+        assert_eq!(
+            end.checked_partition_sum(),
+            Some(end.total_owner_bytes),
+            "invariant 2 holds at zero"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -2102,8 +2847,8 @@ mod tests {
         let real = live_broker();
 
         // Capture state before the denied op on both, via the neutral view.
-        let fake_before: AccountingView = fake.view();
-        let real_before: AccountingView = real.view();
+        let fake_before: AccountingView = fake.view().expect("fake view");
+        let real_before: AccountingView = real.view().expect("real view");
 
         // Over-cap reserve: 7_000 > 6_000 cap on both.
         let fake_denied = fake.reserve(
@@ -2112,7 +2857,7 @@ mod tests {
             quanta_memory_platform_core::ChargeKind::RetainedPayload,
             7_000,
         );
-        let real_denied = real.reserve(
+        let real_denied = real.reserve_owned(
             MemoryClass::ArtifactCache,
             owner.to_string(),
             quanta_memory_platform_core::MemoryContextKind::Request,
@@ -2131,8 +2876,8 @@ mod tests {
         );
 
         // (3) AGREE: fail-closed. Neither denied reserve mutated any axis.
-        assert_eq!(fake.view(), fake_before, "fake denied reserve must be inert");
-        assert_eq!(real.view(), real_before, "real denied reserve must be inert");
+        assert_eq!(fake.view(), Ok(fake_before), "fake denied reserve must be inert");
+        assert_eq!(real.view(), Ok(real_before), "real denied reserve must be inert");
 
         // (2) AGREE: an in-cap reserve (under 6_000) still succeeds on both.
         let fake_ok = fake.reserve(
@@ -2141,7 +2886,7 @@ mod tests {
             quanta_memory_platform_core::ChargeKind::RetainedPayload,
             5_000,
         );
-        let real_ok = real.reserve(
+        let real_ok = real.reserve_owned(
             MemoryClass::ArtifactCache,
             owner.to_string(),
             quanta_memory_platform_core::MemoryContextKind::Request,
@@ -2152,11 +2897,11 @@ mod tests {
         assert!(real_ok.is_ok(), "real in-cap reserve must succeed, got {real_ok:?}");
 
         // And the accounting moved identically (5_000 on the owner/class axis).
-        assert_eq!(fake.view().total_owner_bytes, 5_000);
-        assert_eq!(real.view().total_owner_bytes, 5_000);
+        assert_eq!(fake.view().expect("fake view").total_owner_bytes, 5_000);
+        assert_eq!(real.view().expect("real view").total_owner_bytes, 5_000);
         assert_eq!(
-            fake.view().total_owner_bytes,
-            real.view().total_owner_bytes,
+            fake.view().expect("fake view").total_owner_bytes,
+            real.view().expect("real view").total_owner_bytes,
             "fake and real agree on post-reserve owner usage"
         );
     }
@@ -2186,10 +2931,23 @@ mod tests {
         fn is_available(&self) -> bool {
             true
         }
-        fn accept(&self, _handle: String) -> MemoryResult<()> {
-            Ok(()) // BUG under test: reports success but drops the handle.
+        fn accept(
+            &self,
+            _handle: String,
+        ) -> Result<
+            quanta_memory_platform_facade::SpillReceipt,
+            quanta_memory_platform_facade::SpillFailure<String>,
+        > {
+            Ok(quanta_memory_platform_facade::SpillReceipt::InProcess { inventory_after: 0 })
         }
         // restore uses the trait default -> always Ok(None): nothing comes back.
+    }
+
+    #[cfg(feature = "fixtures")]
+    impl quanta_memory_platform_facade::SpillInventory for DroppingSpillTarget {
+        fn retained_count(&self) -> quanta_memory_platform_core::MemoryResult<u64> {
+            Ok(0)
+        }
     }
 
     // The SpillRouting verdict must be able to VIOLATE: driving the SUITE's own

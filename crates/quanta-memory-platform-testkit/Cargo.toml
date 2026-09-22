@@ -4,6 +4,7 @@ edition.workspace = true
 license.workspace = true
 version.workspace = true
 publish.workspace = true
+rust-version.workspace = true
 
 [lints]
 workspace = true
@@ -27,9 +28,14 @@ faults = [
     "quanta-memory-platform-facade/spill",
 ]
 alloc_tracking = ["dep:tracking-allocator"]
+loom = ["dep:loom"]
 full = ["fixtures", "doctor", "conformance", "faults", "alloc_tracking"]
 
 [dependencies]
 quanta-memory-platform-core = { path = "../quanta-memory-platform-core", default-features = false }
 quanta-memory-platform-facade = { path = "../quanta-memory-platform-facade", default-features = false }
 tracking-allocator = { workspace = true, optional = true }
+loom = { workspace = true, optional = true }
+
+[dev-dependencies]
+proptest.workspace = true

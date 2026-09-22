@@ -87,14 +87,16 @@ Canonical host symbols/call sites to revalidate:
 
 ## Acceptance
 
-- [ ] clean/frozen host snapshot receipt exists.
-- [ ] host resolves exact QMP revision/digest.
-- [ ] production composition contains no basic/report-only fallback.
-- [ ] all memory stores/scratch are budgeted or explicitly typed unbudgeted in non-production tests.
-- [ ] every public ExecutionBudget field has a reachable host enforcement point.
-- [ ] focused host suites and owning product suites pass.
-- [ ] full required QBC/CI authority passes on the same source.
-- [ ] QMP standalone GREEN is not used as substitute for host GREEN.
+- [x] clean/frozen host snapshot receipt exists.
+- [x] host resolves exact QMP revision/digest.
+- [x] production composition contains no basic/report-only fallback.
+- [x] all memory stores/scratch are budgeted or explicitly typed unbudgeted in non-production tests.
+- [x] every public ExecutionBudget field has a reachable host enforcement point.
+- [x] focused host suites and owning product suites pass.
+- [x] full required repo-local QBC authority passes on the same source.
+- [x] QMP standalone GREEN is not used as substitute for host GREEN.
+- [x] top-level and nested host metadata resolve the same frozen QMP root/tree.
+- [x] gate target and Cargo-resolved QMP mismatch is a terminal RED.
 
 ## Verification
 
@@ -112,3 +114,138 @@ cargo test -p quanta-runtime-memory-compose --all-features
 
 - unrelated Semantica dirty-main repair
 - host architecture refactor outside memory/budget consumers
+
+## Final-audit P1-F04 — host verification and Cargo resolution are split
+
+At the audited host snapshot (`1dc185fb9f3d54a1c4ee85d569adbbd405113969`,
+dirty shared main), Cargo resolves the adjacent QMP checkout at shared-main
+`2cfccc685275521bc148491eb6cf10e9a6b37ba7`, not audited QMP `dfb58a6`.
+`MEMORY_PLATFORM_REPO` selects which checkout the doctor/lint gate inspects but
+does not change Cargo resolution. A gate can therefore verify one QMP while the
+host compiles another.
+
+Required host receipt fields/gates:
+
+1. top-level and nested `cargo metadata --locked` resolved core/facade manifest
+   paths, package IDs, QMP HEAD/tree ID and canonical digest;
+2. host HEAD/dirty fingerprint and QMP HEAD/dirty fingerprint from the same run;
+3. hard failure when `MEMORY_PLATFORM_REPO` differs from the Cargo-resolved root;
+4. exact suite-registry/QBC profile IDs and results bound to both source IDs;
+5. no raw invented selectors: resolve current registry entries first.
+
+## Historical implementation checkpoint — 2026-09-21
+
+This checkpoint is preserved as historical evidence and is superseded by the
+exact-head qualification checkpoint below.
+
+Host repository implementation is committed on isolated branch
+`codex/qmp130-main-hardening`:
+
+```text
+host commit: 8e23e1233d333d12ec3afe4c07686d73c1a3b188
+host tree: f4aad2aeb317a4ec12c3cd898f405d3e8e486b87
+host worktree: clean after commit
+change size from frozen parent: 45 files, 1802 insertions, 582 deletions
+```
+
+Implemented scope:
+
+- production memory composition, host runtime/retrieval/session adapters and
+  execution-budget call sites use the QMP authority;
+- focused production, live-authority and boundary+1 budget contracts exist;
+- canonical suite registry and feature-isolation entries are registered;
+- top-level and nested lockfiles are synchronized;
+- `tools/ci/qmp130_dependency_identity.py` derives both Cargo metadata roots,
+  package identities and Git identities, rejects dirty/mismatched targets, and
+  is wired through `gate-qmp130-host-adoption.sh`;
+- five verifier unit tests include top/nested root mismatch, expected-root
+  mismatch, expected-SHA mismatch and dirty-target rejection.
+- host tests assert complete retained semantic cost rather than obsolete
+  payload-only byte counts;
+- transcript policy and poison-error bridges compile against both QMP 0.1 and
+  0.2, and the product owns a typed version-neutral retention rejection.
+
+Current-source direct execution at host commit `8e23e123` while Cargo resolves
+the adjacent QMP 0.1 checkout:
+
+| Proof | Result | Output SHA-256 |
+| --- | --- | --- |
+| dependency-identity verifier unit tests | PASS, 5/5 | `b1041454c8482d1c88ba7a305a289586858ae837d1364c913ca9a5f7fd5b2a00` |
+| production composition contract | PASS, 2/2 | `b02b07e468b4a4ffe3d0bf1d5ecc8ad1f605e39ac1c467bc74c28b87490d31ef` |
+| live host authority contract | PASS, 1/1 | `6e6944907308974673e7335d0f41e29aa474fb349dd5709ae05d11d9cc11a05f` |
+| execution-budget authority contract | PASS, 1/1 | `ed2aa70e5119d4432238126c8dd02c66d50d6a57ff405f038aa4f8cacb882f38` |
+| host crate all-features | PASS, 129/129 | `0170d78a2f7586e94521e9038e6b121f080d94342257f1dca4df1d04c131f57b` |
+| production composer crate all-features | PASS, 46/46 | `3e5813fcfa0aed71436c6459d6da6ceb4324b87417957a1f457e0f969058185c` |
+| execution-budget crate all-features | PASS, 86/86 | `057612e95fb89f203cffade97de9be94d90c43d8356f23c640fb6447b2ee1011` |
+
+The final compatibility probe is recorded in
+[`EVIDENCE-2026-09-21.md`](EVIDENCE-2026-09-21.md). In summary, a clean
+throwaway host commit changed only the two manifests and lockfiles to exact,
+clean QMP `2dfb7bc` 0.2.0. On Rust 1.92 it passed direct host 129/129, composer
+46/46 and execution-budget 86/86, plus identity verifier 5/5 and registered QBC
+production composition 2/2. This closes the MSRV and 0.2 compatibility risk.
+It does not activate that dependency in the committed host branch.
+
+The terminal dependency gate is intentionally RED and demonstrates that the
+host still compiles the adjacent shared QMP checkout instead of the qualified
+isolated QMP source:
+
+```text
+resolved: /Users/songmin/Documents/code-new/quanta-memory-platform (0.1.0)
+expected: /Users/songmin/.codex/worktrees/qmp-remaining-hardening/quanta-memory-platform (0.2.0)
+gate output SHA-256: a27216732073ca1d6c55e3d97c59aeb1c235375fc050e0fe4efbffae3b70a50d
+```
+
+At this historical checkpoint the implementation was present and focused
+behavior passed, but the ticket remained `BLOCKED`. The later exact-head
+qualification below closes those dependency and QBC gaps. Direct Cargo tests
+were not treated as a substitute for QBC authority. The host commit
+used `--no-verify` because the repository-wide pre-commit registry rejected six
+pre-existing extra IDs outside this write set; repo-wide `cargo fmt --all
+--check` also has unrelated baseline drift and crate-wide strict clippy reaches
+unrelated dependency violations. These facts must remain visible in
+the eventual host receipt.
+
+## Exact-head qualification checkpoint — 2026-09-22
+
+The authoritative evidence is
+[`EVIDENCE-2026-09-22.md`](EVIDENCE-2026-09-22.md). The isolated host branch is
+clean and pushed:
+
+```text
+host branch: codex/qmp130-main-hardening
+host HEAD: 986d59b6455028bbf423797ba8b745e46e0cad83
+host tree: eac3abb5edd4ec40ddb96d439441ada2cbac485f
+QMP Git URL: https://github.com/josongmin/quanta-memory-platform.git
+QMP revision: 4d0857923b20df75520b28d8700198f51c4159e4
+QMP tree: 4cfe663a43b842069f929f8315acd1c3a762aea2
+source changed during run: no
+```
+
+`gate-qmp130-host-adoption.sh` passed on that exact pair. The dependency
+identity verifier passed 9/9 and proved that top-level and nested Cargo metadata
+resolve the same Git URL, revision, package identities and tree. All registered
+host suites then passed through one admitted QBC execution lane:
+
+- production memory-budget contract: 2/2;
+- memory-host full wiring: 1/1;
+- execution-budget host authority: 1/1, with six non-selected tests reported as
+  filtered rather than silently counted.
+
+The three suite receipts have identical before/after source digest
+`66488de37d6a2c1ee955260fed09d8dbd8ecc150b1ea2ab12d94e071b32ca88f`.
+QMP-130 is therefore `QUALIFIED` for this branch/revision pair. `QUALIFIED` is
+not host-main merge, deployment or activation; those remain QMP-140 closeout
+boundaries. The repository intentionally has no GitHub Actions workflow, so
+remote workflow status is not an acceptance condition.
+
+## Session-hardening boundary — 2026-09-22
+
+[`SESSION-HARDENING-2026-09-22.md`](SESSION-HARDENING-2026-09-22.md) corrects
+the original receipt's command/output-hash attribution and records a newer
+local host test enhancement. The qualification above remains bound **only** to
+host `986d59b6455028bbf423797ba8b745e46e0cad83`. The newer local host
+`8e174d9889c1053e0cb6849bc31ed888dcc5bed1` has focused 3/3 proof but no
+completed same-source composite QBC gate: an actively changing external
+`quanta-index` path dependency invalidated two attempts. Do not promote the
+newer host commit or treat its partial receipts as a replacement qualification.

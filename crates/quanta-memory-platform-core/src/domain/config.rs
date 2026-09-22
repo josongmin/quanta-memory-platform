@@ -31,8 +31,10 @@ pub enum OverrideSource {
     Env,
     /// CLI / process-launch overrides.
     Cli,
-    /// Test fixture overrides (highest authority).
+    /// Test fixture override used during initial resolution.
     TestFixture,
+    /// Accepted live policy replacement after broker construction.
+    RuntimeReconfigure,
 }
 
 impl OverrideSource {
@@ -45,6 +47,7 @@ impl OverrideSource {
             Self::Env => "env",
             Self::Cli => "cli",
             Self::TestFixture => "test_fixture",
+            Self::RuntimeReconfigure => "runtime_reconfigure",
         }
     }
 }
@@ -274,6 +277,7 @@ fn validate_residency_inner(residency: &ResidencyPolicy) -> MemoryResult<()> {
     // (`reserved <= soft <= hard`, `hard <= global`) plus a bounded
     // `burst_percent` in `0..=100`: a group is a named, weighted admission band,
     // so an incoherent band would silently corrupt the scheduler's split.
+    let mut total_group_reserved = 0u64;
     for (group, policy) in &residency.resource_groups {
         if policy.reserved_bytes > policy.soft_cap_bytes {
             return Err(MemoryError::config(format!(
@@ -299,6 +303,10 @@ fn validate_residency_inner(residency: &ResidencyPolicy) -> MemoryResult<()> {
                 policy.burst_percent
             )));
         }
+        total_group_reserved =
+            total_group_reserved.checked_add(policy.reserved_bytes).ok_or_else(|| {
+                MemoryError::config("sum of resource-group reserved bytes overflowed u64")
+            })?;
     }
 
     // Every owner->group mapping must reference a declared resource group, or
@@ -318,6 +326,16 @@ fn validate_residency_inner(residency: &ResidencyPolicy) -> MemoryResult<()> {
     if residency.global_hard_limit_bytes < floor {
         return Err(MemoryError::config(format!(
             "global hard limit {} below reserved+headroom floor {floor}",
+            residency.global_hard_limit_bytes
+        )));
+    }
+    let group_floor =
+        total_group_reserved.checked_add(residency.headroom_bytes).ok_or_else(|| {
+            MemoryError::config("resource-group reserved+headroom floor overflowed u64")
+        })?;
+    if residency.global_hard_limit_bytes < group_floor {
+        return Err(MemoryError::config(format!(
+            "global hard limit {} below resource-group reserved+headroom floor {group_floor}",
             residency.global_hard_limit_bytes
         )));
     }
@@ -639,11 +657,10 @@ mod tests {
         }
     }
 
-    // scenario B: a resource group never mutates the global reserved+headroom
-    // floor — only class reserved bytes contribute to it. A group with large
-    // reserved bytes must still validate when classes leave the floor satisfied.
+    // Class and resource-group reservations are independent overlapping axes:
+    // each axis must fit the global band, but they are not summed together.
     #[test]
-    fn resource_group_reserved_does_not_count_against_global_floor() {
+    fn resource_group_reserved_has_an_independent_global_floor() {
         let residency =
             ResidencyPolicy::new(10_000).with_headroom_bytes(1_000).with_resource_group(
                 "group:a",
@@ -656,9 +673,36 @@ mod tests {
                     admission_weight: 1,
                 },
             );
-        // floor is only headroom (1_000) since no class reserves anything;
-        // the group's 5_000 reserved does not push global below the floor.
         assert!(validate_residency(&residency).is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_group_reserved_plus_headroom_above_global() {
+        let residency = ResidencyPolicy::new(10_000)
+            .with_headroom_bytes(1_000)
+            .with_resource_group(
+                "group:a",
+                ResourceGroup {
+                    reserved_bytes: 5_000,
+                    soft_cap_bytes: 5_000,
+                    hard_cap_bytes: 5_000,
+                    burst_percent: 0,
+                    reclaim_priority: ReclaimPriority::Normal,
+                    admission_weight: 1,
+                },
+            )
+            .with_resource_group(
+                "group:b",
+                ResourceGroup {
+                    reserved_bytes: 5_000,
+                    soft_cap_bytes: 5_000,
+                    hard_cap_bytes: 5_000,
+                    burst_percent: 0,
+                    reclaim_priority: ReclaimPriority::Normal,
+                    admission_weight: 1,
+                },
+            );
+        assert!(matches!(validate_residency(&residency), Err(MemoryError::Config(_))));
     }
 
     // scenario D: an owner->group mapping to an undeclared group is rejected.

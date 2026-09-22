@@ -6,7 +6,12 @@
 //! [`BrokerConformanceTarget`], so the SAME suite runs against the real contract
 //! and against (honest or deliberately broken) fakes.
 
-use quanta_memory_platform_core::{AllocatorAdvisory, AllocatorSnapshot, LiveProcessMemoryBroker};
+use std::cell::RefCell;
+
+use quanta_memory_platform_core::{
+    AllocatorAdvisory, AllocatorSnapshot, LiveProcessMemoryBroker, ManagedCharge,
+    PendingReservation,
+};
 
 use crate::fake::FakeProcessBroker;
 
@@ -18,6 +23,19 @@ pub struct AccountingView {
     pub total_class_bytes: u64,
     /// Sum of all per-owner usage totals.
     pub total_owner_bytes: u64,
+    /// Sum of the request context used by this conformance workload.
+    pub total_context_bytes: u64,
+    /// Exact totals for Request, Session, Generation, Runtime and Background.
+    pub context_axis_bytes: [u64; 5],
+    /// Exact totals for the two stable class axes.
+    pub class_axis_bytes: [u64; 2],
+    /// Exact totals for the two stable owners used by the suite.
+    pub owner_axis_bytes: [u64; 2],
+    /// Exact totals for the two stable resource groups used by generated traces.
+    /// Targets without those groups report zeroes.
+    pub group_axis_bytes: [u64; 2],
+    /// Pending plus committed ticket authorities that have not terminated.
+    pub live_ticket_count: usize,
     /// Owner retained-payload bytes.
     pub total_retained_payload_bytes: u64,
     /// Owner retained-metadata bytes.
@@ -46,10 +64,16 @@ pub struct AllocatorAdvisoryView {
 impl AccountingView {
     /// The partition sum that owner usage must equal (invariant 2).
     #[must_use]
-    pub fn partition_sum(&self) -> u64 {
+    pub fn checked_partition_sum(&self) -> Option<u64> {
         self.total_retained_payload_bytes
-            .saturating_add(self.total_retained_metadata_bytes)
-            .saturating_add(self.total_live_scratch_bytes)
+            .checked_add(self.total_retained_metadata_bytes)?
+            .checked_add(self.total_live_scratch_bytes)
+    }
+
+    /// Checked sum of the five context axes.
+    #[must_use]
+    pub fn checked_context_sum(&self) -> Option<u64> {
+        self.context_axis_bytes.iter().try_fold(0u64, |sum, bytes| sum.checked_add(*bytes))
     }
 }
 
@@ -93,7 +117,7 @@ pub trait BrokerConformanceTarget {
     }
 
     /// A neutral read of current accounting.
-    fn view(&self) -> AccountingView;
+    fn view(&self) -> Result<AccountingView, String>;
 
     /// Observe allocator telemetry without mutating semantic accounting.
     fn observe_allocator(
@@ -113,6 +137,21 @@ pub enum ChargeAxis {
 /// The two stable conformance class axes used by the suite. Both targets map
 /// these onto two distinct concrete classes.
 const CONFORMANCE_CLASS_AXES: &[&str] = &["artifact-cache", "evidence-cache"];
+
+/// Testkit-owned state machine around the production RAII authorities. The
+/// conformance suite retains reference-based replay probes, but the core crate
+/// no longer exposes cloneable raw ledger tickets to support them.
+#[derive(Debug)]
+pub struct LiveConformanceTicket {
+    state: RefCell<LiveConformanceTicketState>,
+}
+
+#[derive(Debug)]
+enum LiveConformanceTicketState {
+    Pending(PendingReservation),
+    Committed(ManagedCharge),
+    Released,
+}
 
 fn map_charge(axis: ChargeAxis) -> quanta_memory_platform_core::ChargeKind {
     use quanta_memory_platform_core::ChargeKind;
@@ -166,16 +205,57 @@ impl BrokerConformanceTarget for FakeProcessBroker {
 
     // class_axes: uses the trait's provided default (CONFORMANCE_CLASS_AXES).
 
-    fn view(&self) -> AccountingView {
+    fn view(&self) -> Result<AccountingView, String> {
         let snap = self.snapshot();
-        AccountingView {
+        let class_axis_bytes = [
+            snap.class_usage
+                .get(&quanta_memory_platform_core::MemoryClass::ArtifactCache)
+                .map_or(0, crate::fake::FakeUsage::total),
+            snap.class_usage
+                .get(&quanta_memory_platform_core::MemoryClass::EvidenceCache)
+                .map_or(0, crate::fake::FakeUsage::total),
+        ];
+        let owner_axis_bytes = [
+            snap.owner_usage.get("owner:conformance-a").map_or(0, crate::fake::FakeUsage::total),
+            snap.owner_usage.get("owner:conformance-b").map_or(0, crate::fake::FakeUsage::total),
+        ];
+        Ok(AccountingView {
             total_class_bytes: snap.total_class_bytes(),
             total_owner_bytes: snap.total_owner_bytes(),
+            total_context_bytes: snap
+                .context_usage
+                .values()
+                .map(crate::fake::FakeUsage::total)
+                .sum(),
+            context_axis_bytes: [
+                snap.context_usage
+                    .get(&quanta_memory_platform_core::MemoryContextKind::Request)
+                    .map_or(0, crate::fake::FakeUsage::total),
+                snap.context_usage
+                    .get(&quanta_memory_platform_core::MemoryContextKind::Session)
+                    .map_or(0, crate::fake::FakeUsage::total),
+                snap.context_usage
+                    .get(&quanta_memory_platform_core::MemoryContextKind::Generation)
+                    .map_or(0, crate::fake::FakeUsage::total),
+                snap.context_usage
+                    .get(&quanta_memory_platform_core::MemoryContextKind::Runtime)
+                    .map_or(0, crate::fake::FakeUsage::total),
+                snap.context_usage
+                    .get(&quanta_memory_platform_core::MemoryContextKind::Background)
+                    .map_or(0, crate::fake::FakeUsage::total),
+            ],
+            class_axis_bytes,
+            owner_axis_bytes,
+            group_axis_bytes: [
+                snap.group_usage.get("conformance-group-a").copied().unwrap_or(0),
+                snap.group_usage.get("conformance-group-b").copied().unwrap_or(0),
+            ],
+            live_ticket_count: snap.live_ticket_count,
             total_retained_payload_bytes: snap.total_retained_payload_bytes(),
             total_retained_metadata_bytes: snap.total_retained_metadata_bytes(),
             total_live_scratch_bytes: snap.total_live_scratch_bytes(),
             rebuild_in_progress: snap.rebuild_in_progress,
-        }
+        })
     }
 
     fn observe_allocator(
@@ -193,7 +273,7 @@ impl BrokerConformanceTarget for FakeProcessBroker {
 }
 
 impl BrokerConformanceTarget for LiveProcessMemoryBroker {
-    type Ticket = quanta_memory_platform_core::ReservationTicket;
+    type Ticket = LiveConformanceTicket;
 
     fn do_reserve(
         &mut self,
@@ -207,16 +287,57 @@ impl BrokerConformanceTarget for LiveProcessMemoryBroker {
         // The real broker takes a context kind; the conformance suite charges all
         // bytes against a single Request context (the context axis is checked by
         // the core's own owner-tests, not by the portable suite).
-        self.reserve(class, owner.to_string(), MemoryContextKind::Request, map_charge(kind), bytes)
-            .map_err(|e| e.to_string())
+        self.reserve_owned(
+            class,
+            owner.to_string(),
+            MemoryContextKind::Request,
+            map_charge(kind),
+            bytes,
+        )
+        .map(|pending| LiveConformanceTicket {
+            state: RefCell::new(LiveConformanceTicketState::Pending(pending)),
+        })
+        .map_err(|e| e.to_string())
     }
 
     fn do_commit(&mut self, ticket: &Self::Ticket) -> Result<(), String> {
-        LiveProcessMemoryBroker::commit(self, ticket).map(|_| ()).map_err(|e| e.to_string())
+        let current = ticket.state.replace(LiveConformanceTicketState::Released);
+        match current {
+            LiveConformanceTicketState::Pending(pending) => match pending.commit() {
+                Ok(charge) => {
+                    ticket.state.replace(LiveConformanceTicketState::Committed(charge));
+                    Ok(())
+                }
+                Err(error) => Err(error.to_string()),
+            },
+            LiveConformanceTicketState::Committed(charge) => {
+                ticket.state.replace(LiveConformanceTicketState::Committed(charge));
+                Err("reservation is already committed".to_string())
+            }
+            LiveConformanceTicketState::Released => {
+                Err("reservation is already released".to_string())
+            }
+        }
     }
 
     fn do_release(&mut self, ticket: &Self::Ticket) -> Result<(), String> {
-        LiveProcessMemoryBroker::release(self, ticket).map_err(|e| e.to_string())
+        let current = ticket.state.replace(LiveConformanceTicketState::Released);
+        match current {
+            LiveConformanceTicketState::Pending(pending) => {
+                drop(pending);
+                Ok(())
+            }
+            LiveConformanceTicketState::Committed(mut charge) => match charge.release() {
+                Ok(()) => Ok(()),
+                Err(error) => {
+                    ticket.state.replace(LiveConformanceTicketState::Committed(charge));
+                    Err(error.to_string())
+                }
+            },
+            LiveConformanceTicketState::Released => {
+                Err("reservation is already released".to_string())
+            }
+        }
     }
 
     fn do_begin_rebuild(&mut self) -> Result<(), String> {
@@ -229,20 +350,67 @@ impl BrokerConformanceTarget for LiveProcessMemoryBroker {
 
     // class_axes: uses the trait's provided default (CONFORMANCE_CLASS_AXES).
 
-    fn view(&self) -> AccountingView {
-        // A poisoned lock cannot fabricate usage; report an empty view, which the
-        // balance/partition invariants treat as a consistent zero state.
-        match self.ledger_snapshot() {
-            Ok(snap) => AccountingView {
-                total_class_bytes: snap.total_class_bytes(),
-                total_owner_bytes: snap.total_owner_bytes(),
-                total_retained_payload_bytes: snap.total_retained_payload_bytes(),
-                total_retained_metadata_bytes: snap.total_retained_metadata_bytes(),
-                total_live_scratch_bytes: snap.total_live_scratch_bytes(),
-                rebuild_in_progress: snap.rebuild_in_progress,
-            },
-            Err(_) => AccountingView::default(),
-        }
+    fn view(&self) -> Result<AccountingView, String> {
+        self.observe()
+            .map(|observation| {
+                let snap = observation.ledger;
+                AccountingView {
+                    total_class_bytes: snap.total_class_bytes(),
+                    total_owner_bytes: snap.total_owner_bytes(),
+                    total_context_bytes: snap.total_context_bytes(),
+                    context_axis_bytes: [
+                        snap.context_usage
+                            .get(&quanta_memory_platform_core::MemoryContextKind::Request)
+                            .map_or(0, quanta_memory_platform_core::UsageBreakdown::total),
+                        snap.context_usage
+                            .get(&quanta_memory_platform_core::MemoryContextKind::Session)
+                            .map_or(0, quanta_memory_platform_core::UsageBreakdown::total),
+                        snap.context_usage
+                            .get(&quanta_memory_platform_core::MemoryContextKind::Generation)
+                            .map_or(0, quanta_memory_platform_core::UsageBreakdown::total),
+                        snap.context_usage
+                            .get(&quanta_memory_platform_core::MemoryContextKind::Runtime)
+                            .map_or(0, quanta_memory_platform_core::UsageBreakdown::total),
+                        snap.context_usage
+                            .get(&quanta_memory_platform_core::MemoryContextKind::Background)
+                            .map_or(0, quanta_memory_platform_core::UsageBreakdown::total),
+                    ],
+                    class_axis_bytes: [
+                        snap.class_usage
+                            .get(&quanta_memory_platform_core::MemoryClass::ArtifactCache)
+                            .map_or(0, quanta_memory_platform_core::UsageBreakdown::total),
+                        snap.class_usage
+                            .get(&quanta_memory_platform_core::MemoryClass::EvidenceCache)
+                            .map_or(0, quanta_memory_platform_core::UsageBreakdown::total),
+                    ],
+                    owner_axis_bytes: [
+                        snap.owner_usage
+                            .get("owner:conformance-a")
+                            .map_or(0, quanta_memory_platform_core::UsageBreakdown::total),
+                        snap.owner_usage
+                            .get("owner:conformance-b")
+                            .map_or(0, quanta_memory_platform_core::UsageBreakdown::total),
+                    ],
+                    group_axis_bytes: [
+                        observation
+                            .resource_group_usage
+                            .get("conformance-group-a")
+                            .copied()
+                            .unwrap_or(0),
+                        observation
+                            .resource_group_usage
+                            .get("conformance-group-b")
+                            .copied()
+                            .unwrap_or(0),
+                    ],
+                    live_ticket_count: snap.live_ticket_count,
+                    total_retained_payload_bytes: snap.total_retained_payload_bytes(),
+                    total_retained_metadata_bytes: snap.total_retained_metadata_bytes(),
+                    total_live_scratch_bytes: snap.total_live_scratch_bytes(),
+                    rebuild_in_progress: snap.rebuild_in_progress,
+                }
+            })
+            .map_err(|error| error.to_string())
     }
 
     fn observe_allocator(

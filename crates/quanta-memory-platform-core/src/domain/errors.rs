@@ -17,6 +17,9 @@ pub enum MemoryError {
     Closed(String),
     /// Another lifecycle transition owns the store's mutation lane.
     OperationInProgress(String),
+    /// An authority lock or backing store was poisoned. This is distinct from
+    /// empty state and from semantic invariant corruption.
+    Poisoned(String),
     InvalidState(String),
     Report(String),
     Unsupported(String),
@@ -43,6 +46,10 @@ impl MemoryError {
         Self::OperationInProgress(resource.into())
     }
 
+    pub fn poisoned(resource: impl Into<String>) -> Self {
+        Self::Poisoned(resource.into())
+    }
+
     pub fn report(message: impl Into<String>) -> Self {
         Self::Report(message.into())
     }
@@ -58,6 +65,7 @@ impl Display for MemoryError {
             Self::OperationInProgress(resource) => {
                 write!(f, "operation in progress: {resource}")
             }
+            Self::Poisoned(resource) => write!(f, "poisoned: {resource}"),
             Self::InvalidState(message) => write!(f, "invalid state: {message}"),
             Self::Report(message) => write!(f, "report error: {message}"),
             Self::Unsupported(message) => write!(f, "unsupported: {message}"),

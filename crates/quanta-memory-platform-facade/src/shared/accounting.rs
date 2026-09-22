@@ -5,6 +5,8 @@
 //! [`ManagedCharge`]. This fixes one global lock order (`store -> broker`) and
 //! prevents reentrant accounting callbacks from entering a locked store.
 
+#[cfg(any(feature = "revocable_store", feature = "transcript"))]
+use quanta_memory_platform_core::MemoryEvent;
 #[cfg(any(
     feature = "payload_store",
     feature = "retained_map",
@@ -16,6 +18,8 @@ use quanta_memory_platform_core::{
     ChargeKind, LiveProcessMemoryBroker, ManagedCharge, MemoryClass, MemoryContextKind,
     MemoryResult, OwnerKey,
 };
+#[cfg(feature = "revocable_store")]
+use quanta_memory_platform_core::{MemoryOperation, MemoryOutcome};
 
 /// Builder state before accounting policy has been selected.
 ///
@@ -150,6 +154,37 @@ pub(crate) enum StoreAccounting {
     feature = "publish_pipeline"
 ))]
 impl StoreAccounting {
+    #[cfg(any(feature = "revocable_store", feature = "transcript"))]
+    pub(crate) fn emit(&self, event: MemoryEvent) {
+        match self {
+            Self::Budgeted(broker) => broker.record_advisory_event(event),
+            #[cfg(any(
+                feature = "unbudgeted-stores",
+                all(
+                    test,
+                    any(
+                        feature = "retained_map",
+                        feature = "transcript",
+                        feature = "publish_pipeline"
+                    )
+                )
+            ))]
+            Self::Unbudgeted => {}
+        }
+    }
+
+    #[cfg(feature = "revocable_store")]
+    pub(crate) fn emit_result<T>(
+        &self,
+        operation: MemoryOperation,
+        bytes: Option<u64>,
+        result: &MemoryResult<T>,
+    ) {
+        let outcome =
+            result.as_ref().map_or_else(MemoryOutcome::from_error, |_| MemoryOutcome::Succeeded);
+        self.emit(MemoryEvent::new(operation, outcome, bytes));
+    }
+
     pub(crate) fn charge(
         &self,
         class: MemoryClass,

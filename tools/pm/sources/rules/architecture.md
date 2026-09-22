@@ -49,8 +49,8 @@ Boundary rules (hexagonal direction is inward-only):
 - **`application/`** orchestrates domain + ports; carries no host nouns.
 - **`api/`** is the public broker surface, builder-first. Low-level broker
   backdoors stay `pub(crate)` / unexported.
-- **`facade`** composes core behind builders; storage backings (redb, moka, scc)
-  are feature-gated and confined to their `*/backings/` modules.
+- **`facade`** composes core behind builders; production storage backings such
+  as redb are feature-gated and confined to their `*/backings/` modules.
 - **`testkit`** is NEVER a mandatory production dependency. `alloc_tracking` (the
   only `tracking-allocator` integration) is feature-gated so it can never enter a
   production graph.

@@ -13,18 +13,28 @@ use std::sync::{Arc, Mutex, PoisonError};
 use crate::adapters::scratch::BrokerBoundScratchAllocator;
 use crate::application::controller::LadderPressureController;
 use crate::application::scheduler::WeightedResourceGroupScheduler;
-use crate::domain::config::ValidatedResidencyPolicy;
+use crate::domain::config::{OverrideRecord, OverrideSource, ValidatedResidencyPolicy};
 use crate::domain::context::{
     MemoryContextHandle, MemoryContextKind, OwnerKey, RuntimeId, RuntimeKind,
 };
 use crate::domain::errors::{MemoryError, MemoryResult};
 use crate::domain::ledger::{AccountingLedger, ChargeKind, LedgerSnapshot, ReservationTicket};
-use crate::domain::policy::{MemoryClass, ResidencyPolicy};
+use crate::domain::policy::{MemoryClass, ReclaimPriority, ResidencyPolicy};
 use crate::domain::recharge::{RechargeError, RechargeRecoveryV1};
-use crate::domain::stats::{AllocatorSnapshot, EffectiveMemoryBudgetReport, PressureState};
+use crate::domain::stats::{
+    AllocatorSnapshot, BrokerObservation, EffectiveMemoryBudgetReport, PressureState,
+    ReclaimRuntimeStats,
+};
+use crate::ports::reclaim::{
+    MemoryReclaimer, ReclaimCandidate, ReclaimGroupCandidate, ReclaimRequest, ReclaimTrigger,
+};
 use crate::ports::scratch::ScratchAllocator;
 use crate::ports::store::StoreBindingHandle;
-use crate::ports::telemetry::AllocatorAdvisory;
+#[cfg(test)]
+use crate::ports::telemetry::NoopMemoryEventSink;
+use crate::ports::telemetry::{
+    AllocatorAdvisory, MemoryEvent, MemoryEventSink, MemoryOperation, MemoryOutcome,
+};
 
 /// A live, accounting-backed process memory broker.
 ///
@@ -34,6 +44,7 @@ use crate::ports::telemetry::AllocatorAdvisory;
 #[derive(Clone)]
 pub struct LiveProcessMemoryBroker {
     inner: Arc<Mutex<BrokerCore>>,
+    events: Arc<dyn MemoryEventSink>,
 }
 
 struct BrokerCore {
@@ -49,6 +60,8 @@ struct BrokerCore {
     /// fence was closed. They remain charged until `finish_rebuild` opens the
     /// fence and releases the complete batch atomically.
     deferred_committed_releases: Vec<ReservationTicket>,
+    reclaimer: Option<Arc<dyn MemoryReclaimer>>,
+    reclaim_stats: ReclaimRuntimeStats,
 }
 
 /// An owned pending reservation. This type is intentionally not `Clone`.
@@ -71,14 +84,27 @@ impl PendingReservation {
         self.ticket.as_ref().expect("pending reservation owns a ticket").bytes()
     }
 
-    /// Consume this pending authority and produce one committed charge.
-    /// A failed commit rolls the pending reservation back before returning.
-    pub fn commit(mut self) -> MemoryResult<CommittedCharge> {
-        let ticket = self.ticket.take().expect("pending reservation owns a ticket");
-        match self.broker.commit(&ticket) {
-            Ok(_) => Ok(CommittedCharge { ticket }),
+    /// Consume this pending authority and produce one broker-bound committed
+    /// lease. A failed commit rolls the pending reservation back before
+    /// returning; dropping the successful lease releases the charge.
+    pub fn commit(mut self) -> MemoryResult<ManagedCharge> {
+        let ticket = self.ticket.as_ref().expect("pending reservation owns a ticket");
+        match self.broker.commit(ticket) {
+            Ok(_) => Ok(ManagedCharge {
+                broker: self.broker.clone(),
+                charge: Some(CommittedCharge {
+                    ticket: self.ticket.take().expect("successful commit retains ticket authority"),
+                }),
+            }),
             Err(error) => {
-                self.broker.rollback_pending_ticket(&ticket)?;
+                // Do not remove the only rollback authority until rollback has
+                // succeeded. In particular, a poisoned broker rejects both the
+                // commit and the ordinary rollback. Leaving the ticket in
+                // `self` makes Drop execute the poison-recovering exact rollback
+                // before this method returns the original commit error.
+                if self.broker.rollback_pending_ticket(ticket).is_ok() {
+                    self.ticket = None;
+                }
                 Err(error)
             }
         }
@@ -143,34 +169,26 @@ impl crate::api::broker::RuntimeMemoryView for LiveRuntimeMemoryView {
     }
 }
 
-/// Single-owner committed accounting authority.
-///
-/// This type is intentionally not `Clone`:
-///
-/// ```compile_fail
-/// # use quanta_memory_platform_core::CommittedCharge;
-/// # fn cannot_clone(charge: CommittedCharge) {
-/// let duplicate = charge.clone();
-/// # }
-/// ```
+/// Internal single-owner committed accounting authority. It is always wrapped
+/// by [`ManagedCharge`] before crossing the public boundary.
 #[derive(Debug, PartialEq, Eq)]
-pub struct CommittedCharge {
+pub(crate) struct CommittedCharge {
     ticket: ReservationTicket,
 }
 
 impl CommittedCharge {
     #[must_use]
-    pub fn id(&self) -> u64 {
+    pub(crate) fn id(&self) -> u64 {
         self.ticket.id()
     }
 
     #[must_use]
-    pub fn bytes(&self) -> u64 {
+    pub(crate) fn bytes(&self) -> u64 {
         self.ticket.bytes()
     }
 
     #[must_use]
-    pub fn class(&self) -> &MemoryClass {
+    pub(crate) fn class(&self) -> &MemoryClass {
         self.ticket.class()
     }
 }
@@ -178,23 +196,22 @@ impl CommittedCharge {
 /// Failed consuming release. The unchanged live charge is returned so the
 /// caller never loses accounting authority on an error path.
 #[derive(Debug)]
-pub struct ChargeReleaseError {
-    pub error: MemoryError,
-    pub charge: CommittedCharge,
+pub(crate) struct ChargeReleaseError {
+    pub(crate) error: MemoryError,
+    pub(crate) charge: CommittedCharge,
 }
 
 /// Recovery disposition for a failed consuming recharge.
 #[derive(Debug)]
-pub enum ChargeRechargeRecovery {
+pub(crate) enum ChargeRechargeRecovery {
     ChargePreserved(CommittedCharge),
-    RecoveryRequired { rollback_error: MemoryError },
 }
 
 /// Failed consuming recharge with explicit ownership recovery.
 #[derive(Debug)]
-pub struct ChargeRechargeError {
-    pub error: MemoryError,
-    pub recovery: ChargeRechargeRecovery,
+pub(crate) struct ChargeRechargeError {
+    pub(crate) error: MemoryError,
+    pub(crate) recovery: ChargeRechargeRecovery,
 }
 
 /// Recovery disposition for a failed [`ManagedCharge::recharge`]. The lease
@@ -233,6 +250,14 @@ pub struct ManagedCharge {
 }
 
 impl ManagedCharge {
+    /// Whether this live lease was issued by the given broker authority.
+    /// Transfer consumers must check this before attaching a charge to a
+    /// different store; matching ticket numbers are not broker identity.
+    #[must_use]
+    pub fn belongs_to(&self, broker: &LiveProcessMemoryBroker) -> bool {
+        Arc::ptr_eq(&self.broker.inner, &broker.inner)
+    }
+
     #[must_use]
     pub fn is_active(&self) -> bool {
         self.charge.is_some()
@@ -316,13 +341,6 @@ impl ManagedCharge {
                     recovery: ManagedChargeRechargeRecovery::ChargePreserved,
                 })
             }
-            Err(ChargeRechargeError {
-                error,
-                recovery: ChargeRechargeRecovery::RecoveryRequired { rollback_error },
-            }) => Err(ManagedChargeRechargeError {
-                error,
-                recovery: ManagedChargeRechargeRecovery::RecoveryRequired { rollback_error },
-            }),
         }
     }
 }
@@ -339,7 +357,28 @@ impl LiveProcessMemoryBroker {
     /// Build a live broker from a validated effective report. The residency
     /// policy is re-validated here so a broker can never come up on an invalid
     /// policy.
+    #[cfg(test)]
     pub(crate) fn from_report(report: EffectiveMemoryBudgetReport) -> MemoryResult<Self> {
+        Self::from_report_with_reclaimer(report, None)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_report_with_reclaimer(
+        report: EffectiveMemoryBudgetReport,
+        reclaimer: Option<Arc<dyn MemoryReclaimer>>,
+    ) -> MemoryResult<Self> {
+        Self::from_report_with_reclaimer_and_events(
+            report,
+            reclaimer,
+            Arc::new(NoopMemoryEventSink),
+        )
+    }
+
+    pub(crate) fn from_report_with_reclaimer_and_events(
+        report: EffectiveMemoryBudgetReport,
+        reclaimer: Option<Arc<dyn MemoryReclaimer>>,
+        events: Arc<dyn MemoryEventSink>,
+    ) -> MemoryResult<Self> {
         let validated = ValidatedResidencyPolicy::try_from(report.residency.clone())?;
         let residency = validated.as_policy();
         let scheduler = WeightedResourceGroupScheduler::new(
@@ -360,12 +399,47 @@ impl LiveProcessMemoryBroker {
                 report,
                 ticket_groups: BTreeMap::new(),
                 deferred_committed_releases: Vec::new(),
+                reclaimer,
+                reclaim_stats: ReclaimRuntimeStats::default(),
             })),
+            events,
         })
     }
 
     fn lock(&self) -> MemoryResult<std::sync::MutexGuard<'_, BrokerCore>> {
-        self.inner.lock().map_err(|_| MemoryError::InvalidState("broker lock poisoned".to_string()))
+        self.inner.lock().map_err(|_| MemoryError::poisoned("broker lock"))
+    }
+
+    fn outcome(error: &MemoryError) -> MemoryOutcome {
+        MemoryOutcome::from_error(error)
+    }
+
+    fn emit(&self, event: MemoryEvent) {
+        if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.events.emit(event);
+        })) {
+            // A telemetry sink has no accounting authority. Contain a hostile
+            // panic payload rather than letting observation abort a caller.
+            std::mem::forget(payload);
+        }
+    }
+
+    /// Record one advisory, bounded-cardinality event. This is the facade/host
+    /// bridge for operations whose authority lives outside the core broker
+    /// (store close, spill, restore and tombstone saturation). The sink cannot
+    /// mutate accounting through this API, and a sink panic is contained.
+    pub fn record_advisory_event(&self, event: MemoryEvent) {
+        self.emit(event);
+    }
+
+    fn emit_result<T>(
+        &self,
+        operation: MemoryOperation,
+        bytes: Option<u64>,
+        result: &MemoryResult<T>,
+    ) {
+        let outcome = result.as_ref().map_or_else(Self::outcome, |_| MemoryOutcome::Succeeded);
+        self.emit(MemoryEvent::new(operation, outcome, bytes));
     }
 
     /// Reserve bytes against (class, owner, context). Fail-closed before
@@ -373,7 +447,7 @@ impl LiveProcessMemoryBroker {
     /// resource group (weighted-fair admission), and enforces the execution
     /// scratch budget for live-scratch charges — both BEFORE any ledger mutation,
     /// so a denial leaves the ledger byte-for-byte unchanged.
-    pub fn reserve(
+    pub(crate) fn reserve(
         &self,
         class: MemoryClass,
         owner: OwnerKey,
@@ -381,8 +455,7 @@ impl LiveProcessMemoryBroker {
         kind: ChargeKind,
         bytes: u64,
     ) -> MemoryResult<ReservationTicket> {
-        let mut core = self.lock()?;
-        Self::reserve_on(&mut core, class, owner, context, kind, bytes)
+        self.reserve_with_reclaim(class, owner, context, kind, bytes, false)
     }
 
     /// Canonical single-owner reservation path. If the returned value is
@@ -395,15 +468,18 @@ impl LiveProcessMemoryBroker {
         kind: ChargeKind,
         bytes: u64,
     ) -> MemoryResult<PendingReservation> {
-        let ticket = self.reserve(class, owner, context, kind, bytes)?;
-        Ok(PendingReservation { broker: self.clone(), ticket: Some(ticket) })
+        let result = self
+            .reserve(class, owner, context, kind, bytes)
+            .map(|ticket| PendingReservation { broker: self.clone(), ticket: Some(ticket) });
+        self.emit_result(MemoryOperation::Reserve, Some(bytes), &result);
+        result
     }
 
     /// Reserve AND commit under a SINGLE lock acquisition, so no live reconfigure
     /// or rebuild can interleave between the reservation and its commit (which
     /// would otherwise strand reserved bytes behind a discarded ticket). This is
     /// the atomic charge primitive the facade charged-store seam relies on.
-    pub fn reserve_committed(
+    fn reserve_committed(
         &self,
         class: MemoryClass,
         owner: OwnerKey,
@@ -411,12 +487,11 @@ impl LiveProcessMemoryBroker {
         kind: ChargeKind,
         bytes: u64,
     ) -> MemoryResult<ReservationTicket> {
-        let mut core = self.lock()?;
-        Self::reserve_committed_on(&mut core, class, owner, context, kind, bytes)
+        self.reserve_with_reclaim(class, owner, context, kind, bytes, true)
     }
 
     /// Canonical atomic reserve+commit path returning non-clone authority.
-    pub fn reserve_committed_owned(
+    fn reserve_committed_owned(
         &self,
         class: MemoryClass,
         owner: OwnerKey,
@@ -439,30 +514,32 @@ impl LiveProcessMemoryBroker {
         kind: ChargeKind,
         bytes: u64,
     ) -> MemoryResult<ManagedCharge> {
-        let charge = self.reserve_committed_owned(class, owner, context, kind, bytes)?;
-        Ok(ManagedCharge { broker: self.clone(), charge: Some(charge) })
+        let result = self
+            .reserve_committed_owned(class, owner, context, kind, bytes)
+            .map(|charge| ManagedCharge { broker: self.clone(), charge: Some(charge) });
+        self.emit_result(MemoryOperation::Reserve, Some(bytes), &result);
+        result
     }
 
-    /// Consume a committed charge. On denial the same charge is returned.
-    ///
-    /// ```compile_fail
-    /// # use quanta_memory_platform_core::{CommittedCharge, LiveProcessMemoryBroker};
-    /// # fn cannot_reuse(broker: &LiveProcessMemoryBroker, charge: CommittedCharge) {
-    /// let result = broker.release_owned(charge);
-    /// let bytes = charge.bytes();
-    /// # }
-    /// ```
-    pub fn release_owned(&self, charge: CommittedCharge) -> Result<(), ChargeReleaseError> {
-        match self.release(&charge.ticket) {
+    /// Consume an internal committed charge. On denial the same charge is
+    /// returned to its broker-bound [`ManagedCharge`] owner.
+    fn release_owned(&self, charge: CommittedCharge) -> Result<(), ChargeReleaseError> {
+        let bytes = charge.bytes();
+        let result = match self.release(&charge.ticket) {
             Ok(()) => Ok(()),
             Err(error) => Err(ChargeReleaseError { error, charge }),
-        }
+        };
+        let outcome = result
+            .as_ref()
+            .map_or_else(|error| Self::outcome(&error.error), |_| MemoryOutcome::Succeeded);
+        self.emit(MemoryEvent::new(MemoryOperation::Release, outcome, Some(bytes)));
+        result
     }
 
     /// Consume an old committed charge and atomically return its replacement.
     /// Every failure branch returns either a live charge or an explicit recovery
     /// failure; ownership is never silently discarded.
-    pub fn recharge_owned(
+    fn recharge_owned(
         &self,
         old: CommittedCharge,
         class: MemoryClass,
@@ -471,7 +548,7 @@ impl LiveProcessMemoryBroker {
         kind: ChargeKind,
         bytes: u64,
     ) -> Result<CommittedCharge, ChargeRechargeError> {
-        match self.recharge(&old.ticket, class, owner, context, kind, bytes) {
+        let result = match self.recharge(&old.ticket, class, owner, context, kind, bytes) {
             Ok(ticket) => Ok(CommittedCharge { ticket }),
             Err(RechargeError { error, recovery: RechargeRecoveryV1::OldChargePreserved }) => {
                 Err(ChargeRechargeError {
@@ -479,21 +556,12 @@ impl LiveProcessMemoryBroker {
                     recovery: ChargeRechargeRecovery::ChargePreserved(old),
                 })
             }
-            Err(RechargeError {
-                error,
-                recovery: RechargeRecoveryV1::OldChargeRestored(ticket),
-            }) => Err(ChargeRechargeError {
-                error,
-                recovery: ChargeRechargeRecovery::ChargePreserved(CommittedCharge { ticket }),
-            }),
-            Err(RechargeError {
-                error,
-                recovery: RechargeRecoveryV1::RecoveryRequired { rollback_error },
-            }) => Err(ChargeRechargeError {
-                error,
-                recovery: ChargeRechargeRecovery::RecoveryRequired { rollback_error },
-            }),
-        }
+        };
+        let outcome = result
+            .as_ref()
+            .map_or_else(|error| Self::outcome(&error.error), |_| MemoryOutcome::Succeeded);
+        self.emit(MemoryEvent::new(MemoryOperation::Recharge, outcome, Some(bytes)));
+        result
     }
 
     /// Atomically swap one committed charge for another under a SINGLE lock:
@@ -510,7 +578,7 @@ impl LiveProcessMemoryBroker {
     /// Because release-then-charge happens under one lock, an overwrite never
     /// transiently double-counts against caps/group admission, and no rebuild can
     /// interleave to strand bytes.
-    pub fn recharge(
+    pub(crate) fn recharge(
         &self,
         old: &ReservationTicket,
         class: MemoryClass,
@@ -553,12 +621,49 @@ impl LiveProcessMemoryBroker {
             })?;
         }
 
+        // Recharge is an admission operation too. Validate the same complete
+        // resource-group floor postimage as reserve, after removing the old
+        // non-headroom charge and adding the replacement. Without this check a
+        // peer group could consume another group's reserved floor by growing an
+        // already-live charge instead of issuing a fresh reserve.
+        let non_headroom_current = core.ledger.non_headroom_bytes();
+        let without_old = if *old.class() == MemoryClass::Headroom {
+            non_headroom_current
+        } else {
+            non_headroom_current.checked_sub(old.bytes()).ok_or_else(|| RechargeError {
+                error: MemoryError::InvalidState(
+                    "non-headroom recharge old charge exceeds live usage".into(),
+                ),
+                recovery: RechargeRecoveryV1::OldChargePreserved,
+            })?
+        };
+        let non_headroom_after = if class == MemoryClass::Headroom {
+            without_old
+        } else {
+            without_old.checked_add(bytes).ok_or_else(|| RechargeError {
+                error: MemoryError::capacity("non-headroom recharge total exceeds u64"),
+                recovery: RechargeRecoveryV1::OldChargePreserved,
+            })?
+        };
+        let non_headroom_band = core
+            .ledger
+            .policy()
+            .global_hard_limit_bytes
+            .checked_sub(core.ledger.policy().headroom_bytes)
+            .ok_or_else(|| RechargeError {
+                error: MemoryError::capacity("headroom exceeds global hard limit"),
+                recovery: RechargeRecoveryV1::OldChargePreserved,
+            })?;
+        next_scheduler.protected_floor_fits(non_headroom_after, non_headroom_band).map_err(
+            |error| RechargeError { error, recovery: RechargeRecoveryV1::OldChargePreserved },
+        )?;
+
         // The execution scratch ceiling is a broker-owned admission axis, not a
         // ledger class cap. Evaluate the same replacement postimage used by the
         // ledger so the atomic primitive cannot bypass this outer authority.
         if let Some(max) = core.report.execution.max_execution_scratch_bytes {
             let max = u64::try_from(max).unwrap_or(u64::MAX);
-            let current = core.ledger.snapshot().total_live_scratch_bytes();
+            let current = core.ledger.total_live_scratch_bytes();
             let without_old = if old.kind() == ChargeKind::LiveScratch {
                 current.checked_sub(old.bytes()).ok_or_else(|| RechargeError {
                     error: MemoryError::InvalidState(
@@ -620,26 +725,269 @@ impl LiveProcessMemoryBroker {
         Ok(ticket)
     }
 
-    /// Release on an already-held lock guard (ledger release + group bookkeeping),
-    /// fail-closed before any scheduler mutation.
-    fn release_on(core: &mut BrokerCore, ticket: &ReservationTicket) -> MemoryResult<()> {
-        let mut next_scheduler = core.scheduler.clone();
-        if let Some(group) = core.ticket_groups.get(&ticket.id()) {
-            next_scheduler.record_release(group, ticket.bytes())?;
+    fn soft_threshold_request(
+        core: &BrokerCore,
+        class: &MemoryClass,
+        owner: &OwnerKey,
+        bytes: u64,
+    ) -> MemoryResult<Option<ReclaimRequest>> {
+        let policy = core.ledger.policy();
+        let class_current = core.ledger.class_usage(class).checked_total()?;
+        let class_after = class_current
+            .checked_add(bytes)
+            .ok_or_else(|| MemoryError::capacity("class prospective usage exceeds u64"))?;
+        let class_crossed = policy.classes.get(class).is_some_and(|budget| {
+            class_current <= budget.soft_cap_bytes && class_after > budget.soft_cap_bytes
+        });
+
+        let owner_current = core.ledger.owner_usage(owner).checked_total()?;
+        let owner_after = owner_current
+            .checked_add(bytes)
+            .ok_or_else(|| MemoryError::capacity("owner prospective usage exceeds u64"))?;
+        let owner_crossed = policy.owner_quotas.get(owner).is_some_and(|quota| {
+            owner_current <= quota.soft_cap_bytes && owner_after > quota.soft_cap_bytes
+        });
+
+        let group = policy.owner_groups.get(owner).cloned();
+        let group_crossed = group.as_ref().is_some_and(|name| {
+            policy.resource_groups.get(name).is_some_and(|budget| {
+                let current = core.scheduler.current_usage(name);
+                current <= budget.soft_cap_bytes
+                    && current.checked_add(bytes).is_some_and(|after| after > budget.soft_cap_bytes)
+            })
+        });
+
+        if !(class_crossed || owner_crossed || group_crossed) {
+            return Ok(None);
         }
-        core.ledger.release(ticket)?;
-        core.scheduler = next_scheduler;
+        Self::reclaim_request(core, class, owner, group, bytes, ReclaimTrigger::SoftThreshold)
+            .map(Some)
+    }
+
+    fn reclaim_request(
+        core: &BrokerCore,
+        class: &MemoryClass,
+        owner: &OwnerKey,
+        group: Option<String>,
+        bytes: u64,
+        trigger: ReclaimTrigger,
+    ) -> MemoryResult<ReclaimRequest> {
+        let snapshot = core.ledger.snapshot();
+        snapshot.validate_exact()?;
+        let prospective = snapshot
+            .total_owner_bytes()
+            .checked_add(bytes)
+            .ok_or_else(|| MemoryError::capacity("reclaim prospective usage exceeds u64"))?;
+        let classified = core.controller.classify_semantic(prospective);
+        let pressure = match (trigger, classified) {
+            (ReclaimTrigger::SoftThreshold, PressureState::Normal) => PressureState::Soft,
+            (ReclaimTrigger::CapacityDenial, PressureState::Normal | PressureState::Soft) => {
+                PressureState::Hard
+            }
+            _ => classified,
+        };
+        let mut candidates: Vec<ReclaimCandidate> = core
+            .ledger
+            .policy()
+            .classes
+            .iter()
+            .filter(|(_, budget)| budget.hard_cap_bytes > 0)
+            .map(|(candidate, budget)| ReclaimCandidate {
+                class: candidate.clone(),
+                priority: budget.reclaim_priority,
+            })
+            .collect();
+        candidates.sort_by_key(|candidate| {
+            let priority = match candidate.priority {
+                ReclaimPriority::Last => 0,
+                ReclaimPriority::Normal => 1,
+                ReclaimPriority::First => 2,
+            };
+            (priority, candidate.class.clone())
+        });
+        let mut group_candidates: Vec<ReclaimGroupCandidate> = core
+            .ledger
+            .policy()
+            .resource_groups
+            .iter()
+            .map(|(name, budget)| ReclaimGroupCandidate {
+                group: name.clone(),
+                priority: budget.reclaim_priority,
+            })
+            .collect();
+        group_candidates.sort_by_key(|candidate| {
+            let priority = match candidate.priority {
+                ReclaimPriority::Last => 0,
+                ReclaimPriority::Normal => 1,
+                ReclaimPriority::First => 2,
+            };
+            (priority, candidate.group.clone())
+        });
+        Ok(ReclaimRequest {
+            trigger,
+            requested_class: class.clone(),
+            requested_owner: owner.clone(),
+            resource_group: group,
+            requested_bytes: bytes,
+            pressure,
+            rungs: core.controller.ladder_for(pressure),
+            candidates,
+            group_candidates,
+            max_attempts: 1,
+        })
+    }
+
+    fn run_reclaim(&self, reclaimer: Arc<dyn MemoryReclaimer>, request: &ReclaimRequest) {
+        let outcome =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| reclaimer.reclaim(request)));
+        let mut core = match self.lock() {
+            Ok(core) => core,
+            Err(error) => {
+                self.emit(MemoryEvent::new(
+                    MemoryOperation::Reclaim,
+                    Self::outcome(&error),
+                    Some(request.requested_bytes),
+                ));
+                return;
+            }
+        };
+        core.reclaim_stats.attempts += 1;
+        let event_outcome = match outcome {
+            Ok(Ok(outcome)) => {
+                core.reclaim_stats.successes += 1;
+                core.reclaim_stats.reported_reclaimed_bytes += u128::from(outcome.reclaimed_bytes);
+                MemoryOutcome::Succeeded
+            }
+            Ok(Err(_)) => {
+                core.reclaim_stats.failures += 1;
+                MemoryOutcome::CallbackFailed
+            }
+            Err(payload) => {
+                core.reclaim_stats.failures += 1;
+                // A hostile panic payload may itself panic on Drop. This is an
+                // exceptional, bounded leak that keeps a client callback from
+                // aborting the process during panic-payload retirement.
+                std::mem::forget(payload);
+                MemoryOutcome::CallbackFailed
+            }
+        };
+        drop(core);
+        self.emit(MemoryEvent::new(
+            MemoryOperation::Reclaim,
+            event_outcome,
+            Some(request.requested_bytes),
+        ));
+    }
+
+    fn reserve_with_reclaim(
+        &self,
+        class: MemoryClass,
+        owner: OwnerKey,
+        context: MemoryContextKind,
+        kind: ChargeKind,
+        bytes: u64,
+        commit: bool,
+    ) -> MemoryResult<ReservationTicket> {
+        let soft_work = {
+            let core = self.lock()?;
+            let request = Self::soft_threshold_request(&core, &class, &owner, bytes)?;
+            request.and_then(|request| core.reclaimer.clone().map(|reclaimer| (reclaimer, request)))
+        };
+        let attempted_soft = soft_work.is_some();
+        if let Some((reclaimer, request)) = soft_work {
+            self.run_reclaim(reclaimer, &request);
+        }
+
+        let first = {
+            let mut core = self.lock()?;
+            if commit {
+                Self::reserve_committed_on(
+                    &mut core,
+                    class.clone(),
+                    owner.clone(),
+                    context,
+                    kind,
+                    bytes,
+                )
+            } else {
+                Self::reserve_on(&mut core, class.clone(), owner.clone(), context, kind, bytes)
+            }
+        };
+        let first_error = match first {
+            Ok(ticket) => return Ok(ticket),
+            Err(error) => error,
+        };
+        if attempted_soft || !matches!(first_error, MemoryError::Capacity(_)) {
+            return Err(first_error);
+        }
+
+        let hard_work = {
+            let core = self.lock()?;
+            let Some(reclaimer) = core.reclaimer.clone() else {
+                return Err(first_error);
+            };
+            let group = core.ledger.policy().owner_groups.get(&owner).cloned();
+            let request = Self::reclaim_request(
+                &core,
+                &class,
+                &owner,
+                group,
+                bytes,
+                ReclaimTrigger::CapacityDenial,
+            )?;
+            (reclaimer, request)
+        };
+        self.run_reclaim(hard_work.0, &hard_work.1);
+
+        // Final authority is the remeasured semantic state, never the callback's
+        // claimed byte count. One retry is the bounded exhaustion contract.
+        let mut core = self.lock()?;
+        if commit {
+            Self::reserve_committed_on(&mut core, class, owner, context, kind, bytes)
+        } else {
+            Self::reserve_on(&mut core, class, owner, context, kind, bytes)
+        }
+    }
+
+    /// Release on an already-held lock guard (ledger release + group bookkeeping).
+    /// Scheduler state is preflighted and transactionally restored if the
+    /// ledger rejects the ticket, avoiding a full scheduler clone.
+    fn release_on(core: &mut BrokerCore, ticket: &ReservationTicket) -> MemoryResult<()> {
+        let group = core.ticket_groups.get(&ticket.id()).cloned();
+        if let Some(group) = &group {
+            core.scheduler.usage_after_release(group, ticket.bytes())?;
+            core.scheduler.record_release(group, ticket.bytes())?;
+        }
+        if let Err(error) = core.ledger.release(ticket) {
+            if let Some(group) = &group {
+                core.scheduler.record_usage(group, ticket.bytes()).map_err(|rollback| {
+                    MemoryError::InvalidState(format!(
+                        "ledger release failed ({error}); scheduler rollback also failed ({rollback})"
+                    ))
+                })?;
+            }
+            return Err(error);
+        }
         core.ticket_groups.remove(&ticket.id());
         Ok(())
     }
 
     fn rollback_pending_on(core: &mut BrokerCore, ticket: &ReservationTicket) -> MemoryResult<()> {
-        let mut next_scheduler = core.scheduler.clone();
-        if let Some(group) = core.ticket_groups.get(&ticket.id()) {
-            next_scheduler.record_release(group, ticket.bytes())?;
+        let group = core.ticket_groups.get(&ticket.id()).cloned();
+        if let Some(group) = &group {
+            core.scheduler.usage_after_release(group, ticket.bytes())?;
+            core.scheduler.record_release(group, ticket.bytes())?;
         }
-        core.ledger.rollback_pending(ticket)?;
-        core.scheduler = next_scheduler;
+        if let Err(error) = core.ledger.rollback_pending(ticket) {
+            if let Some(group) = &group {
+                core.scheduler.record_usage(group, ticket.bytes()).map_err(|rollback| {
+                    MemoryError::InvalidState(format!(
+                        "ledger pending rollback failed ({error}); scheduler rollback also failed ({rollback})"
+                    ))
+                })?;
+            }
+            return Err(error);
+        }
         core.ticket_groups.remove(&ticket.id());
         Ok(())
     }
@@ -671,9 +1019,12 @@ impl LiveProcessMemoryBroker {
     /// `finish_rebuild` drains the batch.
     fn release_managed_charge_on_drop(&self, charge: CommittedCharge) {
         let ticket = charge.ticket;
+        let bytes = ticket.bytes();
         let mut core = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
-        if core.ledger.snapshot().rebuild_in_progress {
+        if core.ledger.rebuild_in_progress() {
             core.deferred_committed_releases.push(ticket);
+            drop(core);
+            self.emit(MemoryEvent::new(MemoryOperation::Release, MemoryOutcome::Busy, Some(bytes)));
             return;
         }
 
@@ -681,20 +1032,51 @@ impl LiveProcessMemoryBroker {
         // non-rebuild failure is unreachable without an internal invariant break.
         // Retain the exact ticket in the deferred owner queue instead of silently
         // discarding authority if that invariant is ever violated.
-        if Self::release_on(&mut core, &ticket).is_err() {
+        let outcome = if Self::release_on(&mut core, &ticket).is_err() {
             core.deferred_committed_releases.push(ticket);
-        }
+            MemoryOutcome::InvalidState
+        } else {
+            MemoryOutcome::Succeeded
+        };
+        drop(core);
+        self.emit(MemoryEvent::new(MemoryOperation::Release, outcome, Some(bytes)));
     }
 
     fn release_many_on(core: &mut BrokerCore, tickets: &[ReservationTicket]) -> MemoryResult<()> {
-        let mut next_scheduler = core.scheduler.clone();
+        let mut group_refunds = BTreeMap::<String, u64>::new();
         for ticket in tickets {
             if let Some(group) = core.ticket_groups.get(&ticket.id()) {
-                next_scheduler.record_release(group, ticket.bytes())?;
+                let refund = group_refunds.entry(group.clone()).or_default();
+                *refund = refund.checked_add(ticket.bytes()).ok_or_else(|| {
+                    MemoryError::InvalidState("resource-group batch release exceeds u64".into())
+                })?;
             }
         }
-        core.ledger.release_batch(tickets)?;
-        core.scheduler = next_scheduler;
+        for (group, refund) in &group_refunds {
+            core.scheduler.usage_after_release(group, *refund)?;
+        }
+        let mut applied: Vec<(String, u64)> = Vec::with_capacity(group_refunds.len());
+        for (group, refund) in &group_refunds {
+            if let Err(error) = core.scheduler.record_release(group, *refund) {
+                for (applied_group, applied_refund) in applied {
+                    core.scheduler
+                        .record_usage(&applied_group, applied_refund)
+                        .expect("preflighted scheduler batch rollback");
+                }
+                return Err(error);
+            }
+            applied.push((group.clone(), *refund));
+        }
+        if let Err(error) = core.ledger.release_batch(tickets) {
+            for (group, refund) in applied {
+                core.scheduler.record_usage(&group, refund).map_err(|rollback| {
+                    MemoryError::InvalidState(format!(
+                        "ledger batch release failed ({error}); scheduler rollback also failed ({rollback})"
+                    ))
+                })?;
+            }
+            return Err(error);
+        }
         for ticket in tickets {
             core.ticket_groups.remove(&ticket.id());
         }
@@ -718,14 +1100,31 @@ impl LiveProcessMemoryBroker {
         // D: resource-group admission. An owner mapped to a group must pass the
         // weighted-fair scheduler (anti-starvation) before it can reserve.
         let group = core.ledger.policy().owner_groups.get(&owner).cloned();
-        let mut next_scheduler = core.scheduler.clone();
         if let Some(ref group) = group {
-            if !next_scheduler.admits(group, bytes) {
+            if !core.scheduler.admits(group, bytes) {
                 return Err(MemoryError::capacity(format!(
                     "resource group {group} admission denied for owner {owner} reserve of {bytes} bytes"
                 )));
             }
-            next_scheduler.record_usage(group, bytes)?;
+            core.scheduler.usage_after_growth(group, bytes)?;
+        }
+        if class != MemoryClass::Headroom {
+            let non_headroom_current = core.ledger.non_headroom_bytes();
+            let non_headroom_after = non_headroom_current
+                .checked_add(bytes)
+                .ok_or_else(|| MemoryError::capacity("non-headroom reserve total exceeds u64"))?;
+            let band = core
+                .ledger
+                .policy()
+                .global_hard_limit_bytes
+                .checked_sub(core.ledger.policy().headroom_bytes)
+                .ok_or_else(|| MemoryError::capacity("headroom exceeds global hard limit"))?;
+            core.scheduler.protected_floor_fits_after_growth(
+                group.as_deref(),
+                bytes,
+                non_headroom_after,
+                band,
+            )?;
         }
 
         // ExecutionBudget: the memory-relevant cap is `max_execution_scratch_bytes`,
@@ -735,12 +1134,8 @@ impl LiveProcessMemoryBroker {
         if kind == ChargeKind::LiveScratch {
             if let Some(max) = core.report.execution.max_execution_scratch_bytes {
                 let max = u64::try_from(max).unwrap_or(u64::MAX);
-                let live_after = core
-                    .ledger
-                    .snapshot()
-                    .total_live_scratch_bytes()
-                    .checked_add(bytes)
-                    .ok_or_else(|| {
+                let live_after =
+                    core.ledger.total_live_scratch_bytes().checked_add(bytes).ok_or_else(|| {
                         MemoryError::capacity("execution scratch reserve total exceeds u64")
                     })?;
                 if live_after > max {
@@ -752,17 +1147,24 @@ impl LiveProcessMemoryBroker {
         }
 
         let ticket = core.ledger.reserve(class, owner, context, kind, bytes)?;
-        core.scheduler = next_scheduler;
         // Keep scheduler usage in sync so admission reflects live group usage, and
         // remember the issuing group so release is symmetric across reconfigure.
         if let Some(group) = group {
+            if let Err(error) = core.scheduler.record_usage(&group, bytes) {
+                core.ledger.rollback_pending(&ticket).map_err(|rollback| {
+                    MemoryError::InvalidState(format!(
+                        "scheduler commit failed ({error}); ledger rollback also failed ({rollback})"
+                    ))
+                })?;
+                return Err(error);
+            }
             core.ticket_groups.insert(ticket.id(), group);
         }
         Ok(ticket)
     }
 
     /// Commit a previously reserved ticket.
-    pub fn commit(&self, ticket: &ReservationTicket) -> MemoryResult<u64> {
+    pub(crate) fn commit(&self, ticket: &ReservationTicket) -> MemoryResult<u64> {
         let mut core = self.lock()?;
         core.ledger.commit(ticket)
     }
@@ -771,7 +1173,7 @@ impl LiveProcessMemoryBroker {
     /// charge). Returns the released bytes to the owner's resource group (if any)
     /// only after the ledger release succeeds, so a rejected (replayed) release
     /// never returns phantom group capacity.
-    pub fn release(&self, ticket: &ReservationTicket) -> MemoryResult<()> {
+    pub(crate) fn release(&self, ticket: &ReservationTicket) -> MemoryResult<()> {
         let mut core = self.lock()?;
         // `release_on` returns capacity to the group the ticket was ADMITTED under
         // (recorded at reserve time), not the current policy's mapping — so
@@ -780,41 +1182,59 @@ impl LiveProcessMemoryBroker {
         Self::release_on(&mut core, ticket)
     }
 
-    /// Release a batch of tickets atomically.
-    ///
-    /// Used by charged facade mutators that must refund multiple tickets before
-    /// mutating store state. Either every ticket is released or none are.
-    pub fn release_many(&self, tickets: &[ReservationTicket]) -> MemoryResult<()> {
-        let mut core = self.lock()?;
-        Self::release_many_on(&mut core, tickets)
-    }
-
     /// Atomically release active managed charges issued by this broker.
     ///
     /// Broker affinity and active authority are checked before the ledger is
     /// touched. Any validation/rebuild failure leaves every lease unchanged.
     pub fn release_managed_many(&self, charges: &mut [ManagedCharge]) -> MemoryResult<()> {
+        let bytes = charges.iter().try_fold(0u64, |sum, charge| {
+            sum.checked_add(charge.bytes().unwrap_or(0)).ok_or_else(|| {
+                MemoryError::InvalidState("managed release byte total exceeds u64".into())
+            })
+        });
+        let bytes = match bytes {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                let result = Err(error);
+                self.emit_result(MemoryOperation::Release, None, &result);
+                return result;
+            }
+        };
         let mut tickets = Vec::with_capacity(charges.len());
         for charge in charges.iter() {
             if !Arc::ptr_eq(&self.inner, &charge.broker.inner) {
-                return Err(MemoryError::InvalidState(
+                let result = Err(MemoryError::InvalidState(
                     "managed charge batch contains a foreign broker lease".to_string(),
                 ));
+                self.emit_result(MemoryOperation::Release, Some(bytes), &result);
+                return result;
             }
             let committed = charge.charge.as_ref().ok_or_else(|| {
                 MemoryError::InvalidState(
                     "managed charge batch contains an already released lease".to_string(),
                 )
-            })?;
+            });
+            let committed = match committed {
+                Ok(committed) => committed,
+                Err(error) => {
+                    let result = Err(error);
+                    self.emit_result(MemoryOperation::Release, Some(bytes), &result);
+                    return result;
+                }
+            };
             tickets.push(committed.ticket.clone());
         }
 
-        let mut core = self.lock()?;
-        Self::release_many_on(&mut core, &tickets)?;
-        for charge in charges {
-            charge.charge = None;
-        }
-        Ok(())
+        let result = (|| {
+            let mut core = self.lock()?;
+            Self::release_many_on(&mut core, &tickets)?;
+            for charge in charges {
+                charge.charge = None;
+            }
+            Ok(())
+        })();
+        self.emit_result(MemoryOperation::Release, Some(bytes), &result);
+        result
     }
 
     /// Ask resource-group admission whether `group_name` may grow by `bytes`.
@@ -848,11 +1268,15 @@ impl LiveProcessMemoryBroker {
     /// Current pressure classification from semantic usage (not allocator
     /// telemetry).
     pub fn classify_pressure(&self) -> MemoryResult<PressureState> {
-        let core = self.lock()?;
-        let snapshot = core.ledger.snapshot();
-        snapshot.validate_exact()?;
-        let used = snapshot.total_owner_bytes();
-        Ok(core.controller.update_from_semantic(used))
+        let result = (|| {
+            let core = self.lock()?;
+            let snapshot = core.ledger.snapshot();
+            snapshot.validate_exact()?;
+            let used = snapshot.checked_total_owner_bytes()?;
+            Ok(core.controller.update_from_semantic(used))
+        })();
+        self.emit_result(MemoryOperation::Pressure, None, &result);
+        result
     }
 
     /// Observe an allocator snapshot. Advisory only: returns a comparison
@@ -862,11 +1286,23 @@ impl LiveProcessMemoryBroker {
         &self,
         snapshot: &AllocatorSnapshot,
     ) -> MemoryResult<AllocatorAdvisory> {
-        let core = self.lock()?;
-        let semantic_snapshot = core.ledger.snapshot();
-        semantic_snapshot.validate_exact()?;
-        let semantic = semantic_snapshot.total_owner_bytes();
-        Ok(AllocatorAdvisory::compare(snapshot, semantic))
+        let result = (|| {
+            let core = self.lock()?;
+            let semantic_snapshot = core.ledger.snapshot();
+            semantic_snapshot.validate_exact()?;
+            let semantic = semantic_snapshot.checked_total_owner_bytes()?;
+            Ok(AllocatorAdvisory::compare(snapshot, semantic))
+        })();
+        let outcome = result.as_ref().map_or_else(Self::outcome, |advisory| {
+            if advisory.mismatch {
+                MemoryOutcome::AllocatorMismatch
+            } else {
+                MemoryOutcome::Succeeded
+            }
+        });
+        let bytes = result.as_ref().ok().map(|advisory| advisory.semantic_bytes);
+        self.emit(MemoryEvent::new(MemoryOperation::ObserveAllocator, outcome, bytes));
+        result
     }
 
     /// Attempt a live reconfiguration. Fail-closed: an illegal narrowing leaves
@@ -881,74 +1317,26 @@ impl LiveProcessMemoryBroker {
     /// Allowed: raising caps, adding headroom, owner-quota / reclaim-priority
     /// adjustments that still honor live usage without remapping live owners.
     pub fn try_live_reconfigure(&self, new_policy: ResidencyPolicy) -> MemoryResult<()> {
+        let result = self.try_live_reconfigure_inner(new_policy);
+        self.emit_result(MemoryOperation::Reconfigure, None, &result);
+        result
+    }
+
+    fn try_live_reconfigure_inner(&self, new_policy: ResidencyPolicy) -> MemoryResult<()> {
         let validated = ValidatedResidencyPolicy::try_from(new_policy)?;
         let new_policy = validated.as_policy();
         let mut core = self.lock()?;
 
         let snapshot = core.ledger.snapshot();
         snapshot.validate_exact()?;
+        AccountingLedger::validate_policy_postimage(new_policy, &snapshot, None)
+            .map_err(|error| MemoryError::InvalidState(format!("live reconfig denied: {error}")))?;
         let current_total = snapshot.total_owner_bytes();
-        if new_policy.global_hard_limit_bytes < current_total {
-            return Err(MemoryError::InvalidState(format!(
-                "live reconfig denied: new global hard limit {} below current usage {current_total}",
-                new_policy.global_hard_limit_bytes
-            )));
-        }
-
-        // Invariant 5 (headroom band) must keep holding for the LIVE state, not
-        // just for future reserves: non-`Headroom` bytes already resident must fit
-        // under the NEW effective non-Headroom ceiling. Raising `headroom_bytes`
-        // above the free space would otherwise silently strand existing
-        // non-Headroom usage inside the reserved band (a fail-open of invariant 5).
         let headroom_used =
             snapshot.class_usage.get(&MemoryClass::Headroom).map_or(0, |u| u.total());
         let non_headroom_used = current_total.saturating_sub(headroom_used);
         let new_non_headroom_ceiling =
             new_policy.global_hard_limit_bytes.saturating_sub(new_policy.headroom_bytes);
-        if non_headroom_used > new_non_headroom_ceiling {
-            return Err(MemoryError::InvalidState(format!(
-                "live reconfig denied: non-Headroom usage {non_headroom_used} exceeds the new \
-                 effective ceiling {new_non_headroom_ceiling} (global {} - headroom {})",
-                new_policy.global_hard_limit_bytes, new_policy.headroom_bytes
-            )));
-        }
-
-        // Fail-closed over the LIVE usage axes, not the new policy's keys: a class
-        // that currently holds bytes may neither be dropped from the policy (which
-        // would silently uncap it) nor be given a hard cap below its usage.
-        for (class, usage) in &snapshot.class_usage {
-            let class_used = usage.total();
-            if class_used == 0 {
-                continue;
-            }
-            match new_policy.classes.get(class) {
-                Some(budget) if budget.hard_cap_bytes >= class_used => {}
-                Some(budget) => {
-                    return Err(MemoryError::InvalidState(format!(
-                        "live reconfig denied: class {class:?} new hard cap {} below current usage {class_used}",
-                        budget.hard_cap_bytes
-                    )));
-                }
-                None => {
-                    return Err(MemoryError::InvalidState(format!(
-                        "live reconfig denied: class {class:?} holds {class_used} live bytes but is \
-                         absent from the new policy (would silently uncap it)"
-                    )));
-                }
-            }
-        }
-
-        // Any owner quota carried by the new policy must honor that owner's live
-        // usage, or the reconfig would install a quota the owner already violates.
-        for (owner, quota) in &new_policy.owner_quotas {
-            let owner_used = snapshot.owner_usage.get(owner).map_or(0, |u| u.total());
-            if quota.hard_cap_bytes < owner_used {
-                return Err(MemoryError::InvalidState(format!(
-                    "live reconfig denied: owner {owner} new hard cap {} below current usage {owner_used}",
-                    quota.hard_cap_bytes
-                )));
-            }
-        }
 
         let current_owner_groups = &core.ledger.policy().owner_groups;
         for (owner, usage) in &snapshot.owner_usage {
@@ -981,20 +1369,27 @@ impl LiveProcessMemoryBroker {
                 })?;
             }
         }
-        for (group, used) in live_group_usage {
-            if let Some(rg) = new_policy.resource_groups.get(group) {
-                if rg.hard_cap_bytes < used {
-                    return Err(MemoryError::InvalidState(format!(
-                        "live reconfig denied: resource group {group} new hard cap {} below current usage {used}",
-                        rg.hard_cap_bytes
-                    )));
-                }
+        use crate::application::scheduler::ResourceGroupScheduler;
+        let mut candidate_scheduler = WeightedResourceGroupScheduler::new(
+            new_policy.resource_groups.clone(),
+            new_policy.shared_burst_pool_bytes,
+        );
+        for (group, used) in &live_group_usage {
+            if !candidate_scheduler.admits(group, *used) {
+                return Err(MemoryError::InvalidState(format!(
+                    "live reconfig denied: resource group {group} current usage {used} violates \
+                     hard/burst policy"
+                )));
             }
+            candidate_scheduler.record_usage(group, *used)?;
         }
+        candidate_scheduler
+            .protected_floor_fits(non_headroom_used, new_non_headroom_ceiling)
+            .map_err(|error| MemoryError::InvalidState(format!("live reconfig denied: {error}")))?;
 
         // Accepted: install the new policy by rebuilding the ledger's view while
         // preserving usage counters.
-        core.install_policy(validated)?;
+        core.install_policy(validated, OverrideSource::RuntimeReconfigure)?;
         Ok(())
     }
 
@@ -1011,6 +1406,44 @@ impl LiveProcessMemoryBroker {
         let core = self.lock()?;
         Ok(core.report.clone())
     }
+
+    /// Bounded reclaim activity observed by this broker. Callback-reported
+    /// bytes are telemetry only; final admission always uses ledger remeasurement.
+    pub fn reclaim_runtime_stats(&self) -> MemoryResult<ReclaimRuntimeStats> {
+        let core = self.lock()?;
+        Ok(core.reclaim_stats.clone())
+    }
+
+    /// Observe ledger, policy provenance, pressure and reclaim counters from
+    /// one broker-lock snapshot. A poisoned or invalid broker is a typed error;
+    /// no zero/default observation is fabricated.
+    pub fn observe(&self) -> MemoryResult<BrokerObservation> {
+        let result = (|| {
+            let core = self.lock()?;
+            let ledger = core.ledger.snapshot();
+            ledger.validate_exact()?;
+            let semantic_bytes = ledger.checked_total_owner_bytes()?;
+            let pressure = core.controller.update_from_semantic(semantic_bytes);
+            let resource_group_usage = core
+                .report
+                .residency
+                .resource_groups
+                .keys()
+                .map(|name| (name.clone(), core.scheduler.current_usage(name)))
+                .collect();
+            Ok(BrokerObservation {
+                ledger,
+                resource_group_usage,
+                report: core.report.clone(),
+                pressure,
+                reclaim: core.reclaim_stats.clone(),
+                semantic_bytes,
+            })
+        })();
+        let bytes = result.as_ref().ok().map(|observation| observation.semantic_bytes);
+        self.emit_result(MemoryOperation::ObserveBroker, bytes, &result);
+        result
+    }
 }
 
 impl std::fmt::Debug for LiveProcessMemoryBroker {
@@ -1026,13 +1459,22 @@ impl BrokerCore {
     /// only swaps the active policy in place, so all accounting invariants hold
     /// across the reconfiguration. The scheduler and controller are rebuilt
     /// from the new policy.
-    fn install_policy(&mut self, validated: ValidatedResidencyPolicy) -> MemoryResult<()> {
+    fn install_policy(
+        &mut self,
+        validated: ValidatedResidencyPolicy,
+        source: OverrideSource,
+    ) -> MemoryResult<()> {
         // Snapshot live usage BEFORE the swap so the rebuilt scheduler can be
         // re-seeded from it (a fresh scheduler starts at zero usage, which would
         // otherwise make post-reconfigure admission see phantom-empty groups and
         // silently drop the anti-starvation guarantee).
         let snapshot = self.ledger.snapshot();
         snapshot.validate_exact()?;
+        let next_revision = self
+            .report
+            .policy_revision
+            .checked_add(1)
+            .ok_or_else(|| MemoryError::InvalidState("policy revision exhausted".into()))?;
         let new_policy = validated.as_policy().clone();
         let mut scheduler = WeightedResourceGroupScheduler::new(
             new_policy.resource_groups.clone(),
@@ -1059,6 +1501,13 @@ impl BrokerCore {
         self.controller = Arc::new(controller);
         // Keep the report's residency in sync with the active policy.
         self.report.residency = new_policy;
+        self.report.policy_revision = next_revision;
+        let source_label = source.label().to_string();
+        self.report.active_policy_source.clone_from(&source_label);
+        if !self.report.override_sources.contains(&source_label) {
+            self.report.override_sources.push(source_label);
+        }
+        self.report.override_provenance.push(OverrideRecord::new(source, "residency.active"));
         Ok(())
     }
 }
@@ -1085,6 +1534,10 @@ impl crate::api::broker::ProcessMemoryBroker for LiveProcessMemoryBroker {
             Ok(core) => core.report.clone(),
             Err(poisoned) => poisoned.into_inner().report.clone(),
         }
+    }
+
+    fn observe(&self) -> MemoryResult<BrokerObservation> {
+        LiveProcessMemoryBroker::observe(self)
     }
 }
 
@@ -1119,6 +1572,8 @@ mod tests {
             residency,
             override_sources: vec!["test".to_string()],
             override_provenance: Vec::new(),
+            policy_revision: 1,
+            active_policy_source: "test".to_string(),
         }
     }
 
@@ -1476,9 +1931,7 @@ mod tests {
                 700_000,
             )
             .expect_err("replacement over class cap is denied");
-        let ChargeRechargeRecovery::ChargePreserved(charge) = denied.recovery else {
-            panic!("broker denial must preserve the old charge");
-        };
+        let ChargeRechargeRecovery::ChargePreserved(charge) = denied.recovery;
         assert_eq!(charge.bytes(), 100_000);
         assert_eq!(b.ledger_snapshot().expect("snapshot").total_owner_bytes(), 100_000);
         b.release_owned(charge).expect("release preserved charge");
@@ -1487,7 +1940,7 @@ mod tests {
     #[test]
     fn owned_charge_sequence_matches_exact_reference_model() {
         let b = broker();
-        let mut live = Vec::<CommittedCharge>::new();
+        let mut live = Vec::<ManagedCharge>::new();
         let mut model_bytes = 0u64;
 
         for step in 0..100u64 {
@@ -1520,16 +1973,15 @@ mod tests {
                     model_bytes += 100;
                 }
                 2 if !live.is_empty() => {
-                    let charge = live.pop().expect("non-empty");
-                    model_bytes -= charge.bytes();
-                    b.release_owned(charge).expect("release");
+                    let mut charge = live.pop().expect("non-empty");
+                    model_bytes -= charge.bytes().expect("active charge");
+                    charge.release().expect("release");
                 }
                 _ if !live.is_empty() => {
-                    let old = live.pop().expect("non-empty");
-                    model_bytes -= old.bytes();
-                    let replacement = b
-                        .recharge_owned(
-                            old,
+                    let mut replacement = live.pop().expect("non-empty");
+                    model_bytes -= replacement.bytes().expect("active charge");
+                    replacement
+                        .recharge(
                             MemoryClass::ArtifactCache,
                             "owner:a".to_string(),
                             MemoryContextKind::Request,
@@ -1537,7 +1989,7 @@ mod tests {
                             150,
                         )
                         .expect("replacement fits");
-                    model_bytes += replacement.bytes();
+                    model_bytes += replacement.bytes().expect("replacement active");
                     live.push(replacement);
                 }
                 _ => {}
@@ -1550,9 +2002,9 @@ mod tests {
             assert!(snapshot.context_owner_balanced(), "step {step}");
         }
 
-        while let Some(charge) = live.pop() {
-            model_bytes -= charge.bytes();
-            b.release_owned(charge).expect("drain");
+        while let Some(mut charge) = live.pop() {
+            model_bytes -= charge.bytes().expect("active charge");
+            charge.release().expect("drain");
         }
         assert_eq!(model_bytes, 0);
         assert_eq!(b.ledger_snapshot().expect("final").total_owner_bytes(), 0);
@@ -1965,6 +2417,9 @@ mod tests {
             matches!(denied, Err(MemoryError::InvalidState(_))),
             "lowering a group cap below live group usage must be denied, got {denied:?}"
         );
+        let observation = b.observe().expect("lock-consistent group observation");
+        assert_eq!(observation.resource_group_usage.get("g"), Some(&90_000));
+        assert_eq!(observation.ledger.live_ticket_count, 1);
 
         // Raising the cap to 120k (>= 90k live) is legal and accepted.
         let raised = ResidencyPolicy::new(10_000_000)
@@ -1973,6 +2428,9 @@ mod tests {
             .with_owner_group("owner:g", "g");
         b.try_live_reconfigure(raised).expect("raising the group cap over live usage is legal");
         b.release(&t).expect("release");
+        let drained = b.observe().expect("drained group observation");
+        assert_eq!(drained.resource_group_usage.get("g"), Some(&0));
+        assert_eq!(drained.ledger.live_ticket_count, 0);
     }
 
     // --- positive pair: a legal reconfig (raising caps) is accepted
@@ -3261,6 +3719,70 @@ mod tests {
         b.release(&old).expect("release preserved ticket");
     }
 
+    #[test]
+    fn recharge_cannot_consume_peer_group_reserved_floor() {
+        use crate::domain::policy::ResourceGroup;
+        let protected = ResourceGroup {
+            reserved_bytes: 400,
+            soft_cap_bytes: 500,
+            hard_cap_bytes: 600,
+            burst_percent: 0,
+            reclaim_priority: ReclaimPriority::First,
+            admission_weight: 1,
+        };
+        let peer = ResourceGroup {
+            reserved_bytes: 0,
+            soft_cap_bytes: 700,
+            hard_cap_bytes: 1_000,
+            burst_percent: 0,
+            reclaim_priority: ReclaimPriority::Last,
+            admission_weight: 1,
+        };
+        let policy = ResidencyPolicy::new(1_000)
+            .with_class_budget(MemoryClass::ArtifactCache, class_budget(0, 1_000, 1_000, false))
+            .with_resource_group("protected", protected)
+            .with_resource_group("peer", peer)
+            .with_owner_group("protected-owner", "protected")
+            .with_owner_group("peer-owner", "peer");
+        let broker = LiveProcessMemoryBroker::from_report(report_with(policy)).expect("broker");
+        let old = broker
+            .reserve_committed(
+                MemoryClass::ArtifactCache,
+                "peer-owner".into(),
+                MemoryContextKind::Request,
+                ChargeKind::RetainedPayload,
+                500,
+            )
+            .expect("seed peer usage inside unprotected band");
+
+        let denied = broker
+            .recharge(
+                &old,
+                MemoryClass::ArtifactCache,
+                "peer-owner".into(),
+                MemoryContextKind::Request,
+                ChargeKind::RetainedPayload,
+                601,
+            )
+            .expect_err("recharge must preserve the other group's 400-byte floor");
+        assert!(matches!(denied.error, MemoryError::Capacity(_)));
+        assert_eq!(denied.recovery, RechargeRecoveryV1::OldChargePreserved);
+        assert_eq!(broker.ledger_snapshot().expect("snapshot").total_owner_bytes(), 500);
+
+        let replacement = broker
+            .recharge(
+                &old,
+                MemoryClass::ArtifactCache,
+                "peer-owner".into(),
+                MemoryContextKind::Request,
+                ChargeKind::RetainedPayload,
+                600,
+            )
+            .expect("replacement exactly at the unprotected boundary is legal");
+        assert_eq!(broker.ledger_snapshot().expect("snapshot").total_owner_bytes(), 600);
+        broker.release(&replacement).expect("release replacement");
+    }
+
     fn poison_broker_lock(broker: &LiveProcessMemoryBroker) {
         let clone = broker.clone();
         let panicked = std::thread::spawn(move || {
@@ -3300,7 +3822,7 @@ mod tests {
         poison_broker_lock(&b);
 
         let denied = reservation.release();
-        assert!(matches!(denied, Err(MemoryError::InvalidState(_))));
+        assert!(matches!(denied, Err(MemoryError::Poisoned(_))));
         assert!(reservation.is_enforced(), "failed explicit release retains retry authority");
 
         drop(reservation);
@@ -3309,6 +3831,35 @@ mod tests {
         let snapshot = core.ledger.snapshot();
         assert_eq!(snapshot.total_owner_bytes(), 0);
         assert!(snapshot.class_owner_balanced() && snapshot.owner_partition_balanced());
+    }
+
+    #[test]
+    fn poisoned_pending_commit_retains_ticket_until_drop_rollback() {
+        let b = broker();
+        let pending = b
+            .reserve_owned(
+                MemoryClass::ArtifactCache,
+                "owner:pending-poison".to_string(),
+                MemoryContextKind::Request,
+                ChargeKind::RetainedPayload,
+                100_000,
+            )
+            .expect("pending reservation");
+        poison_broker_lock(&b);
+
+        let denied = pending.commit().expect_err("poisoned commit must fail closed");
+        assert!(matches!(denied, MemoryError::Poisoned(_)));
+
+        // `commit` consumes `pending`; its Drop path must already have recovered
+        // the poisoned lock and rolled the exact pending ticket back.
+        let core = b.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        let snapshot = core.ledger.snapshot();
+        assert_eq!(snapshot.total_owner_bytes(), 0);
+        assert_eq!(snapshot.total_context_bytes(), 0);
+        assert!(snapshot.class_owner_balanced());
+        assert!(snapshot.owner_partition_balanced());
+        assert!(snapshot.context_owner_balanced());
+        assert!(core.ticket_groups.is_empty());
     }
 
     #[test]
@@ -3336,25 +3887,26 @@ mod tests {
                 ChargeKind::RetainedPayload,
                 1,
             ),
-            Err(MemoryError::InvalidState(_))
+            Err(MemoryError::Poisoned(_))
         ));
-        assert!(matches!(b.commit(&ticket), Err(MemoryError::InvalidState(_))));
-        assert!(matches!(b.release(&ticket), Err(MemoryError::InvalidState(_))));
-        assert!(matches!(b.begin_rebuild(), Err(MemoryError::InvalidState(_))));
-        assert!(matches!(b.finish_rebuild(), Err(MemoryError::InvalidState(_))));
+        assert!(matches!(b.commit(&ticket), Err(MemoryError::Poisoned(_))));
+        assert!(matches!(b.release(&ticket), Err(MemoryError::Poisoned(_))));
+        assert!(matches!(b.begin_rebuild(), Err(MemoryError::Poisoned(_))));
+        assert!(matches!(b.finish_rebuild(), Err(MemoryError::Poisoned(_))));
         assert!(matches!(
             b.try_live_reconfigure(ResidencyPolicy::new(2_000_000)),
-            Err(MemoryError::InvalidState(_))
+            Err(MemoryError::Poisoned(_))
         ));
-        assert!(matches!(b.ledger_snapshot(), Err(MemoryError::InvalidState(_))));
+        assert!(matches!(b.ledger_snapshot(), Err(MemoryError::Poisoned(_))));
         assert!(matches!(
             b.observe_allocator(&AllocatorSnapshot {
                 resident_bytes: Some(123),
                 ..AllocatorSnapshot::default()
             }),
-            Err(MemoryError::InvalidState(_))
+            Err(MemoryError::Poisoned(_))
         ));
-        assert!(matches!(b.effective_report(), Err(MemoryError::InvalidState(_))));
+        assert!(matches!(b.effective_report(), Err(MemoryError::Poisoned(_))));
+        assert!(matches!(b.observe(), Err(MemoryError::Poisoned(_))));
 
         let report_after = <LiveProcessMemoryBroker as ProcessMemoryBroker>::effective_report(&b);
         assert_eq!(report_after, report_before, "trait report must stay truthful under poison");
@@ -3363,6 +3915,129 @@ mod tests {
             !report_after.override_sources.iter().any(|s| s == "poisoned-fallback"),
             "trait report must not fabricate a poison fallback marker"
         );
+    }
+
+    #[derive(Default)]
+    struct RecordingEventSink {
+        events: Mutex<Vec<MemoryEvent>>,
+        broker: Mutex<Option<LiveProcessMemoryBroker>>,
+    }
+
+    impl MemoryEventSink for RecordingEventSink {
+        fn emit(&self, event: MemoryEvent) {
+            if let Some(broker) = self.broker.lock().expect("recorder broker lock").as_ref() {
+                // This would deadlock if the broker invoked the sink while
+                // holding its mutex.
+                broker.effective_report().expect("event callback runs outside broker lock");
+            }
+            self.events.lock().expect("recorder events lock").push(event);
+        }
+    }
+
+    #[test]
+    fn bounded_events_execute_outside_lock_and_cover_major_broker_outcomes() {
+        let sink = Arc::new(RecordingEventSink::default());
+        let broker = crate::ProcessMemoryBrokerBuilder::new()
+            .with_preset(crate::MemoryPreset::Development)
+            .with_event_sink(sink.clone())
+            .build()
+            .expect("broker");
+        *sink.broker.lock().expect("install broker") = Some(broker.clone());
+
+        let mut charge = broker
+            .reserve_managed_charge(
+                MemoryClass::ArtifactCache,
+                "bounded-owner".into(),
+                MemoryContextKind::Request,
+                ChargeKind::RetainedPayload,
+                64,
+            )
+            .expect("reserve");
+        charge.release().expect("release");
+        let denied = broker.reserve_managed_charge(
+            MemoryClass::ArtifactCache,
+            "bounded-owner".into(),
+            MemoryContextKind::Request,
+            ChargeKind::RetainedPayload,
+            u64::MAX,
+        );
+        assert!(matches!(denied, Err(MemoryError::Capacity(_))));
+        let observation = broker.observe().expect("observation");
+        assert_eq!(observation.semantic_bytes, 0);
+        assert_eq!(observation.report.policy_revision, 1);
+
+        let events = sink.events.lock().expect("events").clone();
+        assert!(events.contains(&MemoryEvent::new(
+            MemoryOperation::Reserve,
+            MemoryOutcome::Succeeded,
+            Some(64),
+        )));
+        assert!(events.contains(&MemoryEvent::new(
+            MemoryOperation::Release,
+            MemoryOutcome::Succeeded,
+            Some(64),
+        )));
+        assert!(events.contains(&MemoryEvent::new(
+            MemoryOperation::Reserve,
+            MemoryOutcome::CapacityDenied,
+            Some(u64::MAX),
+        )));
+        assert!(events.contains(&MemoryEvent::new(
+            MemoryOperation::ObserveBroker,
+            MemoryOutcome::Succeeded,
+            Some(0),
+        )));
+    }
+
+    struct PanickingEventSink;
+
+    impl MemoryEventSink for PanickingEventSink {
+        fn emit(&self, _event: MemoryEvent) {
+            panic!("telemetry failure");
+        }
+    }
+
+    #[test]
+    fn telemetry_panic_cannot_change_or_abort_accounting() {
+        let broker = crate::ProcessMemoryBrokerBuilder::new()
+            .with_preset(crate::MemoryPreset::Development)
+            .with_event_sink(Arc::new(PanickingEventSink))
+            .build()
+            .expect("broker");
+        let charge = broker
+            .reserve_managed_charge(
+                MemoryClass::ArtifactCache,
+                "panic-sink-owner".into(),
+                MemoryContextKind::Request,
+                ChargeKind::RetainedPayload,
+                32,
+            )
+            .expect("telemetry panic is contained after accounting commit");
+        assert_eq!(broker.ledger_snapshot().expect("ledger").total_owner_bytes(), 32);
+        drop(charge);
+        assert_eq!(broker.ledger_snapshot().expect("ledger").total_owner_bytes(), 0);
+    }
+
+    #[test]
+    fn forged_snapshot_has_fallible_totals_without_panicking() {
+        let mut snapshot = LedgerSnapshot::default();
+        snapshot.owner_usage.insert(
+            "a".into(),
+            crate::UsageBreakdown {
+                retained_payload_bytes: u64::MAX,
+                retained_metadata_bytes: 0,
+                live_scratch_bytes: 0,
+            },
+        );
+        snapshot.owner_usage.insert(
+            "b".into(),
+            crate::UsageBreakdown {
+                retained_payload_bytes: 1,
+                retained_metadata_bytes: 0,
+                live_scratch_bytes: 0,
+            },
+        );
+        assert!(matches!(snapshot.checked_total_owner_bytes(), Err(MemoryError::InvalidState(_))));
     }
 
     #[test]
@@ -3447,5 +4122,368 @@ mod tests {
         assert_eq!(snap.total_owner_bytes(), 90_000, "baseline usage must survive unchanged");
         assert!(snap.class_owner_balanced(), "ledger invariants must survive concurrency");
         b.release(&baseline).expect("release baseline");
+    }
+
+    #[derive(Default)]
+    struct RecordingReclaimer {
+        requests: Mutex<Vec<ReclaimRequest>>,
+        charge_to_release: Mutex<Option<ManagedCharge>>,
+        broker_for_reentry: Mutex<Option<LiveProcessMemoryBroker>>,
+    }
+
+    impl MemoryReclaimer for RecordingReclaimer {
+        fn reclaim(
+            &self,
+            request: &ReclaimRequest,
+        ) -> MemoryResult<crate::ports::reclaim::ReclaimOutcome> {
+            self.requests.lock().expect("requests").push(request.clone());
+            if let Some(broker) = self.broker_for_reentry.lock().expect("broker").as_ref() {
+                broker.effective_report().expect("callback must run outside broker lock");
+            }
+            let mut reclaimed = 0;
+            if let Some(mut charge) = self.charge_to_release.lock().expect("charge").take() {
+                reclaimed = charge.bytes().expect("live charge");
+                charge.release().expect("callback release");
+            }
+            Ok(crate::ports::reclaim::ReclaimOutcome { reclaimed_bytes: reclaimed })
+        }
+    }
+
+    #[test]
+    fn soft_cap_crossing_triggers_reclaim_without_immediate_hard_deny() {
+        let reclaimer = Arc::new(RecordingReclaimer::default());
+        let policy = ResidencyPolicy::new(1_000)
+            .with_class_budget(MemoryClass::ArtifactCache, class_budget(0, 50, 100, false));
+        let broker = LiveProcessMemoryBroker::from_report_with_reclaimer(
+            report_with(policy),
+            Some(reclaimer.clone()),
+        )
+        .expect("broker");
+        *reclaimer.broker_for_reentry.lock().expect("broker") = Some(broker.clone());
+
+        let charge = broker
+            .reserve_managed_charge(
+                MemoryClass::ArtifactCache,
+                "soft-owner".into(),
+                MemoryContextKind::Request,
+                ChargeKind::RetainedPayload,
+                60,
+            )
+            .expect("soft crossing remains admissible below hard");
+        let requests = reclaimer.requests.lock().expect("requests");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].trigger, ReclaimTrigger::SoftThreshold);
+        assert_eq!(requests[0].max_attempts, 1);
+        drop(requests);
+        assert_eq!(broker.reclaim_runtime_stats().expect("stats").attempts, 1);
+        drop(charge);
+    }
+
+    #[test]
+    fn owner_and_group_soft_caps_each_trigger_the_same_reclaim_lane() {
+        let owner_reclaimer = Arc::new(RecordingReclaimer::default());
+        let owner_policy = ResidencyPolicy::new(1_000)
+            .with_class_budget(MemoryClass::ArtifactCache, class_budget(0, 100, 100, false))
+            .with_owner_quota("soft-owner", OwnerQuota { soft_cap_bytes: 10, hard_cap_bytes: 100 });
+        let owner_broker = LiveProcessMemoryBroker::from_report_with_reclaimer(
+            report_with(owner_policy),
+            Some(owner_reclaimer.clone()),
+        )
+        .expect("owner broker");
+        let owner_charge = owner_broker
+            .reserve_managed_charge(
+                MemoryClass::ArtifactCache,
+                "soft-owner".into(),
+                MemoryContextKind::Request,
+                ChargeKind::RetainedPayload,
+                11,
+            )
+            .expect("owner soft crossing");
+        assert_eq!(owner_reclaimer.requests.lock().expect("requests").len(), 1);
+
+        let group_reclaimer = Arc::new(RecordingReclaimer::default());
+        let group = ResourceGroup {
+            reserved_bytes: 0,
+            soft_cap_bytes: 10,
+            hard_cap_bytes: 100,
+            burst_percent: 0,
+            reclaim_priority: ReclaimPriority::Normal,
+            admission_weight: 1,
+        };
+        let group_policy = ResidencyPolicy::new(1_000)
+            .with_class_budget(MemoryClass::ArtifactCache, class_budget(0, 100, 100, false))
+            .with_resource_group("soft-group", group)
+            .with_owner_group("group-owner", "soft-group");
+        let group_broker = LiveProcessMemoryBroker::from_report_with_reclaimer(
+            report_with(group_policy),
+            Some(group_reclaimer.clone()),
+        )
+        .expect("group broker");
+        let group_charge = group_broker
+            .reserve_managed_charge(
+                MemoryClass::ArtifactCache,
+                "group-owner".into(),
+                MemoryContextKind::Request,
+                ChargeKind::RetainedPayload,
+                11,
+            )
+            .expect("group soft crossing");
+        let group_requests = group_reclaimer.requests.lock().expect("requests");
+        assert_eq!(group_requests.len(), 1);
+        assert_eq!(group_requests[0].resource_group.as_deref(), Some("soft-group"));
+        drop(group_requests);
+        drop(owner_charge);
+        drop(group_charge);
+    }
+
+    #[test]
+    fn hard_cap_denial_reclaims_outside_lock_remeasures_and_retries_once() {
+        let reclaimer = Arc::new(RecordingReclaimer::default());
+        let policy = ResidencyPolicy::new(1_000)
+            .with_class_budget(MemoryClass::ArtifactCache, class_budget(0, 50, 100, false));
+        let broker = LiveProcessMemoryBroker::from_report_with_reclaimer(
+            report_with(policy),
+            Some(reclaimer.clone()),
+        )
+        .expect("broker");
+        *reclaimer.broker_for_reentry.lock().expect("broker") = Some(broker.clone());
+
+        let baseline = broker
+            .reserve_managed_charge(
+                MemoryClass::ArtifactCache,
+                "hard-owner".into(),
+                MemoryContextKind::Request,
+                ChargeKind::RetainedPayload,
+                80,
+            )
+            .expect("baseline");
+        *reclaimer.charge_to_release.lock().expect("charge") = Some(baseline);
+        let replacement = broker
+            .reserve_managed_charge(
+                MemoryClass::ArtifactCache,
+                "hard-owner".into(),
+                MemoryContextKind::Request,
+                ChargeKind::RetainedPayload,
+                30,
+            )
+            .expect("retry sees callback release and admits");
+
+        let requests = reclaimer.requests.lock().expect("requests");
+        assert_eq!(requests.last().expect("hard request").trigger, ReclaimTrigger::CapacityDenial);
+        assert_eq!(requests.last().expect("hard request").max_attempts, 1);
+        drop(requests);
+        let stats = broker.reclaim_runtime_stats().expect("stats");
+        assert_eq!(stats.attempts, 2, "baseline soft signal plus one hard retry");
+        assert_eq!(stats.reported_reclaimed_bytes, 80);
+        assert_eq!(broker.ledger_snapshot().expect("snapshot").total_owner_bytes(), 30);
+        drop(replacement);
+    }
+
+    #[test]
+    fn group_reserved_floor_is_unavailable_to_peer_group() {
+        let protected = ResourceGroup {
+            reserved_bytes: 400,
+            soft_cap_bytes: 500,
+            hard_cap_bytes: 600,
+            burst_percent: 0,
+            reclaim_priority: ReclaimPriority::First,
+            admission_weight: 1,
+        };
+        let peer = ResourceGroup {
+            reserved_bytes: 0,
+            soft_cap_bytes: 700,
+            hard_cap_bytes: 1_000,
+            burst_percent: 0,
+            reclaim_priority: ReclaimPriority::Last,
+            admission_weight: 1,
+        };
+        let policy = ResidencyPolicy::new(1_000)
+            .with_class_budget(MemoryClass::ArtifactCache, class_budget(0, 1_000, 1_000, false))
+            .with_resource_group("protected", protected)
+            .with_resource_group("peer", peer)
+            .with_owner_group("protected-owner", "protected")
+            .with_owner_group("peer-owner", "peer");
+        let broker = LiveProcessMemoryBroker::from_report(report_with(policy)).expect("broker");
+
+        assert!(matches!(
+            broker.reserve(
+                MemoryClass::ArtifactCache,
+                "peer-owner".into(),
+                MemoryContextKind::Request,
+                ChargeKind::RetainedPayload,
+                601,
+            ),
+            Err(MemoryError::Capacity(_))
+        ));
+        let peer_ticket = broker
+            .reserve(
+                MemoryClass::ArtifactCache,
+                "peer-owner".into(),
+                MemoryContextKind::Request,
+                ChargeKind::RetainedPayload,
+                600,
+            )
+            .expect("peer may use unprotected band");
+        let protected_ticket = broker
+            .reserve(
+                MemoryClass::ArtifactCache,
+                "protected-owner".into(),
+                MemoryContextKind::Request,
+                ChargeKind::RetainedPayload,
+                400,
+            )
+            .expect("protected group consumes its floor");
+        broker.release(&peer_ticket).expect("release peer");
+        broker.release(&protected_ticket).expect("release protected");
+    }
+
+    #[test]
+    fn accepted_reconfigure_updates_revision_source_and_matches_headroom_predicate() {
+        let mut policy = ResidencyPolicy::new(1_000).with_headroom_bytes(200);
+        policy.classes.insert(MemoryClass::Headroom, class_budget(0, 200, 200, false));
+        policy.classes.insert(MemoryClass::ArtifactCache, class_budget(0, 800, 800, false));
+        let broker =
+            LiveProcessMemoryBroker::from_report(report_with(policy.clone())).expect("broker");
+        let headroom = broker
+            .reserve(
+                MemoryClass::Headroom,
+                "headroom".into(),
+                MemoryContextKind::Request,
+                ChargeKind::LiveScratch,
+                200,
+            )
+            .expect("headroom");
+        let work = broker
+            .reserve(
+                MemoryClass::ArtifactCache,
+                "work".into(),
+                MemoryContextKind::Request,
+                ChargeKind::RetainedPayload,
+                800,
+            )
+            .expect("separate non-headroom band");
+
+        broker.try_live_reconfigure(policy).expect("identity policy remains legal");
+        let report = broker.effective_report().expect("report");
+        assert_eq!(report.policy_revision, 2);
+        assert_eq!(report.active_policy_source, "runtime_reconfigure");
+        assert_eq!(
+            report.override_provenance.last(),
+            Some(&OverrideRecord::new(OverrideSource::RuntimeReconfigure, "residency.active"))
+        );
+        assert_eq!(report.residency.headroom_bytes, 200);
+        broker.release(&headroom).expect("release headroom");
+        broker.release(&work).expect("release work");
+    }
+
+    #[test]
+    fn identity_reconfigure_succeeds_during_legal_class_borrow() {
+        let policy = ResidencyPolicy::new(1_000)
+            .with_shared_burst_pool_bytes(100)
+            .with_class_budget(MemoryClass::ArtifactCache, class_budget(0, 50, 100, true));
+        let broker =
+            LiveProcessMemoryBroker::from_report(report_with(policy.clone())).expect("broker");
+        let ticket = broker
+            .reserve(
+                MemoryClass::ArtifactCache,
+                "borrower".into(),
+                MemoryContextKind::Request,
+                ChargeKind::RetainedPayload,
+                150,
+            )
+            .expect("legal 50-byte class borrow");
+        broker.try_live_reconfigure(policy).expect("identity reconfigure preserves legal borrow");
+        broker.release(&ticket).expect("release");
+    }
+
+    #[test]
+    fn identity_reconfigure_succeeds_during_legal_group_burst() {
+        let group = ResourceGroup {
+            reserved_bytes: 0,
+            soft_cap_bytes: 50,
+            hard_cap_bytes: 100,
+            burst_percent: 50,
+            reclaim_priority: ReclaimPriority::Normal,
+            admission_weight: 1,
+        };
+        let policy = ResidencyPolicy::new(1_000)
+            .with_shared_burst_pool_bytes(100)
+            .with_class_budget(MemoryClass::ArtifactCache, class_budget(0, 300, 500, false))
+            .with_resource_group("burstable", group)
+            .with_owner_group("group-owner", "burstable");
+        let broker =
+            LiveProcessMemoryBroker::from_report(report_with(policy.clone())).expect("broker");
+        let ticket = broker
+            .reserve(
+                MemoryClass::ArtifactCache,
+                "group-owner".into(),
+                MemoryContextKind::Request,
+                ChargeKind::RetainedPayload,
+                150,
+            )
+            .expect("legal 50-byte group burst");
+        broker.try_live_reconfigure(policy).expect("identity reconfigure preserves legal burst");
+        broker.release(&ticket).expect("release");
+    }
+
+    #[test]
+    fn reclaim_priority_orders_victims_deterministically() {
+        let reclaimer = Arc::new(RecordingReclaimer::default());
+        let mut last = class_budget(0, 10, 100, false);
+        last.reclaim_priority = ReclaimPriority::Last;
+        let mut normal = class_budget(0, 100, 100, false);
+        normal.reclaim_priority = ReclaimPriority::Normal;
+        let mut first = class_budget(0, 100, 100, false);
+        first.reclaim_priority = ReclaimPriority::First;
+        let group_with_priority = |priority| ResourceGroup {
+            reserved_bytes: 0,
+            soft_cap_bytes: 50,
+            hard_cap_bytes: 100,
+            burst_percent: 0,
+            reclaim_priority: priority,
+            admission_weight: 1,
+        };
+        let policy = ResidencyPolicy::new(1_000)
+            .with_class_budget(MemoryClass::ArtifactCache, last)
+            .with_class_budget(MemoryClass::EvidenceCache, normal)
+            .with_class_budget(MemoryClass::TraceIndex, first)
+            .with_resource_group("last-group", group_with_priority(ReclaimPriority::Last))
+            .with_resource_group("normal-group", group_with_priority(ReclaimPriority::Normal))
+            .with_resource_group("first-group", group_with_priority(ReclaimPriority::First));
+        let broker = LiveProcessMemoryBroker::from_report_with_reclaimer(
+            report_with(policy),
+            Some(reclaimer.clone()),
+        )
+        .expect("broker");
+        let charge = broker
+            .reserve_managed_charge(
+                MemoryClass::ArtifactCache,
+                "priority-owner".into(),
+                MemoryContextKind::Request,
+                ChargeKind::RetainedPayload,
+                11,
+            )
+            .expect("soft crossing");
+        let requests = reclaimer.requests.lock().expect("requests");
+        let candidates = &requests[0].candidates;
+        let last_pos = candidates
+            .iter()
+            .position(|candidate| candidate.class == MemoryClass::ArtifactCache)
+            .expect("last candidate");
+        let normal_pos = candidates
+            .iter()
+            .position(|candidate| candidate.class == MemoryClass::EvidenceCache)
+            .expect("normal candidate");
+        let first_pos = candidates
+            .iter()
+            .position(|candidate| candidate.class == MemoryClass::TraceIndex)
+            .expect("first candidate");
+        assert!(last_pos < normal_pos && normal_pos < first_pos);
+        let groups = &requests[0].group_candidates;
+        assert_eq!(groups[0].group, "last-group");
+        assert_eq!(groups[1].group, "normal-group");
+        assert_eq!(groups[2].group, "first-group");
+        drop(requests);
+        drop(charge);
     }
 }

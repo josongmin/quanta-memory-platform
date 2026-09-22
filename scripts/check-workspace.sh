@@ -22,6 +22,13 @@ cargo build --locked --examples --all-features
 echo "[check-workspace] feature-matrix"
 tools/ci/feature-matrix.sh
 
+echo "[check-workspace] advertised feature runtime capabilities"
+scripts/verify-feature-capabilities.sh
+
+echo "[check-workspace] documented test selectors"
+python3 -m unittest -v scripts/tests/test_doc_test_selectors.py
+scripts/verify-doc-test-selectors.py
+
 if ! command -v cargo-deny >/dev/null 2>&1; then
   echo "check-workspace: cargo-deny unavailable" >&2
   exit 1
