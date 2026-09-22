@@ -75,6 +75,7 @@ override.
 | `BLOCKED` | `depends_on`의 현행 호환 receipt/계약이 없거나 재개방돼 불안정하다. read-only design은 가능하지만 owner mutation은 대기 |
 | `IN_PROGRESS` | 한 owner가 claim했고 write set이 잠김 |
 | `IMPLEMENTED` | 코드와 focused tests는 존재하지만 terminal rails 미완료 |
+| `STALE` | 마지막 receipt가 현재 source와 달라 terminal proof가 무효화됐다. 재실행 전까지 QUALIFIED로 사용할 수 없다 |
 | `QUALIFIED` | ticket acceptance와 요구 receipt가 exact source에서 모두 통과 |
 | `DONE` | 후속 consumer/adoption까지 닫혀 ticket 목적이 완결됨 |
 | `REJECTED` | 설계 결정으로 폐기. 대체 ticket/결정 근거 필수 |
@@ -85,20 +86,20 @@ override.
 
 | ID | 우선순위 | 상태 | 목적 | depends_on | 주요 write set |
 | --- | --- | --- | --- | --- | --- |
-| [QMP-000](QMP-000-campaign-admission/TICKET.md) | P1 | QUALIFIED | status/claim, receipt identity, source digest, selected-count and current-transition admission reject negative fixtures and pass exact-head extraction at `f1d45c9` | — | `tickets/**`, `tools/tickets/**`, validator front door |
+| [QMP-000](QMP-000-campaign-admission/TICKET.md) | P1 | STALE | prior campaign admission receipt invalidated by current validator/extraction boundary changes; re-run admission checks on current main | — | `tickets/**`, `tools/tickets/**`, validator front door |
 | [QMP-010](QMP-010-policy-totality/TICKET.md) | P1 | QUALIFIED | mandatory class totality, validated policy authority, fail-closed reserve and current-source doctor pass at `aeeffe3` | QMP-000 | core `policy.rs`, `config.rs`, builder/policy tests |
-| [QMP-020](QMP-020-reservation-lifecycle/TICKET.md) | P1 | QUALIFIED | raw/discardable authority sealed behind managed RAII; duplicate commit and pending-drop rollback pass at `aeeffe3` | QMP-010 | core `ledger.rs`, recharge/control seams |
-| [QMP-030](QMP-030-enforced-builder-runtime-view/TICKET.md) | P1 | QUALIFIED | enforced builder/runtime scratch and managed RAII authority; current builder/control/public surface refreshed at `f9f6d15` | QMP-010, QMP-020 | core/facade builders, broker/control/scratch API, examples |
+| [QMP-020](QMP-020-reservation-lifecycle/TICKET.md) | P1 | STALE | prior `aeeffe3` terminal receipt invalidated by current-source drift; re-run lifecycle acceptance on current main | QMP-010 | core `ledger.rs`, recharge/control seams |
+| [QMP-030](QMP-030-enforced-builder-runtime-view/TICKET.md) | P1 | STALE | prior `6ef6b59` terminal receipt invalidated by current-source drift; re-run public builder/runtime acceptance on current main | QMP-010, QMP-020 | core/facade builders, broker/control/scratch API, examples |
 | [QMP-040](QMP-040-store-lifecycle/TICKET.md) | P1 | QUALIFIED | five-store lifecycle, exact close/drop authority and hostile panic containment remain green at `aeeffe3` | QMP-020, QMP-030 | facade shared lifecycle + all store services |
 | [QMP-050](QMP-050-total-retained-cost/TICKET.md) | P1 | QUALIFIED | total retained-cost, independent underbilling oracles and 0.2 migration pass the Rust 1.92 doctor at `2dfb7bc` | QMP-040 | measure/accounting + store entry cost paths |
-| [QMP-060](QMP-060-transcript-tombstones/TICKET.md) | P1 | QUALIFIED | bounded fail-closed evidence horizon, typed stats/reconfigure, 620-test doctor and real extraction refreshed at `0c126a2` | QMP-050 | transcript types/service/builder |
+| [QMP-060](QMP-060-transcript-tombstones/TICKET.md) | P1 | STALE | prior `163d28f` terminal receipt invalidated by current-source drift; re-run transcript acceptance on current main | QMP-050 | transcript types/service/builder |
 | [QMP-070](QMP-070-spill-transfer-backings/TICKET.md) | P1 | QUALIFIED | recovery-payload/ack protocol and shared binding identity remain green at `aeeffe3` | QMP-020, QMP-040, QMP-050 | revocable/spill/backings/builders |
-| [QMP-080](QMP-080-policy-runtime-semantics/TICKET.md) | P2 | QUALIFIED | canonical policy postimages plus cached weighted burst and unknown-group fail-closed semantics pass the 639-test Rust 1.92 rail at `f2b7497` | QMP-010, QMP-020, QMP-030 | scheduler/controller/control/config |
-| [QMP-090](QMP-090-conformance-model/TICKET.md) | P1 | QUALIFIED | independent model, negative-family mapping, five Loom models and clean standalone rails pass Rust 1.92 at `f2b7497`; focused Miri remains bound to `aeeffe3` | QMP-020, QMP-040, QMP-070 | testkit conformance/fakes/faults |
-| [QMP-100](QMP-100-scaling-benchmarks/TICKET.md) | P2 | QUALIFIED | cached weighted admission removes per-request group sorting; the fresh-build 33-sample rail directly rejects hot-loop allocations and passes zero-drift plus the 639-test doctor at `557213b` | QMP-040, QMP-050, QMP-070 | payload/revocable containers, scheduler, benches, CI scripts |
-| [QMP-110](QMP-110-operability-observation/TICKET.md) | P2 | QUALIFIED | typed one-lock observation, poison truth and bounded events pass the Rust 1.92 doctor at `2dfb7bc` | QMP-030, QMP-040, QMP-080 | stats traits, metrics adapters, broker/store emitters |
-| [QMP-120](QMP-120-standalone-extraction/TICKET.md) | P1 | QUALIFIED | workflow-free local HEAD/tree/blob/mode-bound extraction, 639-test doctor and clean extracted commit pass at `cdbf94f`; repo-local actual extraction is terminal authority | QMP-000 | extraction manifest/scripts, lockfile, release qualification |
-| [QMP-130](QMP-130-host-adoption/TICKET.md) | P1 | QUALIFIED | clean pushed host `986d59b` resolves exact Git QMP `4d08579`; identity 9/9 and all registered QBC suites pass 2/2 + 1/1 + 1/1 on unchanged source. Newer local `8e174d9` is not qualified after external source drift | QMP-030..QMP-120 | external host repo only; QMP repo read-only except receipts |
+| [QMP-080](QMP-080-policy-runtime-semantics/TICKET.md) | P2 | STALE | prior `f2b7497` terminal receipt invalidated by current-source drift; re-run policy acceptance on current main | QMP-010, QMP-020, QMP-030 | scheduler/controller/control/config |
+| [QMP-090](QMP-090-conformance-model/TICKET.md) | P1 | STALE | prior `f2b7497` terminal receipt invalidated by current-source drift; re-run conformance acceptance on current main | QMP-020, QMP-040, QMP-070 | testkit conformance/fakes/faults |
+| [QMP-100](QMP-100-scaling-benchmarks/TICKET.md) | P2 | STALE | prior `557213b` terminal receipt invalidated by current-source drift; re-run benchmark acceptance on current main | QMP-040, QMP-050, QMP-070 | payload/revocable containers, scheduler, benches, CI scripts |
+| [QMP-110](QMP-110-operability-observation/TICKET.md) | P2 | STALE | prior `849a8dd` terminal receipt invalidated by current-source drift; re-run observation acceptance on current main | QMP-030, QMP-040, QMP-080 | stats traits, metrics adapters, broker/store emitters |
+| [QMP-120](QMP-120-standalone-extraction/TICKET.md) | P1 | STALE | prior `cdbf94f` terminal receipt invalidated by current-source drift; re-run extraction acceptance on current main | QMP-000 | extraction manifest/scripts, lockfile, release qualification |
+| [QMP-130](QMP-130-host-adoption/TICKET.md) | P1 | STALE | prior host-pair receipt references a changed local ticket/source boundary; exact host/QMP pair must be re-recorded after product requalification | QMP-030..QMP-120 | external host repo only; QMP repo read-only except receipts |
 | [QMP-140](QMP-140-semver-docs-closeout/TICKET.md) | P2 | BLOCKED | local 0.2 SemVer/MSRV, feature runtime, selectors, performance, workflow-free extraction and exact-head host qualification are complete; host-main merge/activation and final exact-source reconciliation remain | QMP-010..QMP-130 | public exports, README/EXTRACTION/docs, Cargo metadata |
 
 상태를 바꿀 때 이 표와 ticket receipt를 같은 change에서 갱신한다.

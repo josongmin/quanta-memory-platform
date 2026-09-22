@@ -167,6 +167,10 @@ class TicketValidatorTests(unittest.TestCase):
         with self.assertRaisesRegex(ValidationError, "invalid ticket status"):
             parse_inventory(readme([row("QMP-000", status="GREENISH")]))
 
+    def test_inventory_accepts_stale_status(self) -> None:
+        tickets = parse_inventory(readme([row("QMP-000", status="STALE")]))
+        self.assertEqual(tickets["QMP-000"].status, "STALE")
+
     def test_ticket_inventory_rejects_missing_ticket_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
