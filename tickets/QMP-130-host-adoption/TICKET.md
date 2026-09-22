@@ -238,3 +238,14 @@ QMP-130 is therefore `QUALIFIED` for this branch/revision pair. `QUALIFIED` is
 not host-main merge, deployment or activation; those remain QMP-140 closeout
 boundaries. The repository intentionally has no GitHub Actions workflow, so
 remote workflow status is not an acceptance condition.
+
+## Session-hardening boundary — 2026-09-22
+
+[`SESSION-HARDENING-2026-09-22.md`](SESSION-HARDENING-2026-09-22.md) corrects
+the original receipt's command/output-hash attribution and records a newer
+local host test enhancement. The qualification above remains bound **only** to
+host `986d59b6455028bbf423797ba8b745e46e0cad83`. The newer local host
+`8e174d9889c1053e0cb6849bc31ed888dcc5bed1` has focused 3/3 proof but no
+completed same-source composite QBC gate: an actively changing external
+`quanta-index` path dependency invalidated two attempts. Do not promote the
+newer host commit or treat its partial receipts as a replacement qualification.
