@@ -258,3 +258,58 @@ extraction pre-flight (step 0b, `extract-to-standalone-repo.sh:80`
 against `repo_root`) and `scripts/check-workspace.sh:26` runs the locked
 resolved-graph check inside the destination rail — the removed call was
 genuinely duplicate validation. No edit war; §8 as rewritten stands.
+
+## 14. Final audit round (this session)
+
+- TO-07 reroute mutant executed (closes the §11 waiver):
+  `build_live` rerouted past reclaimer wiring → request-count RED
+  (`builder.rs:299`, `left: 0, right: 1`); post-revert green.
+  TO-07 test body re-checked line-by-line against the ticket
+  (`class_budget(0, 50, 100)` = reserved 0 / soft 50 / hard 100 /
+  borrow false; full chain; trigger/class/owner/bytes/max_attempts;
+  attempts 1; total 60; drop → 0; test-local fake).
+- Full suite re-run at `1634c3f`: 12/12 binaries green, 642 passed,
+  0 failed. `cargo fmt --check` exit 0, `pm lint OK (3 targets)`.
+- `scripts/check-workspace.sh` single-command run: passes fmt,
+  shellcheck, resolved graph, workspace policy, Python contracts,
+  and 4 extraction-contract checks, then halts at the consolidated
+  semgrep fixture scan — same environmental `ca-certs: empty trust
+  anchors` binary crash (exit 2), unchanged since the integrator
+  window. Post-guard stages verified individually green instead
+  (feature-matrix OK, 642 tests, doctests, bench smoke artifact §10).
+- Conclusion: all nine tickets are implementation- and
+  proof-complete. Only the annotated exact-source qualification
+  receipt (tag authority) remains, which this session does not issue.
+
+## 13. Owner-executed mutant proofs, round 2 (closes §11 arrears)
+
+Same protocol as §11 (mutant → RED → revert → `git diff` empty →
+green). This closes TO-02c, TO-02d, and TO-03. All nine tickets now
+have owner-verified negative proofs; none is `DONE` (annotated
+exact-source receipt still owed).
+
+- TO-02c (`retained_map/service.rs` `get_checked`, hash lookup →
+  linear scan over `entries.iter()`, identical results):
+  `first_and_last_key_point_operations_share_one_n_independent_probe_bound_v1`
+  FAILED at `service.rs:1398` (`lookup hashes the exact key once`,
+  `left: 0, right: 1`). Post-revert: 1 passed (0.02s).
+- TO-03 (`benches/scaling.rs`, `Vec::with_capacity(entries)` moved
+  back inside the epoch): bench `--smoke` binary exit `101`,
+  panic at `scaling.rs:571` (`allocation epoch must start with zero
+  tracked allocations`, `left: 8000, right: 0`). Note: the
+  `run-scaling-bench.sh` wrapper refuses dirty trees (exit 2), so the
+  binary was invoked directly with identical args; the oracle (not the
+  wrapper gate) produced the RED. Post-revert: mutant-free tree.
+- TO-02d (`revocable_store/service.rs` `reclaim_one`, redundant O(N)
+  `charged_bytes` rescan + `black_box` per reclaim; totals and order
+  unchanged): full `--sizes=1000,10000` artifact (170 samples) →
+  verifier exit `1` with `revocable_fill_and_drain growth: per-entry
+  cost grew 6.96x from 1000 to 10000 entries (median 889.8ns/entry ->
+  6195.2ns/entry, allowed 4.0x)`. Post-revert clean rerun: `OK (170
+  samples)`, exit `0`.
+- TO-02d process note (no-false-positive evidence): two earlier
+  candidate mutants stayed GREEN for principled reasons —
+  `VecDeque::remove(0)` is O(1) on a ring buffer (ratio 1.12x), and
+  `make_contiguous()` is a no-op on a never-wrapped deque (ratio
+  1.03x). The rail correctly passed both and fired only on the
+  genuinely quadratic rescan.

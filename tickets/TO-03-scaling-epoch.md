@@ -81,3 +81,14 @@ scripts/run-scaling-bench.sh --smoke
 temporary mutant로 `Vec::with_capacity` 또는 scheduler construction을 epoch 내부로 되돌렸을
 때 non-zero allocation assertion이 RED여야 한다. 추적 전 allocate/추적 중 drop 패턴이
 남거나 JSON 소비자 schema가 바뀌면 reopen한다.
+
+## Closeout receipt (owner-verified, IMPLEMENTED — annotated receipt owed)
+
+- `cargo bench -p quanta-memory-platform-facade --features
+  payload_store,revocable_store --bench scaling --no-run` builds
+  (`scaling-25a2413b61efab4d`).
+- Mutant: `Vec::with_capacity(entries)` moved back inside the epoch →
+  bench `--smoke` binary exit 101, panic at `scaling.rs:571`
+  (`allocation epoch must start with zero tracked allocations`,
+  `left: 8000, right: 0`). Binary invoked directly (wrapper refuses
+  dirty trees); oracle produced the RED. Post-revert: clean tree.

@@ -76,3 +76,13 @@ cargo test -p quanta-memory-platform-core --lib
 - 서로 다른 두 cardinality 모두 exact 3-slot bound와 final drain을 검증한다.
 - full-scan mutant가 GREEN이거나 owner cardinality dependence를 assertion에서 제거하면
   reopen한다.
+
+## Closeout receipt (owner-verified, IMPLEMENTED — annotated receipt owed)
+
+- Mutant: full `owner_usage` scan added to
+  `last_release_preflight_axis_probes` in `preflight_release_batch`.
+- RED: cardinality test FAILED at `ledger.rs:1518` on exact-`3`
+  assertion (`left: 35, right: 3`; 3 + 32 owners on first run).
+- Post-revert: 1 passed; production byte-identical to HEAD.
+- Medians (same host/profile, warm, 3 runs): before 0.09s → after
+  0.00s. No time assertion in code.

@@ -76,3 +76,12 @@ cargo test -p quanta-memory-platform-core --all-features
 
 - hard cap 성공, hard cap + 1 typed denial, unchanged snapshot, final zero가 모두 존재한다.
 - public broker를 우회하거나 denial 뒤 state equality를 없애면 reopen한다.
+
+## Closeout receipt (owner-verified, IMPLEMENTED — annotated receipt owed)
+
+- Mutant: `validate_reserve_postimage` pool allowance +1 (admits the
+  over-cap byte).
+- RED: `zero_shared_pool_cannot_extend_borrowing_class_hard_cap` FAILED
+  at `policy_contracts.rs:310` (+1-byte `Capacity` denial missing).
+  Failure is through the public broker, not the validation-only test.
+- Post-revert: 1 passed; production byte-identical to HEAD.

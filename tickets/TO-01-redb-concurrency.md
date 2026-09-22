@@ -78,3 +78,12 @@ median 대비 80% 이상 감소다. 임계값은 코드 assertion이 아니라 c
 - Barrier가 없거나, receipt sequence를 검증하지 않거나, exact payload round-trip/zero
   inventory 중 하나라도 빠지면 미완료다.
 - runtime만 줄고 temporary mutant가 GREEN이면 오라클이 약해진 것이므로 reopen한다.
+
+## Closeout receipt (owner-verified, IMPLEMENTED — annotated receipt owed)
+
+- Mutant: `reserve_record_id` returns constant duplicate ID 0.
+- RED: `concurrent_accepts_lose_no_handle_and_assign_distinct_keys` FAILED,
+  worker threads panicked at `redb.rs:1243` (duplicate-key commit rejected).
+- Post-revert: 1 passed (0.42s); production byte-identical to HEAD.
+- Medians (same host/profile, warm, 3 runs): before 6.53s → after 0.76s
+  (~88% reduction; target ≥80%). No time assertion in code.

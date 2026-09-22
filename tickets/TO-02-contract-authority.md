@@ -201,3 +201,23 @@ rg -n 'include_str!|read_to_string' crates/quanta-memory-platform-facade/src cra
   RED다.
 - README wording만 바꿔도 rail이 실패하지 않는다.
 - public API 계약을 compiler 대신 source text로 다시 검사하면 reopen한다.
+
+## Closeout receipt (owner-verified, IMPLEMENTED — annotated receipt owed)
+
+- Mutant (a): temporary `pub fn new` on `SimplePayloadStore` → doctest
+  `SimplePayloadStore (line 81) - compile fail` FAILED (snippet compiled).
+- Mutant (b): `unbudgeted-stores` added to `full` →
+  `verify-feature-matrix.sh` exit 1
+  (`facade feature 'full' must not enable unbudgeted-stores` + tree).
+  Post-revert: `feature-matrix: OK`.
+- Mutant (c): `get_checked` hash lookup → linear scan →
+  probe-bound test FAILED at `retained_map/service.rs:1398`
+  (`left: 0, right: 1`, hash-once oracle). Post-revert: 1 passed.
+- Mutant (d): O(N) rescan per `reclaim_one` → `--sizes=1000,10000`
+  artifact (170 samples) → verifier exit 1
+  (`per-entry cost grew 6.96x`, medians 889.8ns → 6195.2ns, allowed
+  4.0x). Post-revert clean rerun: `OK (170 samples)`, exit 0.
+  (Two non-quadratic candidates — `VecDeque::remove(0)`, 1.12x; bare
+  `make_contiguous()`, 1.03x — correctly stayed GREEN.)
+- Smoke artifact: receipts §10 (`00ab2a6`, exit 0, 33 samples).
+- All mutants reverted; production byte-identical to HEAD after each.

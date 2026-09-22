@@ -80,3 +80,14 @@ cargo test -p quanta-memory-platform-facade --all-features transcript_store::ser
 - expected partition이 production helper에서 파생되지 않는다.
 - append와 truncate postimage 모두 exact하다.
 - `> 0`/sum-only assertion으로 되돌리거나 partition swap mutant가 GREEN이면 reopen한다.
+
+## Closeout receipt (owner-verified, IMPLEMENTED — annotated receipt owed)
+
+- Mutant: `append` swaps `evidence_bytes` ↔ `key_bytes` cost sources;
+  total preserved at 235.
+- RED: `retention_stats_separate_active_evidence_and_session_costs`
+  FAILED at `service.rs:1510` on the exact `evidence_bytes` component
+  assertion (`left: 41, right: 148`); counter validation passed, oracle
+  fired. Oracle never calls production cost helpers.
+- Post-revert: `transcript_store` suite 47 passed; production regions
+  byte-identical to HEAD.

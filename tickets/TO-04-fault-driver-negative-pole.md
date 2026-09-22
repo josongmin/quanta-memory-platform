@@ -69,3 +69,12 @@ cargo test -p quanta-memory-platform-testkit --features faults faults::scenarios
 - honest/lying component가 같은 classifier code path를 공유한다.
 - public driver의 branch를 바꾼 mutant를 negative pole이 잡는다.
 - test module에 duplicated `match controller.spill` classifier가 다시 생기면 reopen한다.
+
+## Closeout receipt (owner-verified, IMPLEMENTED — annotated receipt owed)
+
+- Mutant: success arm (`(_, Ok(_), _)`) → `Contained` in production
+  `classify_spill_failure`.
+- RED: `spill_fault_classification_reports_escaped_for_a_lying_controller`
+  FAILED at `scenarios.rs:263`; drift/unreadable poles passed (separate
+  arms). Proves both poles share the production code path.
+- Post-revert: 3 passed; file byte-identical to HEAD.

@@ -69,3 +69,16 @@ keeper assertion과 동일 실행 경로를 지목하는 diff proof다.
 - 정확히 duplicate/dead assertion과 stale comment만 바뀐다.
 - unique outcome/variant/capacity invariant가 같이 삭제되거나 production diff가 생기면
   reopen한다.
+
+## Closeout receipt (owner-verified, IMPLEMENTED — annotated receipt owed)
+
+Ticket requires no mutant; keeper-implication diff proof (verified live):
+- (a) Deleted telemetry case's exact row `(2_000, 1_000, 1_000, true)`
+  present in keeper table (`ports/telemetry.rs:267`) with the
+  semantic-authority assertion. Same table, same outcome coverage.
+- (b) Deleted `assert_ne!(after.total_owner_bytes(), 600_000)` implied
+  by keepers `after == before` (`api/control.rs:2083`) +
+  `after == 400_000` (`:2088`): 400_000 ≠ 600_000. Dead by logic.
+- (c) eight→nine comment matches the nine-element exhaustive array
+  (`tests/public_api_surface.rs:174-179`, no wildcard arm).
+- `git diff` on all three owner files shows no production hunk.

@@ -80,3 +80,16 @@ cargo test -p quanta-memory-platform-core --all-features api::builder
 - lower-level constructor가 아닌 builder-first chain 전체가 실행된다.
 - callback request 내용, admitted ledger state, cleanup state를 모두 검증한다.
 - reclaimer를 설치했다는 field-level assertion만 남으면 reopen한다.
+
+## Closeout receipt (owner-verified, IMPLEMENTED — annotated receipt owed)
+
+- Mutant: `build` passes `reclaimer = None` instead of the configured
+  callback.
+- RED: `builder_reclaimer_reaches_build_live_broker` FAILED at
+  `builder.rs:297` (request-count assertion).
+- Post-revert: 1 passed; production byte-identical to HEAD.
+- Reroute mutant: `build_live` rebuilt to bypass reclaimer wiring
+  (`from_report_with_reclaimer_and_events(report, None, …)`) → test
+  FAILED at `builder.rs:299` (`left: 0, right: 1`, request-count).
+  Proves the test exercises `build_live` itself, not `build`.
+  Post-revert: 1 passed.
