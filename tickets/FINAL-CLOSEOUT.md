@@ -57,14 +57,15 @@ copied roots are clean and the resulting commit is re-qualified.
 
 ## Audit-record admission
 
-The copied `docs/` root intentionally retains one bounded audit record:
+The copied `docs/` root intentionally retains two bounded audit records:
 
 | Path | Classification | Closure rule |
 | --- | --- | --- |
+| `docs/bugbash/sep-22-test-optimization/` | v1 five-track audit and synthesis | retained as initial source evidence, never executable admission tooling |
 | `docs/bugbash/sep-22-test-optimization-deep/` | v2 twelve-track census, timing evidence, two critics, and synthesis | retained as prioritized test-quality backlog; no recommendation is an implementation receipt |
 
-The superseded v1 bugbash reports were removed rather than retained beside a
-second overlapping audit. The deep record must be committed as a set. The
+The records cover different levels of detail; the deep audit does not replace
+the v1 source citations. Both paths must be committed as complete sets. The
 extractor rejects any future untracked file beneath copied roots because `git
 archive HEAD` cannot preserve it and allowing one would make the frozen-source
 claim false.

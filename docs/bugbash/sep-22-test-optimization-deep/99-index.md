@@ -23,7 +23,8 @@ a test before its keeper is strengthened, or claiming a runtime qualification.
 | **Total** | **607** | both critics | **pass** |
 
 Timing evidence is retained in `timing/top40.md` and `timing/full.txt`. The
-superseded v1 audit was removed rather than retained beside this deeper census.
+original v1 audit is retained in the sibling directory as its shorter,
+source-citation-first companion.
 
 ## Prioritized implementation backlog
 
