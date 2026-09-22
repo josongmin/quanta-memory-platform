@@ -62,7 +62,10 @@ def manifest_digest(manifest: dict[str, Any]) -> str:
 
 
 def path_is_excluded(path: str, excludes: list[str]) -> bool:
-    return any(path == exclude or path.startswith(exclude.rstrip("/") + "/") for exclude in excludes)
+    return any(
+        path == exclude or path.startswith(exclude.rstrip("/") + "/")
+        for exclude in excludes
+    )
 
 
 def build_manifest(
