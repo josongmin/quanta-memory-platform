@@ -83,6 +83,23 @@ class ExtractionManifestTests(unittest.TestCase):
         self.source.chmod(0o644)
         self.assert_dirty_rejected()
 
+    def test_untracked_content_under_extraction_root_is_rejected(self):
+        (self.root / "scripts/local-only.sh").write_text("#!/bin/sh\n", encoding="utf-8")
+        head = subprocess.check_output(
+            ["git", "-C", str(self.root), "rev-parse", "HEAD"], text=True
+        ).strip()
+        result = self.helper(
+            "assert-clean",
+            "--repo",
+            str(self.root),
+            "--commit",
+            head,
+            "scripts",
+            check=False,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("untracked extraction input differs from frozen HEAD", result.stderr)
+
     def test_repeated_snapshot_has_identical_tree_and_digest(self):
         _, first = self.snapshot("first.json")
         _, second = self.snapshot("second.json")

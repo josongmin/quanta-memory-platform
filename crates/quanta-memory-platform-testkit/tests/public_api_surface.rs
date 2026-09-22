@@ -6,6 +6,10 @@
 //!   `run_facade_store_suite`, and `FACADE_STORE_SUITE`.
 
 #[cfg(feature = "conformance")]
+use quanta_memory_platform_testkit::conformance::suites::{
+    TranscriptAppendConformanceTarget, TranscriptRow,
+};
+#[cfg(feature = "conformance")]
 use quanta_memory_platform_testkit::conformance::{
     run_broker_accounting_suite, AccountingView, AllocatorAdvisoryView, AllocatorObservation,
     BrokerConformanceTarget, ChargeAxis, ConformanceSuite, ConformanceVerdict, ContractFamily,
@@ -33,7 +37,9 @@ fn names_conformance_surface() {
         ConformanceVerdict,
         ContractFamily,
         InvariantAssertion,
+        TranscriptRow,
     );
+    fn transcript_target_bound<T: TranscriptAppendConformanceTarget>() {}
     type _BrokerRunner<T> = fn(&mut T) -> Vec<AssertionVerdict>;
     let _runner: _BrokerRunner<DummyTarget> = run_broker_accounting_suite::<DummyTarget>;
     let _suite_name: &str = CORE_ACCOUNTING_SUITE;

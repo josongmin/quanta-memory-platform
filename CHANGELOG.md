@@ -2,9 +2,10 @@
 
 ## Unreleased - 2026-09-22
 
-- Removed campaign-only ticket verification tooling and its audit artifacts.
-  The retained repo-local rails validate source, feature capability, documented
-  test selectors, scaling results, and standalone extraction directly.
+- Removed campaign-only ticket verification tooling and ticket-campaign
+  artifacts. The retained bugbash reports are a bounded source-audit record;
+  repo-local rails validate source, feature capability, documented test
+  selectors, scaling results, and standalone extraction directly.
 - Consolidated duplicate doctor/CI wrappers into `scripts/check-workspace.sh`,
   moved every portable policy check under `scripts/`, and made feature coverage
   metadata-driven. The guidance generator is now standard-library-only and

@@ -155,6 +155,18 @@ def assert_clean(repo: Path, commit: str, roots: list[str]) -> None:
     if changed:
         raise ManifestError("tracked extraction input differs from frozen HEAD")
 
+    untracked = git(
+        repo,
+        "ls-files",
+        "--others",
+        "--exclude-standard",
+        "-z",
+        "--",
+        *roots,
+    ).stdout
+    if untracked:
+        raise ManifestError("untracked extraction input differs from frozen HEAD")
+
 
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser()

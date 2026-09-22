@@ -47,8 +47,9 @@ dependency direction. Not prose: every step is a command or a verifiable gate.
    scripts/extract-to-standalone-repo.sh /path/to/new/quanta-memory-platform
    ```
 
-   This freezes `HEAD` and its tree ID, rejects relevant staged, unstaged, or
-   executable-bit drift, and exports bytes directly from that committed tree.
+   This freezes `HEAD` and its tree ID, rejects relevant staged, unstaged,
+   untracked, or executable-bit drift, and exports bytes directly from that
+   committed tree.
    The canonical manifest binds every path to its Git mode, blob ID, and
    content SHA-256. Source and extracted manifest digests must match. It
    verifies the extracted workspace before `git init` or any bootstrap commit,
