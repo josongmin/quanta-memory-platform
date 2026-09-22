@@ -40,6 +40,26 @@ class WorkspaceLintPolicyTest(unittest.TestCase):
                 ["workspace member does not inherit lints: member"],
             )
 
+    def test_library_root_without_non_overridable_forbid_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="qmp-missing-forbid-") as directory:
+            root = Path(directory)
+            (root / "member/src").mkdir(parents=True)
+            (root / "Cargo.toml").write_text(
+                '[workspace]\nmembers = ["member"]\n\n'
+                '[workspace.lints.rust]\nunsafe_code = "deny"\n',
+                encoding="utf-8",
+            )
+            (root / "member/Cargo.toml").write_text(
+                '[package]\nname = "member"\nversion = "0.1.0"\n\n'
+                '[lints]\nworkspace = true\n',
+                encoding="utf-8",
+            )
+            (root / "member/src/lib.rs").write_text("pub fn safe() {}\n", encoding="utf-8")
+            self.assertEqual(
+                checker.lint_policy_errors(root),
+                ["library root does not forbid unsafe code: member"],
+            )
+
     def test_inherited_policy_rejects_unsafe_code(self) -> None:
         with tempfile.TemporaryDirectory(prefix="qmp-unsafe-lint-") as directory:
             root = Path(directory)

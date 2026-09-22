@@ -17,8 +17,9 @@ Status: `OPEN`
 - `014eb65`가 원래 TO-10을 해결했다. test별 PID+nonce directory, RAII cleanup, backing
   drop/reopen 검증이 들어가 수동 cleanup과 cross-process path collision이 제거됐다.
   따라서 TO-10은 open queue에서 제외한다.
-- 티켓 파일 자체는 untracked 상태이므로 audit base는 tested head 또는 clean-tree 증명이
-  아니다.
+- 티켓 파일은 `4aff891`에서 tracked 상태가 됐지만 audit base는 tested head 또는
+  clean-tree 증명이 아니다. 구현/qualification은 각 ticket의 postimage exact SHA에
+  다시 결속한다.
 - `d36f29a9` 파일별 계획 보강 시점의 기존 dirty overlay는 `.cursorrules`,
   `CHANGELOG.md`, `CLAUDE.md`, `Cargo.toml`, `EXTRACTION.md`, `README.md`, 세 crate의
   `src/lib.rs`, `scripts/check-workspace.sh`, `scripts/verify-workspace-policy.py`,
@@ -26,9 +27,9 @@ Status: `OPEN`
   `tools/pm/sources/rules/{architecture.md,build.md,cheatsheet.md}`, 삭제 중인
   `tools/pm/sources/agent-specific/{claude.md,cursor.md}`다. 이 큐의 write lease가 아니며
   구현자가 흡수하거나 되돌리면 안 된다.
-  특히 `crates/quanta-memory-platform-facade/src/lib.rs`는 TO-02와 겹치므로 기존 dirty
-  owner가 commit/release하고 새 blob digest를 재동결하기 전에는 TO-02 writer가 수정하지
-  않는다.
+  이 overlay는 `4aff891`에 흡수됐으므로 별도 writer lease가 아니다. 특히
+  `crates/quanta-memory-platform-facade/src/lib.rs`는 TO-02와 겹치므로 구현 시작 전에
+  새 blob digest를 재동결한다.
 - 구현 시작 전에 담당 파일의 digest를 재계산한다. 아래 digest가 달라졌으면
   티켓을 그대로 적용하지 말고 해당 소유자와 오라클을 다시 감사한다.
 

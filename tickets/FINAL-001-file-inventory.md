@@ -5,6 +5,30 @@ Frozen review base: `101781c2ea6122602b4acd9aa69ebfc13fda958f` (`main` and
 commit. Later untracked inputs are listed in `FINAL-CLOSEOUT.md` and are not
 silently treated as part of this frozen set.
 
+## Current requalification delta
+
+Current reviewed commit: `4aff89156049d06145f295b93d9a4b017210cb1f` (tree
+`be72d2a2b4bdf2534dbd9624d43a6a2583daa54d`), relative to the historical
+receipt source `014eb65d09c38f1aba949ec438ca9c04c9261381`. The only remaining
+working-tree path when this section was written is generated `.cursorrules`;
+it is produced from `tools/pm/sources/rules/build.md` and must be committed
+with that source before FINAL-002. The table below classifies all 25 committed
+paths in this requalification delta; it does not treat the historical receipt
+as proof for this newer source.
+
+| Owner / purpose | Paths reviewed | Verdict |
+| --- | --- | --- |
+| Workspace safety and lint policy | `Cargo.toml` | Root workspace lint levels add `unsafe_code = "deny"` plus Clippy levels. Each library still retains non-overridable `#![forbid(unsafe_code)]`; policy verification rejects a missing attribute or unauthorized exception. No dependency graph change. |
+| Generated guidance and source authority | `.cursorrules`; `CLAUDE.md`; `tools/pm/targets.json`; `tools/pm/README.md`; `tools/pm/sources/agent-specific/{claude.md,cursor.md}` (delete); `tools/pm/sources/rules/{architecture.md,build.md,cheatsheet.md}` | The two retired agent-specific source mappings are removed. The three remaining PM targets are authoritative. `.cursorrules` is generated-only and its pending regeneration is tracked explicitly above. |
+| Canonical shell rail | `scripts/check-workspace.sh` | ShellCheck replaces a duplicate `bash -n` pass and fails closed when no shell scripts are found. This is a validation deduplication, not a coverage removal. |
+| Product and extraction documentation | `CHANGELOG.md`; `README.md`; `EXTRACTION.md` | Documentation now names the actual ShellCheck rail and keeps extraction/host proof boundaries explicit. |
+| Current closeout authority | `tickets/FINAL-CLOSEOUT.md` | Historical receipt is preserved; FINAL-001 through FINAL-006 are correctly marked as requalification work for the current source. Ticket files are tracked repository inputs but not extraction-manifest copy roots. |
+| Structural remediation queue | `tickets/TEST-OPTIMIZATION-EXECUTION.md`; `tickets/TO-01-redb-concurrency.md` through `tickets/TO-09-transcript-partitions.md` | Nine scoped producer-owned remediation tickets. They are implementation plans, not evidence of completion; TO-03 precedes TO-02 on the shared scaling owner. |
+
+No unexplained deletion, public API expansion, host noun, upward dependency, or
+direct generated-file edit was found in the requalification delta. The queue
+does not itself close FINAL-002 through FINAL-005.
+
 | Owner / purpose | Paths reviewed | Verdict |
 | --- | --- | --- |
 | Removed local-only build preferences | `.cargo/config.toml` (delete); `clippy.toml` (delete); `deny.toml` | Correct: portable rail owns its settings and deny has no stale exception. |
