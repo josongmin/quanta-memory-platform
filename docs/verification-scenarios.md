@@ -75,7 +75,7 @@ check helpers that the control plane enforces (see group C/D).
 - ✅ resource_groups — `validate_accepts_well_formed_resource_group`, `validate_rejects_resource_group_reserved_above_soft`, `validate_rejects_resource_group_soft_above_hard`, `validate_rejects_resource_group_hard_above_global`, `validate_rejects_resource_group_burst_percent_over_100`, `validate_accepts_resource_group_burst_percent_boundaries`, `resource_group_reserved_has_an_independent_global_floor`.
 - ✅ owner→group mapping validated — `validate_rejects_owner_group_mapping_to_unknown_group` (`core/src/domain/config.rs`).
 - ✅ presets — `for_preset_{populates_every_mandatory_class,is_structurally_valid,class_caps_isolate_below_global,scales_caps_with_global_limit,weighted_split_never_over_allocates_distributable,headroom_class_owns_exactly_the_reserved_band,no_single_class_cap_plus_headroom_exceeds_global}`.
-- ✅🔢 edges — `default_residency_global_one_does_not_underflow_and_validates`, `default_residency_small_globals_all_validate`, `borrow_flag_with_zero_shared_pool_is_valid_but_grants_no_burst`.
+- ✅🔢 edges — `default_residency_global_one_does_not_underflow_and_validates`, `default_residency_small_globals_all_validate`, `borrow_flag_with_zero_shared_pool_is_valid_and_preserved`, `zero_shared_pool_cannot_extend_borrowing_class_hard_cap`.
 - ✅ override resolver/provenance — `higher_precedence_layer_wins_and_is_recorded_in_provenance`, `removing_top_layer_changes_effective_value`, `empty_layer_is_skipped_in_provenance`.
 - ✅ **ExecutionBudget admission helpers** — `check_helpers_admit_within_cap_and_reject_over_cap`, `unlimited_budget_admits_everything` (`core/src/domain/policy.rs`); the cap is enforced at the control surface (see group C scratch enforcement).
 
@@ -185,7 +185,7 @@ choice documented in `facade/src/publish_pipeline/service.rs`, not a gap.
 
 ## L. Telemetry adapters — ✅ (`core/src/adapters/*`, `core/src/ports/telemetry.rs`)
 
-- ✅ advisory correctness — `advisory_flags_mismatch_and_reports_semantic_as_authority`, `compare_reports_signed_drift_and_mismatch_boundary`, `compare_semantic_bytes_is_ssot_not_allocator`, `missing_allocator_data_is_not_treated_as_mismatch`.
+- ✅ advisory correctness — `compare_reports_signed_drift_and_mismatch_boundary`, `compare_semantic_bytes_is_ssot_not_allocator`, `missing_allocator_data_is_not_treated_as_mismatch`.
 - ✅ observation-only invariant — `allocator_telemetry_trait_surface_is_observation_only`, `trait_path_absent_allocator_data_never_contradicts_ssot`, `emitter_holds_no_accounting_state`.
 - ✅ hdrhistogram adapter — `records_deterministic_set_and_reads_back_count_and_percentiles`, `invalid_bounds_return_error_not_panic`, `out_of_range_record_is_rejected_and_does_not_mutate_count`.
 

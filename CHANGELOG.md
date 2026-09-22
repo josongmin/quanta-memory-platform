@@ -21,8 +21,9 @@
 - Consolidated repeated architecture, test, dependency, and error-handling
   guidance in generated agent rules; aligned the documented `MemoryError`
   taxonomy with all nine current variants; removed duplicate live-policy and
-  extracted-destination graph checks; and separated dirty-tree local
-  verification from clean exact-HEAD extraction qualification.
+  extracted-destination graph checks; deduplicated identical default/bare/
+  singleton feature builds; and separated dirty-tree local verification from
+  clean exact-HEAD extraction qualification.
 
 ## 0.2.0 - 2026-09-21
 

@@ -16,9 +16,6 @@ SPEC.loader.exec_module(checker)
 
 
 class WorkspaceLintPolicyTest(unittest.TestCase):
-    def test_live_workspace_forbids_product_unsafe(self) -> None:
-        self.assertEqual(checker.lint_policy_errors(ROOT), [])
-
     def test_new_non_inheriting_member_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory(prefix="qmp-lints-") as directory:
             root = Path(directory)

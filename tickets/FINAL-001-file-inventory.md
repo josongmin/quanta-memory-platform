@@ -50,6 +50,14 @@ The current candidate has no Cargo dependency or public API graph change.
 `core <- facade <- testkit` remains the resolved direction; full feature-matrix
 and public/doctest rails are required again after the candidate is committed.
 
+## Post-candidate rail deduplication delta
+
+| Owner / purpose | Paths reviewed | Verdict |
+| --- | --- | --- |
+| Feature matrix | `scripts/verify-feature-matrix.sh` | Identical Cargo feature sets are compiled once: empty default equals bare, and a singleton default equals that same isolated feature. Every distinct logical feature set remains covered, including bare, full, and workspace bookends. |
+| Policy test selection | `scripts/tests/test_workspace_policy.py` | Removes the current-worktree duplicate; the canonical rail still invokes the live policy checker directly, while fixture tests retain missing inheritance, missing non-overridable forbid, and unauthorized exception negative cases. |
+| Scenario/changelog documentation | `docs/verification-scenarios.md`; `CHANGELOG.md` | Replaces renamed/removed test selectors and records the validated deduplication. No runtime API or extraction input change. |
+
 | Owner / purpose | Paths reviewed | Verdict |
 | --- | --- | --- |
 | Removed local-only build preferences | `.cargo/config.toml` (delete); `clippy.toml` (delete); `deny.toml` | Correct: portable rail owns its settings and deny has no stale exception. |

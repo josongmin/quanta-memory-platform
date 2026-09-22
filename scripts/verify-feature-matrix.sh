@@ -8,7 +8,7 @@
 # being on. This script checks each crate across the meaningful feature axes so
 # such a break is caught BEFORE extraction.
 #
-# Axes checked, per member crate:
+# Logical axes covered, per member crate (identical Cargo feature sets run once):
 #   - default features                      (the consumer-default surface)
 #   - --no-default-features                 (the bare, slice-free surface)
 #   - --no-default-features --features <f>  (each individual feature, ALONE)
@@ -24,8 +24,9 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${repo_root}"
 
 # Cargo metadata is the feature-list authority. Every public feature except the
-# `default` and `full` aggregates is checked alone, so a new feature cannot be
-# added to a manifest without entering this matrix automatically.
+# `default` and `full` aggregates is checked alone or by an identical singleton
+# default, so a new feature cannot be added to a manifest without entering this
+# matrix automatically.
 CORE_CRATE="quanta-memory-platform-core"
 FACADE_CRATE="quanta-memory-platform-facade"
 TESTKIT_CRATE="quanta-memory-platform-testkit"
@@ -45,6 +46,19 @@ print("\n".join(sorted(name for name in package["features"] if name not in {"def
 ' "${crate}" <<<"${metadata}"
 }
 
+crate_default_features() {
+  local crate="$1"
+  python3 -c '
+import json, sys
+crate = sys.argv[1]
+metadata = json.load(sys.stdin)
+package = next((item for item in metadata["packages"] if item["name"] == crate), None)
+if package is None:
+    raise SystemExit(f"missing workspace package: {crate}")
+print("\n".join(package["features"].get("default", [])))
+' "${crate}" <<<"${metadata}"
+}
+
 # check_combo <crate> <human-label> <cargo args...>
 check_combo() {
   local crate="$1"
@@ -59,19 +73,34 @@ check_combo() {
 check_crate() {
   local crate="$1"
   local features=()
+  local default_features=()
   while IFS= read -r feature; do
     [[ -n "${feature}" ]] && features+=("${feature}")
   done < <(crate_features "${crate}")
+  while IFS= read -r feature; do
+    [[ -n "${feature}" ]] && default_features+=("${feature}")
+  done < <(crate_default_features "${crate}")
 
   # 1. consumer-default surface.
   check_combo "${crate}" "default features"
 
-  # 2. bare surface: no default, no features.
-  check_combo "${crate}" "--no-default-features" --no-default-features
+  # 2. bare surface: no default, no features. An empty default is the same
+  # Cargo feature set and is already covered by step 1.
+  if [[ "${#default_features[@]}" -eq 0 ]]; then
+    echo "==> [${crate}] covered without rerun: --no-default-features (default is empty)"
+  else
+    check_combo "${crate}" "--no-default-features" --no-default-features
+  fi
 
-  # 3. each individual feature, enabled ALONE on top of no-default-features.
+  # 3. Each individual feature, enabled ALONE on top of no-default-features.
+  # A singleton default is the same Cargo feature set and is not run twice.
   local feature
   for feature in "${features[@]}"; do
+    if [[ "${#default_features[@]}" -eq 1 ]] && \
+       [[ "${feature}" == "${default_features[0]}" ]]; then
+      echo "==> [${crate}] covered without rerun: feature '${feature}' alone (singleton default)"
+      continue
+    fi
     check_combo "${crate}" "feature '${feature}' alone" \
       --no-default-features --features "${feature}"
   done
