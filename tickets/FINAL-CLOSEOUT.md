@@ -1,10 +1,12 @@
 # Final Closeout SSOT
 
-Status: the historical `qmp-final-qualified` (`014eb65`) receipt covers only
-its own source. Current qualification exists only when the newest annotated
-`qmp-final-qualified-*` tag names the exact current source. Until then, this
-repository is a candidate, not a qualified release. Deployment and production
-activation remain separate operational approvals; neither is claimed here.
+Status: the historical bare `qmp-final-qualified` tag (`014eb65`) covers only
+its own source. The newest annotated `qmp-final-qualified-*` tag is the
+current receipt authority: it must name the exact source under review. At the
+time this document was last qualified, that authority was
+`qmp-final-qualified-0dce55d`; resolve the newest tag rather than copying this
+example. Deployment and production activation remain separate operational
+approvals; neither is claimed here.
 
 ## Scope and non-goals
 
@@ -18,11 +20,11 @@ extraction, host-pair qualification, and deployment activation.
 
 | Gate | Required evidence | Result |
 | --- | --- | --- |
-| FINAL-001 source freeze | File ownership, generated-doc authority, direction/purity/public-surface review, clean diff check | Candidate audit complete; final clean-source digest is bound only by a newer annotated receipt. |
-| FINAL-002 repository qualification | PM, canonical workspace rail, locked fmt/clippy/test/deny on one clean source | Pending a newer exact-source receipt. |
-| FINAL-003 exact-HEAD freeze | Clean `main`, source SHA/tree recorded after qualification | Pending a newer exact-source receipt. |
-| FINAL-004 standalone extraction | Clean-source dry run and real extraction; extracted locked qualification and matching manifest | Pending a newer exact-source receipt. |
-| FINAL-005 host adoption | Exact QMP/host pair, root and nested locked resolution, host adapter tests and hello-world | Pending a newer exact-source receipt. |
+| FINAL-001 source freeze | File ownership, generated-doc authority, direction/purity/public-surface review, clean diff check | Complete for the source named by the newest annotated receipt. |
+| FINAL-002 repository qualification | PM, canonical workspace rail, locked fmt/clippy/test/deny on one clean source | Complete for the source named by the newest annotated receipt. |
+| FINAL-003 exact-HEAD freeze | Clean `main`, source SHA/tree recorded after qualification | Complete for the source named by the newest annotated receipt. |
+| FINAL-004 standalone extraction | Clean-source dry run and real extraction; extracted locked qualification and matching manifest | Complete for the source named by the newest annotated receipt. |
+| FINAL-005 host adoption | Exact QMP/host pair, root and nested locked resolution, host adapter tests and hello-world | Complete only for the host pair named by the newest annotated receipt. |
 | FINAL-006 closeout | This SSOT, cleanup disposition, reproducible commands, residual-risk boundary | This document is ready; the immutable tag annotation is the final receipt. |
 
 ## FINAL-001 audit result
@@ -71,9 +73,11 @@ The tag is intentionally created **after** the last tracked receipt change:
 changes the source commit/tree. Embedding a self-SHA in this file would create a
 new source and invalidate the stated receipt.
 
-## Historical FINAL-002 and FINAL-003 receipt
+## Historical bare-tag evidence (not current qualification)
 
-The following all exit zero on the source named by `qmp-final-qualified`:
+The following command set was recorded for the historical bare tag
+`qmp-final-qualified`. It is retained as provenance only; it does not qualify
+the current source and must not be used instead of the newest annotated tag.
 
 ```text
 python3 tools/pm/pm.py sync
@@ -91,9 +95,9 @@ paths, 166 documented selectors, PM drift checks, Semgrep regressions, and
 dependency policy. No assertion was weakened and no skip/allowlist was added
 for this receipt.
 
-## Historical FINAL-004 extraction receipt
+## Historical bare-tag extraction evidence (not current qualification)
 
-From the clean source named by `qmp-final-qualified`:
+From the clean source named by the historical bare tag:
 
 ```text
 scripts/extract-to-standalone-repo.sh --dry-run /tmp/qmp-final-extraction
@@ -113,11 +117,12 @@ cargo deny --locked --all-features check
 The extraction source scan found no Semantica path/import dependency; the only
 matching text was boundary documentation in a testkit comment and example.
 
-## Historical FINAL-005 host-pair receipt
+## Historical bare-tag host-pair evidence (not current qualification)
 
-Semantica `main` fast-forwarded the isolated, clean host qualification commit
-`2822dc1`. It resolves the QMP path named by `qmp-final-qualified` in both the root and nested
-`packages/analysis/quanta-v2` workspaces under `--locked` metadata.
+Semantica `main` once fast-forwarded the isolated, clean host qualification
+commit `2822dc1`. That older pair is provenance only. The current host-pair
+SHA/tree and command outcomes belong exclusively to the newest annotated QMP
+receipt; do not infer them from this section.
 
 Host changes:
 

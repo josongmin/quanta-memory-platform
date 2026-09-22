@@ -5,9 +5,9 @@ Frozen review base: `101781c2ea6122602b4acd9aa69ebfc13fda958f` (`main` and
 commit. Later untracked inputs are listed in `FINAL-CLOSEOUT.md` and are not
 silently treated as part of this frozen set.
 
-## Current requalification delta
+## Historical requalification delta
 
-Current reviewed commit: `4aff89156049d06145f295b93d9a4b017210cb1f` (tree
+Initial reviewed commit: `4aff89156049d06145f295b93d9a4b017210cb1f` (tree
 `be72d2a2b4bdf2534dbd9624d43a6a2583daa54d`), relative to the historical
 receipt source `014eb65d09c38f1aba949ec438ca9c04c9261381`. The only remaining
 working-tree path when this section was written is generated `.cursorrules`;
