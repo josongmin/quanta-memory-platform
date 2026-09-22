@@ -1,10 +1,46 @@
 # HOST-PAIR-001 — Semantica default budget provenance projection
 
-Status: `OPEN — external host repository`
+Status: `CLOSED — Semantica main implementation + source-bound QBC GREEN`
 Priority: `P1 for FUP-006 host-pair closure; not a QMP repository defect`
 Owner repository: `/Users/songmin/Documents/code-new/semantica-codegraph-v2`
-Blocked by: Semantica shared-main writer/integrator ownership
-Blocks: QMP `FUP-006` host-pair GREEN only
+Resolved by: Semantica commit `4767bcfec2b9e2e9269f423f2b29a3216166f4bd`
+Qualification merge: `86e90abba4cb70d9bd7e7a4872a1ea5abce0a665`
+Unblocks: QMP `FUP-006` host-pair boundary only; later unqualified QMP worktree deltas remain separate
+
+## Closure receipt
+
+The host-owned projection now records `runtime_defaults` if and only if the
+caller supplies no selection. It still validates every explicit selection
+through `ValidatedMemoryBudgetSelectionV2`, and it does not prepend the default
+source to explicit overlay provenance. A new behavioral negative oracle covers
+an explicit inherit selection so `None` and `Some(inherit)` cannot collapse
+back into the same provenance classification.
+
+Qualified on Semantica source `86e90abba4cb70d9bd7e7a4872a1ea5abce0a665`
+with QBC source digest
+`16504f75f8b28c86187b9b6b2e217378c6a462dbfecace91d840b3281e329c5f`:
+
+- `quanta-runtime-memory-compose`, lib, all features: `45 passed / 0 failed`.
+- `quanta-memory-host`, all tests, all features: `114 + 5 + 7` passed,
+  `0 failed`.
+- Both Semantica workspace roots resolved QMP core/facade `0.2.0` to
+  `/Users/songmin/Documents/code-new/quanta-memory-platform/crates/...`.
+- The exact default-provenance, explicit-overlay, and explicit-inherit
+  behavioral tests all passed before the final whole-target rerun; all three
+  are members of the final 45-test receipt.
+
+QBC receipts:
+
+- compose:
+  `/Volumes/Extreme SSD 1/build-cache/semantica-codegraph-v2-target/quanta-build-cli-qmp-host-provenance/_state/execution-roots/semantica-codegraph-v2-qmp-host-provenance-cf8208a1f5d3/lanes/qmp-host-default-provenance/verification-results/20260922T232149.918358Z-637bd6b385f2/receipt.json`
+- host:
+  `/Volumes/Extreme SSD 1/build-cache/semantica-codegraph-v2-target/quanta-build-cli-qmp-host-provenance/_state/execution-roots/semantica-codegraph-v2-qmp-host-provenance-cf8208a1f5d3/lanes/qmp-host-default-provenance/verification-results/20260922T232244.387614Z-ccdc3e2fbe13/receipt.json`
+
+The fix and qualification merge were pushed to Semantica `main`. The next
+remote main commit `0d595a2a576ae05f75c476e0bc9035a396cbf0aa` changed only
+`tools/quanta-build-cli/test_owner_execution_resolver_v1.py`; the two owner
+files below were unchanged. Hosted CI, deploy, and activation remain distinct
+and were not run.
 
 ## Current-source evidence
 
@@ -100,5 +136,6 @@ results above are diagnostic evidence, not Semantica QBC qualification.
 - Reopen if either workspace root resolves a different QMP manifest path.
 - Stop and hand back to the Semantica integrator if the owner file becomes
   dirty from another writer or QBC reports a source-lock/digest mismatch.
-- QMP repository/extraction qualification may proceed independently, but
-  `FUP-006 host-pair GREEN` must remain open until this ticket is closed.
+- Reopen the host-pair boundary if any condition above occurs. QMP
+  repository/extraction qualification and later dirty worktree deltas remain
+  independently source-bound; this closure does not qualify those deltas.
