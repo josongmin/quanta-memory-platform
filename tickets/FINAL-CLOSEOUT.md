@@ -55,20 +55,19 @@ drift check, Semgrep regression guards, and dependency policy checks. This is
 local qualification only: it cannot become an exact-HEAD receipt until the
 copied roots are clean and the resulting commit is re-qualified.
 
-## Untracked copied-root admission
+## Audit-record admission
 
-The current copied `docs/` root contains audit inputs that must be resolved
-before FINAL-003:
+The copied `docs/` root intentionally retains one bounded audit record:
 
-| Path | Classification | Required decision |
+| Path | Classification | Closure rule |
 | --- | --- | --- |
-| `docs/bugbash/sep-22-test-optimization/04-facade-pipeline-spill-shared.md` | completed v1 track report | review, then include with its v1 index or remove deliberately |
-| `docs/bugbash/sep-22-test-optimization/99-index.md` | completed v1 synthesis | review, then include with its v1 reports or remove deliberately |
-| `docs/bugbash/sep-22-test-optimization-deep/` | incomplete v2 scaffold and timing evidence | finish as a bounded report set, or move it outside copied roots; do not silently exclude it |
+| `docs/bugbash/sep-22-test-optimization-deep/` | v2 twelve-track census, timing evidence, two critics, and synthesis | retained as prioritized test-quality backlog; no recommendation is an implementation receipt |
 
-The extractor rejects all three while they remain untracked. This is expected:
-`git archive HEAD` cannot preserve untracked files, so allowing them would make
-the frozen-source claim false.
+The superseded v1 bugbash reports were removed rather than retained beside a
+second overlapping audit. The deep record must be committed as a set. The
+extractor rejects any future untracked file beneath copied roots because `git
+archive HEAD` cannot preserve it and allowing one would make the frozen-source
+claim false.
 
 ## Current checkpoint
 
