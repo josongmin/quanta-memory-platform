@@ -204,7 +204,16 @@ pub(crate) fn check_ledger_postimage(
         return Err(AdmissionFailure::Block(AdmissionBlock::UnknownClass { class: class.clone() }));
     }
 
-    let global_after = usage.total_usage.total().checked_add(bytes).ok_or_else(|| {
+    // The global aggregate is read fallibly like every other axis total in
+    // this chain. Live-ledger totals are representable by construction (each
+    // reserve checks total+bytes before mutating), so this arm is
+    // defense-in-depth for the pure function — but a pure predicate must fail
+    // closed on any input, never panic.
+    let global_current = usage
+        .total_usage
+        .checked_total()
+        .map_err(|error| AdmissionFailure::Block(AdmissionBlock::Internal(error)))?;
+    let global_after = global_current.checked_add(bytes).ok_or_else(|| {
         AdmissionFailure::Breach(LimitBreach::new(
             LimitAxis::Global,
             policy.global_hard_limit_bytes,
@@ -763,5 +772,80 @@ mod tests {
         );
         assert_eq!(breach.deficit, u64::MAX);
         assert_eq!(breach.into_error(), MemoryError::capacity("global postimage exceeds u64"));
+    }
+
+    // Self-audit: the pure engine must fail closed on ANY input, including
+    // a usage view no live ledger can hold (kind slots summing past u64::MAX
+    // is impossible via reserve, which checks total+bytes first). Drive the
+    // chain directly with such a view: typed block, never a panic.
+    #[test]
+    fn unrepresentable_global_aggregate_blocks_without_panic() {
+        use crate::domain::policy::{MemoryClassBudget, ReclaimPriority};
+        let policy = ResidencyPolicy::new(u64::MAX).with_class_budget(
+            MemoryClass::ArtifactCache,
+            MemoryClassBudget {
+                reserved_bytes: 0,
+                soft_cap_bytes: u64::MAX,
+                hard_cap_bytes: u64::MAX,
+                borrow_from_shared_pool: false,
+                reclaim_priority: ReclaimPriority::Normal,
+            },
+        );
+        let total = UsageBreakdown {
+            retained_payload_bytes: u64::MAX,
+            retained_metadata_bytes: 1,
+            live_scratch_bytes: 0,
+        };
+        let empty_classes = BTreeMap::new();
+        let empty_owners = BTreeMap::new();
+        let empty_contexts = BTreeMap::new();
+        let usage = UsageView {
+            class_usage: &empty_classes,
+            owner_usage: &empty_owners,
+            context_usage: &empty_contexts,
+            total_usage: &total,
+        };
+        let class = MemoryClass::ArtifactCache;
+        let owner = "owner:x".to_string();
+        let request = AdmissionRequest {
+            class: &class,
+            owner: &owner,
+            context: MemoryContextKind::Request,
+            kind: ChargeKind::RetainedPayload,
+            bytes: 1,
+        };
+        assert_eq!(
+            check_ledger_postimage(&policy, &usage, &request).map_err(|f| f.into_error()),
+            Err(MemoryError::InvalidState("ledger usage breakdown exceeds u64".into()))
+        );
+    }
+
+    // Self-audit P2-4: an owner mapped to an undeclared group can never be
+    // fixed by reclaim, so the group check denies terminally with the exact
+    // legacy scheduler message. Unreachable via public API (policy validation
+    // rejects dangling owner->group mappings); this pins the defensive arm.
+    #[test]
+    fn unknown_group_denies_terminally_with_legacy_message() {
+        use crate::domain::policy::ResourceGroup;
+        let groups = BTreeMap::from([(
+            "g".to_string(),
+            ResourceGroup {
+                reserved_bytes: 0,
+                soft_cap_bytes: 800,
+                hard_cap_bytes: 900,
+                burst_percent: 0,
+                reclaim_priority: crate::domain::policy::ReclaimPriority::Normal,
+                admission_weight: 1,
+            },
+        )]);
+        let shares = BTreeMap::from([("g".to_string(), 0u64)]);
+        let failure = check_group_admission(&groups, 0, &shares, 0, "missing", "owner:x", 10)
+            .expect_err("unknown group denies");
+        assert_eq!(
+            failure.into_error(),
+            MemoryError::capacity(
+                "resource group missing admission denied for owner owner:x reserve of 10 bytes"
+            )
+        );
     }
 }

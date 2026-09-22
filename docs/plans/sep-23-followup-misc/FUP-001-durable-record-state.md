@@ -1,6 +1,6 @@
 # FUP-001 — Durable record의 정확한 terminal state
 
-Status: `OPEN`
+Status: `VERIFIED — owner-local GREEN + temporary-mutant RED; FUP-006 exact-source gate 별도`
 Priority: `P1`
 Owner: `Lane A`
 Depends on: 실행 인덱스의 source freeze
@@ -65,15 +65,15 @@ Checklist: `I07`의 정확한 record disposition, `I02`의 identity 일부. `I03
 
 ## 검증 계약
 
-- [ ] 낮은 ID hole + 높은 ID finalize 후 hole은 `Absent`; reopen 후에도 동일.
-- [ ] 예약만 하고 reopen; queue empty를 전체 consumed로 오판하지 않음.
-- [ ] ID 예약/commit 순서가 달라도 정확한 상태; 실제 finalized ID 재삽입 거절.
-- [ ] 같은 ID/같은 bytes retry는 inventory 불변; 다른 bytes는 기존 payload 보존.
-- [ ] commit ACK와 probe가 모두 불확실한 테스트에서 source는 fenced·charged 상태 유지.
-- [ ] 위 pending source와 다른 store의 후속 finalize를 결합해 잘못된 source retire를 막음.
-- [ ] legacy DB fixture의 queued/recovery bytes 보존; 불명확한 history는 명시적 오류.
-- [ ] watermark 추정으로 되돌린 mutant를 hole regression이 검출.
-- [ ] owner-local RED→GREEN에서 위 **1 selected** 반례가 GREEN이 되고, 같은
+- [x] 낮은 ID hole + 높은 ID finalize 후 hole은 `Absent`; reopen 후에도 동일.
+- [x] 예약만 하고 reopen; queue empty를 전체 consumed로 오판하지 않음.
+- [x] ID 예약/commit 순서가 달라도 정확한 상태; 실제 finalized ID 재삽입 거절.
+- [x] 같은 ID/같은 bytes retry는 inventory 불변; 다른 bytes는 기존 payload 보존.
+- [x] commit ACK와 probe가 모두 불확실한 테스트에서 source는 fenced·charged 상태 유지.
+- [x] 위 pending source와 다른 store의 후속 finalize를 결합해 잘못된 source retire를 막음.
+- [x] legacy DB fixture의 queued/recovery bytes 보존; 불명확한 history는 명시적 오류.
+- [x] watermark 추정으로 되돌린 mutant를 hole regression이 검출.
+- [x] owner-local RED→GREEN에서 위 **1 selected** 반례가 GREEN이 되고, 같은
   final source에서 reopen/legacy/ACK-loss 음성 검증이 유지된다. selector 0건은 무효.
 
 Fault injection은 test-only Redb 경계에 둔다. 실제 disk 장애 재현과 deterministic

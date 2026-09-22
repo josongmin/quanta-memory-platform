@@ -4284,6 +4284,7 @@ mod tests {
         broker_for_reentry: Mutex<Option<LiveProcessMemoryBroker>>,
         reconfigure_inside: Mutex<Option<ResidencyPolicy>>,
         reconfigure_attempts: Mutex<Vec<MemoryResult<()>>>,
+        forged_reported_bytes: Mutex<Option<u64>>,
     }
 
     impl MemoryReclaimer for RecordingReclaimer {
@@ -4299,12 +4300,32 @@ mod tests {
                     self.reconfigure_attempts.lock().expect("attempts").push(outcome);
                 }
             }
+            // A forged report lies about reclaimed bytes while freeing nothing:
+            // telemetry records the lie, but admission must remeasure the
+            // ledger and never trust it.
+            if let Some(forged) = self.forged_reported_bytes.lock().expect("forged").take() {
+                return Ok(crate::ports::reclaim::ReclaimOutcome { reclaimed_bytes: forged });
+            }
             let mut reclaimed = 0;
             if let Some(mut charge) = self.charge_to_release.lock().expect("charge").take() {
                 reclaimed = charge.bytes().expect("live charge");
                 charge.release().expect("callback release");
             }
             Ok(crate::ports::reclaim::ReclaimOutcome { reclaimed_bytes: reclaimed })
+        }
+    }
+
+    struct PanickingReclaimer {
+        calls: Mutex<u32>,
+    }
+
+    impl MemoryReclaimer for PanickingReclaimer {
+        fn reclaim(
+            &self,
+            _request: &ReclaimRequest,
+        ) -> MemoryResult<crate::ports::reclaim::ReclaimOutcome> {
+            *self.calls.lock().expect("calls") += 1;
+            panic!("reclaimer panic");
         }
     }
 
@@ -4977,6 +4998,9 @@ mod tests {
             "the single current record names the live source"
         );
         assert_eq!(after.active_policy_source, "runtime_reconfigure");
+        // `observe` and `effective_report` share one report object: same
+        // active policy, same revision, same bounded provenance.
+        assert_eq!(b.observe().expect("observe").report, after);
         sep23_assert_fully_drained(&b);
     }
 
@@ -5502,6 +5526,171 @@ mod tests {
         sep23_assert_fully_drained(&broker);
     }
 
+    // --- Self-audit: max-scale exact fill + 1 byte denies clean -------------
+    //
+    // At u64::MAX live usage the next byte is a ReclaimCandidate (the byte
+    // alone fits everywhere), but the hard plan cannot even be constructed:
+    // the prospective aggregate is unrepresentable. Plan construction fails
+    // BEFORE any callback fires, the broker stays usable, and the exact fill
+    // still drains to zero.
+
+    #[test]
+    fn sep23_audit_max_scale_plus_one_byte_denies_clean_without_callback() {
+        let reclaimer = Arc::new(RecordingReclaimer::default());
+        let policy = ResidencyPolicy::new(u64::MAX).with_class_budget(
+            MemoryClass::ArtifactCache,
+            class_budget(0, u64::MAX, u64::MAX, false),
+        );
+        let broker = LiveProcessMemoryBroker::from_report_with_reclaimer(
+            report_with(policy),
+            Some(reclaimer.clone()),
+        )
+        .expect("max-scale policy validates");
+        // Exact-fill one kind slot to u64::MAX in a single reserve.
+        let maxed = broker
+            .reserve_managed_charge(
+                MemoryClass::ArtifactCache,
+                "owner:max".to_string(),
+                MemoryContextKind::Request,
+                ChargeKind::RetainedPayload,
+                u64::MAX,
+            )
+            .expect("exact u64::MAX fill admits");
+        assert!(reclaimer.requests.lock().expect("requests").is_empty());
+        // One more byte: the preflight sees a reclaimable breach, but the
+        // hard plan's prospective aggregate overflows u64, so construction
+        // fails before any callback can run.
+        let denied = broker.reserve(
+            MemoryClass::ArtifactCache,
+            "owner:max".to_string(),
+            MemoryContextKind::Request,
+            ChargeKind::RetainedMetadata,
+            1,
+        );
+        assert_eq!(denied, Err(MemoryError::capacity("reclaim prospective usage exceeds u64")));
+        assert_eq!(broker.reclaim_runtime_stats().expect("stats").attempts, 0);
+        assert!(reclaimer.requests.lock().expect("requests").is_empty());
+        // The broker is fully usable afterwards: observe, release, drain.
+        assert_eq!(broker.ledger_snapshot().expect("snapshot").total_owner_bytes(), u64::MAX);
+        drop(maxed);
+        sep23_assert_fully_drained(&broker);
+        let fresh = broker
+            .reserve_managed_charge(
+                MemoryClass::ArtifactCache,
+                "owner:max".to_string(),
+                MemoryContextKind::Request,
+                ChargeKind::RetainedMetadata,
+                7,
+            )
+            .expect("broker admits after the blocked attempt");
+        drop(fresh);
+        sep23_assert_fully_drained(&broker);
+    }
+
+    // --- Self-audit P2-2: deferred drains never discard authority -----------
+    //
+    // The deferred queues only fill on an internal invariant break (or a
+    // rebuild race), so no public flow seeds them — but if a drain retry
+    // still fails, the exact ticket must stay queued for a later retry, never
+    // silently dropped. A foreign ticket (wrong ledger identity) is the
+    // deterministic stand-in for an unfailable rollback.
+
+    fn sep23_audit_seed_deferred_foreign_ticket() -> ReservationTicket {
+        let foreign = LiveProcessMemoryBroker::from_report(report_with(base_residency()))
+            .expect("foreign broker");
+        foreign
+            .reserve(
+                MemoryClass::ArtifactCache,
+                "owner:foreign".to_string(),
+                MemoryContextKind::Request,
+                ChargeKind::RetainedPayload,
+                64,
+            )
+            .expect("foreign ticket")
+    }
+
+    #[test]
+    fn sep23_audit_failing_pending_drain_preserves_ticket_for_retry() {
+        let b = broker();
+        let pristine = b.ledger_snapshot().expect("snapshot");
+        let foreign = sep23_audit_seed_deferred_foreign_ticket();
+        let foreign_id = foreign.id();
+        // A Drop-time rollback failure seeds the deferred queue (never swallowed).
+        b.rollback_pending_ticket_on_drop(&foreign);
+        {
+            let core = b.inner.lock().expect("core");
+            assert_eq!(core.deferred_pending_rollbacks.len(), 1, "Drop seeds the queue");
+            assert_eq!(core.deferred_pending_rollbacks[0].id(), foreign_id);
+            assert_eq!(core.deferred_pending_rollbacks[0].bytes(), 64);
+        }
+        // A still-failing drain retry keeps the exact ticket queued. The
+        // pending drain is deliberately silent (like the post-reconfigure
+        // retry): finish_rebuild reports Ok while authority stays preserved
+        // for a later retry — documented here, not assumed.
+        {
+            let mut core = b.inner.lock().expect("core");
+            LiveProcessMemoryBroker::drain_deferred_pending_rollbacks(&mut core);
+            assert_eq!(core.deferred_pending_rollbacks.len(), 1, "drain preserves failures");
+            assert_eq!(core.deferred_pending_rollbacks[0].id(), foreign_id);
+        }
+        b.begin_rebuild().expect("begin rebuild");
+        b.finish_rebuild().expect("pending drain retries silently");
+        assert_eq!(
+            b.inner.lock().expect("core").deferred_pending_rollbacks.len(),
+            1,
+            "finish_rebuild keeps the failing ticket queued"
+        );
+        assert_eq!(b.ledger_snapshot().expect("snapshot"), pristine, "drain mutates nothing");
+        assert_eq!(b.ledger_snapshot().expect("snapshot").live_ticket_count, 0);
+        // The broker is unusable-state-free: fresh admission works on top.
+        let fresh = b
+            .reserve_managed_charge(
+                MemoryClass::ArtifactCache,
+                "owner:a".to_string(),
+                MemoryContextKind::Request,
+                ChargeKind::RetainedPayload,
+                8,
+            )
+            .expect("broker usable after failed drain");
+        drop(fresh);
+        // Ledger counters drain to zero; the foreign ticket intentionally
+        // stays queued (sep23_assert_fully_drained would reject it).
+        let drained = b.ledger_snapshot().expect("snapshot");
+        drained.validate_exact().expect("axes balance after drain");
+        assert_eq!(drained.total_owner_bytes(), 0);
+        assert_eq!(drained.total_class_bytes(), 0);
+        assert_eq!(
+            b.inner.lock().expect("core").deferred_pending_rollbacks.len(),
+            1,
+            "foreign authority still preserved at the end"
+        );
+    }
+
+    #[test]
+    fn sep23_audit_failing_committed_drain_restores_whole_batch() {
+        let b = broker();
+        let pristine = b.ledger_snapshot().expect("snapshot");
+        let foreign = sep23_audit_seed_deferred_foreign_ticket();
+        let foreign_id = foreign.id();
+        b.inner.lock().expect("core").deferred_committed_releases.push(foreign);
+        b.begin_rebuild().expect("begin rebuild");
+        let drained = b.finish_rebuild();
+        assert!(drained.is_err(), "a still-failing batch drain surfaces its error");
+        let core = b.inner.lock().expect("core");
+        assert_eq!(core.deferred_committed_releases.len(), 1, "whole batch restored");
+        assert_eq!(core.deferred_committed_releases[0].id(), foreign_id);
+        drop(core);
+        assert_eq!(b.ledger_snapshot().expect("snapshot"), pristine, "drain mutates nothing");
+        let drained = b.ledger_snapshot().expect("snapshot");
+        drained.validate_exact().expect("axes balance after drain");
+        assert_eq!(drained.total_owner_bytes(), 0);
+        assert_eq!(
+            b.inner.lock().expect("core").deferred_committed_releases.len(),
+            1,
+            "foreign authority still preserved at the end"
+        );
+    }
+
     #[test]
     fn sep23_fup006_denied_reconfigure_inside_callback_preserves_receipt_and_admits() {
         let reclaimer = Arc::new(RecordingReclaimer::default());
@@ -5562,5 +5751,520 @@ mod tests {
         assert_eq!(after.ledger.total_owner_bytes(), 30);
         drop(admitted);
         sep23_assert_fully_drained(&broker);
+    }
+
+    // --- Self-audit P2-4: FUP-003 contract gaps ------------------------------
+    //
+    // The audit's group-ladder probe, wrong-victim release, forged telemetry,
+    // callback panic, and 0-byte silence each get a pinned regression, plus
+    // the randomized preflight/attempt agreement test the admission module
+    // docstring promises.
+
+    fn sep23_audit_group_ladder_policy(group_soft: u64) -> ResidencyPolicy {
+        ResidencyPolicy::new(10_000)
+            .with_class_budget(MemoryClass::ArtifactCache, class_budget(0, 9_000, 10_000, false))
+            .with_resource_group(
+                "g",
+                ResourceGroup {
+                    reserved_bytes: 0,
+                    soft_cap_bytes: group_soft,
+                    hard_cap_bytes: 50,
+                    burst_percent: 0,
+                    reclaim_priority: ReclaimPriority::Normal,
+                    admission_weight: 1,
+                },
+            )
+            .with_owner_group("owner:r", "g")
+    }
+
+    #[test]
+    fn sep23_audit_group_denial_runs_single_hard_regardless_of_soft_crossing() {
+        // The audit's soft-45 vs soft-30 probe: the first plan for a group
+        // hard denial must be Hard in both cases — soft crossing only adds an
+        // earlier proactive signal on the seed, never a soft-first plan.
+        for group_soft in [45u64, 30u64] {
+            let reclaimer = Arc::new(RecordingReclaimer::default());
+            let broker = LiveProcessMemoryBroker::from_report_with_reclaimer(
+                report_with(sep23_audit_group_ladder_policy(group_soft)),
+                Some(reclaimer.clone()),
+            )
+            .expect("broker");
+            let baseline = broker
+                .reserve_managed_charge(
+                    MemoryClass::ArtifactCache,
+                    "owner:r".to_string(),
+                    MemoryContextKind::Request,
+                    ChargeKind::RetainedPayload,
+                    40,
+                )
+                .expect("baseline");
+            let seed_requests = reclaimer.requests.lock().expect("requests").len();
+            *reclaimer.charge_to_release.lock().expect("charge") = Some(baseline);
+            let admitted = broker
+                .reserve_managed_charge(
+                    MemoryClass::ArtifactCache,
+                    "owner:r".to_string(),
+                    MemoryContextKind::Request,
+                    ChargeKind::RetainedPayload,
+                    20,
+                )
+                .expect("hard reclaim admits the group denial");
+            let requests = reclaimer.requests.lock().expect("requests").clone();
+            assert_eq!(
+                requests.len(),
+                seed_requests + 1,
+                "soft {group_soft}: exactly one plan for the denial"
+            );
+            assert_eq!(
+                requests.last().expect("hard request").trigger,
+                ReclaimTrigger::CapacityDenial,
+                "soft {group_soft}: the denial plan is Hard, never soft-first"
+            );
+            drop(admitted);
+            sep23_assert_fully_drained(&broker);
+        }
+    }
+
+    #[test]
+    fn sep23_audit_wrong_victim_release_does_not_admit() {
+        let reclaimer = Arc::new(RecordingReclaimer::default());
+        let policy = ResidencyPolicy::new(10_000)
+            .with_class_budget(MemoryClass::ArtifactCache, class_budget(0, 90, 100, false))
+            .with_class_budget(MemoryClass::EvidenceCache, class_budget(0, 90, 100, false));
+        let broker = LiveProcessMemoryBroker::from_report_with_reclaimer(
+            report_with(policy),
+            Some(reclaimer.clone()),
+        )
+        .expect("broker");
+        let baseline = broker
+            .reserve_managed_charge(
+                MemoryClass::ArtifactCache,
+                "owner:r".to_string(),
+                MemoryContextKind::Request,
+                ChargeKind::RetainedPayload,
+                80,
+            )
+            .expect("baseline");
+        let victim = broker
+            .reserve_managed_charge(
+                MemoryClass::EvidenceCache,
+                "owner:r".to_string(),
+                MemoryContextKind::Request,
+                ChargeKind::RetainedPayload,
+                50,
+            )
+            .expect("victim");
+        // The callback frees 50 bytes on the WRONG class: the Artifact breach
+        // (80 + 30 > 100) survives, so the remeasure denies terminally.
+        *reclaimer.charge_to_release.lock().expect("charge") = Some(victim);
+        let denied = broker.reserve(
+            MemoryClass::ArtifactCache,
+            "owner:r".to_string(),
+            MemoryContextKind::Request,
+            ChargeKind::RetainedPayload,
+            30,
+        );
+        assert!(matches!(denied, Err(MemoryError::Capacity(_))), "got {denied:?}");
+        assert_eq!(reclaimer.requests.lock().expect("requests").len(), 1);
+        assert_eq!(
+            reclaimer.requests.lock().expect("requests")[0].trigger,
+            ReclaimTrigger::CapacityDenial
+        );
+        assert_eq!(broker.reclaim_runtime_stats().expect("stats").terminal_denials, 1);
+        let snapshot = broker.ledger_snapshot().expect("snapshot");
+        assert_eq!(snapshot.total_owner_bytes(), 80, "only the victim left");
+        drop(baseline);
+        sep23_assert_fully_drained(&broker);
+    }
+
+    #[test]
+    fn sep23_audit_forged_reclaimed_bytes_are_recorded_but_never_trusted() {
+        let reclaimer = Arc::new(RecordingReclaimer::default());
+        let policy = ResidencyPolicy::new(10_000)
+            .with_class_budget(MemoryClass::ArtifactCache, class_budget(0, 90, 100, false));
+        let broker = LiveProcessMemoryBroker::from_report_with_reclaimer(
+            report_with(policy),
+            Some(reclaimer.clone()),
+        )
+        .expect("broker");
+        let baseline = broker
+            .reserve_managed_charge(
+                MemoryClass::ArtifactCache,
+                "owner:r".to_string(),
+                MemoryContextKind::Request,
+                ChargeKind::RetainedPayload,
+                80,
+            )
+            .expect("baseline");
+        // The callback frees nothing but reports 30 reclaimed bytes.
+        *reclaimer.forged_reported_bytes.lock().expect("forged") = Some(30);
+        let denied = broker.reserve(
+            MemoryClass::ArtifactCache,
+            "owner:r".to_string(),
+            MemoryContextKind::Request,
+            ChargeKind::RetainedPayload,
+            30,
+        );
+        assert!(matches!(denied, Err(MemoryError::Capacity(_))), "got {denied:?}");
+        let stats = broker.reclaim_runtime_stats().expect("stats");
+        assert_eq!(stats.attempts, 1);
+        assert_eq!(stats.reported_reclaimed_bytes, 30, "telemetry records the lie");
+        assert_eq!(stats.terminal_denials, 1, "admission remeasured the ledger");
+        assert_eq!(broker.ledger_snapshot().expect("snapshot").total_owner_bytes(), 80);
+        drop(baseline);
+        sep23_assert_fully_drained(&broker);
+    }
+
+    #[test]
+    fn sep23_audit_panicking_reclaimer_is_contained_and_broker_survives() {
+        let reclaimer = Arc::new(PanickingReclaimer { calls: Mutex::new(0) });
+        let policy = ResidencyPolicy::new(10_000)
+            .with_class_budget(MemoryClass::ArtifactCache, class_budget(0, 90, 100, false));
+        let broker = LiveProcessMemoryBroker::from_report_with_reclaimer(
+            report_with(policy),
+            Some(reclaimer.clone()),
+        )
+        .expect("broker");
+        let baseline = broker
+            .reserve_managed_charge(
+                MemoryClass::ArtifactCache,
+                "owner:r".to_string(),
+                MemoryContextKind::Request,
+                ChargeKind::RetainedPayload,
+                80,
+            )
+            .expect("baseline");
+        // The hard plan panics inside the callback: the panic is contained,
+        // the remeasure denies on the unmoved ledger, and the broker (and its
+        // lock) stays fully usable.
+        let denied = broker.reserve(
+            MemoryClass::ArtifactCache,
+            "owner:r".to_string(),
+            MemoryContextKind::Request,
+            ChargeKind::RetainedPayload,
+            30,
+        );
+        assert!(matches!(denied, Err(MemoryError::Capacity(_))), "got {denied:?}");
+        assert_eq!(*reclaimer.calls.lock().expect("calls"), 1, "single attempt");
+        let stats = broker.reclaim_runtime_stats().expect("stats");
+        assert_eq!(stats.attempts, 1);
+        assert_eq!(stats.failures, 1, "panic counts as a callback failure");
+        assert_eq!(stats.terminal_denials, 1);
+        assert_eq!(broker.ledger_snapshot().expect("snapshot").total_owner_bytes(), 80);
+        drop(baseline);
+        sep23_assert_fully_drained(&broker);
+        // And a second panicking attempt behaves identically (no poisoning).
+        let baseline = broker
+            .reserve_managed_charge(
+                MemoryClass::ArtifactCache,
+                "owner:r".to_string(),
+                MemoryContextKind::Request,
+                ChargeKind::RetainedPayload,
+                80,
+            )
+            .expect("baseline again");
+        let denied = broker.reserve(
+            MemoryClass::ArtifactCache,
+            "owner:r".to_string(),
+            MemoryContextKind::Request,
+            ChargeKind::RetainedPayload,
+            30,
+        );
+        assert!(matches!(denied, Err(MemoryError::Capacity(_))), "got {denied:?}");
+        assert_eq!(*reclaimer.calls.lock().expect("calls"), 2);
+        drop(baseline);
+        sep23_assert_fully_drained(&broker);
+    }
+
+    #[test]
+    fn sep23_audit_zero_byte_reserve_fires_no_callback_even_over_soft() {
+        let reclaimer = Arc::new(RecordingReclaimer::default());
+        let policy = ResidencyPolicy::new(10_000)
+            .with_class_budget(MemoryClass::ArtifactCache, class_budget(0, 90, 100, false));
+        let broker = LiveProcessMemoryBroker::from_report_with_reclaimer(
+            report_with(policy),
+            Some(reclaimer.clone()),
+        )
+        .expect("broker");
+        // Seed past soft 90: the seed itself fires one proactive soft signal.
+        let baseline = broker
+            .reserve_managed_charge(
+                MemoryClass::ArtifactCache,
+                "owner:r".to_string(),
+                MemoryContextKind::Request,
+                ChargeKind::RetainedPayload,
+                95,
+            )
+            .expect("baseline");
+        assert_eq!(reclaimer.requests.lock().expect("requests").len(), 1);
+        // A 0-byte reserve over soft adds nothing, crosses nothing, fires nothing.
+        let zero = broker
+            .reserve_managed_charge(
+                MemoryClass::ArtifactCache,
+                "owner:r".to_string(),
+                MemoryContextKind::Request,
+                ChargeKind::RetainedPayload,
+                0,
+            )
+            .expect("0-byte admits");
+        assert_eq!(
+            reclaimer.requests.lock().expect("requests").len(),
+            1,
+            "no callback for a 0-byte edge that crosses no threshold"
+        );
+        drop(zero);
+        drop(baseline);
+        sep23_assert_fully_drained(&broker);
+    }
+
+    // --- Randomized preflight/attempt agreement (FUP-003) --------------------
+    //
+    // The admission module promises this test: the preflight verdict and the
+    // no-callback attempt must agree on outcome AND byte-identical error for
+    // every request, and every TerminalDenial must also deny on a fresh
+    // broker (proving no callback could help). Deterministic xorshift stream,
+    // no threads, no timing.
+
+    struct Sep23XorShift64(u64);
+
+    impl Sep23XorShift64 {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    fn sep23_agreement_policy(shape: u64) -> ResidencyPolicy {
+        let group = ResourceGroup {
+            reserved_bytes: 0,
+            soft_cap_bytes: 800,
+            hard_cap_bytes: 900,
+            burst_percent: 0,
+            reclaim_priority: ReclaimPriority::Normal,
+            admission_weight: 1,
+        };
+        match shape {
+            0 => ResidencyPolicy::new(1_000)
+                .with_class_budget(MemoryClass::ArtifactCache, class_budget(0, 800, 1_000, false))
+                .with_class_budget(MemoryClass::EvidenceCache, class_budget(0, 100, 100, false)),
+            1 => ResidencyPolicy::new(1_000)
+                .with_class_budget(MemoryClass::ArtifactCache, class_budget(0, 800, 1_000, false))
+                .with_class_budget(MemoryClass::EvidenceCache, class_budget(0, 100, 100, false))
+                .with_resource_group("g", group)
+                .with_owner_group("owner:r", "g"),
+            2 => ResidencyPolicy::new(1_000)
+                .with_class_budget(MemoryClass::ArtifactCache, class_budget(0, 800, 1_000, false))
+                .with_class_budget(MemoryClass::EvidenceCache, class_budget(0, 100, 100, false))
+                .with_owner_quota(
+                    "owner:q",
+                    OwnerQuota { soft_cap_bytes: 800, hard_cap_bytes: 900 },
+                ),
+            _ => ResidencyPolicy::new(10_000)
+                .with_shared_burst_pool_bytes(50)
+                .with_class_budget(MemoryClass::ArtifactCache, class_budget(0, 90, 100, true))
+                .with_class_budget(MemoryClass::EvidenceCache, class_budget(0, 100, 100, false)),
+        }
+    }
+
+    #[test]
+    fn sep23_fup003_preflight_attempt_agreement_randomized() {
+        use crate::domain::admission::AdmissionVerdict;
+        const EDGE_BYTES: [u64; 20] = [
+            0,
+            1,
+            2,
+            63,
+            64,
+            65,
+            99,
+            100,
+            101,
+            799,
+            800,
+            801,
+            899,
+            900,
+            901,
+            999,
+            1_000,
+            1_001,
+            u64::MAX - 1,
+            u64::MAX,
+        ];
+        const CLASSES: [MemoryClass; 5] = [
+            MemoryClass::ArtifactCache,
+            MemoryClass::EvidenceCache,
+            MemoryClass::TraceIndex,
+            MemoryClass::Headroom,
+            MemoryClass::SpillFileCache,
+        ];
+        const OWNERS: [&str; 3] = ["owner:plain", "owner:q", "owner:r"];
+        const KINDS: [ChargeKind; 3] =
+            [ChargeKind::RetainedPayload, ChargeKind::RetainedMetadata, ChargeKind::LiveScratch];
+        for shape in 0..4u64 {
+            let policy = sep23_agreement_policy(shape);
+            // No reclaimer: ReclaimCandidate denies with the live breach and
+            // fires nothing, so verdict and attempt are directly comparable.
+            let broker =
+                LiveProcessMemoryBroker::from_report(report_with(policy.clone())).expect("broker");
+            let mut rng = Sep23XorShift64(0x9E37_79B9_7F4A_7C15u64.wrapping_add(shape));
+            let mut live: Vec<ManagedCharge> = Vec::new();
+            let mut terminal_spot_checks = 0u32;
+            for step in 0..500u32 {
+                if step % 100 == 99 {
+                    // Rebuild-fence agreement inside the evolving state.
+                    broker.begin_rebuild().expect("begin rebuild");
+                    let class = CLASSES[rng.below(5) as usize].clone();
+                    let owner = OWNERS[rng.below(3) as usize].to_string();
+                    let core = broker.inner.lock().expect("core");
+                    let verdict = LiveProcessMemoryBroker::admission_preflight(
+                        &core,
+                        &class,
+                        &owner,
+                        MemoryContextKind::Request,
+                        ChargeKind::RetainedPayload,
+                        10,
+                    );
+                    drop(core);
+                    assert!(
+                        matches!(
+                            verdict,
+                            AdmissionVerdict::Blocked {
+                                reason: crate::domain::admission::AdmissionBlock::RebuildInProgress
+                            }
+                        ),
+                        "shape {shape} step {step}: fenced preflight blocks, got {verdict:?}"
+                    );
+                    let result = broker.reserve(
+                        class,
+                        owner,
+                        MemoryContextKind::Request,
+                        ChargeKind::RetainedPayload,
+                        10,
+                    );
+                    assert_eq!(
+                        result,
+                        Err(MemoryError::InvalidState(
+                            "rebuild in progress: live reserve rejected".into()
+                        )),
+                        "shape {shape} step {step}: fenced attempt matches"
+                    );
+                    broker.finish_rebuild().expect("finish rebuild");
+                    continue;
+                }
+                let class = CLASSES[rng.below(5) as usize].clone();
+                let owner = OWNERS[rng.below(3) as usize].to_string();
+                let kind = KINDS[rng.below(3) as usize];
+                let bytes = if rng.below(2) == 0 {
+                    EDGE_BYTES[rng.below(20) as usize]
+                } else {
+                    rng.below(2_000)
+                };
+                let core = broker.inner.lock().expect("core");
+                let verdict = LiveProcessMemoryBroker::admission_preflight(
+                    &core,
+                    &class,
+                    &owner,
+                    MemoryContextKind::Request,
+                    kind,
+                    bytes,
+                );
+                drop(core);
+                let result = broker.reserve_managed_charge(
+                    class.clone(),
+                    owner.clone(),
+                    MemoryContextKind::Request,
+                    kind,
+                    bytes,
+                );
+                match verdict {
+                    AdmissionVerdict::Admit => {
+                        let charge = result.unwrap_or_else(|error| {
+                            panic!(
+                                "shape {shape} step {step}: preflight Admit but attempt \
+                                 denied ({class:?} {owner} {kind:?} {bytes}): {error:?}"
+                            )
+                        });
+                        // Hold most charges to evolve live state; release some
+                        // to exercise the release path mid-stream.
+                        if live.len() < 24 && rng.below(4) != 0 {
+                            live.push(charge);
+                        }
+                        if live.len() == 24 {
+                            live.remove(0);
+                        }
+                        if rng.below(8) == 0 && !live.is_empty() {
+                            live.remove(rng.below(live.len() as u64) as usize);
+                        }
+                    }
+                    AdmissionVerdict::TerminalDenial { breach } => {
+                        let expected = breach.into_error();
+                        match &result {
+                            Err(error) if error == &expected => {}
+                            other => panic!(
+                                "shape {shape} step {step}: terminal verdict but attempt \
+                                 diverged ({class:?} {owner} {kind:?} {bytes}): {other:?} \
+                                 vs {expected:?}"
+                            ),
+                        }
+                        // Terminality proof: the same request denies
+                        // identically on a fresh broker, so no callback on
+                        // live state could have helped.
+                        if terminal_spot_checks < 20 {
+                            terminal_spot_checks += 1;
+                            let fresh =
+                                LiveProcessMemoryBroker::from_report(report_with(policy.clone()))
+                                    .expect("fresh broker");
+                            let fresh_result = fresh
+                                .reserve_managed_charge(
+                                    class.clone(),
+                                    owner.clone(),
+                                    MemoryContextKind::Request,
+                                    kind,
+                                    bytes,
+                                )
+                                .map(|_| ());
+                            assert_eq!(
+                                fresh_result,
+                                Err(expected),
+                                "shape {shape} step {step}: terminal denial reproduces at zero usage"
+                            );
+                        }
+                    }
+                    AdmissionVerdict::ReclaimCandidate { breach } => {
+                        let expected = breach.into_error();
+                        match &result {
+                            Err(error) if error == &expected => {}
+                            other => panic!(
+                                "shape {shape} step {step}: candidate verdict but attempt \
+                                 diverged ({class:?} {owner} {kind:?} {bytes}): {other:?} \
+                                 vs {expected:?}"
+                            ),
+                        }
+                    }
+                    AdmissionVerdict::Blocked { reason } => {
+                        let expected = reason.into_error();
+                        match &result {
+                            Err(error) if error == &expected => {}
+                            other => panic!(
+                                "shape {shape} step {step}: blocked verdict but attempt \
+                                 diverged ({class:?} {owner} {kind:?} {bytes}): {other:?} \
+                                 vs {expected:?}"
+                            ),
+                        }
+                    }
+                }
+            }
+            drop(live);
+            sep23_assert_fully_drained(&broker);
+        }
     }
 }

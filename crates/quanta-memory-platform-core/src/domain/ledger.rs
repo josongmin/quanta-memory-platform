@@ -1882,6 +1882,93 @@ mod tests {
         );
     }
 
+    // Self-audit P2-5: recharge and batch release move kind bytes on every
+    // axis exactly — pinned with full kind vectors, not just scalar totals.
+    fn sep23_audit_mixed_kind_ledger_with_tickets() -> (AccountingLedger, Vec<ReservationTicket>) {
+        let mut ledger = ledger_from_policy(ResidencyPolicy::new(1_000_000));
+        let mut tickets = Vec::new();
+        for (class, owner, context, kind, bytes) in [
+            (
+                MemoryClass::ArtifactCache,
+                "owner:a",
+                MemoryContextKind::Request,
+                ChargeKind::RetainedPayload,
+                1_000,
+            ),
+            (
+                MemoryClass::EvidenceCache,
+                "owner:a",
+                MemoryContextKind::Session,
+                ChargeKind::RetainedMetadata,
+                250,
+            ),
+            (
+                MemoryClass::ArtifactCache,
+                "owner:b",
+                MemoryContextKind::Request,
+                ChargeKind::LiveScratch,
+                500,
+            ),
+        ] {
+            let ticket = ledger
+                .reserve(class, owner.to_string(), context, kind, bytes)
+                .expect("mixed-kind reserve");
+            ledger.commit(&ticket).expect("commit");
+            tickets.push(ticket);
+        }
+        (ledger, tickets)
+    }
+
+    fn sep23_audit_kind_vectors(snap: &LedgerSnapshot) -> ([u64; 3], [u64; 3], [u64; 3]) {
+        (
+            LedgerSnapshot::checked_kind_totals(&snap.class_usage).expect("class kinds"),
+            LedgerSnapshot::checked_kind_totals(&snap.owner_usage).expect("owner kinds"),
+            LedgerSnapshot::checked_kind_totals(&snap.context_usage).expect("context kinds"),
+        )
+    }
+
+    #[test]
+    fn sep23_audit_admitted_recharge_moves_kind_vectors_exactly() {
+        let (mut ledger, tickets) = sep23_audit_mixed_kind_ledger_with_tickets();
+        // Recharge the payload leg into a metadata leg on another class: kind
+        // [1000,250,500] becomes [0,500,500] on every axis.
+        let _replacement = ledger
+            .replace_committed(
+                &tickets[0],
+                MemoryClass::EvidenceCache,
+                "owner:a".to_string(),
+                MemoryContextKind::Session,
+                ChargeKind::RetainedMetadata,
+                250,
+            )
+            .expect("admitted recharge");
+        let snap = ledger.snapshot();
+        snap.validate_exact().expect("recharged ledger validates");
+        assert_eq!(
+            sep23_audit_kind_vectors(&snap),
+            ([0, 500, 500], [0, 500, 500], [0, 500, 500]),
+            "recharge moves the kind split on every axis"
+        );
+        assert_eq!(snap.total_owner_bytes(), 1_000);
+    }
+
+    #[test]
+    fn sep23_audit_batch_release_moves_kind_vectors_exactly() {
+        let (mut ledger, tickets) = sep23_audit_mixed_kind_ledger_with_tickets();
+        ledger.release_batch(&tickets[0..2]).expect("batch release");
+        let snap = ledger.snapshot();
+        snap.validate_exact().expect("batch-released ledger validates");
+        assert_eq!(
+            sep23_audit_kind_vectors(&snap),
+            ([0, 0, 500], [0, 0, 500], [0, 0, 500]),
+            "only the scratch leg remains on every axis"
+        );
+        ledger.release_batch(&tickets[2..3]).expect("final release");
+        let drained = ledger.snapshot();
+        drained.validate_exact().expect("drained ledger validates");
+        assert_eq!(sep23_audit_kind_vectors(&drained), ([0, 0, 0], [0, 0, 0], [0, 0, 0]));
+    }
+
     #[test]
     fn sep23_fup004_class_kind_swap_preserving_totals_is_rejected() {
         let ledger = sep23_mixed_kind_ledger();

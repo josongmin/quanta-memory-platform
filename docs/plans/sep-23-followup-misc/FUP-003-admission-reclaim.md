@@ -1,6 +1,6 @@
 # FUP-003 — 공유 admission preflight와 단일 reclaim 계획
 
-Status: `OPEN`
+Status: `VERIFIED — behavioral closure + randomized agreement + temporary-mutant RED`
 Priority: `P2`
 Owner: `Lane B`
 Depends on: `FUP-007`의 `control.rs`/`ledger.rs` lease 반환, `FUP-004` ledger lease 반환, `FUP-005` control/report 변경 반영
@@ -70,16 +70,16 @@ charge가 회수됐다. group 비교 probe는 soft 45에서 `admitted=false`, So
 
 ## 검증 계약
 
-- [ ] 불가능한 101 요청: callback 0회, 기존 40 charge/ticket/state 그대로.
-- [ ] group hard denial은 soft crossing 여부와 무관하게 유효한 단일 계획; 최대 1회.
-- [ ] class/owner/group/global/floor/headroom/scratch별 거절 이유와 실제 판정 일치.
-- [ ] 여러 축 동시 초과 시 scope/deficit 보존; 잘못된 victim release만으로 승인되지 않음.
-- [ ] callback 중 reconfigure/reentrant release/panic에서도 현재 정책과 fail-closed 원장 유지.
-- [ ] 0-byte, overflow, rebuild, unknown class/group, ticket exhaustion에서 불필요한 callback 없음.
-- [ ] 초기/최종 revision과 receipt가 실제 판정 시점에 대응; forged reclaimed_bytes로 승인 불가.
-- [ ] 기존 reserved floor/Hamilton/static isolation/recharge와 bounded release 성능 계약 유지.
-- [ ] preflight 생략 또는 Soft 우선 mutant를 해당 regression이 검출.
-- [ ] FUP-007의 0-byte live ticket/group 이동 거절 계약이 preflight 변경 뒤에도
+- [x] 불가능한 101 요청: callback 0회, 기존 40 charge/ticket/state 그대로.
+- [x] group hard denial은 soft crossing 여부와 무관하게 유효한 단일 계획; 최대 1회.
+- [x] class/owner/group/global/floor/headroom/scratch별 거절 이유와 실제 판정 일치.
+- [x] 여러 축 동시 초과 시 scope/deficit 보존; 잘못된 victim release만으로 승인되지 않음.
+- [x] callback 중 reconfigure/reentrant release/panic에서도 현재 정책과 fail-closed 원장 유지.
+- [x] 0-byte, overflow, rebuild, unknown class/group, ticket exhaustion에서 불필요한 callback 없음.
+- [x] 초기/최종 revision과 report provenance가 실제 판정 시점에 대응; forged reclaimed_bytes로 승인 불가. 현재 consumer 요구가 없어 새 public per-call receipt API는 추가하지 않음.
+- [x] 기존 reserved floor/Hamilton/static isolation/recharge와 bounded release 성능 계약 유지.
+- [x] preflight 생략 또는 Soft 우선 mutant를 해당 regression이 검출.
+- [x] FUP-007의 0-byte live ticket/group 이동 거절 계약이 preflight 변경 뒤에도
   유지되고, reclaim callback이 그 authority를 우회하지 못한다.
 
 ```bash

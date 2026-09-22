@@ -1051,6 +1051,14 @@ impl DurableRestoreTarget for RedbSpillBacking {
                 .get(sequence)
                 .map_err(|e| MemoryError::report(format!("redb recovery read failed: {e}")))?
                 .is_some();
+            // Terminal proof first: this generation's finalize already landed
+            // (proof and payload removal share one transaction), so the retry
+            // succeeds exactly — regardless of which unrelated claim is live
+            // now. A landed finalize can never be un-consumed, and the proof
+            // row is immutable, so no live state can contradict this.
+            if proof == Some(generation) && !recovery_present {
+                return Ok(());
+            }
             // Single-owner consume: exactly one claimant's finalize can land.
             // A bare sequence with no live claim and no finalize proof is
             // rejected — the old unconditional `(None, false) => Ok(())` let a
@@ -1078,9 +1086,6 @@ impl DurableRestoreTarget for RedbSpillBacking {
                         MemoryError::report(format!("redb finalize proof write failed: {e}"))
                     })?;
                 }
-                // Same-claimant idempotent retry: this generation's finalize
-                // already landed, so success is exact, not assumed.
-                (None, _, false) if proof == Some(generation) => return Ok(()),
                 (None, _, false) => {
                     return Err(MemoryError::InvalidState(format!(
                         "cannot finalize restore {sequence}: no active claim and no finalize \
@@ -2203,6 +2208,68 @@ mod tests {
         assert_eq!(recovery.candidate.bytes, b"stable");
         backing.commit_restore(&recovery.candidate.claim).expect("recovered claim commits");
         backing.finalize_restore(&recovery.candidate.claim).expect("recovered claim finalizes");
+    }
+
+    // Self-audit P2-1: a landed finalize is terminal. Retrying it with the
+    // same claim succeeds exactly even while an unrelated claim is live, and
+    // the retry disturbs neither the live claim nor the remaining record.
+    #[test]
+    fn sep23_audit_finalize_retry_succeeds_while_unrelated_claim_is_live() {
+        let db = test_db();
+        let backing = RedbSpillBacking::create(&db.path).expect("open");
+        for payload in [b"first".as_slice(), b"second".as_slice()] {
+            let id = backing.reserve_record_id().expect("reserve");
+            let _receipt = backing.commit_spill(id, payload).expect("commit");
+        }
+        let first = backing.prepare_restore().expect("prepare 0").expect("candidate 0");
+        assert_eq!(first.sequence, 0);
+        backing.commit_restore(&first.claim).expect("commit 0");
+        backing.finalize_restore(&first.claim).expect("finalize 0 lands");
+        // A new restore makes an unrelated claim live.
+        let second = backing.prepare_restore().expect("prepare 1").expect("candidate 1");
+        assert_eq!(second.sequence, 1);
+        // Same-claimant ACK-loss retry of the landed finalize: idempotent Ok,
+        // not an error the caller must reconcile away.
+        backing.finalize_restore(&first.claim).expect("landed finalize retry succeeds");
+        assert_eq!(
+            backing.active_restore().expect("active"),
+            Some(DurableRecordId::new(1)),
+            "the retry leaves the live claim untouched"
+        );
+        assert_eq!(second.bytes, b"second", "the live candidate is intact");
+        backing.abort_restore(&second.claim).expect("abort the live claim");
+        backing
+            .finalize_restore(&first.claim)
+            .expect("landed proof still answers after the live claim aborts");
+        assert_eq!(backing.retained_count().expect("count"), 1, "only record 1 remains");
+        assert_eq!(
+            backing.resolve_record(DurableRecordId::new(0)).expect("resolve"),
+            DurableRecordResolution::Finalized,
+            "record 0 stays exactly finalized"
+        );
+    }
+
+    #[test]
+    fn sep23_audit_finalize_proof_does_not_mask_reappeared_recovery_payload() {
+        let db = test_db();
+        let backing = RedbSpillBacking::create(&db.path).expect("open");
+        let id = backing.reserve_record_id().expect("reserve");
+        let _receipt = backing.commit_spill(id, b"payload").expect("commit");
+        let candidate = backing.prepare_restore().expect("prepare").expect("candidate");
+        backing.commit_restore(&candidate.claim).expect("commit restore");
+        backing.finalize_restore(&candidate.claim).expect("finalize");
+
+        let txn = backing.database.begin_write().expect("write");
+        {
+            let mut recovery = txn.open_table(SPILL_RECOVERY).expect("recovery");
+            recovery.insert(id.get(), b"corrupt".as_slice()).expect("inject inconsistency");
+        }
+        txn.commit().expect("commit inconsistency");
+
+        assert!(
+            matches!(backing.finalize_restore(&candidate.claim), Err(MemoryError::InvalidState(_))),
+            "a finalize proof must not hide a recovery payload that contradicts terminal state"
+        );
     }
 
     // Exhausted keyspace: with u64::MAX already present, allocating a new stable

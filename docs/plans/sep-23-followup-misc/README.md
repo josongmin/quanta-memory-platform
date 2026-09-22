@@ -1,6 +1,6 @@
 # Sep-23 follow-up misc — 실행 계획
 
-Status: `PLANNED — 구현·최종 qualification 아님`
+Status: `QMP IMPLEMENTED / OWNER-VERIFIED — repository exact-source 재검증 중; host-pair 1건 OPEN`
 작성일: `2026-09-23`
 계획 기준 HEAD: `028448946caa95676df034481a830c1d3e3b1f33`
 계획 기준 tree: `f983669731805a330200213bad7bf1bd5573f308`
@@ -9,8 +9,14 @@ Status: `PLANNED — 구현·최종 qualification 아님`
 
 현 HEAD 감사에서 확인한 **P1 독립 근본 원인 3건**(durable record 상태,
 durable recovery 단일 소유권, 0-byte ticket의 scope 수명)과 P2 개선 3건을
-구현 가능한 티켓으로 분리한다. P0으로 확정된 건은 없다. 이 문서 작성은 제품 코드 수정, commit/push,
-host 변경, 배포를 수행하거나 승인한 것이 아니다.
+구현 가능한 티켓으로 분리했다. P0으로 확정된 건은 없다. FUP-001~005/007은
+현재 QMP 소스에서 구현·focused GREEN·temporary-mutant RED가 확보됐다.
+QMP repository/standalone extraction은 clean `beba437` 후보에서 GREEN이었고,
+이후 self-audit 보완을 포함한 최종 source 재검증은 `FUP-006`과
+`RECEIPT.md`가 소유한다. Semantica host-pair는 QMP 경로 해석과
+`quanta-memory-host`가 GREEN이지만 downstream default provenance 1건이 RED다.
+실제 남은 외부 작업은
+`tickets/HOST-PAIR-RUNTIME-DEFAULT-PROVENANCE.md` 한 건이다.
 
 - **실행 재현:** 실제 Redb의 동시 recovery가 같은 sequence를 두 store에 복원;
   예약만 된 ID가 후속 ID의 finalize 뒤 `Finalized`로 판정됨.
@@ -26,7 +32,8 @@ host 변경, 배포를 수행하거나 승인한 것이 아니다.
   기대값 차이로 실패했다. 0-byte committed 경로와 public reclaimer 두 경로도 격리
   실행했다. 정확한 명령·출력·미실행 범위는
   `docs/misc/memory-state-substrate-gap-reaudit-2026-09-23.md`와 최초 감사 보고서에 있다.
-  이 티켓의 `sep23_fupNNN` selector는 **아직 생성되지 않은 예정 테스트**다.
+  이 티켓의 `sep23_fupNNN` selector는 현재 owner tests로 구현되어 non-zero
+  selection과 GREEN을 확인했다.
 - 기존 `qmp-final-qualified-d370529`는 현재 후보의 qualification이 아니다.
   기존 late-attach compile-fail 교정과 ticket index의 `BTreeMap` 복원은 이번 작업에서 보존한다.
 
@@ -48,9 +55,8 @@ host 변경, 배포를 수행하거나 승인한 것이 아니다.
    lease에서 이어서 한다. B0는 007의 ledger/control lease를 반환한다.
 3. **P2 Wave:** C=004는 007이 `ledger.rs`를 반환한 뒤, B=005는 007이 `control.rs`를
    반환한 뒤 시작할 수 있다. B=003은 004/005 결과와 두 파일 lease를 인수한 뒤 시작한다.
-4. **통합:** I=006은 선택한 후보에 포함된 writer가 모두 멈추고 동일 source를 고정한 뒤
-   단독 검증한다. P1-only 후보의 receipt는 P2 003/004/005를 OPEN으로 명시하며
-   이들의 미검증 계약을 전체 체크리스트 GREEN으로 표현하지 않는다.
+4. **통합:** full-followup 범위로 구현됐다. 최종 고정 source의 canonical/extraction
+   결과와 host-pair RED를 `RECEIPT.md`에 분리 기록한다.
 
 P1이 우선이다. `spill-redb`는 opt-in이므로 **사용하지 않는다는 host/dependency graph
 증거가 있을 때만** durable 미해결 상태를 기능 비활성 범위로 분리할 수 있다. 이 경우에도

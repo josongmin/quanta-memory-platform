@@ -1,6 +1,6 @@
 # FUP-005 — Reconfigure provenance의 bounded representation
 
-Status: `OPEN`
+Status: `VERIFIED — 10k bounded oracle + temporary append-mutant RED`
 Priority: `P2 — 운영 비용, 장애 임계치 미측정`
 Owner: `Lane B`
 Depends on: source freeze와 `FUP-007`의 `control.rs` lease 반환
@@ -48,12 +48,12 @@ append되고 `effective_report`/`observe`가 broker lock 아래 report를 clone�
 
 ## 검증 계약
 
-- [ ] 10,000회 accepted reconfigure 후 entry 수가 초기 수 + active 1개 이하.
-- [ ] 초기 resolved field provenance 보존, 현재 active source 정확, 중복 active 항목 없음.
-- [ ] accepted N회 후 revision은 initial + N; rejected operation은 revision/report 불변.
-- [ ] `observe`와 `effective_report`가 동일 active 정책과 provenance 의미를 제공.
-- [ ] 다시 append하도록 한 mutant에서 bounded-size regression RED.
-- [ ] absolute latency assertion 없음. 추가 측정 시 source/machine/profile과 표본을 기록.
+- [x] 10,000회 accepted reconfigure 후 entry 수가 초기 수 + active 1개 이하.
+- [x] 초기 resolved field provenance 보존, 현재 active source 정확, 중복 active 항목 없음.
+- [x] accepted N회 후 revision은 initial + N; rejected operation은 revision/report 불변.
+- [x] `observe`와 `effective_report`가 동일 active 정책과 provenance 의미를 제공.
+- [x] 다시 append하도록 한 mutant에서 bounded-size regression RED.
+- [x] absolute latency assertion 없음. 추가 측정 시 source/machine/profile과 표본을 기록.
 
 ```bash
 cargo test --locked -p quanta-memory-platform-core --all-features sep23_fup005 -- --nocapture

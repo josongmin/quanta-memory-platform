@@ -2105,6 +2105,108 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    // Self-audit P2-3: a panicking decode must unwind WITHOUT stranding a
+    // claim, a fence, or a charge. Prepared-phase panic aborts the live claim
+    // so a plain retry works; Committed-phase panic preserves the durable
+    // recovery so a recovery retry publishes exactly once.
+    #[cfg(feature = "spill-redb")]
+    #[test]
+    fn sep23_audit_panicking_decode_aborts_prepared_claim_and_retries_clean() {
+        use crate::spill::backings::redb::RedbSpillBacking;
+        static DB_SEQ: AtomicUsize = AtomicUsize::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "qmp-audit-decode-panic-{}-{}.redb",
+            std::process::id(),
+            DB_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_file(&path);
+        let controller = RoutedSpillController::new(RedbSpillBacking::create(&path).expect("redb"));
+        let broker = live_broker(1_000_000);
+        let store = store_with_broker(&broker);
+        store.insert_checked("first".into(), vec![1, 2, 3, 4]).expect("insert");
+        let total = store.committed_bytes().expect("before");
+        let receipt = store
+            .spill_one_durable(&controller, |key, value| {
+                let mut encoded = key.as_bytes().to_vec();
+                encoded.push(0);
+                encoded.extend(value);
+                Ok(encoded)
+            })
+            .expect("spill")
+            .expect("entry");
+        assert_eq!(receipt, SpillReceipt::Durable { sequence: 0, inventory_after: 1 });
+
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = store
+                .restore_one_durable(&controller, |_: &[u8]| -> MemoryResult<(String, Vec<u8>)> {
+                    panic!("restore decode panic")
+                });
+        }));
+        assert!(panic.is_err(), "decode panic unwinds through restore");
+        // The prepared claim was aborted: nothing active, nothing fenced,
+        // nothing charged — the store is exactly as before the attempt.
+        assert_eq!(controller.active_restore(), Ok(None));
+        assert!(store.pending_durable_restores().expect("none fenced").is_empty());
+        assert_eq!(store.committed_bytes().expect("bytes"), 0);
+        assert_eq!(broker.ledger_snapshot().expect("ledger").total_owner_bytes(), 0);
+        assert_eq!(controller.spilled_count(), Ok(1), "durable record retained");
+
+        // A plain retry with honest decode restores exactly once.
+        let restore = store.restore_one_durable(&controller, sep23_fup002_decode).expect("retry");
+        assert!(matches!(restore, DurableRestoreOutcome::Restored { sequence: 0 }));
+        assert_eq!(store.committed_bytes().expect("restored bytes"), total);
+        assert_eq!(store.reclaim_one().expect("entry").expect("restored").0, "first");
+        assert_eq!(broker.ledger_snapshot().expect("drained").total_owner_bytes(), 0);
+        assert_eq!(controller.spilled_count(), Ok(0));
+        drop(controller);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(feature = "spill-redb")]
+    #[test]
+    fn sep23_audit_panicking_decode_preserves_committed_recovery_until_retry() {
+        use crate::spill::backings::redb::RedbSpillBacking;
+        static DB_SEQ: AtomicUsize = AtomicUsize::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "qmp-audit-recovery-decode-panic-{}-{}.redb",
+            std::process::id(),
+            DB_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_file(&path);
+        sep23_fup002_seed_committed_recovery(&path);
+        let controller =
+            RoutedSpillController::new(RedbSpillBacking::create(&path).expect("redb reopen"));
+        let broker = live_broker(1_000_000);
+        let store = store_with_broker(&broker);
+
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = store.recover_active_durable_restore(
+                &controller,
+                |_: &[u8]| -> MemoryResult<(String, Vec<u8>)> { panic!("recovery decode panic") },
+            );
+        }));
+        assert!(panic.is_err(), "decode panic unwinds through recovery");
+        // Committed recovery is preserved untouched: still active, still
+        // restorable, with no provisional local state (nothing decoded yet).
+        assert_eq!(controller.active_restore(), Ok(Some(DurableRecordId::new(0))));
+        assert!(store.pending_durable_restores().expect("none fenced").is_empty());
+        assert_eq!(store.committed_bytes().expect("bytes"), 0);
+        assert_eq!(broker.ledger_snapshot().expect("ledger").total_owner_bytes(), 0);
+
+        // Honest recovery retry publishes the preserved copy exactly once.
+        let restore =
+            store.recover_active_durable_restore(&controller, sep23_fup002_decode).expect("retry");
+        assert!(matches!(restore, DurableRestoreOutcome::Restored { sequence: 0 }));
+        let (key, value) = store.reclaim_one().expect("entry").expect("restored");
+        assert_eq!(key, "shared");
+        assert_eq!(value, b"payload");
+        assert_eq!(broker.ledger_snapshot().expect("drained").total_owner_bytes(), 0);
+        assert_eq!(controller.spilled_count(), Ok(0));
+        assert_eq!(controller.active_restore(), Ok(None));
+        drop(controller);
+        let _ = std::fs::remove_file(path);
+    }
+
     #[cfg(feature = "spill-redb")]
     #[test]
     fn sep23_fup002_stolen_claim_reconcile_retires_provisional_copy() {

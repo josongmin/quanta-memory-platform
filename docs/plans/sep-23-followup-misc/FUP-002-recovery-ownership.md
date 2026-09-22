@@ -1,6 +1,6 @@
 # FUP-002 — Backend 범위의 single-owner recovery
 
-Status: `OPEN`
+Status: `VERIFIED — owner-local GREEN + temporary-mutant RED; FUP-006 exact-source gate 별도`
 Priority: `P1`
 Owner: `Lane A`
 Depends on: `FUP-001`의 persisted state와 migration 계약
@@ -59,18 +59,18 @@ test 경로는 `docs/misc/memory-state-substrate-gap-reaudit-2026-09-23.md`에 �
 
 ## 검증 계약
 
-- [ ] 동시 새 recovery 두 개 중 성공은 정확히 하나; 다른 store에는 읽을 수 있는 copy 없음.
-- [ ] 패자와 재시도 경로의 charge leak 없음; 최종 close 후 정확한 ledger 0.
-- [ ] 같은 claimant의 commit/finalize ACK-loss retry는 성공, 다른 claimant는 거절.
-- [ ] Prepared/Committed 각각의 reopen recovery 성공; stale generation은 거절.
-- [ ] decode 실패·panic, admission 거절, finalize 불확실성에서 payload 또는 recovery copy 보존.
-- [ ] 서로 다른 DB가 같은 numeric sequence를 발행해도 foreign claim/ID는 권한 변경 불가.
-- [ ] 현재 ordinary restore의 단일 active claim, FIFO, pending close 거절 계약 유지.
-- [ ] claim 검증 제거 mutant에서 중복 recovery regression RED.
-- [ ] 외부 crate가 lease를 임의 생성/복제하거나 raw sequence로 우회할 수 없는 compiler 계약.
-- [ ] 위 현재-head **1 selected** 반례가 같은 최종 소스에서 GREEN. 패자는
+- [x] 동시 새 recovery 두 개 중 성공은 정확히 하나; 다른 store에는 읽을 수 있는 copy 없음.
+- [x] 패자와 재시도 경로의 charge leak 없음; 최종 close 후 정확한 ledger 0.
+- [x] 같은 claimant의 commit/finalize ACK-loss retry는 성공, 다른 claimant는 거절.
+- [x] Prepared/Committed 각각의 reopen recovery 성공; stale generation은 거절.
+- [x] decode 실패·panic, admission 거절, finalize 불확실성에서 payload 또는 recovery copy 보존.
+- [x] 서로 다른 DB가 같은 numeric sequence를 발행해도 foreign claim/ID는 권한 변경 불가.
+- [x] 현재 ordinary restore의 단일 active claim, FIFO, pending close 거절 계약 유지.
+- [x] claim 검증 제거 mutant에서 중복 recovery regression RED.
+- [x] 외부 crate가 lease를 임의 생성/복제하거나 raw sequence로 우회할 수 없는 compiler 계약.
+- [x] 위 현재-head **1 selected** 반례가 같은 최종 소스에서 GREEN. 패자는
   `Restored`를 반환하지 않고 읽을 수 있는 resident copy/charge도 남기지 않는다.
-- [ ] `finalize_restore`의 idempotent `Ok`는 동일 claimant의 재시도에만 허용한다.
+- [x] `finalize_restore`의 idempotent `Ok`는 동일 claimant의 재시도에만 허용한다.
   이미 완료한 다른 claimant는 bare sequence만으로 성공할 수 없다.
 
 ```bash

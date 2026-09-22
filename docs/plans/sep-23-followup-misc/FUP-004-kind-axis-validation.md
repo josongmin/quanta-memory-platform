@@ -1,6 +1,6 @@
 # FUP-004 — 축별 kind 검증과 독립 oracle 확장
 
-Status: `OPEN`
+Status: `VERIFIED — defensive oracle closure + temporary-mutant RED`
 Priority: `P2 — 방어 강화, reachable corruption 미입증`
 Owner: `Lane C`
 Depends on: source freeze와 `FUP-007`의 `ledger.rs` lease 반환
@@ -52,13 +52,13 @@ class/context 내부에서 payload↔metadata를 바꿔 총량만 보존한 snap
 
 ## 검증 계약
 
-- [ ] 총량 보존 class-kind/context-kind 변조를 snapshot validator가 거절.
-- [ ] aggregate kind까지 보존한 bucket 간 swap을 independent model/oracle가 거절.
-- [ ] mixed-kind reserve/commit/release/batch/recharge trace에서 모든 관측 축 일치.
-- [ ] zero-byte/overflow/rejected mutation/foreign ticket/replay 후 기존 state 불변.
-- [ ] 기존 WrongChargeKindAxis fake와 기존 property suite도 계속 유효.
-- [ ] 새 class/context 비교 제거 mutant에서 적절한 negative test RED.
-- [ ] single-release bounded-probe 계약과 `BTreeMap` ticket index 보존.
+- [x] 총량 보존 class-kind/context-kind 변조를 snapshot validator가 거절.
+- [x] aggregate kind까지 보존한 bucket 간 swap을 independent model/oracle가 거절.
+- [x] mixed-kind reserve/commit/release/batch/recharge trace에서 모든 관측 축 일치.
+- [x] zero-byte/overflow/rejected mutation/foreign ticket/replay 후 기존 state 불변.
+- [x] 기존 WrongChargeKindAxis fake와 기존 property suite도 계속 유효.
+- [x] 새 class/context 비교 제거 mutant에서 적절한 negative test RED.
+- [x] single-release bounded-probe 계약과 `BTreeMap` ticket index 보존.
 
 ```bash
 cargo test --locked -p quanta-memory-platform-core --all-features sep23_fup004 -- --nocapture

@@ -2065,7 +2065,8 @@ mod tests {
     #[test]
     fn sep23_fup004_mixed_kind_trace_agrees_on_every_axis_bucket() {
         // Fixed mixed-kind script asserting the FULL kind matrices on both
-        // honest targets — not just the scalar projections.
+        // honest targets — not just the scalar projections — across a
+        // reserve phase AND a release phase.
         let script = [
             (0usize, 0usize, ChargeAxis::RetainedPayload, 1_000u64),
             (1, 0, ChargeAxis::RetainedMetadata, 250),
@@ -2073,6 +2074,14 @@ mod tests {
             (1, 1, ChargeAxis::RetainedPayload, 100),
         ];
         let owners = ["owner:conformance-a", "owner:conformance-b"];
+        let model_ticket = |(class_axis, owner_axis, kind, bytes)| ModelTicket {
+            target: (),
+            class_axis,
+            owner_axis,
+            kind,
+            bytes,
+            state: ModelTicketState::Committed,
+        };
         let mut model = IndependentAccountingModel::default();
         let mut fake = FakeProcessBroker::honest();
         let mut fake_tickets = Vec::new();
@@ -2084,6 +2093,13 @@ mod tests {
             fake_tickets.push(ticket);
         }
         assert_eq!(fake.view().expect("fake view"), model.view(), "fake full view");
+        // Release phase: drop the payload leg and the scratch leg; the kind
+        // matrices must track the release exactly, per bucket.
+        for index in [0, 2] {
+            fake.do_release(&fake_tickets[index]).expect("fake release");
+            model.apply_release(&model_ticket(script[index]));
+        }
+        assert_eq!(fake.view().expect("fake view"), model.view(), "fake view after release");
 
         let mut model = IndependentAccountingModel::default();
         let mut live = live_broker();
@@ -2095,11 +2111,18 @@ mod tests {
             live_tickets.push(ticket);
         }
         assert_eq!(live.view().expect("live view"), model.view(), "live full view");
+        for index in [0, 2] {
+            live.do_release(&live_tickets[index]).expect("live release");
+            model.apply_release(&model_ticket(script[index]));
+        }
+        assert_eq!(live.view().expect("live view"), model.view(), "live view after release");
 
+        // Only (1,0,metadata,250) and (1,1,payload,100) remain.
         let view = model.view();
-        assert_eq!(view.class_kind_bytes, [[1_000, 0, 500], [100, 250, 0]]);
-        assert_eq!(view.owner_kind_bytes, [[1_000, 250, 0], [100, 0, 500]]);
-        assert_eq!(view.context_kind_bytes[0], [1_100, 250, 500], "every reserve lands in Request");
+        assert_eq!(view.class_kind_bytes, [[0, 0, 0], [100, 250, 0]]);
+        assert_eq!(view.owner_kind_bytes, [[0, 250, 0], [100, 0, 0]]);
+        assert_eq!(view.context_kind_bytes[0], [100, 250, 0], "every reserve lands in Request");
+        assert_eq!(view.total_owner_bytes, 350);
     }
 
     #[test]

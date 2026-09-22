@@ -1,6 +1,6 @@
 # FUP-007 — 0-byte ticket의 group 수명과 최종 반환
 
-Status: `OPEN`
+Status: `VERIFIED — committed/pending/Drop/rebuild matrix GREEN + temporary-mutant RED`
 Priority: `P1 — core authority/lifecycle correctness`
 Owner: `Lane B0` (`api/control.rs` 단독 writer)
 Depends on: source freeze

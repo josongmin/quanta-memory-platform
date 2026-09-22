@@ -20,8 +20,13 @@ pub struct EffectiveMemoryBudgetReport {
     /// Stable string labels of override sources, in precedence order. Retained
     /// as the human-readable provenance summary.
     pub override_sources: Vec<String>,
-    /// Structured override provenance: which source last wrote which field.
-    /// Empty when the report was built from a bare manifest with no resolver.
+    /// Structured override provenance: the initial resolver records
+    /// (`residency.base`, per-field overrides) plus at most one CURRENT
+    /// `residency.active` record naming the live policy source. Accepted live
+    /// reconfigures upsert that single record instead of appending, so the
+    /// vector stays bounded no matter how many reconfigures land; it is NOT a
+    /// chronological history. Empty when the report was built from a bare
+    /// manifest with no resolver.
     pub override_provenance: Vec<OverrideRecord>,
     /// Monotonic identity of the active policy. Initial construction is 1;
     /// every accepted live reconfiguration increments it atomically.

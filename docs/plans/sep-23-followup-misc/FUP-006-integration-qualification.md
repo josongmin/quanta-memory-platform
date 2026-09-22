@@ -1,6 +1,6 @@
 # FUP-006 — 통합과 current-source qualification
 
-Status: `OPEN`
+Status: `PARTIAL — QMP owner/extraction candidate GREEN; final source rerun pending; Semantica host-pair RED 1건`
 Priority: `SCOPE-SPECIFIC RELEASE GATE` (구현 결함 티켓이 아님)
 Owner: `Lane I — serial integrator`
 Depends on: core-enabled 후보는 `FUP-007`; durable-enabled 후보는 추가로 `FUP-001`, `FUP-002`; full-followup 후보는 추가로 `FUP-003`, `FUP-004`, `FUP-005`

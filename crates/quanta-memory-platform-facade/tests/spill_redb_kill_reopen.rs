@@ -167,7 +167,21 @@ fn spawn_until_ready(db: &Path, mode_args: &[&str]) -> (Child, Vec<String>) {
 /// its own (which would downgrade this rail to a clean-shutdown test wearing
 /// a crash costume).
 fn sigkill_child(child: &mut Child) {
-    child.kill().expect("SIGKILL the crash child");
+    if let Err(error) = child.kill() {
+        // The child died before the kill (a real crash, not a clean exit —
+        // no mode exits on its own): reap it and show why instead of a bare
+        // kill error.
+        let mut stderr = Vec::new();
+        if let Some(mut pipe) = child.stderr.take() {
+            use std::io::Read;
+            let _ = pipe.read_to_end(&mut stderr);
+        }
+        let status = child.wait().expect("reap dead child");
+        panic!(
+            "crash child died before SIGKILL (kill error: {error}, status {status}):\n{}",
+            String::from_utf8_lossy(&stderr)
+        );
+    }
     let status = child.wait().expect("reap the crash child");
     #[cfg(unix)]
     {
