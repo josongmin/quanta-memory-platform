@@ -20,6 +20,16 @@
 //! ```compile_fail
 //! use quanta_memory_platform_facade::scratch::bumpalo::BumpaloScratchArena;
 //! ```
+//!
+//! Accounting authority remains internal to the facade:
+//!
+//! ```compile_fail
+//! use quanta_memory_platform_facade::AccountingSink;
+//! ```
+//!
+//! ```compile_fail
+//! use quanta_memory_platform_facade::SharedAccountingSink;
+//! ```
 
 // Slice-agnostic glue is always available: the broker builder, presets, the
 // accounting seam, and byte-measurement. Each store/pipeline slice is gated

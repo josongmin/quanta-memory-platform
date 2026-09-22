@@ -7,7 +7,7 @@
 //! folds into an assertion.
 
 use quanta_memory_platform_core::{
-    ChargeKind, MemoryClass, MemoryPreset, RetainedEnvelope, StoreBindingHandle,
+    ChargeKind, MemoryClass, MemoryPreset, MemoryResult, RetainedEnvelope, StoreBindingHandle,
 };
 use quanta_memory_platform_facade::{
     InMemorySpillTarget, MemoryPlatformBuilder, PayloadStore, RoutedSpillController,
@@ -151,14 +151,33 @@ pub fn drive_rebuild_race_accepts_write_too_early() -> FaultOutcome {
     }
 }
 
-/// NEGATIVE PATH 4: spill controller fails after the target is unavailable.
-/// Contained means the spill fails closed and the success count does not move.
-#[must_use]
-pub fn drive_spill_failure_after_reservation() -> FaultOutcome {
-    let controller = RoutedSpillController::new(InMemorySpillTarget::unavailable());
-    let before = controller.spilled_count();
+/// Private inventory probe behind a spill controller: the authoritative count the
+/// [`classify_spill_failure`] classifier reads before and after the spill. The
+/// facade exposes counts only on the concrete routed controller, so this local
+/// trait (never exported, never touching facade APIs) lets the single
+/// production classifier run unchanged over both the honest controller and
+/// test-only fault doubles.
+trait SpillCountProbe {
+    fn spill_count(&self) -> MemoryResult<u64>;
+}
+
+impl SpillCountProbe for RoutedSpillController<InMemorySpillTarget<String>> {
+    fn spill_count(&self) -> MemoryResult<u64> {
+        self.spilled_count()
+    }
+}
+
+/// Production spill-failure classifier: reads `spilled_count before → spill →
+/// spilled_count after` and owns every `Contained`/`Escaped` branch. Both the
+/// public driver and the lying-controller negative pole call this one path, so
+/// a broken driver that always reports `Contained` is caught by the tests.
+fn classify_spill_failure<C>(controller: &C) -> FaultOutcome
+where
+    C: SpillController<String> + SpillCountProbe,
+{
+    let before = controller.spill_count();
     let result = controller.spill("spillable-handle".to_string());
-    let after = controller.spilled_count();
+    let after = controller.spill_count();
     match (before, result, after) {
         (Ok(before), Err(e), Ok(after)) if before == after => FaultOutcome::Contained {
             evidence: format!("spill failed closed ({e}); spilled_count stayed at {after}"),
@@ -170,6 +189,14 @@ pub fn drive_spill_failure_after_reservation() -> FaultOutcome {
             evidence: "spill to an unavailable target reported success".to_string(),
         },
     }
+}
+
+/// NEGATIVE PATH 4: spill controller fails after the target is unavailable.
+/// Contained means the spill fails closed and the success count does not move.
+#[must_use]
+pub fn drive_spill_failure_after_reservation() -> FaultOutcome {
+    let controller = RoutedSpillController::new(InMemorySpillTarget::unavailable());
+    classify_spill_failure(&controller)
 }
 
 #[cfg(test)]
@@ -206,23 +233,11 @@ mod tests {
 
     // NEGATIVE POLE: the fault drivers' `Escaped` detection must actually fire for a
     // broken component — otherwise a driver that can only ever report `Contained` is
-    // a rubber stamp. Classify an unavailable-spill against a LYING controller (one
-    // that reports success when it must fail closed) and prove it is `Escaped`, with
-    // the honest fail-closed controller as the `Contained` positive pole.
+    // a rubber stamp. Both poles call the production `classify_spill_failure`
+    // helper: a LYING controller (reports success when it must fail closed)
+    // proves `Escaped`, and the honest fail-closed controller proves `Contained`.
     #[test]
     fn spill_fault_classification_reports_escaped_for_a_lying_controller() {
-        // Shared classification shape: Err => Contained, Ok => Escaped.
-        fn classify<C: SpillController<String>>(controller: &C) -> FaultOutcome {
-            match controller.spill("spillable-handle".to_string()) {
-                Err(e) => {
-                    FaultOutcome::Contained { evidence: format!("spill failed closed ({e})") }
-                }
-                Ok(_) => FaultOutcome::Escaped {
-                    evidence: "spill to an unavailable target reported success".to_string(),
-                },
-            }
-        }
-
         // A controller that LIES (reports Ok when it should fail closed).
         #[derive(Debug, Default)]
         struct LyingSpillController;
@@ -237,13 +252,96 @@ mod tests {
                 Ok(quanta_memory_platform_facade::SpillReceipt::InProcess { inventory_after: 0 })
             }
         }
+        impl SpillCountProbe for LyingSpillController {
+            fn spill_count(&self) -> MemoryResult<u64> {
+                Ok(0)
+            }
+        }
 
-        let escaped = classify(&LyingSpillController);
+        let escaped = classify_spill_failure(&LyingSpillController);
         assert!(!escaped.contained(), "a lying controller must classify as Escaped");
         assert!(matches!(escaped, FaultOutcome::Escaped { .. }));
+        assert!(
+            escaped.evidence().contains("reported success"),
+            "lying evidence must name the false success: {}",
+            escaped.evidence()
+        );
 
-        // Positive pole: the real fail-closed controller is Contained.
+        // Positive pole: the real fail-closed controller is Contained through the
+        // same helper code path.
         let honest = RoutedSpillController::new(InMemorySpillTarget::unavailable());
-        assert!(classify(&honest).contained(), "the honest controller fails closed (Contained)");
+        let contained = classify_spill_failure(&honest);
+        assert!(
+            contained.contained(),
+            "the honest controller fails closed (Contained): {}",
+            contained.evidence()
+        );
+        assert!(contained.evidence().contains("stayed at 0"));
+    }
+
+    #[test]
+    fn spill_fault_classification_reports_escaped_when_count_drifts() {
+        use quanta_memory_platform_core::MemoryError;
+
+        // Fails closed but moves the inventory: the before/after proof disagrees.
+        struct DriftingSpillController {
+            count: std::cell::Cell<u64>,
+        }
+        impl SpillController<String> for DriftingSpillController {
+            fn spill(
+                &self,
+                handle: String,
+            ) -> Result<
+                quanta_memory_platform_facade::SpillReceipt,
+                quanta_memory_platform_facade::SpillFailure<String>,
+            > {
+                self.count.set(1);
+                Err(quanta_memory_platform_facade::SpillFailure::new(
+                    MemoryError::capacity("spill target unavailable"),
+                    handle,
+                ))
+            }
+        }
+        impl SpillCountProbe for DriftingSpillController {
+            fn spill_count(&self) -> MemoryResult<u64> {
+                Ok(self.count.get())
+            }
+        }
+
+        let controller = DriftingSpillController { count: std::cell::Cell::new(0) };
+        let outcome = classify_spill_failure(&controller);
+        assert!(!outcome.contained(), "a drifted count must classify as Escaped");
+        assert!(outcome.evidence().contains("inventory proof"));
+    }
+
+    #[test]
+    fn spill_fault_classification_reports_escaped_when_count_is_unreadable() {
+        use quanta_memory_platform_core::MemoryError;
+
+        // Fails closed but the inventory cannot be read back.
+        struct UnreadableCountController;
+        impl SpillController<String> for UnreadableCountController {
+            fn spill(
+                &self,
+                handle: String,
+            ) -> Result<
+                quanta_memory_platform_facade::SpillReceipt,
+                quanta_memory_platform_facade::SpillFailure<String>,
+            > {
+                Err(quanta_memory_platform_facade::SpillFailure::new(
+                    MemoryError::capacity("spill target unavailable"),
+                    handle,
+                ))
+            }
+        }
+        impl SpillCountProbe for UnreadableCountController {
+            fn spill_count(&self) -> MemoryResult<u64> {
+                Err(MemoryError::capacity("inventory unreadable"))
+            }
+        }
+
+        let outcome = classify_spill_failure(&UnreadableCountController);
+        assert!(!outcome.contained(), "an unreadable count must classify as Escaped");
+        assert!(outcome.evidence().contains("inventory proof"));
     }
 }

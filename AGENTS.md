@@ -87,23 +87,17 @@ On any change:
   a feature; never reach back into `core` internals.
 - **Public API change** → update the `lib.rs` re-exports and the examples
   (`hello_world`, `effective_budget_report`) so they still compile.
-- **Agent guidance** → edit `tools/pm/sources/**`, run `python3 tools/pm/pm.py sync`.
-
-Direction & portability are the two things reviewers check first: never invert
-`core <- facade <- testkit`, and never let Semantica/host nouns into the public
-API. When in doubt, run `scripts/extract-to-standalone-repo.sh --dry-run /tmp/qmp`.
 
 ## Closeout Playbook
 
-Every meaningful slice should close with:
+Every meaningful code slice should close with the applicable items:
 
 1. The code change (smallest surface that proves the behavior).
 2. Tests in the owning crate module (`#[cfg(test)]`), asserting invariants — not
    just `Ok`.
 3. A conformance / contract test if the slice touches accounting or a public
    contract (and the suite still REJECTS a broken fake).
-4. Updated `lib.rs` re-exports + examples if the public API changed.
-5. Doc updates (`README.md` / `EXTRACTION.md`) if direction, surface, or build
+4. Doc updates (`README.md` / `EXTRACTION.md`) if direction, surface, or build
    steps changed.
 
 Before closeout, run:
@@ -112,8 +106,12 @@ Before closeout, run:
 # Regenerate agent docs if you edited tools/pm/sources/**
 python3 tools/pm/pm.py sync
 scripts/check-workspace.sh          # canonical static/test/feature/selector/PM/deny rail
+```
 
-# if you changed any Cargo.toml or cross-crate use path:
+After the candidate source is committed and clean, run the extraction pre-flight
+if you changed any `Cargo.toml` or cross-crate use path:
+
+```bash
 scripts/extract-to-standalone-repo.sh --dry-run /tmp/qmp-check
 ```
 
@@ -132,7 +130,7 @@ Changed:
 
 Verified:
 - scripts/check-workspace.sh
-- extraction dry-run (if Cargo.toml/use paths changed)
+- extraction dry-run on the committed candidate (if Cargo.toml/use paths changed)
 
 Not run:
 - ...
@@ -142,5 +140,4 @@ Known risk:
 ```
 
 Fail-closed principle: if `pm lint` fails, sync — do not patch generated files.
-If tests fail, fix behavior; do not weaken assertions to greenwash. Never invert
-the `core <- facade <- testkit` direction to make something compile.
+If tests fail, fix behavior; do not weaken assertions to greenwash.

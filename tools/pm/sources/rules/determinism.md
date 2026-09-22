@@ -1,10 +1,10 @@
 ## Determinism & Accounting Invariants
 
 The ledger (`crates/quanta-memory-platform-core/src/domain/ledger.rs`) is the
-semantic accounting SSOT. It is
-single-threaded and synchronous; the public broker wraps it behind a lock. Its
-behavior must be **deterministic and reproducible** for the same operation
-sequence — conformance suites and fault fixtures depend on it.
+semantic accounting SSOT. It is single-threaded and synchronous; the public
+broker wraps it behind a lock. Its behavior must be **deterministic and
+reproducible** for the same operation sequence — conformance suites and fault
+fixtures depend on it.
 
 Global invariants (must hold after every committed operation):
 

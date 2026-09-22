@@ -30,10 +30,7 @@ fail-closed. A Semgrep exception requires a trailing
 | resolved dependency from `core` to facade/testkit (or facade to testkit), including a renamed dependency | keep `core <- facade <- testkit` | Cargo-metadata graph contract in `check-workspace`, extraction pre-flight |
 | Semantica nouns (`Semantica*`, `quanta_runtime`, `codegraph`) in public API | keep the library host-independent | review |
 | raw broker constructor backdoor in public code | go through the builder-first surface | public API compile-fail tests |
-| stale `V1`/`V2` / old renamed symbols | use the current names | review |
 | allocator telemetry mutating ledger counters | telemetry is **advisory** — never writes counters | review (ledger invariant) |
 | mutating the ledger partway then erroring | validate first; fail-closed BEFORE any mutation | review (all-or-nothing) |
 | `assert!(true)` / `assert_eq!(x, x)` placeholder test | assert the real behavior / invariant | review |
 | `#[ignore]` without a reason | `#[ignore = "<reason>"]` | review |
-
-Run the full rail with `scripts/check-workspace.sh`.

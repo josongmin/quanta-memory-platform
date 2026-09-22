@@ -7,7 +7,8 @@ The single error type is `MemoryError`
 (`crates/quanta-memory-platform-core/src/domain/errors.rs`):
 
 ```text
-MemoryError = Build | Config | Capacity | InvalidState | Report | Unsupported
+MemoryError = Build | Config | Capacity | Closed | OperationInProgress |
+              Poisoned | InvalidState | Report | Unsupported
 MemoryResult<T> = Result<T, MemoryError>
 ```
 
@@ -19,27 +20,17 @@ Principles:
 
 - **No silent recovery.** Production code must not coerce a capacity / config /
   invalid-state failure into an empty default or a swallowed `Ok`.
-- **Fail-closed before mutation.** An over-budget reserve, an invalid policy, or a
-  write during rebuild returns the appropriate `MemoryError` BEFORE touching the
-  ledger — never half-apply then error.
-- **Preserve the source.** When wrapping a backing error (redb), include
-  it: `format!("spill write failed: {e}")`. Never `map_err(|_| …)`.
+- **Preserve actionable source context.** When wrapping a backing error (redb),
+  include it: `format!("spill write failed: {e}")`. A poison or range-conversion
+  error may be discarded when the replacement typed error already contains the
+  complete actionable context.
 - **Pick the right variant.** Over-budget → `Capacity`; bad manifest/policy →
-  `Config`; builder misuse → `Build`; operation illegal in current state (e.g.
-  write during rebuild) → `InvalidState`; snapshot/report failure → `Report`;
+  `Config`; builder misuse → `Build`; terminal service → `Closed`; occupied
+  mutation lane → `OperationInProgress`; poisoned authority → `Poisoned`;
+  other illegal state → `InvalidState`; snapshot/report failure → `Report`;
   not-wired capability → `Unsupported`.
-
-Rust patterns:
-
-| Avoid | Prefer |
-| --- | --- |
-| `.unwrap()` in non-test code | `?` with a `MemoryError` variant, or `.ok_or_else(...)` |
-| `.expect("")` / `.expect("TODO")` | tests only, with `.expect("<invariant that cannot fail>")` |
-| `Err(_) => {}` / `let _ = fallible();` | propagate with `?` or map to a typed error |
-| `panic!()` / `todo!()` in shipping paths | return `MemoryError` with an explicit variant |
-| `map_err(|_| MemoryError::…)` | `map_err(|e| MemoryError::…(format!("…: {e}")))` |
-| lossy `as` / wrapping math on counters | `try_from` + `checked_*` / `saturating_*` |
 
 `MemoryError` derives `Clone, Debug, PartialEq, Eq` and implements
 `std::error::Error` + `Display` — assert on the variant in tests, not on string
-substrings where avoidable.
+substrings where avoidable. Concrete Rust patterns live in the cheatsheet so
+the policy has one wording authority.

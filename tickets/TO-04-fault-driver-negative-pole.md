@@ -60,8 +60,8 @@ temporary mutant로 success arm을 `Contained`로 바꾼다. lying-controller te
 한다. 별도 local classifier가 RED인 것은 인정하지 않는다.
 
 ```bash
-cargo test -p quanta-memory-platform-testkit spill_failure -- --nocapture
-cargo test -p quanta-memory-platform-testkit faults::scenarios
+cargo test -p quanta-memory-platform-testkit --features faults spill_failure -- --nocapture
+cargo test -p quanta-memory-platform-testkit --features faults faults::scenarios
 ```
 
 ## Acceptance / reopen

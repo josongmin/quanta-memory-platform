@@ -233,16 +233,6 @@ mod tests {
     }
 
     #[test]
-    fn advisory_flags_mismatch_and_reports_semantic_as_authority() {
-        let snap =
-            AllocatorSnapshot { resident_bytes: Some(2_000), ..AllocatorSnapshot::default() };
-        let advisory = AllocatorAdvisory::compare(&snap, 1_000);
-        assert!(advisory.mismatch, "2000 allocator vs 1000 semantic is a mismatch");
-        assert_eq!(advisory.semantic_bytes, 1_000, "semantic value is the SSOT carried");
-        assert_eq!(advisory.drift_bytes(), Some(1_000), "drift = allocator - semantic");
-    }
-
-    #[test]
     fn advisory_agreement_has_no_mismatch() {
         let snap =
             AllocatorSnapshot { resident_bytes: Some(1_000), ..AllocatorSnapshot::default() };

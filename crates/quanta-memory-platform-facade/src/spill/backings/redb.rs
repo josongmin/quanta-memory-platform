@@ -1217,37 +1217,63 @@ mod tests {
     // duplicate. Drains every handle and asserts the exact multiset round-trips.
     #[test]
     fn concurrent_accepts_lose_no_handle_and_assign_distinct_keys() {
-        use std::collections::BTreeSet;
-        use std::sync::Arc;
+        use std::collections::{BTreeMap, BTreeSet};
+        use std::sync::{Arc, Barrier};
+
+        const WRITERS: usize = 4;
+        const WRITES_PER_WRITER: usize = 2;
 
         let db = test_db();
         let backing = Arc::new(RedbSpillBacking::create(&db.path).expect("open"));
+        let start = Arc::new(Barrier::new(WRITERS + 1));
+        let expected = WRITERS.checked_mul(WRITES_PER_WRITER).expect("bounded test record count");
+        let expected_u64 = u64::try_from(expected).expect("record count fits u64");
 
-        let threads = 8u32;
-        let per_thread = 25u32;
         let mut handles = Vec::new();
-        for t in 0..threads {
+        for writer in 0..WRITERS {
             let backing = Arc::clone(&backing);
-            handles.push(std::thread::spawn(move || {
-                for i in 0..per_thread {
-                    let payload = format!("t{t}-{i}").into_bytes();
-                    let _receipt = spill_backing(&backing, &payload).expect("concurrent accept");
+            let start = Arc::clone(&start);
+            handles.push(std::thread::spawn(move || -> Vec<(Vec<u8>, SpillReceipt)> {
+                let mut accepted = Vec::with_capacity(WRITES_PER_WRITER);
+                start.wait();
+                for record in 0..WRITES_PER_WRITER {
+                    let payload = format!("writer-{writer}-record-{record}").into_bytes();
+                    let receipt = spill_backing(&backing, &payload).expect("concurrent accept");
+                    accepted.push((payload, receipt));
                 }
+                accepted
             }));
         }
-        for h in handles {
-            h.join().expect("thread panicked");
-        }
+        start.wait();
 
-        let expected = (threads * per_thread) as u64;
-        assert_eq!(backing.retained_count().expect("len"), expected, "no accept was lost");
-
-        // Drain everything; every handle is distinct (no key collision lost a write).
-        let mut drained = BTreeSet::new();
-        while let Some(h) = restore_backing(&backing).expect("restore") {
-            assert!(drained.insert(h), "a handle was restored twice (key collision)");
+        let mut accepted = Vec::with_capacity(expected);
+        for handle in handles {
+            accepted.extend(handle.join().expect("writer thread panicked"));
         }
-        assert_eq!(drained.len() as u64, expected, "every accepted handle restored exactly once");
+        assert_eq!(accepted.len(), expected, "every writer returned every acceptance receipt");
+
+        let mut accepted_payloads = BTreeMap::new();
+        let mut sequences = BTreeSet::new();
+        for (payload, receipt) in accepted {
+            *accepted_payloads.entry(payload).or_insert(0usize) += 1;
+            let SpillReceipt::Durable { sequence, .. } = receipt else {
+                panic!("redb backing must report durable acceptance: {receipt:?}");
+            };
+            assert!(sequences.insert(sequence), "duplicate durable sequence {sequence}");
+        }
+        let expected_sequences = (0..expected_u64).collect::<BTreeSet<_>>();
+        assert_eq!(sequences, expected_sequences, "durable sequences are contiguous from zero");
+        assert_eq!(
+            backing.retained_count().expect("len"),
+            expected_u64,
+            "no accepted record was lost"
+        );
+
+        let mut restored_payloads = BTreeMap::new();
+        while let Some(payload) = restore_backing(&backing).expect("restore") {
+            *restored_payloads.entry(payload).or_insert(0usize) += 1;
+        }
+        assert_eq!(restored_payloads, accepted_payloads, "exact payload multiset round-trips");
         assert_eq!(backing.retained_count().expect("len"), 0, "fully drained");
     }
 

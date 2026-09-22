@@ -171,7 +171,7 @@ fn names_every_public_reexport() {
     type _Telemetry = (AllocatorAdvisory, Box<dyn AllocatorTelemetry>, StaticAllocatorTelemetry);
 }
 
-/// All eight `MemoryError` variants remain constructible. The single error type is
+/// All nine `MemoryError` variants remain constructible. The single error type is
 /// a public contract
 /// (Build|Config|Capacity|Closed|OperationInProgress|Poisoned|InvalidState|Report|Unsupported);
 /// removing or renaming a variant breaks this exhaustive match.

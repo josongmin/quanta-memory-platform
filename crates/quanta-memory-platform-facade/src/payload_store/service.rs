@@ -1218,20 +1218,6 @@ mod tests {
     }
 
     #[test]
-    fn source_has_no_public_raw_constructor_or_late_attach() {
-        let source = include_str!("service.rs");
-        assert!(!source.lines().any(|line| line.trim_start().starts_with("pub fn new(")));
-        assert!(!source
-            .lines()
-            .any(|line| line.trim_start().starts_with("pub fn charged_against(")));
-        assert!(!source.lines().any(|line| {
-            let line = line.trim_start();
-            line.starts_with("pub struct SimplePayloadStore<") && line.contains("Mode = Budgeted")
-        }));
-        assert!(source.contains("pub(crate) fn new_budgeted"));
-    }
-
-    #[test]
     fn delete_contains_two_panicking_client_destructors_after_exact_refund() {
         use std::sync::atomic::AtomicBool;
 

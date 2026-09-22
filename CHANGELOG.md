@@ -14,10 +14,15 @@
   added fail-closed ShellCheck validation to the canonical rail, and hardened
   generated guidance against source/output symlink escapes and reserved Git
   paths.
-- Removed duplicate shell parsing, crate-local unsafe lint declarations, and
-  repeated agent-specific guidance; centralized low-noise Clippy policy in the
-  workspace manifest and corrected review-only rules that were mislabeled as
-  automated gates.
+- Removed duplicate shell parsing and repeated agent-specific guidance;
+  centralized low-noise Clippy policy in the workspace manifest while retaining
+  the crate-local non-overridable unsafe boundary, and corrected review-only
+  rules that were mislabeled as automated gates.
+- Consolidated repeated architecture, test, dependency, and error-handling
+  guidance in generated agent rules; aligned the documented `MemoryError`
+  taxonomy with all nine current variants; removed duplicate live-policy and
+  extracted-destination graph checks; and separated dirty-tree local
+  verification from clean exact-HEAD extraction qualification.
 
 ## 0.2.0 - 2026-09-21
 

@@ -1495,18 +1495,17 @@ mod tests {
         assert!(ledger.ticket_states.contains_key(&second.id()));
     }
 
-    #[test]
-    fn single_release_preflight_is_bounded_by_affected_slots_at_10k_owners() {
-        let mut ledger = ledger_from_policy(ResidencyPolicy::new(20_000));
-        let mut tickets = Vec::with_capacity(10_000);
-        for owner in 0..10_000 {
+    fn assert_single_release_probe_bound(owner_count: usize) {
+        let mut ledger = ledger_from_policy(ResidencyPolicy::new((owner_count as u64) + 1));
+        let mut tickets = Vec::with_capacity(owner_count);
+        for owner in 0..owner_count {
             tickets.push(
                 reserve(&mut ledger, MemoryClass::ArtifactCache, &format!("owner-{owner}"), 1)
                     .expect("reserve one byte per owner"),
             );
         }
-        assert_eq!(ledger.total_semantic_bytes(), 10_000);
-        assert_eq!(ledger.non_headroom_bytes(), 10_000);
+        assert_eq!(ledger.total_semantic_bytes(), owner_count as u64);
+        assert_eq!(ledger.non_headroom_bytes(), owner_count as u64);
 
         let released = tickets.pop().expect("one ticket");
         ledger.release(&released).expect("single owner release");
@@ -1515,15 +1514,25 @@ mod tests {
             ledger.last_release_preflight_axis_probes, 3,
             "one release probes exactly one class/kind, owner/kind and context/kind slot"
         );
-        assert_eq!(ledger.owner_usage.len(), 9_999, "unaffected owner cardinality is preserved");
-        assert_eq!(ledger.total_semantic_bytes(), 9_999);
-        assert_eq!(ledger.non_headroom_bytes(), 9_999);
+        assert_eq!(
+            ledger.owner_usage.len(),
+            owner_count - 1,
+            "unaffected owner cardinality is preserved"
+        );
+        assert_eq!(ledger.total_semantic_bytes(), (owner_count - 1) as u64);
+        assert_eq!(ledger.non_headroom_bytes(), (owner_count - 1) as u64);
         assert_axes_balanced(&ledger.snapshot());
 
         ledger.release_batch(&tickets).expect("drain remaining tickets");
         assert_eq!(ledger.total_semantic_bytes(), 0);
         assert_eq!(ledger.non_headroom_bytes(), 0);
         assert_axes_balanced(&ledger.snapshot());
+    }
+
+    #[test]
+    fn single_release_preflight_is_bounded_independent_of_owner_cardinality() {
+        assert_single_release_probe_bound(32);
+        assert_single_release_probe_bound(128);
     }
 
     #[test]

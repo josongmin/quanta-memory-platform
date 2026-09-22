@@ -27,8 +27,3 @@ On any change:
   a feature; never reach back into `core` internals.
 - **Public API change** → update the `lib.rs` re-exports and the examples
   (`hello_world`, `effective_budget_report`) so they still compile.
-- **Agent guidance** → edit `tools/pm/sources/**`, run `python3 tools/pm/pm.py sync`.
-
-Direction & portability are the two things reviewers check first: never invert
-`core <- facade <- testkit`, and never let Semantica/host nouns into the public
-API. When in doubt, run `scripts/extract-to-standalone-repo.sh --dry-run /tmp/qmp`.

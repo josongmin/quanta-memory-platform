@@ -98,14 +98,25 @@ if rg -q 'quanta-memory-platform-core feature "(default|live_control)"' <<<"${fa
   exit 1
 fi
 
-# The documented production aggregate must not expose the explicit unbudgeted
-# escape hatch. `--all-features` covers its compilation separately.
-facade_full_tree="$(cargo tree --locked -p "${FACADE_CRATE}" --no-default-features --features full \
-  -e features -i "${FACADE_CRATE}")"
-if rg -q 'quanta-memory-platform-facade feature "unbudgeted-stores"' <<<"${facade_full_tree}"; then
-  echo "feature-matrix: facade feature 'full' must not enable unbudgeted-stores" >&2
-  exit 1
-fi
+# Production/default aggregates must not expose the explicit unbudgeted escape
+# hatch. Resolve the graph instead of parsing Cargo.toml text: dependency feature
+# forwarding and renamed edges are visible only in Cargo's resolved graph.
+assert_facade_escape_hatch_absent() {
+  local label="$1"
+  shift
+  local tree
+  tree="$(cargo tree --locked -p "${FACADE_CRATE}" "$@" -e features -i "${FACADE_CRATE}")"
+  if rg -q 'quanta-memory-platform-facade feature "unbudgeted-stores"' <<<"${tree}"; then
+    echo "feature-matrix: facade ${label} must not enable unbudgeted-stores" >&2
+    printf '%s\n' "${tree}" >&2
+    exit 1
+  fi
+}
+
+assert_facade_escape_hatch_absent "default features"
+assert_facade_escape_hatch_absent "feature 'full'" --no-default-features --features full
+assert_facade_escape_hatch_absent \
+  "feature 'full-backings'" --no-default-features --features full-backings
 
 # Whole-workspace bookends: the two extremes must resolve together. The
 # all-features workspace run subsumes redundant per-crate all-feature runs and

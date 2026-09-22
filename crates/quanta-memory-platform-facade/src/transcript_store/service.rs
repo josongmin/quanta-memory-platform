@@ -1226,6 +1226,29 @@ mod tests {
                 .sum::<u64>()
     }
 
+    const ORDERED_INDEX_BYTES_ORACLE: u64 = 24;
+    const DIGEST_BYTES_ORACLE: u64 = 32;
+    const ENTRY_STATE_BYTES_ORACLE: u64 = 16;
+
+    fn expected_partition_costs(
+        session_id: &str,
+        message_id: &str,
+        body: &str,
+    ) -> (u64, u64, u64, u64) {
+        let active = body.len() as u64
+            + message_id.len() as u64
+            + ORDERED_INDEX_BYTES_ORACLE
+            + ENTRY_STATE_BYTES_ORACLE;
+        let evidence = 2 * message_id.len() as u64
+            + 2 * ORDERED_INDEX_BYTES_ORACLE
+            + 2 * DIGEST_BYTES_ORACLE
+            + 2 * ENTRY_STATE_BYTES_ORACLE;
+        let session =
+            session_id.len() as u64 + ORDERED_INDEX_BYTES_ORACLE + ENTRY_STATE_BYTES_ORACLE;
+        let total = active + evidence + session;
+        (active, evidence, session, total)
+    }
+
     #[test]
     fn reentrant_load_stats_and_close_under_read_lock_are_typed_busy() {
         let store = store();
@@ -1472,12 +1495,19 @@ mod tests {
     fn retention_stats_separate_active_evidence_and_session_costs() {
         let store = store();
         store.append(request("s", 0, "m0", "body")).expect("seed");
+        let (expected_active, expected_evidence, expected_session, expected_total) =
+            expected_partition_costs("s", "m0", "body");
+        assert_eq!(
+            (expected_active, expected_evidence, expected_session, expected_total),
+            (46, 148, 41, 235)
+        );
         let active = store.retention_stats().expect("active stats");
         assert_eq!(active.active_row_count, 1);
         assert_eq!(active.evidence_count, 1);
-        assert!(active.active_bytes > 0);
-        assert!(active.evidence_bytes > 0);
-        assert!(active.session_key_bytes > 0);
+        assert_eq!(active.active_bytes, expected_active);
+        assert_eq!(active.evidence_bytes, expected_evidence);
+        assert_eq!(active.session_key_bytes, expected_session);
+        assert_eq!(active.total_retained_bytes, expected_total);
         assert_eq!(
             active.total_retained_bytes,
             active.active_bytes + active.evidence_bytes + active.session_key_bytes
@@ -1488,8 +1518,15 @@ mod tests {
         assert_eq!(truncated.active_row_count, 0);
         assert_eq!(truncated.active_bytes, 0);
         assert_eq!(truncated.evidence_count, 1);
-        assert_eq!(truncated.evidence_bytes, active.evidence_bytes);
-        assert_eq!(truncated.session_key_bytes, active.session_key_bytes);
+        assert_eq!(truncated.evidence_bytes, expected_evidence);
+        assert_eq!(truncated.evidence_bytes, 148);
+        assert_eq!(truncated.session_key_bytes, expected_session);
+        assert_eq!(truncated.session_key_bytes, 41);
+        assert_eq!(truncated.total_retained_bytes, 189);
+        assert_eq!(
+            truncated.total_retained_bytes,
+            truncated.active_bytes + truncated.evidence_bytes + truncated.session_key_bytes
+        );
     }
 
     #[test]

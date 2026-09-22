@@ -19,28 +19,8 @@ Placement:
 
 Conventions:
 
-- **Conformance must bite.** The testkit's meta-requirement: feed a deliberately
-  broken/lying fake into the public suite and assert it is REJECTED, alongside the
-  honest-fake and real-broker positive cases. A suite that passes everything is
-  worthless — preserve this when extending.
-- **Assert invariants, not vibes.** After an op, assert the ledger invariants
-  (`total_owner_bytes`, class/owner balance) hold — not just that a call returned
-  `Ok`. No `assert!(true)` / `assert_eq!(x, x)` placeholders.
-- **Assert on the `MemoryError` variant**, not on stringly-typed message
-  substrings where avoidable.
 - **Feature-gate tests** with the feature they exercise; `--all-features` must be
   green and each feature must build alone.
-- `#[ignore]` needs a reason: `#[ignore = "<why>"]`.
 
-Run before closeout:
-
-```bash
-scripts/check-workspace.sh
-```
-
-Regression guards (`scripts/regression-guards.sh`, rules in
-`tools/semgrep/qmp-regressions.yml`) pin bug classes this repo already hit —
-magnitude-to-signed casts, saturate-before-divide ratios, underflowing
-`fetch_sub`, and direct I/O/clock/adapter access from pure layers. A
-flagged-but-safe use needs a trailing
-`// nosemgrep: <rule-id> -- reason: <…>`.
+The cheatsheet owns assertion/ignore conventions. The determinism section owns
+the conformance negative-pole requirement and invariant semantics.

@@ -76,6 +76,10 @@ def validate(
     for sample in samples:
         key = scenario_key(sample)
         grouped[key].append(sample)
+        if integer(sample, "entries") <= 0:
+            raise ValidationError(f"{key}: entries must be positive")
+        if integer(sample, "elapsed_ns") <= 0:
+            raise ValidationError(f"{key}: elapsed_ns must be positive")
         p50 = integer(sample, "p50_ns")
         p95 = integer(sample, "p95_ns")
         p99 = integer(sample, "p99_ns")
@@ -117,6 +121,38 @@ def validate(
         repetitions = {integer(sample, "repetition") for sample in scenario_samples}
         if len(repetitions) != len(scenario_samples):
             raise ValidationError(f"{key}: duplicate repetition identifiers")
+
+    revocable_by_shape: dict[
+        tuple[object, object], dict[int, list[dict[str, object]]]
+    ] = defaultdict(lambda: defaultdict(list))
+    for sample in samples:
+        if sample.get("operation") == "revocable_fill_and_drain":
+            revocable_by_shape[(sample.get("mode"), integer(sample, "threads"))][
+                integer(sample, "entries")
+            ].append(sample)
+    for (mode, threads), by_entries in revocable_by_shape.items():
+        if len(by_entries) < 2:
+            continue
+        sizes = sorted(by_entries)
+        smallest, largest = sizes[0], sizes[-1]
+        if smallest <= 0 or largest < smallest * 10:
+            continue
+        small_median = statistics.median(
+            integer(sample, "elapsed_ns") / smallest for sample in by_entries[smallest]
+        )
+        large_median = statistics.median(
+            integer(sample, "elapsed_ns") / largest for sample in by_entries[largest]
+        )
+        allowed_ratio = 4.0
+        ratio = large_median / small_median if small_median > 0 else float("inf")
+        if ratio > allowed_ratio:
+            raise ValidationError(
+                "revocable_fill_and_drain growth: per-entry cost grew "
+                f"{ratio:.2f}x from {smallest} to {largest} entries "
+                f"(mode={mode} threads={threads} "
+                f"median {small_median:.1f}ns/entry -> {large_median:.1f}ns/entry, "
+                f"allowed {allowed_ratio:.1f}x)"
+            )
 
     contention = [sample for sample in samples if sample.get("operation") == "payload_contention"]
     observed_matrix = {

@@ -29,6 +29,27 @@ No unexplained deletion, public API expansion, host noun, upward dependency, or
 direct generated-file edit was found in the requalification delta. The queue
 does not itself close FINAL-002 through FINAL-005.
 
+## Remediation implementation delta
+
+The following candidate delta is reviewed before its exact-HEAD commit. It is
+the implementation of the tracked TO-01 through TO-09 queue, plus structural
+deduplication discovered while executing it. Its qualification status is
+pending the clean committed SHA; no result below reuses the historical receipt.
+
+| Owner / purpose | Paths reviewed | Verdict |
+| --- | --- | --- |
+| Core behavioral contracts | `core/src/api/{builder.rs,control.rs}`; `core/src/domain/{ledger.rs,policy.rs}`; `core/src/ports/telemetry.rs`; `core/tests/{policy_contracts.rs,public_api_surface.rs}` | TO-05/06/07/08: two-cardinality bounded release probe; public zero-pool fail-closed admission; builder-to-live reclaimer path; exact duplicate/dead assertion removal. No production ledger mutation. |
+| Facade storage and public boundary | `facade/src/{lib.rs,payload_store/service.rs,retained_map/service.rs,revocable_store/service.rs,spill/backings/redb.rs,transcript_store/service.rs}`; `facade/tests/public_api_surface.rs` | TO-01/02/09: barrier-backed Redb receipt/payload oracle, compiler-backed visibility contracts replacing source greps, and independent transcript partition-cost oracle. Product production changes are limited to test-only contract/doc changes; no new public export. |
+| Facade performance authority | `facade/benches/scaling.rs`; `scripts/verify-scaling-results.py`; `scripts/tests/test_scaling_results.py` | TO-02/03: allocation epoch excludes fixture allocation and disables on panic; revocable elapsed includes fill plus drain; a single 10x cardinality normalized-growth validator has linear, quadratic-negative, and single-cardinality-smoke fixtures. |
+| Feature resolution authority | `scripts/verify-feature-matrix.sh` | TO-02: resolved Cargo feature graph, not TOML/README text, rejects `unbudgeted-stores` in default, `full`, and `full-backings`. |
+| Fault negative pole | `testkit/src/faults/scenarios.rs`; `tickets/TO-04-fault-driver-negative-pole.md` | TO-04: one private before/result/after classifier is shared by honest, lying, drift, and unreadable-count controllers; focused selector explicitly enables `faults`. |
+| Extraction and generated guidance | `scripts/extract-to-standalone-repo.sh`; `.cursorrules`; `AGENTS.md`; `CLAUDE.md`; `CHANGELOG.md`; `tools/pm/sources/{operational/agent-core.md,operational/agent-playbook.md,rules/{architecture.md,build.md,cheatsheet.md,dependencies.md,determinism.md,error-handling.md,tests.md}}` | Extraction runs its canonical rail once rather than invoking its metadata subcheck twice; source guidance is consolidated, and all generated outputs are produced by PM sync. The extraction rail still performs locked metadata validation through `scripts/check-workspace.sh`. |
+| Ticket command correctness | `tickets/TO-03-scaling-epoch.md` | The bench selector names its required `payload_store,revocable_store` features; the previous command could not compile the target. |
+
+The current candidate has no Cargo dependency or public API graph change.
+`core <- facade <- testkit` remains the resolved direction; full feature-matrix
+and public/doctest rails are required again after the candidate is committed.
+
 | Owner / purpose | Paths reviewed | Verdict |
 | --- | --- | --- |
 | Removed local-only build preferences | `.cargo/config.toml` (delete); `clippy.toml` (delete); `deny.toml` | Correct: portable rail owns its settings and deny has no stale exception. |

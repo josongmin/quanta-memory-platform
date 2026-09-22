@@ -660,11 +660,10 @@ mod tests {
     }
 
     #[test]
-    fn borrow_flag_with_zero_shared_pool_is_valid_but_grants_no_burst() {
-        // scenario B: a class may declare borrow_from_shared_pool = true while
-        // the shared pool is 0. This is a coherent (if useless) policy: it
-        // validates, but the empty pool means the class can never actually
-        // oversubscribe — its effective ceiling stays its own hard cap.
+    fn borrow_flag_with_zero_shared_pool_is_valid_and_preserved() {
+        // Validation-only: borrow_from_shared_pool = true with an empty pool is
+        // a coherent policy. Admission behavior is covered by the public-broker
+        // contract in tests/policy_contracts.rs, not here.
         let elastic = MemoryClassBudget {
             reserved_bytes: 0,
             soft_cap_bytes: 600,
@@ -682,9 +681,5 @@ mod tests {
             r.classes[&MemoryClass::ExecutionScratch].borrow_from_shared_pool,
             "the borrow flag is preserved"
         );
-        // The coherent outcome: effective headroom above the class hard cap is
-        // exactly the (empty) pool, i.e. zero burstable bytes.
-        let burstable = r.shared_burst_pool_bytes;
-        assert_eq!(burstable, 0, "an empty shared pool grants no burst capacity");
     }
 }

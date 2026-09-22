@@ -37,7 +37,7 @@ deallocate하여 counter underflow/오염이 생긴다.
   않는다.
 - TO-02가 같은 파일의 `revocable_fill_and_drain`을 후속 수정하므로 이 파일을 먼저
   넘기고 postimage digest를 기록한다.
-- File-local verification: `cargo bench -p quanta-memory-platform-facade --bench scaling --no-run`.
+- File-local verification: `cargo bench -p quanta-memory-platform-facade --features payload_store,revocable_store --bench scaling --no-run`.
 
 ## Phase ownership
 
@@ -64,7 +64,7 @@ production scheduler를 fake하거나 allocator assertions를 삭제하지 않�
 ## Verification
 
 ```bash
-cargo bench -p quanta-memory-platform-facade --bench scaling --no-run
+cargo bench -p quanta-memory-platform-facade --features payload_store,revocable_store --bench scaling --no-run
 ```
 
 clean/frozen commit에서:

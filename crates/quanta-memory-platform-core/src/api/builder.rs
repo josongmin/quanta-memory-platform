@@ -251,6 +251,73 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "live_control")]
+    #[test]
+    fn builder_reclaimer_reaches_build_live_broker() {
+        use crate::domain::context::MemoryContextKind;
+        use crate::domain::ledger::ChargeKind;
+        use crate::ports::reclaim::{ReclaimOutcome, ReclaimRequest, ReclaimTrigger};
+        use std::sync::Mutex;
+
+        struct RecordingReclaimer {
+            requests: Mutex<Vec<ReclaimRequest>>,
+        }
+
+        impl MemoryReclaimer for RecordingReclaimer {
+            fn reclaim(&self, request: &ReclaimRequest) -> MemoryResult<ReclaimOutcome> {
+                self.requests.lock().expect("requests").push(request.clone());
+                Ok(ReclaimOutcome { reclaimed_bytes: 0 })
+            }
+        }
+
+        let reclaimer = Arc::new(RecordingReclaimer { requests: Mutex::new(Vec::new()) });
+        let residency = ResidencyPolicy::new(1_000)
+            .with_class_budget(MemoryClass::ArtifactCache, class_budget(0, 50, 100));
+        let manifest = MemoryBudgetManifest::new(
+            MemoryPreset::Production,
+            ExecutionBudget::default(),
+            residency,
+        );
+        let broker = ProcessMemoryBrokerBuilder::new()
+            .with_manifest(manifest)
+            .with_reclaimer(reclaimer.clone())
+            .build_live()
+            .expect("builder-first build_live must succeed");
+        let charge = broker
+            .reserve_managed_charge(
+                MemoryClass::ArtifactCache,
+                "builder-reclaimer".to_string(),
+                MemoryContextKind::Request,
+                ChargeKind::RetainedPayload,
+                60,
+            )
+            .expect("60-byte charge below the hard cap must be admitted");
+        let requests = reclaimer.requests.lock().expect("requests");
+        assert_eq!(requests.len(), 1, "soft crossing must invoke the reclaimer exactly once");
+        assert_eq!(requests[0].trigger, ReclaimTrigger::SoftThreshold);
+        assert_eq!(requests[0].requested_class, MemoryClass::ArtifactCache);
+        assert_eq!(requests[0].requested_owner, "builder-reclaimer");
+        assert_eq!(requests[0].requested_bytes, 60);
+        assert_eq!(requests[0].max_attempts, 1);
+        drop(requests);
+        assert_eq!(
+            broker.reclaim_runtime_stats().expect("stats").attempts,
+            1,
+            "runtime must record exactly one reclaim attempt"
+        );
+        assert_eq!(
+            broker.ledger_snapshot().expect("snapshot").total_owner_bytes(),
+            60,
+            "admitted ledger total must be 60"
+        );
+        drop(charge);
+        assert_eq!(
+            broker.ledger_snapshot().expect("after drop").total_owner_bytes(),
+            0,
+            "ledger must drain to zero after charge drop"
+        );
+    }
+
     #[test]
     fn report_only_builder_applies_override_layers() {
         let report = ProcessMemoryBrokerBuilder::new()

@@ -63,16 +63,6 @@ Boundary rules (hexagonal direction is inward-only):
   only `tracking-allocator` integration) is feature-gated so it can never enter a
   production graph.
 
-Forbidden usages (fail-closed under `-D warnings` + the repo-local rail + deny):
-
-- Semantica nouns in the public API (`Semantica*`, `quanta_runtime`, `codegraph`).
-  The portable library carries none.
-- `core` depending on `facade`/`testkit`; `facade` depending on `testkit`.
-- A path dependency escaping the workspace (breaks extraction).
-- `crate::adapters` imported from `domain/` or `ports/`.
-- Raw constructor backdoors leaking past the builder-first surface; public API
-  compile-fail contracts and review own this boundary.
-
 Enforcement: the root workspace lint policy, `cargo clippy --workspace
 --all-targets --all-features -- -D warnings`, `cargo deny --all-features check`,
 `scripts/check-workspace.sh`, and the extraction pre-flight in
@@ -115,13 +105,10 @@ fail-closed. A Semgrep exception requires a trailing
 | resolved dependency from `core` to facade/testkit (or facade to testkit), including a renamed dependency | keep `core <- facade <- testkit` | Cargo-metadata graph contract in `check-workspace`, extraction pre-flight |
 | Semantica nouns (`Semantica*`, `quanta_runtime`, `codegraph`) in public API | keep the library host-independent | review |
 | raw broker constructor backdoor in public code | go through the builder-first surface | public API compile-fail tests |
-| stale `V1`/`V2` / old renamed symbols | use the current names | review |
 | allocator telemetry mutating ledger counters | telemetry is **advisory** — never writes counters | review (ledger invariant) |
 | mutating the ledger partway then erroring | validate first; fail-closed BEFORE any mutation | review (all-or-nothing) |
 | `assert!(true)` / `assert_eq!(x, x)` placeholder test | assert the real behavior / invariant | review |
 | `#[ignore]` without a reason | `#[ignore = "<reason>"]` | review |
-
-Run the full rail with `scripts/check-workspace.sh`.
 
 ## Build & Verification Front Door
 
@@ -138,9 +125,9 @@ scripts/check-workspace.sh
 
 Run focused commands while developing, but do not report them as equivalent to
 the canonical rail. The feature matrix discovers feature names from Cargo
-metadata and covers default, bare, every non-aggregate feature, `full`, and
-all-features; adding a manifest feature therefore adds it to the matrix without
-editing a shell list.
+metadata and covers default, bare, every feature other than the `default`/`full`
+aliases, explicit `full`, and workspace all-features; adding a manifest feature
+therefore adds it to the matrix without editing a shell list.
 
 Examples use the real public APIs:
 
@@ -194,39 +181,19 @@ Placement:
 
 Conventions:
 
-- **Conformance must bite.** The testkit's meta-requirement: feed a deliberately
-  broken/lying fake into the public suite and assert it is REJECTED, alongside the
-  honest-fake and real-broker positive cases. A suite that passes everything is
-  worthless — preserve this when extending.
-- **Assert invariants, not vibes.** After an op, assert the ledger invariants
-  (`total_owner_bytes`, class/owner balance) hold — not just that a call returned
-  `Ok`. No `assert!(true)` / `assert_eq!(x, x)` placeholders.
-- **Assert on the `MemoryError` variant**, not on stringly-typed message
-  substrings where avoidable.
 - **Feature-gate tests** with the feature they exercise; `--all-features` must be
   green and each feature must build alone.
-- `#[ignore]` needs a reason: `#[ignore = "<why>"]`.
 
-Run before closeout:
-
-```bash
-scripts/check-workspace.sh
-```
-
-Regression guards (`scripts/regression-guards.sh`, rules in
-`tools/semgrep/qmp-regressions.yml`) pin bug classes this repo already hit —
-magnitude-to-signed casts, saturate-before-divide ratios, underflowing
-`fetch_sub`, and direct I/O/clock/adapter access from pure layers. A
-flagged-but-safe use needs a trailing
-`// nosemgrep: <rule-id> -- reason: <…>`.
+The cheatsheet owns assertion/ignore conventions. The determinism section owns
+the conformance negative-pole requirement and invariant semantics.
 
 ## Determinism & Accounting Invariants
 
 The ledger (`crates/quanta-memory-platform-core/src/domain/ledger.rs`) is the
-semantic accounting SSOT. It is
-single-threaded and synchronous; the public broker wraps it behind a lock. Its
-behavior must be **deterministic and reproducible** for the same operation
-sequence — conformance suites and fault fixtures depend on it.
+semantic accounting SSOT. It is single-threaded and synchronous; the public
+broker wraps it behind a lock. Its behavior must be **deterministic and
+reproducible** for the same operation sequence — conformance suites and fault
+fixtures depend on it.
 
 Global invariants (must hold after every committed operation):
 
@@ -273,7 +240,8 @@ The single error type is `MemoryError`
 (`crates/quanta-memory-platform-core/src/domain/errors.rs`):
 
 ```text
-MemoryError = Build | Config | Capacity | InvalidState | Report | Unsupported
+MemoryError = Build | Config | Capacity | Closed | OperationInProgress |
+              Poisoned | InvalidState | Report | Unsupported
 MemoryResult<T> = Result<T, MemoryError>
 ```
 
@@ -285,30 +253,20 @@ Principles:
 
 - **No silent recovery.** Production code must not coerce a capacity / config /
   invalid-state failure into an empty default or a swallowed `Ok`.
-- **Fail-closed before mutation.** An over-budget reserve, an invalid policy, or a
-  write during rebuild returns the appropriate `MemoryError` BEFORE touching the
-  ledger — never half-apply then error.
-- **Preserve the source.** When wrapping a backing error (redb), include
-  it: `format!("spill write failed: {e}")`. Never `map_err(|_| …)`.
+- **Preserve actionable source context.** When wrapping a backing error (redb),
+  include it: `format!("spill write failed: {e}")`. A poison or range-conversion
+  error may be discarded when the replacement typed error already contains the
+  complete actionable context.
 - **Pick the right variant.** Over-budget → `Capacity`; bad manifest/policy →
-  `Config`; builder misuse → `Build`; operation illegal in current state (e.g.
-  write during rebuild) → `InvalidState`; snapshot/report failure → `Report`;
+  `Config`; builder misuse → `Build`; terminal service → `Closed`; occupied
+  mutation lane → `OperationInProgress`; poisoned authority → `Poisoned`;
+  other illegal state → `InvalidState`; snapshot/report failure → `Report`;
   not-wired capability → `Unsupported`.
-
-Rust patterns:
-
-| Avoid | Prefer |
-| --- | --- |
-| `.unwrap()` in non-test code | `?` with a `MemoryError` variant, or `.ok_or_else(...)` |
-| `.expect("")` / `.expect("TODO")` | tests only, with `.expect("<invariant that cannot fail>")` |
-| `Err(_) => {}` / `let _ = fallible();` | propagate with `?` or map to a typed error |
-| `panic!()` / `todo!()` in shipping paths | return `MemoryError` with an explicit variant |
-| `map_err(|_| MemoryError::…)` | `map_err(|e| MemoryError::…(format!("…: {e}")))` |
-| lossy `as` / wrapping math on counters | `try_from` + `checked_*` / `saturating_*` |
 
 `MemoryError` derives `Clone, Debug, PartialEq, Eq` and implements
 `std::error::Error` + `Display` — assert on the variant in tests, not on string
-substrings where avoidable.
+substrings where avoidable. Concrete Rust patterns live in the cheatsheet so
+the policy has one wording authority.
 
 ## Dependency Policy
 
@@ -316,17 +274,23 @@ Runtime dependencies are declared in each crate's `Cargo.toml`, pinned in the
 root `[workspace.dependencies]`, and audited by `cargo deny --all-features check`
 against `deny.toml`.
 
-**Shared versions** (pin in root `[workspace.dependencies]`, opt in per crate):
+**Shared versions** (declare in root `[workspace.dependencies]`, opt in per crate):
 
-- `redb` — facade `spill` backing
+- `blake3` — facade transcript and publish-pipeline identity hashing
+- `hashlink` — facade retained-map storage
 - `hdrhistogram`, `metrics` — core `telemetry` adapters
+- `redb` — facade `spill-redb` backing
 - `tracking-allocator` — testkit `alloc_tracking` ONLY
+- `loom` — testkit concurrency models under the `loom` feature
+- `proptest` — testkit dev-only property tests
 
 **Rules:**
 
 - Every non-trivial third-party crate is **optional** and behind a feature gate.
   `core` and `facade` build with `--no-default-features` and pull infra crates in
-  only via their feature (`telemetry`, `spill`, `revocable_store`, …).
+  only via their feature (`telemetry`, `retained_map`, `transcript`,
+  `publish_pipeline`, `spill-redb`). Dev-only test dependencies are not runtime
+  graph members.
 - `tracking-allocator` may appear ONLY under testkit `alloc_tracking`; it must
   never reach a production dependency graph.
 - New runtime deps must pass `cargo deny --all-features check`. `deny.toml`

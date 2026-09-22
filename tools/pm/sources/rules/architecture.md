@@ -55,16 +55,6 @@ Boundary rules (hexagonal direction is inward-only):
   only `tracking-allocator` integration) is feature-gated so it can never enter a
   production graph.
 
-Forbidden usages (fail-closed under `-D warnings` + the repo-local rail + deny):
-
-- Semantica nouns in the public API (`Semantica*`, `quanta_runtime`, `codegraph`).
-  The portable library carries none.
-- `core` depending on `facade`/`testkit`; `facade` depending on `testkit`.
-- A path dependency escaping the workspace (breaks extraction).
-- `crate::adapters` imported from `domain/` or `ports/`.
-- Raw constructor backdoors leaking past the builder-first surface; public API
-  compile-fail contracts and review own this boundary.
-
 Enforcement: the root workspace lint policy, `cargo clippy --workspace
 --all-targets --all-features -- -D warnings`, `cargo deny --all-features check`,
 `scripts/check-workspace.sh`, and the extraction pre-flight in

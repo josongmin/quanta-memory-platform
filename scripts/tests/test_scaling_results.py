@@ -56,6 +56,12 @@ def valid_records() -> list[dict[str, object]]:
             value = sample("single-thread", 1, repetition)
             value["operation"] = operation
             records.append(value)
+    for repetition in range(3):
+        value = sample("single-thread", 1, repetition)
+        value["operation"] = "revocable_fill_and_drain"
+        value["entries"] = 10_000
+        value["elapsed_ns"] = 10_000
+        records.append(value)
     for mode in MODULE.MODES:
         for threads in (1, 2):
             records.extend(sample(mode, threads, repetition) for repetition in range(3))
@@ -64,7 +70,22 @@ def valid_records() -> list[dict[str, object]]:
 
 class ScalingResultTests(unittest.TestCase):
     def test_valid_smoke_matrix_passes(self) -> None:
-        self.assertEqual(MODULE.validate(valid_records(), {1, 2}), 33)
+        records = [record for record in valid_records() if record.get("entries") != 10_000]
+        self.assertEqual(MODULE.validate(records, {1, 2}), 33)
+
+    def test_linear_revocable_growth_passes(self) -> None:
+        self.assertEqual(MODULE.validate(valid_records(), {1, 2}), 36)
+
+    def test_quadratic_revocable_growth_is_rejected(self) -> None:
+        records = valid_records()
+        for record in records:
+            if (
+                record.get("operation") == "revocable_fill_and_drain"
+                and record.get("entries") == 10_000
+            ):
+                record["elapsed_ns"] = 100_000
+        with self.assertRaisesRegex(MODULE.ValidationError, "revocable_fill_and_drain growth"):
+            MODULE.validate(records, {1, 2})
 
     def test_allocator_drift_is_rejected(self) -> None:
         records = valid_records()
@@ -116,6 +137,13 @@ class ScalingResultTests(unittest.TestCase):
                 baseline,
                 max_throughput_regression_percent=90,
             )
+
+    def test_single_cardinality_smoke_passes_without_growth_contract(self) -> None:
+        records = [record for record in valid_records() if record.get("entries") != 10_000]
+        for record in records:
+            if record.get("operation") == "revocable_fill_and_drain":
+                record["elapsed_ns"] = 1_000_000_000
+        MODULE.validate(records, {1, 2})
 
     def test_baseline_p99_regression_beyond_noise_floor_is_rejected(self) -> None:
         baseline = valid_records()

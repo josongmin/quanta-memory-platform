@@ -13,9 +13,9 @@ scripts/check-workspace.sh
 
 Run focused commands while developing, but do not report them as equivalent to
 the canonical rail. The feature matrix discovers feature names from Cargo
-metadata and covers default, bare, every non-aggregate feature, `full`, and
-all-features; adding a manifest feature therefore adds it to the matrix without
-editing a shell list.
+metadata and covers default, bare, every feature other than the `default`/`full`
+aliases, explicit `full`, and workspace all-features; adding a manifest feature
+therefore adds it to the matrix without editing a shell list.
 
 Examples use the real public APIs:
 

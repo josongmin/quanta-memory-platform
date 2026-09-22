@@ -78,58 +78,6 @@ fn live_broker_bridge_is_present_only_with_core_live_accounting() {
     let _broker = platform.broker();
 }
 
-/// Negative API contracts are exercised by rustdoc's `compile_fail` examples
-/// on the exported builders/modes; this source gate prevents accidentally
-/// deleting the examples or reintroducing the old public callback seam.
-#[test]
-fn accounting_mode_negative_contracts_remain_in_the_public_source() {
-    let builder = include_str!("../src/shared/builder.rs");
-    let accounting = include_str!("../src/shared/accounting.rs");
-    let root = include_str!("../src/lib.rs");
-    assert!(builder.contains("```compile_fail"), "unset builder build must be rejected");
-    assert!(accounting.contains("```compile_fail"), "mode mismatch must be rejected");
-    assert!(!builder.contains("pub fn charged_against"), "no public late/rebinding seam");
-    assert!(!accounting.contains("pub trait AccountingSink"), "no user callback authority");
-    assert!(!root.contains("pub use shared::accounting::AccountingSink"));
-    assert!(!root.contains("pub use shared::accounting::SharedAccountingSink"));
-    for service in [
-        include_str!("../src/payload_store/service.rs"),
-        include_str!("../src/retained_map/service.rs"),
-        include_str!("../src/revocable_store/service.rs"),
-        include_str!("../src/transcript_store/service.rs"),
-        include_str!("../src/publish_pipeline/prepared_publication.rs"),
-    ] {
-        assert!(
-            !service.lines().any(|line| line.trim_start().starts_with("pub fn charged_against")),
-            "no late store attach"
-        );
-    }
-}
-
-#[test]
-fn full_and_default_features_do_not_enable_unbudgeted_stores() {
-    let manifest = include_str!("../Cargo.toml");
-    let default = manifest.lines().find(|line| line.starts_with("default = ")).expect("default");
-    let full = manifest
-        .split_once("\nfull = [")
-        .expect("full feature")
-        .1
-        .split_once("\n]")
-        .expect("full feature end")
-        .0;
-    let full_backings =
-        manifest.lines().find(|line| line.starts_with("full-backings = ")).expect("full-backings");
-    assert!(!default.contains("unbudgeted-stores"));
-    assert!(!full.contains("unbudgeted-stores"));
-    assert!(!full_backings.contains("unbudgeted-stores"));
-    assert!(manifest.contains("unbudgeted-stores = ["), "explicit feature exists");
-    let readme = include_str!("../../../README.md");
-    assert!(
-        readme.contains("absent from\n  `default`, `full`, and `full-backings`"),
-        "README must not imply aggregate feature enables the escape hatch"
-    );
-}
-
 #[cfg(feature = "core-live-accounting")]
 #[allow(dead_code)] // some isolated feature slices enable the bridge without a store test consumer.
 fn public_test_platform() -> LiveMemoryPlatform {

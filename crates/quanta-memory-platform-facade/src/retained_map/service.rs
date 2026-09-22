@@ -101,6 +101,23 @@ impl<Key, Value> Drop for MapStatePlan<'_, Key, Value> {
 /// different product types. Production construction starts at
 /// [`crate::MemoryPlatformBuilder`]; the raw concrete type has no public
 /// constructor and cannot acquire accounting authority after materialization.
+///
+/// ```compile_fail
+/// use quanta_memory_platform_core::{LiveProcessMemoryBroker, MemoryClass, StoreBindingHandle};
+/// use quanta_memory_platform_facade::{Budgeted, SimpleRetainedMapStore};
+///
+/// let binding = StoreBindingHandle::new(MemoryClass::MemoResidency, "owner".into(), None);
+/// let broker: LiveProcessMemoryBroker = unimplemented!();
+/// let _ = SimpleRetainedMapStore::<String, Vec<u8>, Budgeted>::new_budgeted(binding, broker);
+/// ```
+///
+/// ```compile_fail
+/// use quanta_memory_platform_facade::{Budgeted, SimpleRetainedMapStore};
+///
+/// fn late_attach(store: SimpleRetainedMapStore<String, Vec<u8>, Budgeted>) {
+///     let _ = store.charged_against;
+/// }
+/// ```
 #[derive(Debug)]
 pub struct SimpleRetainedMapStore<Key, Value, Mode> {
     binding: StoreBindingHandle,
@@ -753,26 +770,6 @@ mod tests {
     }
 
     #[test]
-    fn retained_map_owner_has_one_keyed_container_and_no_linear_point_path() {
-        let source = include_str!("service.rs");
-        for forbidden in [
-            concat!("Vec<", "MapEntry"),
-            concat!("Index", "Map"),
-            concat!(".iter()", ".position("),
-            concat!(".iter()", ".find("),
-            concat!("shift_", "remove"),
-            concat!("pub fn charged", "_against"),
-        ] {
-            assert!(
-                !source.contains(forbidden),
-                "retained-map owner must not regain forbidden linear/dual-authority path: {forbidden}"
-            );
-        }
-        assert!(source.contains("LinkedHashMap<Key, MapEntry<Value>, RandomState>"));
-        assert!(source.contains("pub(crate) fn new_budgeted"));
-    }
-
-    #[test]
     fn insert_commits_envelope_bytes() {
         let store = store();
         store.insert_checked("k1".to_string(), vec![1u8, 2, 3]).expect("insert");
@@ -1225,11 +1222,6 @@ mod tests {
         assert!(
             matches!(store.entries_checked(), Err(MemoryError::Poisoned(message)) if message == "retained map lock"),
             "checked entry enumeration must preserve the typed poison failure"
-        );
-        let trait_source = include_str!("mod.rs");
-        assert!(
-            !trait_source.contains("unwrap_or_default"),
-            "the public trait must not fabricate empty observations after poison"
         );
     }
 

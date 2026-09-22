@@ -205,6 +205,35 @@ fn end_allocation_epoch(counters: &AllocationCounters) -> AllocationSample {
     }
 }
 
+/// Bench-local scoped allocation-epoch guard. The plain `begin`/`end` pair
+/// leaves tracking enabled when the measured region panics, leaking the flag
+/// into the next scenario. The guard fail-safes `Drop` to tracking-disabled
+/// only: it never resets global counters and never consumes another
+/// scenario's allocations. The normal path keeps the explicit `finish()` read.
+struct AllocationEpochGuard {
+    finished: bool,
+}
+
+impl AllocationEpochGuard {
+    fn begin(counters: &AllocationCounters) -> Self {
+        begin_allocation_epoch(counters);
+        Self { finished: false }
+    }
+
+    fn finish(mut self, counters: &AllocationCounters) -> AllocationSample {
+        self.finished = true;
+        end_allocation_epoch(counters)
+    }
+}
+
+impl Drop for AllocationEpochGuard {
+    fn drop(&mut self) {
+        if !self.finished {
+            ALLOCATION_TRACKING_ENABLED.store(false, Ordering::Release);
+        }
+    }
+}
+
 fn percentile(sorted: &[u64], percentile: usize) -> u64 {
     let index = ((sorted.len() - 1) * percentile).div_ceil(100);
     sorted[index]
@@ -429,11 +458,11 @@ fn revocable_fill_and_drain(entries: usize, repetition: usize, allocations: &All
         store.insert_checked(format!("key-{value}"), vec![0; 8]).expect("revocable insert");
         latencies.push(operation.elapsed().as_nanos() as u64);
     }
-    let elapsed = started.elapsed();
     let semantic_peak = store.stats().expect("stats").estimated_bytes;
     for _ in 0..entries {
         black_box(store.reclaim_one().expect("reclaim").expect("entry"));
     }
+    let elapsed = started.elapsed();
     store.close().expect("close revocable store");
     drop(store);
     let semantic_after =
@@ -513,7 +542,9 @@ fn scheduler_admission_group_cardinality(
     repetition: usize,
     allocations: &AllocationCounters,
 ) {
-    begin_allocation_epoch(allocations);
+    // Phase 1: fixture construction with tracking disabled. Everything
+    // allocated here (groups, target, scheduler, latency buffer) must be
+    // dropped after the epoch closes, never while tracked.
     let mut groups = BTreeMap::new();
     for index in 0..entries {
         groups.insert(
@@ -531,10 +562,28 @@ fn scheduler_admission_group_cardinality(
     let target = format!("group-{:08}", entries / 2);
     let mut scheduler = WeightedResourceGroupScheduler::new(groups, entries as u64);
     scheduler.record_usage(&target, 1_000).expect("record target hard-cap usage");
-
     let mut latencies = Vec::with_capacity(entries);
-    let allocated_before_admission = allocations.allocated.load(Ordering::Relaxed);
-    let deallocated_before_admission = allocations.deallocated.load(Ordering::Relaxed);
+
+    // Phase 2: open the epoch immediately before the admission loop and
+    // require a clean precondition.
+    let epoch = AllocationEpochGuard::begin(allocations);
+    assert_eq!(
+        allocations.allocated.load(Ordering::Relaxed),
+        0,
+        "allocation epoch must start with zero tracked allocations"
+    );
+    assert_eq!(
+        allocations.deallocated.load(Ordering::Relaxed),
+        0,
+        "allocation epoch must start with zero tracked deallocations"
+    );
+    assert_eq!(
+        allocations.live.load(Ordering::Relaxed),
+        0,
+        "allocation epoch must start with zero tracked live bytes"
+    );
+
+    // Phase 3: admission loop only.
     let started = Instant::now();
     for _ in 0..entries {
         let operation = Instant::now();
@@ -545,18 +594,26 @@ fn scheduler_admission_group_cardinality(
     let elapsed = started.elapsed();
     assert_eq!(
         allocations.allocated.load(Ordering::Relaxed),
-        allocated_before_admission,
+        0,
         "scheduler admission must not allocate after policy construction"
     );
     assert_eq!(
         allocations.deallocated.load(Ordering::Relaxed),
-        deallocated_before_admission,
+        0,
         "scheduler admission must not deallocate policy state"
     );
+
+    // Phase 4: stop tracking before touching fixture memory again.
+    let allocation = epoch.finish(allocations);
+    assert!(
+        !ALLOCATION_TRACKING_ENABLED.load(Ordering::Relaxed),
+        "tracker must be inactive after the admission measurement"
+    );
+
+    // Phase 5: summarize and drop with tracking disabled.
+    let latency = summarize_latencies(latencies);
     drop(scheduler);
     drop(target);
-    let latency = summarize_latencies(latencies);
-    let allocation = end_allocation_epoch(allocations);
     emit(
         "scheduler_admission_group_cardinality",
         "single-thread",

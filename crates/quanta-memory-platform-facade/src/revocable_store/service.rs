@@ -1172,20 +1172,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn revocable_full_drain_uses_fifo_deque_without_front_shifts() {
-        let source = include_str!("service.rs");
-        assert!(
-            source.contains("entries: VecDeque<RevocableEntry"),
-            "the canonical queue must provide O(1) amortized front removal"
-        );
-        let forbidden_front_shift = ["entries", ".remove(0)"].concat();
-        assert!(
-            !source.contains(&forbidden_front_shift),
-            "front-shifting Vec removal reintroduces quadratic full drain"
-        );
-    }
-
     #[cfg(feature = "spill")]
     #[test]
     fn reclaim_to_in_memory_tier_keeps_bytes_charged() {

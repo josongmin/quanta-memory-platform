@@ -282,6 +282,48 @@ mod live_control_contracts {
     }
 
     #[test]
+    fn zero_shared_pool_cannot_extend_borrowing_class_hard_cap() {
+        let b = broker_from_residency(
+            ResidencyPolicy::new(10_000)
+                .with_shared_burst_pool_bytes(0)
+                .with_class_budget(MemoryClass::ArtifactCache, class_budget(0, 600, 800, true)),
+        );
+
+        let charge_at_cap = b
+            .reserve_managed_charge(
+                MemoryClass::ArtifactCache,
+                "owner:a".to_string(),
+                MemoryContextKind::Request,
+                ChargeKind::RetainedPayload,
+                800,
+            )
+            .expect("up to the class hard cap");
+        let before = b.ledger_snapshot().expect("snap before overdraw");
+
+        let denied = b.reserve_managed_charge(
+            MemoryClass::ArtifactCache,
+            "owner:a".to_string(),
+            MemoryContextKind::Request,
+            ChargeKind::RetainedPayload,
+            1,
+        );
+        assert!(
+            matches!(denied, Err(MemoryError::Capacity(_))),
+            "one byte past the hard cap with an empty pool must be a typed capacity error, got {denied:?}"
+        );
+        let after = b.ledger_snapshot().expect("snap after overdraw");
+        assert_eq!(before, after, "denied zero-pool borrow must be fail-closed");
+        assert_eq!(after.total_owner_bytes(), 800, "usage stays exactly at the hard cap");
+
+        drop(charge_at_cap);
+        assert_eq!(
+            b.ledger_snapshot().expect("snap after release").total_owner_bytes(),
+            0,
+            "releasing the live charge must return the ledger to zero"
+        );
+    }
+
+    #[test]
     fn non_borrowing_class_cannot_use_burst_pool_at_public_surface() {
         let b = broker_from_residency(
             ResidencyPolicy::new(10_000_000)

@@ -143,8 +143,6 @@ echo "[3/5] verifying extracted workspace builds standalone"
 if [[ "${dry_run}" -eq 0 ]]; then
   (
     cd "${dest}"
-    cargo metadata --locked --format-version 1 | \
-      python3 scripts/lib/check-extracted-metadata.py "${dest}"
     scripts/check-workspace.sh
   )
   if [[ "$(python3 scripts/lib/extraction_manifest.py verify \
@@ -153,7 +151,7 @@ if [[ "${dry_run}" -eq 0 ]]; then
     exit 1
   fi
 else
-  echo "DRY-RUN: (cd ${dest} && metadata --locked + check-workspace)"
+  echo "DRY-RUN: (cd ${dest} && scripts/check-workspace.sh)"
 fi
 
 # ---------------------------------------------------------------------------

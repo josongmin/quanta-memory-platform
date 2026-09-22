@@ -4,17 +4,23 @@ Runtime dependencies are declared in each crate's `Cargo.toml`, pinned in the
 root `[workspace.dependencies]`, and audited by `cargo deny --all-features check`
 against `deny.toml`.
 
-**Shared versions** (pin in root `[workspace.dependencies]`, opt in per crate):
+**Shared versions** (declare in root `[workspace.dependencies]`, opt in per crate):
 
-- `redb` — facade `spill` backing
+- `blake3` — facade transcript and publish-pipeline identity hashing
+- `hashlink` — facade retained-map storage
 - `hdrhistogram`, `metrics` — core `telemetry` adapters
+- `redb` — facade `spill-redb` backing
 - `tracking-allocator` — testkit `alloc_tracking` ONLY
+- `loom` — testkit concurrency models under the `loom` feature
+- `proptest` — testkit dev-only property tests
 
 **Rules:**
 
 - Every non-trivial third-party crate is **optional** and behind a feature gate.
   `core` and `facade` build with `--no-default-features` and pull infra crates in
-  only via their feature (`telemetry`, `spill`, `revocable_store`, …).
+  only via their feature (`telemetry`, `retained_map`, `transcript`,
+  `publish_pipeline`, `spill-redb`). Dev-only test dependencies are not runtime
+  graph members.
 - `tracking-allocator` may appear ONLY under testkit `alloc_tracking`; it must
   never reach a production dependency graph.
 - New runtime deps must pass `cargo deny --all-features check`. `deny.toml`

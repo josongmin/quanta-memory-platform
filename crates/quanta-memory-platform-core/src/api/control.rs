@@ -2086,8 +2086,6 @@ mod tests {
             "denied reserve must NOT mutate accounting"
         );
         assert_eq!(after.total_owner_bytes(), 400_000);
-        // negative mutation: if the cap were not enforced the totals would differ
-        assert_ne!(after.total_owner_bytes(), 600_000);
     }
 
     // --- Negative path 3: class hard cap exceeded when class may not borrow
