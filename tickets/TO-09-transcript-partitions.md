@@ -1,6 +1,6 @@
 # TO-09 — Assert Exact Independent Transcript Cost Partitions
 
-Status: `OPEN`
+Status: `IMPLEMENTED; final exact-source receipt pending`
 Priority: `P1`
 Depends on: none
 

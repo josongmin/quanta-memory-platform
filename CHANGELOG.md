@@ -24,6 +24,9 @@
   extracted-destination graph checks; deduplicated identical default/bare/
   singleton feature builds; and separated dirty-tree local verification from
   clean exact-HEAD extraction qualification.
+- Added a workspace-wide `redundant_clone` guard and removed the existing
+  unnecessary policy/configuration clones; rejected broader allocation lints
+  that misclassify intentional collect-then-join concurrency tests.
 
 ## 0.2.0 - 2026-09-21
 

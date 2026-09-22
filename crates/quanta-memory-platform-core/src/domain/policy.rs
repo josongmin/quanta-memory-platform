@@ -673,7 +673,7 @@ mod tests {
         };
         let r = ResidencyPolicy::new(10_000)
             .with_shared_burst_pool_bytes(0)
-            .with_class_budget(MemoryClass::ExecutionScratch, elastic.clone());
+            .with_class_budget(MemoryClass::ExecutionScratch, elastic);
 
         validate_residency(&r).expect("borrow=true with empty pool is a valid policy");
         assert_eq!(r.shared_burst_pool_bytes, 0, "the pool stays empty");

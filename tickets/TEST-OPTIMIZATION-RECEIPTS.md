@@ -1,6 +1,9 @@
 # Test-Optimization Wave — Integrator Receipts
 
-Status: `INTEGRATOR-COLLATED, NOT QUALIFIED` — no ticket is marked `DONE` by this file.
+Status: `HISTORICAL INTEGRATOR-COLLATED, NOT QUALIFIED` — this is a
+time-scoped observation of `41faf05`, not a current qualification receipt and
+not authority to mark any ticket `DONE`. The only final authority is the newer
+annotated `qmp-final-qualified-*` receipt defined in `FINAL-CLOSEOUT.md`.
 
 ## 1. Integrator observation window
 
@@ -122,3 +125,35 @@ these. Therefore per the execution SSOT none can be marked `DONE`.
    closeout receipt.
 4. Rollback: each ticket reverts to its owner file(s) only; shared
    `scaling.rs` must unwind TO-02 before TO-03 (writer order TO-03→TO-02).
+
+## 8. Owner-verified addendum (post-integration, same host)
+
+Verified by the wave owner directly against final HEAD `41faf05`:
+
+- TO-01 after-median (warm, same host/profile, 3 runs,
+  `concurrent_accepts_lose_no_handle_and_assign_distinct_keys`,
+  `--features spill-redb`): test-time 1.19s / 0.65s / 0.76s →
+  median **0.76s** vs before-median 6.53s = **~88% reduction**
+  (ticket target ≥80% met; not hardcoded as an assertion).
+- TO-05 after-median (same conditions,
+  `single_release_preflight_is_bounded_independent_of_owner_cardinality`):
+  0.02s / 0.00s / 0.00s → median **0.00s** vs before-median 0.09s.
+- TO-09 negative proof (temporary swap mutant in `append`: `evidence_bytes`
+  ↔ `key_bytes` cost sources; total preserved at 235): focused test RED at
+  `service.rs:1510` with `left: 41, right: 148` on the exact
+  `evidence_bytes` component assertion — validation passed, exact oracle
+  fired. Mutant reverted; `transcript_store` suite green (47 passed).
+  During the proof the owner briefly introduced, then fully removed, a
+  duplicated `session.key_bytes` accumulation in `checked_component_totals`;
+  production regions verified byte-identical to HEAD afterwards.
+- Extraction rail review: the outer `cargo metadata |
+  check-extracted-metadata.py` call is intentionally absent because the
+  extracted destination's canonical `scripts/check-workspace.sh` runs the
+  same locked resolved-graph check fail-closed before any later rail stage.
+  Keeping both checks would be duplicate validation of the same destination
+  and source graph. Dry-run still refuses on a dirty tree by design (manifest
+  freeze), so gate function needs a clean-tree run to confirm.
+- Remaining gaps (still owed by ticket owners, not inferred here):
+  per-ticket mutant-RED excerpts for TO-01..TO-08 and a TO-02 scaling-bench
+  smoke artifact. Ticket status is `IMPLEMENTED; final exact-source receipt
+  pending`, not `DONE`.

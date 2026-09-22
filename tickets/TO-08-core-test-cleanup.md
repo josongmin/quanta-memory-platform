@@ -1,6 +1,6 @@
 # TO-08 — Remove Exact Duplicate/Dead Assertions Only
 
-Status: `OPEN`
+Status: `IMPLEMENTED; final exact-source receipt pending`
 Priority: `P2`
 Depends on: none
 

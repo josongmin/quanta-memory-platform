@@ -1,6 +1,6 @@
 # TO-02 — Replace Source/Text Greps with Executable Contract Authorities
 
-Status: `OPEN`
+Status: `IMPLEMENTED; final exact-source receipt pending`
 Priority: `P0`
 Depends on: `TO-03` for `scaling.rs`
 

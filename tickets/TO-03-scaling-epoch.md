@@ -1,6 +1,6 @@
 # TO-03 — Make the Scaling Allocation Epoch Measure Admission Only
 
-Status: `OPEN`
+Status: `IMPLEMENTED; final exact-source receipt pending`
 Priority: `P0`
 Depends on: none
 

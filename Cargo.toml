@@ -19,6 +19,7 @@ unsafe_code = "deny"
 [workspace.lints.clippy]
 dbg_macro = "deny"
 float_cmp = "deny"
+redundant_clone = "deny"
 
 [workspace.dependencies]
 blake3 = "=1.5.3"

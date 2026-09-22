@@ -1,6 +1,6 @@
 # TO-01 — Keep the redb Race Oracle, Remove the 200-Transaction Hotspot
 
-Status: `OPEN`
+Status: `IMPLEMENTED; final exact-source receipt pending`
 Priority: `P0`
 Depends on: none; use `TestDb` landed in `014eb65`
 

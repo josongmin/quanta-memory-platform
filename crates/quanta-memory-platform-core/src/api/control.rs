@@ -2408,7 +2408,7 @@ mod tests {
         // Lower group g's cap to 50k (< 90k live), mapping unchanged -> denied.
         let lowered = ResidencyPolicy::new(10_000_000)
             .with_class_budget(MemoryClass::ArtifactCache, class_budget(0, 200_000, 300_000, false))
-            .with_resource_group("g", ResourceGroup { hard_cap_bytes: 50_000, ..group.clone() })
+            .with_resource_group("g", ResourceGroup { hard_cap_bytes: 50_000, ..group })
             .with_owner_group("owner:g", "g");
         let denied = b.try_live_reconfigure(lowered);
         assert!(

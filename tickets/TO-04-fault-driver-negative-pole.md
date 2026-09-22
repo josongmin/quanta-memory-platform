@@ -1,6 +1,6 @@
 # TO-04 — Route the Broken Spill Fake through the Real Fault Classifier
 
-Status: `OPEN`
+Status: `IMPLEMENTED; final exact-source receipt pending`
 Priority: `P0`
 Depends on: none
 

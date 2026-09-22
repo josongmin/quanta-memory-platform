@@ -1,6 +1,6 @@
 # TO-06 — Make Zero Shared-Pool Borrowing an Executable Public Contract
 
-Status: `OPEN`
+Status: `IMPLEMENTED; final exact-source receipt pending`
 Priority: `P1`
 Depends on: none
 

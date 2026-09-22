@@ -1,6 +1,6 @@
 # TO-07 — Exercise Reclaimer Wiring through the Builder-First API
 
-Status: `OPEN`
+Status: `IMPLEMENTED; final exact-source receipt pending`
 Priority: `P1`
 Depends on: none
 

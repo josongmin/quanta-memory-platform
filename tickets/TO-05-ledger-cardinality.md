@@ -1,6 +1,6 @@
 # TO-05 — Prove Bounded Release Preflight without 10,000 Owners
 
-Status: `OPEN`
+Status: `IMPLEMENTED; final exact-source receipt pending`
 Priority: `P1`
 Depends on: none
 

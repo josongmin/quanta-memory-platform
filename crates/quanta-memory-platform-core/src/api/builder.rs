@@ -218,7 +218,7 @@ mod tests {
         let manifest = MemoryBudgetManifest::new(
             MemoryPreset::Production,
             ExecutionBudget::default(),
-            residency.clone(),
+            residency,
         );
         let report = ProcessMemoryBrokerBuilder::new()
             .with_manifest(manifest)

@@ -43,7 +43,7 @@ pending the clean committed SHA; no result below reuses the historical receipt.
 | Facade performance authority | `facade/benches/scaling.rs`; `scripts/verify-scaling-results.py`; `scripts/tests/test_scaling_results.py` | TO-02/03: allocation epoch excludes fixture allocation and disables on panic; revocable elapsed includes fill plus drain; a single 10x cardinality normalized-growth validator has linear, quadratic-negative, and single-cardinality-smoke fixtures. |
 | Feature resolution authority | `scripts/verify-feature-matrix.sh` | TO-02: resolved Cargo feature graph, not TOML/README text, rejects `unbudgeted-stores` in default, `full`, and `full-backings`. |
 | Fault negative pole | `testkit/src/faults/scenarios.rs`; `tickets/TO-04-fault-driver-negative-pole.md` | TO-04: one private before/result/after classifier is shared by honest, lying, drift, and unreadable-count controllers; focused selector explicitly enables `faults`. |
-| Extraction and generated guidance | `scripts/extract-to-standalone-repo.sh`; `.cursorrules`; `AGENTS.md`; `CLAUDE.md`; `CHANGELOG.md`; `tools/pm/sources/{operational/agent-core.md,operational/agent-playbook.md,rules/{architecture.md,build.md,cheatsheet.md,dependencies.md,determinism.md,error-handling.md,tests.md}}` | Extraction runs its canonical rail once rather than invoking its metadata subcheck twice; source guidance is consolidated, and all generated outputs are produced by PM sync. The extraction rail still performs locked metadata validation through `scripts/check-workspace.sh`. |
+| Extraction and generated guidance | `scripts/extract-to-standalone-repo.sh`; `.cursorrules`; `AGENTS.md`; `CLAUDE.md`; `CHANGELOG.md`; `tools/pm/sources/{operational/agent-core.md,operational/agent-playbook.md,rules/{architecture.md,build.md,cheatsheet.md,dependencies.md,determinism.md,error-handling.md,tests.md}}` | Extraction runs its canonical rail once; its first fail-closed stage performs locked destination metadata validation, so no outer duplicate metadata call remains. Source guidance is consolidated, and all generated outputs are produced by PM sync. |
 | Ticket command correctness | `tickets/TO-03-scaling-epoch.md` | The bench selector names its required `payload_store,revocable_store` features; the previous command could not compile the target. |
 
 The current candidate has no Cargo dependency or public API graph change.
@@ -57,6 +57,17 @@ and public/doctest rails are required again after the candidate is committed.
 | Feature matrix | `scripts/verify-feature-matrix.sh` | Identical Cargo feature sets are compiled once: empty default equals bare, and a singleton default equals that same isolated feature. Every distinct logical feature set remains covered, including bare, full, and workspace bookends. |
 | Policy test selection | `scripts/tests/test_workspace_policy.py` | Removes the current-worktree duplicate; the canonical rail still invokes the live policy checker directly, while fixture tests retain missing inheritance, missing non-overridable forbid, and unauthorized exception negative cases. |
 | Scenario/changelog documentation | `docs/verification-scenarios.md`; `CHANGELOG.md` | Replaces renamed/removed test selectors and records the validated deduplication. No runtime API or extraction input change. |
+
+## Final candidate hardening delta
+
+| Owner / purpose | Paths reviewed | Verdict |
+| --- | --- | --- |
+| Workspace lint authority | `Cargo.toml`; `CHANGELOG.md`; `core/src/api/{builder.rs,control.rs}`; `core/src/domain/policy.rs` | Adds `clippy::redundant_clone = deny` at the workspace authority and removes three provably moved test-only clones. No accounting semantics, dependency, or public API changes. |
+| Exact-source receipt authority | `tickets/FINAL-CLOSEOUT.md`; `tickets/TEST-OPTIMIZATION-RECEIPTS.md`; `tickets/TO-01-*` through `tickets/TO-09-*` | Separates the historical bare tag from a new exact-source tag family. The receipt annotation, not a self-referential tracked document, binds SHA/tree/commands. Implemented tickets cannot be called done before that receipt exists. |
+| Extraction validation ownership | `scripts/extract-to-standalone-repo.sh` | The extracted destination runs the canonical rail once. That rail's first resolved-graph stage owns locked metadata validation; the extractor has no duplicate outer invocation. |
+
+No current candidate change introduces a host noun, upward dependency, raw
+authority export, generated-file hand edit, test skip, or assertion weakening.
 
 | Owner / purpose | Paths reviewed | Verdict |
 | --- | --- | --- |

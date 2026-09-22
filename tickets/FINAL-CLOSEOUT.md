@@ -1,8 +1,9 @@
 # Final Closeout SSOT
 
-Status: historical qualification complete at `qmp-final-qualified` (`014eb65`);
-current `main` requalification is in progress. The open test-optimization
-queue is not covered by the historical receipt. Deployment and production
+Status: the historical `qmp-final-qualified` (`014eb65`) receipt covers only
+its own source. Current qualification exists only when the newest annotated
+`qmp-final-qualified-*` tag names the exact current source. Until then, this
+repository is a candidate, not a qualified release. Deployment and production
 activation remain separate operational approvals; neither is claimed here.
 
 ## Scope and non-goals
@@ -17,12 +18,12 @@ extraction, host-pair qualification, and deployment activation.
 
 | Gate | Required evidence | Result |
 | --- | --- | --- |
-| FINAL-001 source freeze | File ownership, generated-doc authority, direction/purity/public-surface review, clean diff check | In progress for the current post-`014eb65` source. The historical inventory remains evidence only for its own frozen base. |
-| FINAL-002 repository qualification | PM, canonical workspace rail, locked fmt/clippy/test/deny on one clean source | Historical pass at `qmp-final-qualified`; rerun required after the current freeze. |
-| FINAL-003 exact-HEAD freeze | Clean `main`, source SHA/tree recorded after qualification | Historical pass at `qmp-final-qualified`; rerun required after the current freeze. |
-| FINAL-004 standalone extraction | Clean-source dry run and real extraction; extracted locked qualification and matching manifest | Historical pass at `qmp-final-qualified`; rerun required after the current freeze. |
-| FINAL-005 host adoption | Exact QMP/host pair, root and nested locked resolution, host adapter tests and hello-world | Historical pass for `qmp-final-qualified` + Semantica `2822dc1`; rerun required after the current freeze. |
-| FINAL-006 closeout | This SSOT, cleanup disposition, reproducible commands, residual-risk boundary | Pending the current FINAL-001 through FINAL-005 sequence. |
+| FINAL-001 source freeze | File ownership, generated-doc authority, direction/purity/public-surface review, clean diff check | Candidate audit complete; final clean-source digest is bound only by a newer annotated receipt. |
+| FINAL-002 repository qualification | PM, canonical workspace rail, locked fmt/clippy/test/deny on one clean source | Pending a newer exact-source receipt. |
+| FINAL-003 exact-HEAD freeze | Clean `main`, source SHA/tree recorded after qualification | Pending a newer exact-source receipt. |
+| FINAL-004 standalone extraction | Clean-source dry run and real extraction; extracted locked qualification and matching manifest | Pending a newer exact-source receipt. |
+| FINAL-005 host adoption | Exact QMP/host pair, root and nested locked resolution, host adapter tests and hello-world | Pending a newer exact-source receipt. |
+| FINAL-006 closeout | This SSOT, cleanup disposition, reproducible commands, residual-risk boundary | This document is ready; the immutable tag annotation is the final receipt. |
 
 ## FINAL-001 audit result
 
@@ -54,17 +55,23 @@ not executable campaign tooling or a qualification receipt. The inventory in
 
 ## Receipt binding
 
-The executable and extraction receipt is the immutable annotated local tag
-`qmp-final-qualified`. Its annotation carries the exact QMP SHA/tree, canonical
-source manifest, extracted SHA/tree, host SHA, commands, and outcome. Resolve
-it with `git show --no-patch --format=fuller qmp-final-qualified`.
+The executable and extraction receipt is the newest immutable annotated local
+tag matching `qmp-final-qualified-*`. Its annotation carries the exact QMP
+SHA/tree, canonical source manifest, extracted SHA/tree, host SHA, commands,
+and outcome. Do not infer current qualification from the historical bare
+`qmp-final-qualified` tag. Resolve the current receipt with:
+
+```text
+git tag --list 'qmp-final-qualified-*' --sort=-creatordate | head -1
+git show --no-patch --format=fuller <resolved-tag>
+```
 
 The tag is intentionally created **after** the last tracked receipt change:
 `tickets/` is not an extraction-manifest input, but any tracked ticket edit
 changes the source commit/tree. Embedding a self-SHA in this file would create a
 new source and invalidate the stated receipt.
 
-## FINAL-002 and FINAL-003 receipt
+## Historical FINAL-002 and FINAL-003 receipt
 
 The following all exit zero on the source named by `qmp-final-qualified`:
 
@@ -84,7 +91,7 @@ paths, 166 documented selectors, PM drift checks, Semgrep regressions, and
 dependency policy. No assertion was weakened and no skip/allowlist was added
 for this receipt.
 
-## FINAL-004 extraction receipt
+## Historical FINAL-004 extraction receipt
 
 From the clean source named by `qmp-final-qualified`:
 
@@ -106,7 +113,7 @@ cargo deny --locked --all-features check
 The extraction source scan found no Semantica path/import dependency; the only
 matching text was boundary documentation in a testkit comment and example.
 
-## FINAL-005 host-pair receipt
+## Historical FINAL-005 host-pair receipt
 
 Semantica `main` fast-forwarded the isolated, clean host qualification commit
 `2822dc1`. It resolves the QMP path named by `qmp-final-qualified` in both the root and nested
