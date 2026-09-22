@@ -209,7 +209,154 @@ invent or own host activation state.
 | `full-backings` | `full` plus the currently supported production backing, `spill-redb`. |
 | `unbudgeted-stores` | Explicit non-production escape hatch; absent from default/full/full-backings. |
 
-## 5. Error and failure semantics
+## 5. Algorithms, data structures, and state machines
+
+This section names techniques that are present in the source. It deliberately
+does not attribute an algorithm to QMP when it is merely provided by a
+dependency, nor treat an implementation choice as a service-level guarantee.
+There is no proprietary or external commercial decision engine in this
+repository: admission policy is local, deterministic Rust code. The optional
+backing and utility crates are open-source dependencies selected at build time.
+
+### 5.1 Algorithm inventory
+
+| Technique / provenance | Source owner | What QMP uses it for | Explicit limit |
+| --- | --- | --- | --- |
+| Hamilton (largest-remainder) apportionment, a classical proportional-allocation method | `core/src/application/scheduler.rs` | Split a configured shared burst pool among resource groups by `admission_weight`. | It is an admission allowance, not a work queue, packet scheduler, or throughput-fairness guarantee. |
+| Checked integer accounting | `core/src/domain/ledger.rs`, facade `shared/measure.rs` | Compute counter/cost postimages before committing a charge or release. | It meters declared semantic retention, not RSS, allocator capacity, or every transient copy. |
+| BLAKE3 cryptographic hash | `facade/src/{transcript_store,publish_pipeline}/` when their features are enabled | Derive fixed 32-byte, domain-separated replay/token identities from canonical input. | A digest is an identity aid; it does not make host publication or activation transactional. |
+| Randomized hash table plus linked newest-first order (`hashlink`) | `facade/src/retained_map/service.rs` | Point lookup with randomized hashing and a linked order for newest-first reclamation. | The map's iteration/order is local store behavior, not an inter-process ordering contract. |
+| Digest-bucket index with exact-equality collision check | `facade/src/payload_store/service.rs` | Find canonical payload/reference candidates efficiently, then compare the full canonical key/reference before reuse. | Its `DefaultHasher` `u64` digest is not cryptographic and never by itself establishes equality. |
+| Ordered maps/sets (`BTreeMap`, `BTreeSet`) | scheduler, transcript, prepared publication | Canonical group/tie order and deterministic identity/token traversal. | Determinism is within one implementation and its canonical inputs; it is not a consensus protocol. |
+| Durable record/reconciliation protocol over optional Redb backing | `facade/src/revocable_store/` | Fence source ownership across spill/restore when acknowledgement is uncertain. | It is not distributed two-phase commit: host coordination, retry policy, and backing durability configuration remain outside QMP. |
+| HdrHistogram and `metrics` adapters | `core/src/adapters/` | Record advisory telemetry through ports. | Telemetry cannot alter ledger counters, admission, or recovery decisions. |
+
+### 5.2 Weighted burst admission: Hamilton allocation plus live cap checks
+
+`WeightedResourceGroupScheduler` precomputes the allocation once per policy
+snapshot. For shared pool `P`, group weight `w_i`, and total weight `W`, it
+first assigns `floor(P * w_i / W)`. It then gives the remaining bytes to the
+largest fractional remainders; equal remainders break by ascending canonical
+group name. The implementation uses `u128` for the product/remainder math and
+stores the final `u64` shares in a `BTreeMap`. Therefore all bytes of `P` have a
+deterministic owner and runtime admission does not repeat the allocation sort.
+
+For a request that produces proposed group usage `u'`, admission requires all
+of the following:
+
+1. The named group exists; unknown names fail closed.
+2. The group's protected reserved floor still fits the non-headroom band.
+3. `u'` is within the group's hard cap, or its excess over that cap is no more
+   than the precomputed weighted burst share and the configured
+   `burst_percent` permits.
+4. The surrounding broker's global, class, owner, and rebuild-fence checks also
+   accept the same prospective mutation.
+
+This is closest to *static weighted resource apportionment*. It is intentionally
+not weighted fair queuing (WFQ), deficit round-robin, token-bucket rate
+limiting, or an eviction algorithm: QMP has no request queue, clock-based
+refill, or execution scheduler. A policy reconfiguration creates a replacement
+scheduler/allocation table rather than mutating shares in place.
+
+### 5.3 Semantic-cost accounting, not heap measurement
+
+Every budgeted facade object computes a `RetainedCostV1` before it acquires a
+broker charge. The version-1 total is the checked sum:
+
+```text
+payload_bytes + key_identity_bytes + index_bytes
+  + tombstone_bytes + fixed_overhead_bytes
+```
+
+The fixed constants encode logical retained structures: entry state (16 B),
+hash-link index (24 B), ordered-index node (24 B), FIFO position (16 B), and a
+digest/token slot (32 B). Each store persists the exact charged total with its
+non-clone lease and releases that lease rather than remeasuring potentially
+mutated caller data. Overflow is a capacity error, never saturation/wrap.
+
+This is a portable admission model analogous to capacity accounting used by
+cache/storage systems, but it is not an allocation profiler. `ByteSized` is
+caller-supplied; `size_of`, allocator slack, system RSS, and temporary cloning
+are explicitly out of scope. Changing a formula is a policy/API change and
+requires a new version rather than silently reinterpret old receipts.
+
+### 5.4 Identity, replay, and collision handling
+
+Two distinct approaches are used according to the required property:
+
+- Transcript and prepared-publication identity use BLAKE3 only in their enabled
+  facade features. Prepared publication hashes a fixed domain tag, little-endian
+  lengths, identity bytes, and canonical payload-key bytes, producing a 32-byte
+  token. Length framing prevents ambiguous concatenation of variable-size
+  fields. Exact identity/payload retries return the existing authority; a
+  divergent payload for an existing identity is rejected.
+- The payload store uses `DefaultHasher` `u64` values only as index buckets.
+  Candidate entries are checked again against the full canonical key or full
+  reference. A collision can therefore increase candidate work but cannot
+  incorrectly deduplicate, pin, unpin, or delete an unequal object.
+
+Neither mechanism is an authorization system. Callers must still protect token
+distribution and supply authoritative host state for activation/root snapshots.
+
+### 5.5 Store lifecycle and panic-safe mutation protocol
+
+All facade services share the finite lifecycle:
+
+```text
+Open -> OperationInProgress -> Open
+Open -> Closing -> Closed
+```
+
+Only one mutating operation may own the transition. Reentry during an active
+operation returns `OperationInProgress`; post-close access returns `Closed`.
+For operations that invoke user-defined `Hash`, `Clone`, or destructors, the
+service removes the canonical state into a local plan, performs the fallible
+work outside the mutex, and restores the preimage on unwind/failure. It commits
+the terminal image before invoking client destructors, so a destructor panic
+cannot reopen a ticketless entry or leak the accounting authority.
+
+The retained map specifically combines `RandomState` hashing (to avoid a
+caller-selected deterministic point-lookup degradation) with `LinkedHashMap`
+order for newest-first sweeps. This is a data-structure policy, not an LRU
+claim: access does not silently redefine reclamation order unless the store API
+performs an ordering mutation.
+
+### 5.6 Durable spill/restore custody state machine
+
+When the optional durable spill backing is configured, transfer is a
+reconciliation-oriented custody protocol:
+
+```text
+resident + source charge
+  --reserve durable record / commit spill--> durable + source retired
+  --claim restore / read / source charge / finalize delete--> resident + source charge
+```
+
+The important transitions are fenced rather than guessed. A successful spill
+does not retire the source authority until durable commit acknowledgement. A
+restore does not make the resident value visible until it has a source charge
+and the durable delete/finalization has a determinate outcome. If a backing
+operation may have committed but its acknowledgement is ambiguous, QMP records
+pending spill/restore state and exposes reconciliation; it does not duplicate
+or silently drop authority. The Redb-specific interface rejects generic
+accept/restore shortcuts so a backing cannot bypass the custody protocol.
+
+This resembles write-ahead/recovery design in storage systems, but it is not a
+database transaction coordinator. It gives QMP a local ownership invariant;
+cross-process locking, backing-file lifecycle, host retries, and publication
+activation require host policy.
+
+### 5.7 Determinism boundaries
+
+Canonical ordering is intentionally used where receipt/replay/fair-share output
+must be reproducible: resource groups and prepared entries use ordered
+collections, and Hamilton ties use group names. Membership-only hot paths may
+use randomized hashes. The contract is therefore deterministic for canonical
+input and policy within the library, while resistant lookup hashing is allowed
+to vary across process instances. Consumers must not use incidental allocation
+addresses, randomized map iteration, or telemetry timing as an API contract.
+
+## 6. Error and failure semantics
 
 | Condition | Result | State rule |
 | --- | --- | --- |
@@ -226,7 +373,7 @@ Telemetry and event sinks are explicitly non-authoritative. Sink panics are
 contained, operation labels are closed enums, and user-controlled strings are
 not metric labels.
 
-## 6. Testkit: prove the contracts can fail
+## 7. Testkit: prove the contracts can fail
 
 `testkit` is feature-sliced and host-independent.
 
@@ -249,7 +396,7 @@ valid conformance rail.
 activates it for compatibility coverage; enabling `full` alone does not claim
 to run Loom models.
 
-## 7. Verification map
+## 8. Verification map
 
 | Rail | What it establishes | What it does not establish |
 | --- | --- | --- |
@@ -271,7 +418,7 @@ Its verifier requires the expected matrix, enough repetitions, final semantic
 and allocator zero, no allocator underflow, and bounded revocable growth. These
 are host-local receipts, not portable SLOs.
 
-## 8. Extraction and host adoption
+## 9. Extraction and host adoption
 
 Extraction is mechanical. The script freezes a clean source `HEAD`, verifies
 the resolved graph and self-hosting manifest before copying, binds source and
@@ -288,7 +435,7 @@ After extraction, host adoption remains a coordinated external change:
 
 See [EXTRACTION.md](EXTRACTION.md) for the executable procedure.
 
-## 9. Source map
+## 10. Source map
 
 | Need | Source of truth |
 | --- | --- |
