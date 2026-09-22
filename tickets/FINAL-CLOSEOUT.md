@@ -17,10 +17,10 @@ extraction, host-pair qualification, and deployment activation.
 | Gate | Required evidence | Result |
 | --- | --- | --- |
 | FINAL-001 source freeze | File ownership, generated-doc authority, direction/purity/public-surface review, clean diff check | Passed. `FINAL-001-file-inventory.md` owns the original consolidation; follow-up extraction and public-interface fixes are committed separately. |
-| FINAL-002 repository qualification | PM, canonical workspace rail, locked fmt/clippy/test/deny on one clean source | Passed at QMP `265ff8f647c932c31b1fe59ee1b4f0d51b7c1be9`. |
-| FINAL-003 exact-HEAD freeze | Clean `main`, source SHA/tree recorded after qualification | Passed at QMP `265ff8f647c932c31b1fe59ee1b4f0d51b7c1be9`, tree `eae31f5c290e071a3bca27fcba9643b5a154852f`. |
-| FINAL-004 standalone extraction | Clean-source dry run and real extraction; extracted locked qualification and matching manifest | Passed from QMP `265ff8f`; source manifest `3ed6ed508fffacda4058bcdfca1f10d592262bd783c0c71f12ec081eeb13a962`; extracted commit `052f4e2b0172586869ae68a3e2f62f794dc84392`, tree `e9b283e53ccf473bf7145c1b0eda5668f5cb9e66`. |
-| FINAL-005 host adoption | Exact QMP/host pair, root and nested locked resolution, host adapter tests and hello-world | Passed for QMP `265ff8f` + Semantica `main` `2822dc1eeedba119ccf87815a81d35447a8ac06d`. |
+| FINAL-002 repository qualification | PM, canonical workspace rail, locked fmt/clippy/test/deny on one clean source | Passed at `qmp-final-qualified`; resolve the immutable annotated tag for SHA/tree/commands. |
+| FINAL-003 exact-HEAD freeze | Clean `main`, source SHA/tree recorded after qualification | Passed at `qmp-final-qualified`; its annotation is the exact source receipt. |
+| FINAL-004 standalone extraction | Clean-source dry run and real extraction; extracted locked qualification and matching manifest | Passed at `qmp-final-qualified`; its annotation records source and extracted manifest/commit. |
+| FINAL-005 host adoption | Exact QMP/host pair, root and nested locked resolution, host adapter tests and hello-world | Passed for `qmp-final-qualified` + Semantica `main` `2822dc1eeedba119ccf87815a81d35447a8ac06d`. |
 | FINAL-006 closeout | This SSOT, cleanup disposition, reproducible commands, residual-risk boundary | Complete after the final QMP receipt requalification below. |
 
 ## FINAL-001 audit result
@@ -46,15 +46,18 @@ not executable campaign tooling or a qualification receipt. The inventory in
 
 ## Receipt binding
 
-The executable and extraction receipt is locally tagged
-`qmp-final-qualified-265ff8f` at QMP `265ff8f`. This document is committed
-after that immutable source receipt. It changes only `tickets/`, which is not
-part of the standalone extraction manifest and does not affect the Rust build
-or test source set.
+The executable and extraction receipt is the immutable annotated local tag
+`qmp-final-qualified`. Its annotation carries the exact QMP SHA/tree, canonical
+source manifest, extracted SHA/tree, host SHA, commands, and outcome. Resolve
+it with `git show --no-patch --format=fuller qmp-final-qualified`.
+
+The tag is intentionally created **after** the last tracked ticket change:
+`tickets/` contributes to the extraction manifest, so embedding a self-SHA in
+this file would create a new source and invalidate the stated receipt.
 
 ## FINAL-002 and FINAL-003 receipt
 
-The following all exited zero on clean QMP source `265ff8f`:
+The following all exit zero on the source named by `qmp-final-qualified`:
 
 ```text
 python3 tools/pm/pm.py sync
@@ -73,7 +76,7 @@ skip/allowlist was added for this receipt.
 
 ## FINAL-004 extraction receipt
 
-From clean QMP `265ff8f`:
+From the clean source named by `qmp-final-qualified`:
 
 ```text
 scripts/extract-to-standalone-repo.sh --dry-run /tmp/qmp-final-extraction
@@ -97,7 +100,7 @@ matching text was boundary documentation in a testkit comment and example.
 ## FINAL-005 host-pair receipt
 
 Semantica `main` fast-forwarded the isolated, clean host qualification commit
-`2822dc1`. It resolves the QMP path at `265ff8f` in both the root and nested
+`2822dc1`. It resolves the QMP path named by `qmp-final-qualified` in both the root and nested
 `packages/analysis/quanta-v2` workspaces under `--locked` metadata.
 
 Host changes:
