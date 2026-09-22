@@ -30,6 +30,9 @@
 - Consolidated four Semgrep fixture processes into one exact rule-ID scan,
   reducing lint startup cost while strengthening the negative contract so each
   of the six regression rules must independently produce evidence.
+- Reused the authoritative all-feature test output for documented-selector
+  validation and removed the workspace bare Clippy union already covered by
+  each crate's bare all-target sweep.
 
 ## 0.2.0 - 2026-09-21
 

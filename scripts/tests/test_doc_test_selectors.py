@@ -31,6 +31,23 @@ class DocTestSelectorTests(unittest.TestCase):
         )
         self.assertEqual(MODULE.parse_listed_tests(output), {"exact_test_selector"})
 
+    def test_cargo_execution_parser_reuses_passed_and_ignored_test_names(self) -> None:
+        output = (
+            "running 3 tests\n"
+            "test module::exact_test_selector ... ok\n"
+            "test module::ignored_test_selector ... ignored\n"
+            "test module::failed_test_selector ... FAILED\n"
+            "test result: FAILED. 1 passed; 1 failed; 1 ignored\n"
+        )
+        self.assertEqual(
+            MODULE.parse_executed_tests(output),
+            {
+                "exact_test_selector",
+                "failed_test_selector",
+                "ignored_test_selector",
+            },
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

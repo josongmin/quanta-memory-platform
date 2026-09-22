@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import argparse
 import re
 import subprocess
 import sys
@@ -57,6 +58,15 @@ def parse_listed_tests(output: str) -> set[str]:
     }
 
 
+def parse_executed_tests(output: str) -> set[str]:
+    tests: set[str] = set()
+    for line in output.splitlines():
+        match = re.match(r"^test (?P<name>.+?) \.\.\. (?:ok|FAILED|ignored)$", line)
+        if match:
+            tests.add(match.group("name").split("::")[-1])
+    return tests
+
+
 def listed_tests() -> set[str]:
     command = [
         "cargo",
@@ -81,9 +91,21 @@ def listed_tests() -> set[str]:
     return parse_listed_tests(completed.stdout)
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--test-output",
+        type=Path,
+        help="reuse output from a completed cargo test run instead of invoking cargo --list",
+    )
+    args = parser.parse_args(argv)
+
     candidates = documented_candidates()
-    tests = listed_tests()
+    tests = (
+        parse_executed_tests(args.test_output.read_text(encoding="utf-8"))
+        if args.test_output
+        else listed_tests()
+    )
     missing = sorted(set(candidates) - tests - NON_TEST_IDENTIFIERS)
     if missing:
         for selector in missing:

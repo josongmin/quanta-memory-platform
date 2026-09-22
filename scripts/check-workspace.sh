@@ -4,6 +4,14 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${repo_root}"
 
+workspace_test_output=""
+cleanup() {
+  if [[ -n "${workspace_test_output}" && -f "${workspace_test_output}" ]]; then
+    rm -f -- "${workspace_test_output}"
+  fi
+}
+trap cleanup EXIT
+
 echo "[check-workspace] fmt --check"
 cargo fmt --all --check
 
@@ -41,13 +49,14 @@ echo "[check-workspace] feature-matrix"
 scripts/verify-feature-matrix.sh
 
 echo "[check-workspace] cargo test --workspace --all-features"
-cargo test --locked --workspace --all-features
+workspace_test_output="$(mktemp /tmp/qmp-workspace-tests.XXXXXX)"
+cargo test --locked --workspace --all-features 2>&1 | tee "${workspace_test_output}"
 
 echo "[check-workspace] advertised feature runtime capabilities"
 scripts/verify-feature-capabilities.sh
 
 echo "[check-workspace] documented test selectors"
-scripts/verify-doc-test-selectors.py
+scripts/verify-doc-test-selectors.py --test-output "${workspace_test_output}"
 
 echo "[check-workspace] generated guidance"
 python3 tools/pm/pm.py lint

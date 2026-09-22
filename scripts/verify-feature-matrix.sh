@@ -147,11 +147,10 @@ assert_facade_escape_hatch_absent "feature 'full'" --no-default-features --featu
 assert_facade_escape_hatch_absent \
   "feature 'full-backings'" --no-default-features --features full-backings
 
-# Whole-workspace bookends: the two extremes must resolve together. The
-# all-features workspace run subsumes redundant per-crate all-feature runs and
-# also catches cross-crate feature unification bugs.
-echo "==> [workspace] checking: --workspace --no-default-features"
-cargo clippy --locked --workspace --all-targets --no-default-features -- -D warnings
+# Every crate's bare all-target surface was checked above. Their union is the
+# workspace no-default surface because all intra-workspace dependency edges
+# disable default features, so rerunning that union adds no coverage. Keep the
+# all-features workspace run because it uniquely catches feature unification.
 echo "==> [workspace] checking: --workspace --all-features"
 cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 
