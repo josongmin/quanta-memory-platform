@@ -10,7 +10,7 @@ isolation defect, or a warm test-binary measurement establishes material cost.
 
 | Order | ID | Owner | Required result |
 |---|---|---|---|
-| 1 | TO-01 | facade spill/redb | Preserve concurrent durable-write semantics while removing the 20.10 s default-suite hotspot. |
+| 1 | TO-01 | facade spill/redb | Preserve concurrent durable-write semantics while removing the canonical all-features rail hotspot. |
 | 2 | TO-02 | facade API contracts | Replace source/TOML/README string greps with compile-time or metadata-backed authorities. |
 | 3 | TO-03 | facade scaling bench | Move benchmark setup outside the allocation epoch. |
 | 4 | TO-04 | testkit faults | Make the broken spill fake exercise the real fault driver, not a local classifier. |

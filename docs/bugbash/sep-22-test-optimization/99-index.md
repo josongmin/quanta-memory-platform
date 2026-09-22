@@ -6,7 +6,7 @@ Snapshot audited: `main@101781c2ea6122602b4acd9aa69ebfc13fda958f`.
 
 | Priority | ID | Problem | Evidence | Required fix |
 |---|---|---|---|---|
-| P0 | TO-01 | redb concurrency test costs 20.10 s | `spill/backings/redb.rs:1213-1251` | Barrier + small concurrent sample; preserve unique-key/multiset/zero-inventory oracle. |
+| P0 | TO-01 | redb concurrency test costs 10.946–20.10 s | `spill/backings/redb.rs:1213-1251` | Barrier + small concurrent sample; preserve unique-key/multiset/zero-inventory oracle. |
 | P0 | TO-02 | Architecture/feature tests grep source, TOML, and README formatting | facade store tests; `facade/tests/public_api_surface.rs:84-133` | Use rustdoc compile-fail and cargo metadata/tree authorities; delete text greps. |
 | P0 | TO-03 | Scaling allocation epoch includes scheduler setup | `benches/scaling.rs:511-546` | Start epoch immediately before admission loop. |
 | P0 | TO-04 | Spill negative pole tests a local classifier, not the real driver | `testkit/src/faults/scenarios.rs:213-248` | Inject honest and lying controllers through the production driver seam. |

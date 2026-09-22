@@ -5,9 +5,9 @@ Snapshot: `main@101781c2ea6122602b4acd9aa69ebfc13fda958f`.
 ## TO-01 — Fix the 20-second redb concurrency hotspot
 
 - Evidence: `crates/quanta-memory-platform-facade/src/spill/backings/redb.rs:1213-1251`.
-- Warm exact-test measurement:
-  `concurrent_accepts_lose_no_handle_and_assign_distinct_keys` = **20.10 s**.
-  The full facade library binary = **49.34 s**.
+- Nightly full-suite timing recorded **10.946 s**; an isolated warm rerun under
+  current host load recorded **20.10 s**. The full facade library binary in the
+  latter run took **49.34 s**.
 - The test performs 8×25 durable writes and then 200 durable restore/finalize
   cycles. The contract is concurrent record-id allocation, no lost write, unique
   keys, exact multiset recovery, and final zero inventory; it does not require
@@ -15,8 +15,8 @@ Snapshot: `main@101781c2ea6122602b4acd9aa69ebfc13fda958f`.
 - Change: add a start barrier so writers demonstrably overlap, then use a small
   count (for example 4 writers × 2 records). Preserve exact multiset and final
   inventory assertions.
-- Acceptance: warm exact test is at most 2 s on the same host and still fails a
-  backing that allocates record IDs outside the serialized transaction.
+- Acceptance: the same-host warm exact test is at least 80% faster and still
+  fails a backing that allocates record IDs outside the serialized transaction.
 
 ## TO-02B — Replace public-contract string parsing
 
