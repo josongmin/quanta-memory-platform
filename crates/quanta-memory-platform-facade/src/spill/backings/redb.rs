@@ -887,9 +887,24 @@ mod tests {
 
     static SEQ: AtomicU64 = AtomicU64::new(0);
 
-    fn temp_db_path() -> std::path::PathBuf {
+    struct TestDb {
+        directory: std::path::PathBuf,
+        path: std::path::PathBuf,
+    }
+
+    impl Drop for TestDb {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.directory);
+        }
+    }
+
+    fn test_db() -> TestDb {
         let n = SEQ.fetch_add(1, Ordering::Relaxed);
-        std::env::temp_dir().join(format!("qmp-redb-backing-test-{n}.redb"))
+        let process = std::process::id();
+        let directory = std::env::temp_dir().join(format!("qmp-redb-backing-test-{process}-{n}"));
+        std::fs::create_dir(&directory).expect("create isolated redb test directory");
+        let path = directory.join("spill.redb");
+        TestDb { directory, path }
     }
 
     fn restore_backing(backing: &RedbSpillBacking) -> MemoryResult<Option<Vec<u8>>> {
@@ -957,10 +972,27 @@ mod tests {
     }
 
     #[test]
+    fn live_backing_excludes_second_open_and_drop_releases_persisted_file() {
+        let db = test_db();
+        let first = RedbSpillBacking::create(&db.path).expect("open first");
+        let _receipt = spill_backing(&first, b"persisted").expect("seed");
+
+        let err =
+            RedbSpillBacking::create(&db.path).expect_err("second live open must be excluded");
+        assert!(matches!(err, MemoryError::Build(_)), "got {err:?}");
+
+        drop(first);
+        let reopened = RedbSpillBacking::create(&db.path).expect("open after drop");
+        assert_eq!(
+            restore_backing(&reopened).expect("restore persisted"),
+            Some(b"persisted".to_vec())
+        );
+    }
+
+    #[test]
     fn durable_spill_target_round_trips_fifo_through_the_trait() {
-        let path = temp_db_path();
-        let _ = std::fs::remove_file(&path);
-        let backing = RedbSpillBacking::create(&path).expect("open");
+        let db = test_db();
+        let backing = RedbSpillBacking::create(&db.path).expect("open");
 
         // Reached only through the SpillTarget abstraction — no redb types in sight.
         let first = spill_backing(&backing, b"first").expect("accept 1");
@@ -973,32 +1005,27 @@ mod tests {
         assert_eq!(restore_backing(&backing).expect("r2"), Some(b"second".to_vec()));
         assert_eq!(restore_backing(&backing).expect("drained"), None);
         assert_eq!(backing.retained_count().expect("len"), 0);
-
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn reopened_backing_resumes_sequence_and_restores_persisted_handles() {
-        let path = temp_db_path();
-        let _ = std::fs::remove_file(&path);
+        let db = test_db();
         {
-            let backing = RedbSpillBacking::create(&path).expect("open 1");
+            let backing = RedbSpillBacking::create(&db.path).expect("open 1");
             let _receipt = spill_backing(&backing, b"persisted").expect("accept");
         }
         // Reopen: the persisted handle survives and the sequence does not collide.
-        let backing = RedbSpillBacking::create(&path).expect("open 2");
+        let backing = RedbSpillBacking::create(&db.path).expect("open 2");
         let receipt = spill_backing(&backing, b"after-restart").expect("accept again");
         assert_eq!(receipt, SpillReceipt::Durable { sequence: 1, inventory_after: 2 });
         assert_eq!(restore_backing(&backing).expect("r1"), Some(b"persisted".to_vec()));
         assert_eq!(restore_backing(&backing).expect("r2"), Some(b"after-restart".to_vec()));
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn drained_queue_never_reuses_sequence_or_accepts_stale_restore_token() {
-        let path = temp_db_path();
-        let _ = std::fs::remove_file(&path);
-        let backing = RedbSpillBacking::create(&path).expect("open");
+        let db = test_db();
+        let backing = RedbSpillBacking::create(&db.path).expect("open");
 
         let first = spill_backing(&backing, b"first").expect("accept first");
         assert_eq!(first, SpillReceipt::Durable { sequence: 0, inventory_after: 1 });
@@ -1022,23 +1049,20 @@ mod tests {
             .expect_err("a finalized record ID must never be resurrected");
         assert!(matches!(stale_write, DurableWriteFailure::NotCommitted(_)));
         assert_eq!(backing.retained_count(), Ok(1));
-
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn persisted_restore_claim_blocks_duplicate_prepare_and_recovers_after_reopen() {
-        let path = temp_db_path();
-        let _ = std::fs::remove_file(&path);
+        let db = test_db();
         {
-            let backing = RedbSpillBacking::create(&path).expect("open 1");
+            let backing = RedbSpillBacking::create(&db.path).expect("open 1");
             let _receipt = spill_backing(&backing, b"claimed").expect("seed");
             let candidate = backing.prepare_restore().expect("prepare").expect("candidate");
             assert_eq!(candidate.sequence, 0);
             assert_eq!(backing.active_restore(), Ok(Some(DurableRecordId::new(0))));
         }
 
-        let backing = RedbSpillBacking::create(&path).expect("open 2");
+        let backing = RedbSpillBacking::create(&db.path).expect("open 2");
         assert_eq!(backing.active_restore(), Ok(Some(DurableRecordId::new(0))));
         assert!(matches!(backing.prepare_restore(), Err(MemoryError::OperationInProgress(_))));
         assert!(matches!(
@@ -1047,16 +1071,13 @@ mod tests {
         ));
         assert_eq!(backing.active_restore(), Ok(None));
         assert_eq!(backing.prepare_restore().expect("prepare after recovery").unwrap().sequence, 0);
-
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn committed_restore_payload_survives_reopen_until_resident_ack() {
-        let path = temp_db_path();
-        let _ = std::fs::remove_file(&path);
+        let db = test_db();
         {
-            let backing = RedbSpillBacking::create(&path).expect("open 1");
+            let backing = RedbSpillBacking::create(&db.path).expect("open 1");
             let _receipt = spill_backing(&backing, b"crash-safe").expect("seed");
             let candidate = backing.prepare_restore().expect("prepare").expect("candidate");
             backing.commit_restore(candidate.sequence).expect("move to recovery");
@@ -1064,7 +1085,7 @@ mod tests {
             assert_eq!(backing.active_restore(), Ok(Some(DurableRecordId::new(0))));
         }
 
-        let backing = RedbSpillBacking::create(&path).expect("open 2");
+        let backing = RedbSpillBacking::create(&db.path).expect("open 2");
         let recovery =
             backing.recover_active_restore().expect("read recovery").expect("persisted recovery");
         assert_eq!(recovery.phase, DurableRestorePhase::Committed);
@@ -1079,15 +1100,12 @@ mod tests {
             backing.resolve_record(DurableRecordId::new(0)),
             Ok(DurableRecordResolution::Finalized)
         );
-
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn injected_write_crash_points_converge_without_duplicate_records() {
-        let path = temp_db_path();
-        let _ = std::fs::remove_file(&path);
-        let backing = RedbSpillBacking::create(&path).expect("open");
+        let db = test_db();
+        let backing = RedbSpillBacking::create(&db.path).expect("open");
 
         let first = backing.reserve_record_id().expect("reserve first");
         backing.inject_fail_write_before_transaction();
@@ -1108,15 +1126,12 @@ mod tests {
             .expect("same record and payload are idempotent");
         assert_eq!(retry, receipt);
         assert_eq!(backing.retained_count(), Ok(1));
-
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn injected_restore_and_finalize_ack_loss_preserve_recovery_authority() {
-        let path = temp_db_path();
-        let _ = std::fs::remove_file(&path);
-        let backing = RedbSpillBacking::create(&path).expect("open");
+        let db = test_db();
+        let backing = RedbSpillBacking::create(&db.path).expect("open");
         let _receipt = spill_backing(&backing, b"recoverable").expect("seed");
         let candidate = backing.prepare_restore().expect("prepare").expect("candidate");
 
@@ -1142,15 +1157,12 @@ mod tests {
             .expect("post-finalize probe converts lost ack to success");
         assert_eq!(backing.active_restore(), Ok(None));
         assert_eq!(backing.retained_count(), Ok(0));
-
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn generic_restore_is_non_destructive_and_requires_owned_two_phase_path() {
-        let path = temp_db_path();
-        let _ = std::fs::remove_file(&path);
-        let backing = RedbSpillBacking::create(&path).expect("open");
+        let db = test_db();
+        let backing = RedbSpillBacking::create(&db.path).expect("open");
         let _receipt = spill_backing(&backing, b"only-copy").expect("accept");
 
         let error = SpillTarget::restore(&backing)
@@ -1161,32 +1173,26 @@ mod tests {
             backing.prepare_restore().expect("prepare").expect("candidate").bytes,
             b"only-copy"
         );
-
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn generic_write_is_non_mutating_and_returns_the_original_payload() {
-        let path = temp_db_path();
-        let _ = std::fs::remove_file(&path);
-        let backing = RedbSpillBacking::create(&path).expect("open");
+        let db = test_db();
+        let backing = RedbSpillBacking::create(&db.path).expect("open");
 
         let failure = SpillTarget::accept(&backing, b"only-copy".to_vec())
             .expect_err("generic write cannot represent an ambiguous durable commit");
         assert!(matches!(failure.error(), MemoryError::Unsupported(_)));
         assert_eq!(failure.into_parts().1, b"only-copy");
         assert_eq!(backing.retained_count(), Ok(0));
-
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn reopened_redb_reconciles_controller_count_from_persisted_inventory() {
-        let path = temp_db_path();
-        let _ = std::fs::remove_file(&path);
+        let db = test_db();
         {
             let controller =
-                RoutedSpillController::new(RedbSpillBacking::create(&path).expect("open 1"));
+                RoutedSpillController::new(RedbSpillBacking::create(&db.path).expect("open 1"));
             let first = spill_controller(&controller, b"first").expect("first");
             let second = spill_controller(&controller, b"second").expect("second");
             assert_eq!(first, SpillReceipt::Durable { sequence: 0, inventory_after: 1 });
@@ -1194,7 +1200,8 @@ mod tests {
             assert_eq!(controller.spilled_count(), Ok(2));
         }
 
-        let reopened = RoutedSpillController::new(RedbSpillBacking::create(&path).expect("open 2"));
+        let reopened =
+            RoutedSpillController::new(RedbSpillBacking::create(&db.path).expect("open 2"));
         assert_eq!(reopened.spilled_count(), Ok(2));
         assert_eq!(restore_controller(&reopened).expect("restore first"), Some(b"first".to_vec()));
         assert_eq!(reopened.spilled_count(), Ok(1));
@@ -1203,8 +1210,6 @@ mod tests {
             Some(b"second".to_vec())
         );
         assert_eq!(reopened.spilled_count(), Ok(0));
-        drop(reopened);
-        let _ = std::fs::remove_file(&path);
     }
 
     // Concurrency: the FIFO key is derived INSIDE each write txn (redb serializes
@@ -1215,9 +1220,8 @@ mod tests {
         use std::collections::BTreeSet;
         use std::sync::Arc;
 
-        let path = temp_db_path();
-        let _ = std::fs::remove_file(&path);
-        let backing = Arc::new(RedbSpillBacking::create(&path).expect("open"));
+        let db = test_db();
+        let backing = Arc::new(RedbSpillBacking::create(&db.path).expect("open"));
 
         let threads = 8u32;
         let per_thread = 25u32;
@@ -1245,16 +1249,14 @@ mod tests {
         }
         assert_eq!(drained.len() as u64, expected, "every accepted handle restored exactly once");
         assert_eq!(backing.retained_count().expect("len"), 0, "fully drained");
-        let _ = std::fs::remove_file(&path);
     }
 
     // Exhausted keyspace: with u64::MAX already present, allocating a new stable
     // record ID must fail before any payload can be accepted.
     #[test]
     fn accept_at_exhausted_keyspace_fails_closed_without_overwriting() {
-        let path = temp_db_path();
-        let _ = std::fs::remove_file(&path);
-        let backing = RedbSpillBacking::create(&path).expect("open");
+        let db = test_db();
+        let backing = RedbSpillBacking::create(&db.path).expect("open");
         backing.seed_key_for_test(u64::MAX, b"last").expect("seed max key");
 
         let err = backing
@@ -1265,6 +1267,5 @@ mod tests {
         // The retained handle at u64::MAX was NOT overwritten or lost.
         assert_eq!(backing.retained_count().expect("len"), 1, "the seeded handle survives");
         assert_eq!(restore_backing(&backing).expect("restore"), Some(b"last".to_vec()));
-        let _ = std::fs::remove_file(&path);
     }
 }

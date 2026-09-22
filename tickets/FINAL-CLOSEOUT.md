@@ -41,6 +41,10 @@ extraction, host-pair qualification, and deployment activation.
   dependencies and comment lookalikes cannot evade the extraction fence.
 - Testkit's public API surface now pins the public transcript conformance
   aliases; conformance bite tests still reject broken lifecycle fakes.
+- Durable Redb tests own a private directory per test process and remove it
+  only after the backing drops. They assert both live-file exclusion and
+  persisted reopen after drop, so overlapping `cargo test` processes cannot
+  corrupt the reopen oracle.
 
 `docs/bugbash/sep-22-test-optimization/` and
 `docs/bugbash/sep-22-test-optimization-deep/` are retained audit evidence,
