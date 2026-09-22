@@ -22,9 +22,15 @@ class ExtractionManifestTests(unittest.TestCase):
         )
         (self.root / "scripts").mkdir()
         self.source = self.root / "scripts/check.sh"
+        self.campaign = self.root / "scripts/verify-tickets.sh"
         self.source.write_text("#!/bin/sh\necho first\n", encoding="utf-8")
+        self.campaign.write_text("#!/bin/sh\necho campaign\n", encoding="utf-8")
         self.source.chmod(0o755)
-        subprocess.run(["git", "-C", str(self.root), "add", "scripts/check.sh"], check=True)
+        self.campaign.chmod(0o755)
+        subprocess.run(
+            ["git", "-C", str(self.root), "add", "scripts/check.sh", "scripts/verify-tickets.sh"],
+            check=True,
+        )
         subprocess.run(["git", "-C", str(self.root), "commit", "-qm", "fixture"], check=True)
 
     def tearDown(self):
@@ -88,6 +94,41 @@ class ExtractionManifestTests(unittest.TestCase):
         self.assertEqual(first["tree"], second["tree"])
         self.assertEqual(first["digest"], second["digest"])
         self.assertEqual(first["entries"][0]["mode"], "100755")
+
+    def test_excluded_campaign_path_is_not_in_manifest(self):
+        manifest = self.root / "excluded.json"
+        self.helper(
+            "snapshot",
+            "--repo",
+            str(self.root),
+            "--revision",
+            "HEAD",
+            "--output",
+            str(manifest),
+            "--exclude",
+            "scripts/verify-tickets.sh",
+            "scripts",
+        )
+        paths = {entry["path"] for entry in json.loads(manifest.read_text())["entries"]}
+        self.assertEqual(paths, {"scripts/check.sh"})
+
+    def test_excluded_dirty_path_does_not_fail_clean_check(self):
+        head = subprocess.check_output(
+            ["git", "-C", str(self.root), "rev-parse", "HEAD"], text=True
+        ).strip()
+        self.campaign.write_text("#!/bin/sh\necho changed\n", encoding="utf-8")
+        result = self.helper(
+            "assert-clean",
+            "--repo",
+            str(self.root),
+            "--commit",
+            head,
+            "--exclude",
+            "scripts/verify-tickets.sh",
+            "scripts",
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_committed_mode_change_changes_manifest_digest(self):
         _, first = self.snapshot("before.json")
