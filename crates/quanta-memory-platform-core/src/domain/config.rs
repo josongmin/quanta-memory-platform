@@ -603,9 +603,10 @@ mod tests {
     fn validate_accepts_resource_group_reserved_equal_to_soft_cap() {
         let mut group = good_group();
         group.reserved_bytes = group.soft_cap_bytes;
+        let result = validate_residency(&residency_with_group(group));
         assert!(
-            validate_residency(&residency_with_group(group)).is_ok(),
-            "reserved == soft is valid under the inclusive reserved<=soft contract"
+            result.is_ok(),
+            "reserved == soft is valid under the inclusive reserved<=soft contract, got {result:?}"
         );
     }
 

@@ -1,6 +1,6 @@
 # FUP-006 — 통합과 current-source qualification
 
-Status: `FINAL QUALIFICATION CANDIDATE — authority: qmp-final-qualified-sep23-followup-v3; host-pair CLOSED`
+Status: `IN_PROGRESS — the test-only source delta requires a new QBC digest and exact-source host-pair rerun`
 Priority: `SCOPE-SPECIFIC RELEASE GATE` (구현 결함 티켓이 아님)
 Owner: `Lane I — serial integrator`
 Depends on: core-enabled 후보는 `FUP-007`; durable-enabled 후보는 추가로 `FUP-001`, `FUP-002`; full-followup 후보는 추가로 `FUP-003`, `FUP-004`, `FUP-005`
@@ -145,28 +145,28 @@ randomized preflight/attempt agreement, lazy `GroupAdmission` breach
 (zero-alloc `admits` restoration), docs (`RECEIPT.md` completion,
 `MIGRATION.md`, `CHANGELOG.md`, verification rows, all handoffs).
 
-Verified on the final workdir source: full mutant battery RED (15
+Historical v3/v4 source verification: full mutant battery RED (15
 mutants incl. KILL2 identity re-mint and G1 deny-vanish); per-ticket
 selectors GREEN (001:6, 002:8, 003:7, 004:4+4, 005:2, 006:2+3, 007:8);
 `scripts/check-workspace.sh` exit 0; both public examples run;
 no-default/spill-only/full feature checks GREEN with `redb` absent from
 the `full` graph; scaling verifier OK (170 samples).
 
-Extraction: real extraction + in-extract rail GREEN on `c7706d0`
+Historical extraction: real extraction + in-extract rail GREEN on `c7706d0`
 (bootstrap `276893f`, tree `8e10fc78…`). The lazy-breach delta is
 intra-crate (no manifest/use-path change); the v2 annotated tag owns the
 repeated exact-source extraction receipt.
 
-Host-pair: the Semantica-owned default-provenance projection was repaired;
-QBC compose 45/45 and host 114+5+7 are GREEN. The v3 tag annotation owns
-the final exact-source rerun tuple; details and reopen conditions are in
+Historical host-pair: the Semantica-owned default-provenance projection was
+repaired; QBC compose 45/45 and host 114+5+7 are GREEN on the v3/v4 source
+digest. This does not qualify the two-test v5 source delta. Details and reopen conditions are in
 `tickets/HOST-PAIR-RUNTIME-DEFAULT-PROVENANCE.md`.
 
 Not run: hosted CI; deploy/activation; power loss; mid-finalize
 instruction-point kill.
 
-Promotion authority: predecessor tags `qmp-final-qualified-sep23-followup`
-and `qmp-final-qualified-sep23-followup-v2` must not move. The committed
-lazy-breach plus move-only durable-claim candidate is qualified only when the
-new annotated tag `qmp-final-qualified-sep23-followup-v3` exists and targets
-the exact clean candidate.
+Promotion authority: predecessor tags `qmp-final-qualified-sep23-followup`,
+`qmp-final-qualified-sep23-followup-v2`, v3, and v4 remain immutable. The
+updated candidate is qualified only when all repository, extraction,
+benchmark, and host-pair rails pass for its exact source digest and a new
+annotated v5 tag targets the clean candidate.

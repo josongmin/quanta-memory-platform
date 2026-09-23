@@ -1,6 +1,6 @@
 # Sep-23 follow-up qualification receipt
 
-Status: `FINAL QUALIFICATION CANDIDATE — authority is annotated tag qmp-final-qualified-sep23-followup-v3`
+Status: `FINAL QUALIFICATION CANDIDATE — exact-source v5 tag is the result authority`
 Scope: `full-followup` (`FUP-001` through `FUP-007`)
 Date: `2026-09-23 Asia/Seoul`
 
@@ -9,8 +9,8 @@ commit ID. Resolve the annotated tag and verify that it targets the current
 candidate:
 
 ```bash
-git rev-parse qmp-final-qualified-sep23-followup-v3^{}
-git show --no-patch --format=fuller qmp-final-qualified-sep23-followup-v3
+git rev-parse qmp-final-qualified-sep23-followup-v5^{}
+git show --no-patch --format=fuller qmp-final-qualified-sep23-followup-v5
 ```
 
 The tag annotation is the immutable source/result authority. Absence of that
@@ -115,7 +115,7 @@ Because the final self-audit delta changes Rust and documentation after
 bound to the tag target. The historical extraction above is lineage evidence,
 not final-source substitution.
 
-## Host-pair result
+## Historical host-pair result (v3/v4 source only)
 
 Read-only Cargo metadata from both Semantica workspace roots resolved the same
 QMP `0.2.0` manifests under
@@ -127,8 +127,9 @@ QMP `0.2.0` manifests under
 - QBC `quanta-runtime-memory-compose` lib/all-features: `45 / 45` GREEN.
 - QBC `quanta-memory-host` all-tests/all-features: `114 + 5 + 7` GREEN.
 - The paired default, explicit-overlay, and explicit-inherit provenance
-  oracles are all members of the compose target. The final v3 tag annotation
-  records the exact rerun source digest against the v3 QMP target.
+  oracles are all members of the compose target. The receipts above are the
+  historical v3/v4 source digest; the exact-source v5 host rerun is a separate
+  required gate after the two-test delta.
 - Exact owner patch, prior RED, receipts, and reopen conditions are in
   `tickets/HOST-PAIR-RUNTIME-DEFAULT-PROVENANCE.md`.
 
@@ -136,12 +137,12 @@ Therefore:
 
 | Boundary | Verdict |
 | --- | --- |
-| QMP owner-local behavior | GREEN |
-| QMP canonical repository rail | tag annotation authority |
-| QMP standalone extraction | tag annotation authority |
-| Semantica dependency identity | GREEN |
-| `quanta-memory-host` QBC owner rail | GREEN |
-| Semantica compose/QBC host-pair | GREEN / CLOSED |
+| QMP owner-local behavior | GREEN on current candidate; see final v5 tag counts |
+| QMP canonical repository rail | final v5 tag annotation authority |
+| QMP standalone extraction | final v5 tag annotation authority |
+| Semantica dependency identity | final v5 source digest in tag annotation |
+| `quanta-memory-host` QBC owner rail | final v5 QBC receipts in tag annotation |
+| Semantica compose/QBC host-pair | final v5 exact-source tuple in tag annotation |
 | Hosted CI | NOT RUN |
 | Deploy / activation | NOT RUN |
 
@@ -228,9 +229,83 @@ while an unrelated claim is live).
 - Feature checks: `--no-default-features`, `spill`-only, `full` GREEN;
   `redb` absent from the `full` graph (host-dependency proof).
 - Real standalone extraction of `c7706d0` + in-extract rail: exit 0
-  (bootstrap `276893f`, extracted tree `8e10fc78…`). The v3 tag annotation
+  (bootstrap `276893f`, extracted tree `8e10fc78…`). The final tag annotation
   is the authority for the repeated extraction that includes the committed
   lazy-breach delta.
-- Host-pair is CLOSED after the host-owned provenance repair. The v3 tag
+- Host-pair is CLOSED after the host-owned provenance repair. The final tag
   annotation binds the final QMP commit to the repeated Semantica QBC tuple.
 - Absolute latency assertions: none added anywhere, per contract.
+
+## Independent adversarial review supplement — v5 candidate
+
+Review base: `3038dae7d472ad37085ed309851b40b3e064e5fb` / tree
+`a495da407331529ba39d4a4a260878c924bd1496`. The only Rust changes in this
+supplement are two positive boundary oracles; production behavior is unchanged.
+They add two core tests (235 -> 237); facade and testkit counts remain 282 and
+82. `docs/verification-scenarios.md` lists the new policy-boundary test.
+
+### Required independent mutants
+
+Each target test was first run GREEN with `--locked --all-features`. The
+mutant was applied only in a detached temporary worktree, and each expected
+RED was a behavioral assertion failure (Cargo exit 101), not a compile error.
+The mutated file was restored and its SHA-256 matched the worktree's HEAD blob:
+
+| Mutant | Exact target | RED evidence | Restored SHA-256 |
+| --- | --- | --- | --- |
+| M4 equivalent: skip cross-axis kind-vector comparison | `ledger.rs`; `sep23_fup004_class_kind_swap_preserving_totals_is_rejected` | `validate_exact()` returned `Ok(())` for the corrupted class split | `e8fb281e8a1aa0efb029fbb91e1b2be2e257adbdcc4340da69bdfd5453cbfd7c` |
+| M2 equivalent: accept a foreign backend claim | `redb.rs`; `sep23_fup002_foreign_backend_claim_rejected_on_every_permission_change` | foreign `commit_restore` was accepted | `68b7f5b19d621acf38588e3dbf369e5b3785b5b53c0eabad82e408cc394a4e56` |
+| M7 equivalent: omit zero-byte live owner index | `control.rs`; `sep23_fup007_zero_byte_committed_blocks_group_removal_until_explicit_release` | group-removal reconfigure returned `Ok(())` while the ticket was live | `8595281a2cabfc771f9cbe11d099dc5d1b17e1db17e5ad35da2cae34848daf0d` |
+| M6 equivalent: stop incrementing policy revision | `control.rs`; `sep23_fup005_ten_thousand_reconfigures_keep_provenance_bounded` | revision remained 1 instead of 10001 | same `control.rs` SHA above |
+| G1 equivalent: omit lazy denial breach | `admission.rs`; `unknown_group_denies_terminally_with_legacy_message` | required typed breach was absent | `6371e59ae8dc1f38f37bef65dd6ba16e64e4ff2be29a44426ea028750317ca74` |
+
+An initial attempted M7 mutation omitted `ticket_groups`; its test remained
+GREEN because zero-byte scope authority is intentionally held in
+`ticket_owners`, not the positive-byte scheduler-usage map. It was not counted
+as a killed mutant; the corrected `ticket_owners` mutation above was RED.
+
+### Two new boundary mutants
+
+| New mutant | Existing suite before supplement | Added oracle and result |
+| --- | --- | --- |
+| Scratch-cap predicate `live_after > max` -> `>= max` | Existing 80k + 40k test stayed GREEN; it did not test exact-cap admission | `execution_scratch_budget_accepts_exact_cap_and_denies_one_more` now fails under the mutant at `reserve to 100000`; unmutated test is GREEN and checks no ledger drift after +1 |
+| Group validation `reserved > soft` -> `>=` | Existing coherent-policy test stayed GREEN; it did not exercise equality | `validate_accepts_resource_group_reserved_equal_to_soft_cap` now fails under the mutant; unmutated test is GREEN and pins inclusive `reserved <= soft` |
+
+Both reverted mutant worktree files matched the updated review source byte for
+byte. These two additions close observed test-strength gaps without changing
+production semantics.
+
+### Cross-dimension review
+
+- The randomized preflight/attempt test is deterministic (fixed xorshift seed),
+  uses four policy shapes and 500 transitions per shape, and compares exact
+  `MemoryError` values. Independent semantic rules are pinned by the terminal,
+  hard-remeasure, borrowing-class, protected-floor, and execution-scratch tests;
+  FUP-004 has independent class/owner/context kind-swap probes plus fake-rejection
+  conformance tests. The random test is not the only oracle.
+- The SIGKILL rail uses a child `READY` protocol and explicit `Child::kill`, not
+  sleep ordering. The 30-second deadline only bounds a hung child; a fresh
+  locked build of the helper is required before execution. The rail proves its
+  documented interruption points, not power loss or an instruction point
+  inside a redb transaction.
+- Restore callbacks are outside the store-state mutex and serialized by the
+  lifecycle mutation permit. Decode panic on a Prepared claim aborts and then
+  resumes unwind; a Committed claim remains recoverable. Finalize error/panic
+  fences the published charged copy and claim for reconciliation. Poisoned
+  locks return errors; the remaining `expect` calls are after checks protected
+  by the mutation permit, not on caller-controlled data.
+- FUP-001 through FUP-007 focused selectors all passed on this source. The
+  exact-source `scripts/check-workspace.sh` passed on a clean, dedicated
+  `CARGO_TARGET_DIR` (`/Volumes/Extreme SSD 1/build-cache/qmp-v5-canonical-target`);
+  it covered workspace/all-features tests, doc tests, feature matrix/runtime
+  capability checks, 217 resolved selectors, generated-doc lint, and cargo-deny.
+  Both public examples also ran successfully. An earlier attempt using a target
+  shared with the detached mutation checkout is discarded: it reused a mutant
+  binary and failed one boundary test; a separate clean target rebuilt and
+  passed the full canonical rail. Extraction, full scaling benchmark, and exact-
+  source host-pair remain required before any v5 qualification tag; prior v3/v4
+  receipts are not substituted for those gates.
+- This supplement does not claim 100/100 across the separate 100-item product
+  checklist. Host activation, hosted CI, physical power loss, finalize-point
+  kill, physical memory caps, and other explicitly conditional capabilities
+  remain separate or unverified boundaries.
