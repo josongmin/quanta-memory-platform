@@ -1,6 +1,6 @@
 # Sep-23 follow-up misc — 실행 계획
 
-Status: `QUALIFICATION UPDATE IN PROGRESS — v4 remains immutable; updated source needs new exact-source rails before v5`
+Status: `LOCAL REPOSITORY / EXTRACTION / BENCHMARK GREEN — exact-source host-pair OPEN; no v5 authority`
 작성일: `2026-09-23`
 계획 기준 HEAD: `028448946caa95676df034481a830c1d3e3b1f33`
 계획 기준 tree: `f983669731805a330200213bad7bf1bd5573f308`
@@ -16,10 +16,11 @@ QMP repository/standalone extraction은 predecessor tag
 deny-path allocation 회귀를 lazy `GroupAdmission`으로 수정한 후, durable claim-bearing
 public value도 non-`Clone`/non-`Copy`로 만들어 하나의 backend-issued lease가
 복수 caller-owned restore flow로 분할되지 않게 했다. v3/v4는 기존 source commit에
-대한 불변 attestation으로 보존한다. 이 업데이트는 두 신규 boundary oracle을 추가했으므로
-기존 Semantica QBC digest는 이 새 source에 재사용하지 않는다. 새 canonical rail,
-추출, host-pair를 동일 source digest로 통과한 뒤 v5 attestation을 발행한다. 정확한
-source/result tuple과 잔여 경계는
+대한 불변 attestation으로 보존한다. 신규 boundary oracle 둘을 포함한 현재 후보에서
+canonical repository, real extraction, full scaling verifier가 통과했다. Semantica와
+QIndex sibling checkout이 dirty/활성 작업 상태여서 exact-source host-pair를 안전하게
+고정하지 못했다. 그러므로 후보는 아직 v5 qualified가 아니며 v5 attestation도 발행하지
+않았다. 정확한 source/result tuple과 잔여 경계는
 `RECEIPT.md` 및 `tickets/HOST-PAIR-RUNTIME-DEFAULT-PROVENANCE.md`가 소유한다.
 
 - **실행 재현:** 실제 Redb의 동시 recovery가 같은 sequence를 두 store에 복원;

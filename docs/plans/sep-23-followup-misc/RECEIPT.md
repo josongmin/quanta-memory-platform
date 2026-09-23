@@ -1,6 +1,6 @@
 # Sep-23 follow-up qualification receipt
 
-Status: `FINAL QUALIFICATION CANDIDATE — exact-source v5 tag is the result authority`
+Status: `PARTIALLY QUALIFIED — local repository, extraction, benchmark GREEN; exact-source host-pair OPEN; no v5 tag`
 Scope: `full-followup` (`FUP-001` through `FUP-007`)
 Date: `2026-09-23 Asia/Seoul`
 
@@ -13,9 +13,9 @@ git rev-parse qmp-final-qualified-sep23-followup-v5^{}
 git show --no-patch --format=fuller qmp-final-qualified-sep23-followup-v5
 ```
 
-The tag annotation is the immutable source/result authority. Absence of that
-tag, a tag/HEAD mismatch, or a dirty tree downgrades this document to planning
-evidence.
+The prospective tag annotation is the immutable source/result authority.
+Until the exact-source host-pair passes and that tag exists, this receipt is
+partial evidence only, not a release qualification.
 
 ## Source lineage
 
@@ -274,6 +274,37 @@ as a killed mutant; the corrected `ticket_owners` mutation above was RED.
 Both reverted mutant worktree files matched the updated review source byte for
 byte. These two additions close observed test-strength gaps without changing
 production semantics.
+
+### Exact candidate local qualification
+
+- QMP commit/tree: `466f08648af05b7b509fb74dbfdce3c6da1c213d` /
+  `113868d0a7d309596b82994ef56e5667675c8278`.
+- Canonical `scripts/check-workspace.sh`: exit 0 (`check-workspace: clean`) on
+  a dedicated clean target. All-feature unit/integration/doc suites passed:
+  core 237, facade 282, testkit 82; Hellgate E2E 18, public API 20, SIGKILL
+  reopen 3, facade doctests 28. The feature matrix compiled warning-free,
+  10 advertised feature paths each executed a non-empty capability test,
+  217 documentation selectors resolved, generated guidance lint and cargo-deny
+  passed. Both `hello_world` and `effective_budget_report` examples ran.
+- Real extraction destination:
+  `/private/tmp/qmp-v5-extraction.KwcKya`; canonical source/extract digest
+  `aa425a8591975b5236b8c72fb4d8549cf70a89d113c5efd816a2dd13490dc915`;
+  extracted bootstrap commit/tree `27d0570641989a2bb80b8eccadf2da25f56726c4` /
+  `2db4b0f9e473f0d6e6aceb06bee39ff20b9ce3e6`. In-extract
+  `scripts/check-workspace.sh` exited 0 and preserved the canonical digest.
+- Full `scripts/run-scaling-bench.sh`: verifier `OK (170 samples)` on that
+  commit/tree using rustc/cargo 1.92.0, Darwin 24.6.0 arm64. This is verifier
+  qualification, not a latency or cross-machine performance claim.
+- Exact-source host-pair is **OPEN**. Read-only metadata from both Semantica
+  workspace roots resolves the same QMP core/facade manifests at the candidate
+  path. However Semantica is at dirty `a226ea29a0dc64823fbfd2f5f3d1f02664a66319`
+  (16 commits ahead of origin with many modified files); QIndex is at dirty
+  `384cecb5825d8ebf38ff6c07bc6bf64ffc43fbe0` with broad modified sources; a
+  workspace bench build was active during review. Earlier QBC source-closure capture also
+  drifted while QIndex changed. No new QBC receipt was accepted or synthesized.
+  Re-run compose/host QBC after the sibling repositories can be frozen, binding
+  the exact resulting QMP source digest. Historic v3/v4 receipts do not close
+  this gate.
 
 ### Cross-dimension review
 
