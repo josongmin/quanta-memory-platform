@@ -599,6 +599,16 @@ mod tests {
         );
     }
 
+    #[test]
+    fn validate_accepts_resource_group_reserved_equal_to_soft_cap() {
+        let mut group = good_group();
+        group.reserved_bytes = group.soft_cap_bytes;
+        assert!(
+            validate_residency(&residency_with_group(group)).is_ok(),
+            "reserved == soft is valid under the inclusive reserved<=soft contract"
+        );
+    }
+
     // scenario B: reserved > soft inside a resource group is rejected as Config.
     #[test]
     fn validate_rejects_resource_group_reserved_above_soft() {

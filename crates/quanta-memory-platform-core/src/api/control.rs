@@ -3125,6 +3125,42 @@ mod tests {
         );
     }
 
+    #[test]
+    fn execution_scratch_budget_accepts_exact_cap_and_denies_one_more() {
+        let report = EffectiveMemoryBudgetReport {
+            execution: crate::domain::policy::ExecutionBudget {
+                max_execution_scratch_bytes: Some(100_000),
+                ..crate::domain::policy::ExecutionBudget::unlimited()
+            },
+            ..report_with(ResidencyPolicy::new(10_000_000))
+        };
+        let broker = LiveProcessMemoryBroker::from_report(report).expect("valid");
+        let at_cap = broker
+            .reserve(
+                MemoryClass::ExecutionScratch,
+                "boundary-owner".to_string(),
+                MemoryContextKind::Request,
+                ChargeKind::LiveScratch,
+                100_000,
+            )
+            .expect("the exact configured cap is admissible");
+        broker.commit(&at_cap).expect("commit at cap");
+
+        let denied = broker.reserve(
+            MemoryClass::ExecutionScratch,
+            "boundary-owner".to_string(),
+            MemoryContextKind::Request,
+            ChargeKind::LiveScratch,
+            1,
+        );
+        assert!(matches!(denied, Err(MemoryError::Capacity(_))));
+        assert_eq!(
+            broker.ledger_snapshot().expect("snapshot").total_live_scratch_bytes(),
+            100_000,
+            "the over-cap attempt leaves semantic accounting unchanged"
+        );
+    }
+
     fn runtime_scratch_broker(cap: usize) -> LiveProcessMemoryBroker {
         let report = EffectiveMemoryBudgetReport {
             execution: crate::domain::policy::ExecutionBudget {
