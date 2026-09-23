@@ -305,6 +305,7 @@ check helpers that the control plane enforces (see group C/D).
   survivor charge drains. This is still process termination, not power loss.
 - ✅ **Redb logical quota, file cap and restore staging** —
   `limits_reject_oversized_record_before_commit_without_consuming_reserved_id`,
+  `every_invalid_limit_relation_rejects_before_creating_database_file`,
   `retained_limits_count_recovery_and_refund_only_after_finalize`,
   `retained_payload_cap_denies_next_record_without_changing_durable_authority`,
   `in_flight_restore_budget_denial_preserves_claim_and_releases_on_candidate_drop`,
@@ -315,7 +316,10 @@ check helpers that the control plane enforces (see group C/D).
   `persisted_payload_usage_mismatch_fails_closed_without_erasing_record`,
   `capped_file_backend_rejects_extension_before_file_mutation`,
   `reopening_above_database_file_cap_fails_without_erasing_payload`,
-  and `database_file_cap_denial_preserves_prior_durable_record_across_reopen`
+  `database_file_cap_denial_preserves_prior_durable_record_across_reopen`,
+  `partial_storage_full_write_reopens_to_whole_records_only`,
+  `partial_storage_full_during_restore_commit_preserves_one_whole_copy`,
+  and `partial_storage_full_during_finalize_reopens_present_or_finalized`
   (`spill/backings/redb.rs`). Limits reject writes before commit, count
   recovery payloads until finalize, and reject smaller reopen limits without
   erasing the only copy. The per-file cap blocks Redb file extension and
@@ -323,6 +327,26 @@ check helpers that the control plane enforces (see group C/D).
   cap, Redb can require a cold reopen after I/O error and more file headroom
   before all restores complete. This is not a whole-volume quota, actual
   ENOSPC injection or caller codec scratch bound.
+  The partial-write oracles use a test-only backend that writes and reads back
+  a strict prefix of one Redb I/O buffer before returning `StorageFull` at
+  spill, restore-commit and finalize boundaries. Cold reopen yields only whole
+  committed records or their valid finalized disposition. These are not
+  actual filesystem ENOSPC or power-loss tests.
+- ✅ **Redb schema, identity and recovery concurrency** —
+  `unsupported_explicit_schema_versions_fail_closed_before_v2_initialization`,
+  `missing_schema_marker_on_v2_shaped_database_fails_without_restamping`,
+  `missing_metadata_table_on_v2_shaped_database_fails_without_recreation`,
+  `incomplete_backend_identity_fails_closed_without_replacing_surviving_half`,
+  `schema_v2_missing_required_authority_fails_without_recreating_it`,
+  `schema_v2_payload_disposition_mismatch_fails_without_repair`,
+  `concurrent_prepare_restore_issues_exactly_one_live_claim`,
+  `concurrent_recovery_claims_are_generation_fenced_to_latest_owner`,
+  `backend_identity_and_pending_claim_survive_cold_rename`, and
+  `consistent_cold_copy_preserves_logical_lineage_identity`
+  (`spill/backings/redb.rs`). Invalid persisted authority fails before
+  migration or replacement; concurrent claimants cannot both publish one
+  record. A quiesced rename or consistent copy preserves logical lineage,
+  whereas two independently created databases remain distinct authorities.
 - ✅ **Redb file-cap denial with live source authority** —
   `redb_file_cap_denial_keeps_store_source_charged_until_exact_resolution`
   (`revocable_store/service.rs`) fills the capped Redb through the charged
@@ -330,6 +354,23 @@ check helpers that the control plane enforces (see group C/D).
   fenced until a cold reopen and exact record reconciliation. The final
   source or durable authority drains without a double refund. This injects
   QMP's file cap, not a real filesystem ENOSPC fault.
+- ✅ **Oversized encoded record with live source authority** —
+  `oversized_encoded_record_preserves_charged_source_and_no_durable_payload`
+  (`revocable_store/service.rs`) rejects a caller-produced record above the
+  configured per-record limit, preserves the exact resident entry and charge,
+  and cold-reopens to zero durable payloads. The caller has already allocated
+  the encoded `Vec`; this does not bound codec output before allocation or
+  private encoder scratch.
+- 🧪 **Real Linux volume ENOSPC, isolated from host data** —
+  `scripts/durability/run-enospc-docker.sh` runs the
+  Redb ENOSPC example on a disposable 8 MiB Docker tmpfs.
+  The example fills that filesystem to a real `ENOSPC`, checks that Redb
+  classifies a subsequent payload commit as `Capacity`, frees only the filler,
+  cold-reopens the database, then verifies the anchor and every acknowledged
+  or uncertain record is whole and drains exactly once. The runner fingerprints
+  all present source files before and after. This is a standalone Linux
+  volume-error oracle, not the consuming host's volume/quota policy, physical
+  power-loss durability, or a caller codec scratch bound.
 - 🧪 **Optional Linux syscall-error subrail (DURABILITY-001 L2 partial)** —
   `scripts/durability/run-emulated-linux.sh` calibrates the real finalize
   boundary, injects EIO into the first `pwrite64` and `fdatasync` after it, then

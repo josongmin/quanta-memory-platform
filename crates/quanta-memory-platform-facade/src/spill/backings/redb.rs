@@ -68,10 +68,12 @@ const RESTORE_CLAIM_GENERATION: &str = "restore_claim_generation";
 /// horizon (same rule as FUP-001 tombstones).
 const SPILL_FINALIZED_BY: TableDefinition<'static, u64, u64> =
     TableDefinition::new("qmp_spill_finalized_by");
-/// Persisted 128-bit identity of this backend file (FUP-002), stored as two
-/// halves. Generated once, stable across renames and reopens, never derived
-/// from pathnames or memory addresses. A claim presented to a file that did
-/// not issue it is foreign and rejected.
+/// Persisted 128-bit logical-lineage identity of this backend (FUP-002), stored
+/// as two halves. Generated once, stable across renames and reopens, never
+/// derived from pathnames or memory addresses. Consistent byte copies preserve
+/// the lineage; they are backups/replacements, not independent writable
+/// backends. The identity fences accidental cross-lineage claim presentation;
+/// it is not cryptographic authentication against hostile file modification.
 const BACKEND_ID_LO: &str = "backend_id_lo";
 const BACKEND_ID_HI: &str = "backend_id_hi";
 /// Legacy watermark (schema 1): greatest sequence believed consumed. It cannot
@@ -86,6 +88,12 @@ const FINALIZED_THROUGH: &str = "finalized_through";
 /// an exact [`RecordDisposition`] row.
 const SCHEMA_VERSION: &str = "schema_version";
 const SCHEMA_VERSION_V2: u64 = 2;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PersistedSchema {
+    LegacyV1,
+    V2,
+}
 
 /// Exact persisted disposition of one durable record id (schema 2 authority).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -368,7 +376,8 @@ pub mod finalize_kill_hooks {
     }
 }
 
-/// Best-effort 128-bit backend identity minted once per database file.
+/// Best-effort 128-bit backend identity minted once per logical database
+/// lineage.
 ///
 /// Entropy mixes per-call random hash keys with the process id, wall-clock
 /// time, and a process counter, then persists the result in the file itself —
@@ -415,6 +424,12 @@ impl RedbSpillBacking {
     /// Open (creating if absent) a redb-backed durable spill tier at `path`. A
     /// backend failure is surfaced as a neutral [`MemoryError`], never a leaked
     /// `redb` error type.
+    ///
+    /// A consistent byte copy/reflink/snapshot retains the persisted logical
+    /// lineage and is suitable only as a quiesced replacement or backup. To
+    /// create an independently writable backend, create a fresh database and
+    /// transfer records through the public durable-spill protocol; do not mount
+    /// copied lineages concurrently.
     pub fn create(path: impl AsRef<Path>) -> MemoryResult<Self> {
         Self::create_with_limits(path, RedbSpillLimits::default())
     }
@@ -440,22 +455,199 @@ impl RedbSpillBacking {
         let database = builder
             .create_with_backend(backend)
             .map_err(|e| MemoryError::build(format!("redb spill backing open failed: {e}")))?;
-        Self::initialize(database, limits)
+        let schema = Self::inspect_schema(&database)?;
+        let backend_id = Self::inspect_backend_identity(&database, schema)?;
+        Self::validate_current_schema_layout(&database, schema)?;
+        Self::initialize(database, limits, schema, backend_id)
     }
 
-    fn initialize(database: Database, limits: RedbSpillLimits) -> MemoryResult<Self> {
+    fn inspect_schema(database: &Database) -> MemoryResult<PersistedSchema> {
+        let read = database.begin_read().map_err(|e| {
+            MemoryError::build(format!("redb schema inspection transaction failed: {e}"))
+        })?;
+        let meta = match read.open_table(SPILL_META) {
+            Ok(meta) => meta,
+            Err(redb::TableError::TableDoesNotExist(_)) => {
+                let state_exists = match read.open_table(SPILL_RECORD_STATE) {
+                    Ok(_) => true,
+                    Err(redb::TableError::TableDoesNotExist(_)) => false,
+                    Err(error) => {
+                        return Err(MemoryError::build(format!(
+                            "redb disposition evidence open failed: {error}"
+                        )));
+                    }
+                };
+                let proof_exists = match read.open_table(SPILL_FINALIZED_BY) {
+                    Ok(_) => true,
+                    Err(redb::TableError::TableDoesNotExist(_)) => false,
+                    Err(error) => {
+                        return Err(MemoryError::build(format!(
+                            "redb finalize-proof evidence open failed: {error}"
+                        )));
+                    }
+                };
+                if state_exists || proof_exists {
+                    return Err(MemoryError::InvalidState(
+                        "redb metadata table is missing from a schema-2-shaped database".into(),
+                    ));
+                }
+                return Ok(PersistedSchema::LegacyV1);
+            }
+            Err(error) => {
+                return Err(MemoryError::build(format!(
+                    "redb schema metadata open failed: {error}"
+                )));
+            }
+        };
+        let version = meta
+            .get(SCHEMA_VERSION)
+            .map_err(|e| MemoryError::build(format!("redb schema version read failed: {e}")))?
+            .map(|value| value.value());
+        match version {
+            None => {
+                let has_v2_metadata = [
+                    BACKEND_ID_LO,
+                    BACKEND_ID_HI,
+                    RETAINED_PAYLOAD_BYTES,
+                    ACTIVE_RESTORE_GENERATION,
+                    RESTORE_CLAIM_GENERATION,
+                ]
+                .into_iter()
+                .try_fold(false, |found, key| {
+                    meta.get(key)
+                        .map(|value| found || value.is_some())
+                        .map_err(|e| {
+                            MemoryError::build(format!(
+                                "redb schema evidence read failed for {key}: {e}"
+                            ))
+                        })
+                })?;
+                let has_v2_state_table = match read.open_table(SPILL_RECORD_STATE) {
+                    Ok(_) => true,
+                    Err(redb::TableError::TableDoesNotExist(_)) => false,
+                    Err(error) => {
+                        return Err(MemoryError::build(format!(
+                            "redb disposition evidence open failed: {error}"
+                        )));
+                    }
+                };
+                let has_v2_proof_table = match read.open_table(SPILL_FINALIZED_BY) {
+                    Ok(_) => true,
+                    Err(redb::TableError::TableDoesNotExist(_)) => false,
+                    Err(error) => {
+                        return Err(MemoryError::build(format!(
+                            "redb finalize-proof evidence open failed: {error}"
+                        )));
+                    }
+                };
+                if has_v2_metadata || has_v2_state_table || has_v2_proof_table {
+                    return Err(MemoryError::InvalidState(
+                        "redb schema version is missing from a schema-2-shaped database"
+                            .into(),
+                    ));
+                }
+                Ok(PersistedSchema::LegacyV1)
+            }
+            Some(SCHEMA_VERSION_V2) => Ok(PersistedSchema::V2),
+            Some(version) => Err(MemoryError::Unsupported(format!(
+                "unsupported redb spill schema version {version}; expected {SCHEMA_VERSION_V2} or an absent legacy version"
+            ))),
+        }
+    }
+
+    fn inspect_backend_identity(
+        database: &Database,
+        schema: PersistedSchema,
+    ) -> MemoryResult<Option<u128>> {
+        let read = database.begin_read().map_err(|e| {
+            MemoryError::build(format!("redb backend identity transaction failed: {e}"))
+        })?;
+        let meta = match read.open_table(SPILL_META) {
+            Ok(meta) => meta,
+            Err(redb::TableError::TableDoesNotExist(_)) if schema == PersistedSchema::LegacyV1 => {
+                return Ok(None);
+            }
+            Err(error) => {
+                return Err(MemoryError::build(format!(
+                    "redb backend identity metadata open failed: {error}"
+                )));
+            }
+        };
+        let low = meta
+            .get(BACKEND_ID_LO)
+            .map_err(|e| MemoryError::build(format!("redb backend identity read failed: {e}")))?
+            .map(|value| value.value());
+        let high = meta
+            .get(BACKEND_ID_HI)
+            .map_err(|e| MemoryError::build(format!("redb backend identity read failed: {e}")))?
+            .map(|value| value.value());
+        match (low, high, schema) {
+            (Some(low), Some(high), _) => Ok(Some(u128::from(high) << 64 | u128::from(low))),
+            (None, None, PersistedSchema::LegacyV1) => Ok(None),
+            (None, None, PersistedSchema::V2) => {
+                Err(MemoryError::InvalidState("schema-2 redb backend identity is missing".into()))
+            }
+            _ => Err(MemoryError::InvalidState(
+                "redb backend identity is incomplete; refusing to replace a surviving half".into(),
+            )),
+        }
+    }
+
+    fn validate_current_schema_layout(
+        database: &Database,
+        schema: PersistedSchema,
+    ) -> MemoryResult<()> {
+        if schema == PersistedSchema::LegacyV1 {
+            return Ok(());
+        }
+        let read = database.begin_read().map_err(|e| {
+            MemoryError::build(format!("redb schema layout transaction failed: {e}"))
+        })?;
+        let _queue = read.open_table(SPILL_QUEUE).map_err(|e| {
+            MemoryError::InvalidState(format!("schema-2 redb spill queue is missing: {e}"))
+        })?;
+        let _recovery = read.open_table(SPILL_RECOVERY).map_err(|e| {
+            MemoryError::InvalidState(format!("schema-2 redb recovery table is missing: {e}"))
+        })?;
+        let _states = read.open_table(SPILL_RECORD_STATE).map_err(|e| {
+            MemoryError::InvalidState(format!("schema-2 redb disposition table is missing: {e}"))
+        })?;
+        let _proofs = read.open_table(SPILL_FINALIZED_BY).map_err(|e| {
+            MemoryError::InvalidState(format!("schema-2 redb finalize-proof table is missing: {e}"))
+        })?;
+        let meta = read.open_table(SPILL_META).map_err(|e| {
+            MemoryError::InvalidState(format!("schema-2 redb metadata table is missing: {e}"))
+        })?;
+        if meta
+            .get(NEXT_SEQUENCE)
+            .map_err(|e| MemoryError::build(format!("redb spill metadata read failed: {e}")))?
+            .is_none()
+        {
+            return Err(MemoryError::InvalidState(
+                "schema-2 redb sequence frontier is missing".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn initialize(
+        database: Database,
+        limits: RedbSpillLimits,
+        schema: PersistedSchema,
+        persisted_backend_id: Option<u128>,
+    ) -> MemoryResult<Self> {
         let txn = database.begin_write().map_err(|e| {
             MemoryError::build(format!("redb spill metadata transaction failed: {e}"))
         })?;
         let backend_id = {
+            let mut meta = txn.open_table(SPILL_META).map_err(|e| {
+                MemoryError::build(format!("redb spill metadata initialization failed: {e}"))
+            })?;
             let queue = txn.open_table(SPILL_QUEUE).map_err(|e| {
                 MemoryError::build(format!("redb spill queue initialization failed: {e}"))
             })?;
             let recovery = txn.open_table(SPILL_RECOVERY).map_err(|e| {
                 MemoryError::build(format!("redb spill recovery initialization failed: {e}"))
-            })?;
-            let mut meta = txn.open_table(SPILL_META).map_err(|e| {
-                MemoryError::build(format!("redb spill metadata initialization failed: {e}"))
             })?;
             // Ensure every table exists so later read transactions never meet
             // a missing table: the disposition table (schema 2) and the
@@ -487,13 +679,32 @@ impl RedbSpillBacking {
             // checks the transactional usage counter rather than trusting a
             // stale or corrupted value to authorize later writes.
             let mut payload_bytes = 0u64;
-            for table in [&queue, &recovery] {
+            for (table, expected_disposition) in
+                [(&queue, RecordDisposition::Queued), (&recovery, RecordDisposition::Recovery)]
+            {
                 for entry in table.iter().map_err(|e| {
                     MemoryError::build(format!("redb payload usage scan failed: {e}"))
                 })? {
-                    let (_, value) = entry.map_err(|e| {
+                    let (key, value) = entry.map_err(|e| {
                         MemoryError::build(format!("redb payload usage scan failed: {e}"))
                     })?;
+                    if schema == PersistedSchema::V2 {
+                        let disposition = states
+                            .get(key.value())
+                            .map_err(|e| {
+                                MemoryError::build(format!(
+                                    "redb record disposition validation failed: {e}"
+                                ))
+                            })?
+                            .map(|value| RecordDisposition::decode(value.value()))
+                            .transpose()?;
+                        if disposition != Some(expected_disposition) {
+                            return Err(MemoryError::InvalidState(format!(
+                                "schema-2 durable record {} has payload disposition {disposition:?}, expected {expected_disposition:?}",
+                                key.value()
+                            )));
+                        }
+                    }
                     let len = limits.check_record(value.value().len())?;
                     payload_bytes = payload_bytes.checked_add(len).ok_or_else(|| {
                         MemoryError::capacity("redb retained payload bytes exceed u64")
@@ -547,19 +758,18 @@ impl RedbSpillBacking {
             // Backend identity (FUP-002): mint once, persist in the same
             // transaction, then cache. Legacy files without an identity adopt
             // one here; it is stable from this open onward.
-            if meta
-                .get(BACKEND_ID_LO)
-                .map_err(|e| MemoryError::build(format!("redb backend identity read failed: {e}")))?
-                .is_none()
-            {
-                let minted = generate_backend_id();
-                meta.insert(BACKEND_ID_LO, minted as u64).map_err(|e| {
+            let backend_id = if let Some(backend_id) = persisted_backend_id {
+                backend_id
+            } else {
+                let backend_id = generate_backend_id();
+                meta.insert(BACKEND_ID_LO, backend_id as u64).map_err(|e| {
                     MemoryError::build(format!("redb backend identity seed failed: {e}"))
                 })?;
-                meta.insert(BACKEND_ID_HI, (minted >> 64) as u64).map_err(|e| {
+                meta.insert(BACKEND_ID_HI, (backend_id >> 64) as u64).map_err(|e| {
                     MemoryError::build(format!("redb backend identity seed failed: {e}"))
                 })?;
-            }
+                backend_id
+            };
             // Schema-2 migration: convert only explicit payload evidence
             // (queue/recovery rows) into exact disposition rows, in the same
             // transaction that stamps the schema version. Ids below the next
@@ -569,11 +779,7 @@ impl RedbSpillBacking {
             // with an explicit unresolved error instead of guessing from the
             // legacy watermark. The legacy watermark itself is preserved
             // untouched and never consulted again.
-            if meta
-                .get(SCHEMA_VERSION)
-                .map_err(|e| MemoryError::build(format!("redb schema version read failed: {e}")))?
-                .is_none()
-            {
+            if schema == PersistedSchema::LegacyV1 {
                 for entry in queue.iter().map_err(|e| {
                     MemoryError::build(format!("redb spill migration scan failed: {e}"))
                 })? {
@@ -598,25 +804,7 @@ impl RedbSpillBacking {
                     MemoryError::build(format!("redb schema version migration failed: {e}"))
                 })?;
             }
-            let lo = meta
-                .get(BACKEND_ID_LO)
-                .map_err(|e| MemoryError::build(format!("redb backend identity read failed: {e}")))?
-                .map(|value| value.value())
-                .ok_or_else(|| {
-                    MemoryError::InvalidState(
-                        "redb backend identity is missing after seeding".into(),
-                    )
-                })?;
-            let hi = meta
-                .get(BACKEND_ID_HI)
-                .map_err(|e| MemoryError::build(format!("redb backend identity read failed: {e}")))?
-                .map(|value| value.value())
-                .ok_or_else(|| {
-                    MemoryError::InvalidState(
-                        "redb backend identity is missing after seeding".into(),
-                    )
-                })?;
-            u128::from(hi) << 64 | u128::from(lo)
+            backend_id
         };
         txn.commit()
             .map_err(|e| MemoryError::build(format!("redb spill metadata commit failed: {e}")))?;
@@ -1921,6 +2109,8 @@ mod tests {
         inner: CappedFileBackend,
         armed: Arc<AtomicBool>,
         observed: Arc<AtomicBool>,
+        attempted_bytes: Arc<AtomicU64>,
+        written_bytes: Arc<AtomicU64>,
     }
 
     impl StorageBackend for PartialWriteBackend {
@@ -1941,13 +2131,41 @@ mod tests {
         }
 
         fn write(&self, offset: u64, data: &[u8]) -> io::Result<()> {
-            if data.len() > 1 && self.armed.swap(false, AtomicOrdering::SeqCst) {
-                self.inner.write(offset, &data[..data.len() / 2])?;
-                self.observed.store(true, AtomicOrdering::SeqCst);
-                return Err(io::Error::new(
-                    io::ErrorKind::StorageFull,
-                    "injected partial Redb file write",
-                ));
+            if data.len() > 1 && self.armed.load(AtomicOrdering::SeqCst) {
+                let prefix_len = data.len() / 2;
+                let before = self.inner.read(offset, prefix_len)?;
+                if before != data[..prefix_len]
+                    && self
+                        .armed
+                        .compare_exchange(
+                            true,
+                            false,
+                            AtomicOrdering::SeqCst,
+                            AtomicOrdering::SeqCst,
+                        )
+                        .is_ok()
+                {
+                    self.inner.write(offset, &data[..prefix_len])?;
+                    let after = self.inner.read(offset, prefix_len)?;
+                    if after != data[..prefix_len] || after == before {
+                        return Err(io::Error::other(
+                            "partial-write injector could not verify changed prefix",
+                        ));
+                    }
+                    self.attempted_bytes.store(
+                        u64::try_from(data.len()).unwrap_or(u64::MAX),
+                        AtomicOrdering::SeqCst,
+                    );
+                    self.written_bytes.store(
+                        u64::try_from(prefix_len).unwrap_or(u64::MAX),
+                        AtomicOrdering::SeqCst,
+                    );
+                    self.observed.store(true, AtomicOrdering::SeqCst);
+                    return Err(io::Error::new(
+                        io::ErrorKind::StorageFull,
+                        "injected partial Redb file write",
+                    ));
+                }
             }
             self.inner.write(offset, data)
         }
@@ -1968,11 +2186,43 @@ mod tests {
         TestDb { directory, path }
     }
 
+    fn assert_no_v2_initialization(database: &Database) {
+        let read = database.begin_read().expect("read rejected fixture");
+        assert!(matches!(
+            read.open_table(SPILL_QUEUE),
+            Err(redb::TableError::TableDoesNotExist(_))
+        ));
+        assert!(matches!(
+            read.open_table(SPILL_RECOVERY),
+            Err(redb::TableError::TableDoesNotExist(_))
+        ));
+        assert!(matches!(
+            read.open_table(SPILL_RECORD_STATE),
+            Err(redb::TableError::TableDoesNotExist(_))
+        ));
+        assert!(matches!(
+            read.open_table(SPILL_FINALIZED_BY),
+            Err(redb::TableError::TableDoesNotExist(_))
+        ));
+        let meta = read.open_table(SPILL_META).expect("fixture metadata");
+        for key in [
+            NEXT_SEQUENCE,
+            RETAINED_PAYLOAD_BYTES,
+            ACTIVE_RESTORE_SEQUENCE,
+            ACTIVE_RESTORE_GENERATION,
+            RESTORE_CLAIM_GENERATION,
+        ] {
+            assert!(meta.get(key).expect("read unseeded metadata").is_none(), "unexpected {key}");
+        }
+    }
+
     fn open_with_partial_write_fault(
         path: &Path,
         limits: RedbSpillLimits,
         armed: Arc<AtomicBool>,
         observed: Arc<AtomicBool>,
+        attempted_bytes: Arc<AtomicU64>,
+        written_bytes: Arc<AtomicU64>,
     ) -> RedbSpillBacking {
         let file = OpenOptions::new()
             .read(true)
@@ -1986,9 +2236,19 @@ mod tests {
         let mut builder = redb::Builder::new();
         builder.set_cache_size(limits.cache_bytes);
         let database = builder
-            .create_with_backend(PartialWriteBackend { inner, armed, observed })
+            .create_with_backend(PartialWriteBackend {
+                inner,
+                armed,
+                observed,
+                attempted_bytes,
+                written_bytes,
+            })
             .expect("open fault-injection database");
-        RedbSpillBacking::initialize(database, limits).expect("initialize fault-injection backing")
+        let schema = RedbSpillBacking::inspect_schema(&database).expect("inspect fault fixture");
+        let backend_id = RedbSpillBacking::inspect_backend_identity(&database, schema)
+            .expect("inspect fault identity");
+        RedbSpillBacking::initialize(database, limits, schema, backend_id)
+            .expect("initialize fault-injection backing")
     }
 
     fn restore_backing(backing: &RedbSpillBacking) -> MemoryResult<Option<Vec<u8>>> {
@@ -2720,6 +2980,95 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_prepare_restore_issues_exactly_one_live_claim() {
+        use std::sync::{Arc, Barrier};
+
+        let db = test_db();
+        let backing = Arc::new(RedbSpillBacking::create(&db.path).expect("open"));
+        let _ = spill_backing(&backing, b"claim").expect("persist");
+        let barrier = Arc::new(Barrier::new(3));
+        let workers = (0..2)
+            .map(|_| {
+                let backing = Arc::clone(&backing);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    backing.prepare_restore()
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+
+        let mut winner = None;
+        let mut blocked = 0;
+        for worker in workers {
+            match worker.join().expect("preparer") {
+                Ok(Some(candidate)) => {
+                    assert!(winner.replace(candidate).is_none(), "two claims escaped");
+                }
+                Err(MemoryError::OperationInProgress(_)) => blocked += 1,
+                other => panic!("unexpected prepare outcome: {other:?}"),
+            }
+        }
+        assert_eq!(blocked, 1);
+        let winner = winner.expect("one live claim");
+        assert_eq!(backing.active_restore(), Ok(Some(DurableRecordId::new(0))));
+        backing.commit_restore(&winner.claim).expect("winner commits");
+        backing.finalize_restore(&winner.claim).expect("winner finalizes");
+        drop(winner);
+        assert_eq!(backing.retained_count(), Ok(0));
+        assert_eq!(backing.restore_buffers_used.load(AtomicOrdering::SeqCst), 0);
+    }
+
+    #[test]
+    fn concurrent_recovery_claims_are_generation_fenced_to_latest_owner() {
+        use std::sync::{Arc, Barrier};
+
+        let db = test_db();
+        let limits = RedbSpillLimits {
+            max_inflight_restore_bytes: 16,
+            max_inflight_restore_buffers: 4,
+            ..tiny_limits()
+        };
+        let backing =
+            Arc::new(RedbSpillBacking::create_with_limits(&db.path, limits).expect("open"));
+        let _ = spill_backing(&backing, b"four").expect("persist");
+        let original = backing.prepare_restore().expect("prepare").expect("original claim");
+        let barrier = Arc::new(Barrier::new(3));
+        let workers = (0..2)
+            .map(|_| {
+                let backing = Arc::clone(&backing);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    backing.recover_active_restore().expect("recover").expect("active")
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+        let mut recovered =
+            workers.into_iter().map(|worker| worker.join().expect("recoverer")).collect::<Vec<_>>();
+        recovered.sort_by_key(|recovery| recovery.candidate.claim.generation());
+        assert_eq!(recovered.len(), 2);
+        assert!(
+            recovered[0].candidate.claim.generation() < recovered[1].candidate.claim.generation()
+        );
+        assert!(matches!(
+            backing.commit_restore(&recovered[0].candidate.claim),
+            Err(DurableCommitFailure::Retained(_))
+        ));
+        backing.commit_restore(&recovered[1].candidate.claim).expect("latest generation commits");
+        backing
+            .finalize_restore(&recovered[1].candidate.claim)
+            .expect("latest generation finalizes");
+        drop(original);
+        drop(recovered);
+        assert_eq!(backing.retained_count(), Ok(0));
+        assert_eq!(backing.restore_budget_used.load(AtomicOrdering::SeqCst), 0);
+        assert_eq!(backing.restore_buffers_used.load(AtomicOrdering::SeqCst), 0);
+    }
+
+    #[test]
     fn tighter_reopen_rejects_existing_inventory_without_erasing_it() {
         let db = test_db();
         let original = tiny_limits();
@@ -2788,14 +3137,48 @@ mod tests {
     }
 
     #[test]
-    fn invalid_limits_reject_before_creating_database_file() {
-        let db = test_db();
-        let invalid = RedbSpillLimits { max_retained_records: 0, ..tiny_limits() };
-        assert!(matches!(
-            RedbSpillBacking::create_with_limits(&db.path, invalid),
-            Err(MemoryError::Config(_))
-        ));
-        assert!(!db.path.exists(), "invalid policy must not create a durable file");
+    fn every_invalid_limit_relation_rejects_before_creating_database_file() {
+        let cases = [
+            ("zero record cap", RedbSpillLimits { max_retained_records: 0, ..tiny_limits() }),
+            ("zero file cap", RedbSpillLimits { max_database_file_bytes: 0, ..tiny_limits() }),
+            (
+                "one restore buffer",
+                RedbSpillLimits { max_inflight_restore_buffers: 1, ..tiny_limits() },
+            ),
+            (
+                "record exceeds retained bytes",
+                RedbSpillLimits {
+                    max_record_bytes: 5,
+                    max_retained_payload_bytes: 4,
+                    max_inflight_restore_bytes: 10,
+                    ..tiny_limits()
+                },
+            ),
+            (
+                "two-buffer byte multiplication overflows",
+                RedbSpillLimits {
+                    max_record_bytes: u64::MAX,
+                    max_retained_payload_bytes: u64::MAX,
+                    max_inflight_restore_bytes: u64::MAX,
+                    ..tiny_limits()
+                },
+            ),
+            (
+                "two-buffer byte budget is short",
+                RedbSpillLimits { max_inflight_restore_bytes: 7, ..tiny_limits() },
+            ),
+        ];
+        for (name, invalid) in cases {
+            let db = test_db();
+            assert!(
+                matches!(
+                    RedbSpillBacking::create_with_limits(&db.path, invalid),
+                    Err(MemoryError::Config(_))
+                ),
+                "{name}"
+            );
+            assert!(!db.path.exists(), "{name} must not create a durable file");
+        }
     }
 
     #[test]
@@ -2944,6 +3327,414 @@ mod tests {
         }
         assert_eq!(reopened.retained_count(), Ok(0));
         assert_eq!(restore_backing(&reopened).expect("empty after drain"), None);
+    }
+
+    #[test]
+    fn partial_storage_full_write_reopens_to_whole_records_only() {
+        let db = test_db();
+        let limits = RedbSpillLimits { max_retained_payload_bytes: 8, ..tiny_limits() };
+        let armed = Arc::new(AtomicBool::new(false));
+        let observed = Arc::new(AtomicBool::new(false));
+        let attempted_bytes = Arc::new(AtomicU64::new(0));
+        let written_bytes = Arc::new(AtomicU64::new(0));
+        let backing = open_with_partial_write_fault(
+            &db.path,
+            limits,
+            Arc::clone(&armed),
+            Arc::clone(&observed),
+            Arc::clone(&attempted_bytes),
+            Arc::clone(&written_bytes),
+        );
+        let anchor = backing.reserve_record_id().expect("reserve anchor");
+        let _receipt = backing.commit_spill(anchor, b"old").expect("commit anchor");
+        let uncertain = backing.reserve_record_id().expect("reserve uncertain record");
+        armed.store(true, AtomicOrdering::SeqCst);
+        let failure = backing.commit_spill(uncertain, b"new!").expect_err("partial I/O fault");
+        assert!(observed.load(AtomicOrdering::SeqCst), "fault must hit a real write");
+        let attempted = attempted_bytes.load(AtomicOrdering::SeqCst);
+        let written = written_bytes.load(AtomicOrdering::SeqCst);
+        assert!(written > 0 && written < attempted, "not a strict partial write");
+        assert!(matches!(
+            failure,
+            DurableWriteFailure::NotCommitted(_) | DurableWriteFailure::RecoveryRequired { .. }
+        ));
+        drop(backing);
+
+        let reopened = RedbSpillBacking::create_with_limits(&db.path, limits).expect("cold reopen");
+        assert_eq!(restore_backing(&reopened).expect("prior record intact"), Some(b"old".to_vec()));
+        match reopened.resolve_record(uncertain).expect("exact postimage") {
+            DurableRecordResolution::Present { .. } => {
+                assert_eq!(
+                    restore_backing(&reopened).expect("whole new record"),
+                    Some(b"new!".to_vec())
+                );
+            }
+            DurableRecordResolution::Absent => {
+                assert_eq!(restore_backing(&reopened).expect("no torn new record"), None);
+            }
+            other => panic!("uncommitted record has impossible disposition {other:?}"),
+        }
+        assert_eq!(reopened.retained_count(), Ok(0));
+    }
+
+    #[test]
+    fn partial_storage_full_during_restore_commit_preserves_one_whole_copy() {
+        let db = test_db();
+        let limits = RedbSpillLimits { max_retained_payload_bytes: 8, ..tiny_limits() };
+        let armed = Arc::new(AtomicBool::new(false));
+        let observed = Arc::new(AtomicBool::new(false));
+        let attempted_bytes = Arc::new(AtomicU64::new(0));
+        let written_bytes = Arc::new(AtomicU64::new(0));
+        let backing = open_with_partial_write_fault(
+            &db.path,
+            limits,
+            Arc::clone(&armed),
+            Arc::clone(&observed),
+            Arc::clone(&attempted_bytes),
+            Arc::clone(&written_bytes),
+        );
+        let id = backing.reserve_record_id().expect("reserve");
+        let _receipt = backing.commit_spill(id, b"four").expect("commit");
+        let candidate = backing.prepare_restore().expect("prepare").expect("candidate");
+        armed.store(true, AtomicOrdering::SeqCst);
+        let _failure =
+            backing.commit_restore(&candidate.claim).expect_err("partial restore-commit I/O fault");
+        assert!(observed.load(AtomicOrdering::SeqCst));
+        let attempted = attempted_bytes.load(AtomicOrdering::SeqCst);
+        let written = written_bytes.load(AtomicOrdering::SeqCst);
+        assert!(written > 0 && written < attempted, "not a strict partial write");
+        drop(candidate);
+        drop(backing);
+
+        let reopened = RedbSpillBacking::create_with_limits(&db.path, limits).expect("cold reopen");
+        assert_eq!(
+            reopened.resolve_record(id),
+            Ok(DurableRecordResolution::Present { inventory_after: 1 })
+        );
+        let recovery = reopened.recover_active_restore().expect("recover").expect("candidate");
+        assert_eq!(recovery.candidate.bytes(), b"four");
+        reopened
+            .commit_restore(&recovery.candidate.claim)
+            .expect("prepared or committed recovery converges");
+        reopened.finalize_restore(&recovery.candidate.claim).expect("finalize recovered record");
+        assert_eq!(reopened.retained_count(), Ok(0));
+    }
+
+    #[test]
+    fn partial_storage_full_during_finalize_reopens_present_or_finalized() {
+        let db = test_db();
+        let limits = RedbSpillLimits { max_retained_payload_bytes: 8, ..tiny_limits() };
+        let armed = Arc::new(AtomicBool::new(false));
+        let observed = Arc::new(AtomicBool::new(false));
+        let attempted_bytes = Arc::new(AtomicU64::new(0));
+        let written_bytes = Arc::new(AtomicU64::new(0));
+        let backing = open_with_partial_write_fault(
+            &db.path,
+            limits,
+            Arc::clone(&armed),
+            Arc::clone(&observed),
+            Arc::clone(&attempted_bytes),
+            Arc::clone(&written_bytes),
+        );
+        let id = backing.reserve_record_id().expect("reserve");
+        let _receipt = backing.commit_spill(id, b"four").expect("commit");
+        let candidate = backing.prepare_restore().expect("prepare").expect("candidate");
+        backing.commit_restore(&candidate.claim).expect("commit restore");
+        armed.store(true, AtomicOrdering::SeqCst);
+        let _failure =
+            backing.finalize_restore(&candidate.claim).expect_err("partial finalize I/O fault");
+        assert!(observed.load(AtomicOrdering::SeqCst));
+        let attempted = attempted_bytes.load(AtomicOrdering::SeqCst);
+        let written = written_bytes.load(AtomicOrdering::SeqCst);
+        assert!(written > 0 && written < attempted, "not a strict partial write");
+        drop(candidate);
+        drop(backing);
+
+        let reopened = RedbSpillBacking::create_with_limits(&db.path, limits).expect("cold reopen");
+        match reopened.resolve_record(id).expect("exact postimage") {
+            DurableRecordResolution::Present { inventory_after: 1 } => {
+                let recovery =
+                    reopened.recover_active_restore().expect("recover").expect("candidate");
+                assert_eq!(recovery.phase, DurableRestorePhase::Committed);
+                assert_eq!(recovery.candidate.bytes(), b"four");
+                reopened
+                    .finalize_restore(&recovery.candidate.claim)
+                    .expect("finish retained record");
+            }
+            DurableRecordResolution::Finalized => {}
+            other => panic!("partial finalize produced impossible postimage {other:?}"),
+        }
+        assert_eq!(reopened.retained_count(), Ok(0));
+    }
+
+    #[test]
+    fn unsupported_explicit_schema_versions_fail_closed_before_v2_initialization() {
+        for version in [0, 1, 3, u64::MAX] {
+            let db = test_db();
+            {
+                let database = Database::create(&db.path).expect("create schema fixture");
+                let txn = database.begin_write().expect("schema fixture txn");
+                {
+                    let mut meta = txn.open_table(SPILL_META).expect("schema fixture metadata");
+                    meta.insert(SCHEMA_VERSION, version).expect("write unsupported schema");
+                    meta.insert("future_schema_sentinel", 97u64).expect("write sentinel");
+                }
+                txn.commit().expect("commit schema fixture");
+            }
+
+            let error = RedbSpillBacking::create(&db.path)
+                .expect_err("unsupported explicit schema must fail closed");
+            assert!(
+                matches!(&error, MemoryError::Unsupported(message)
+                    if message.contains(&version.to_string())),
+                "unexpected rejection for schema {version}: {error:?}"
+            );
+
+            let database = Database::create(&db.path).expect("reopen rejected schema fixture");
+            assert_no_v2_initialization(&database);
+            let read = database.begin_read().expect("read rejected schema fixture");
+            let meta = read.open_table(SPILL_META).expect("schema fixture metadata survives");
+            assert_eq!(
+                meta.get(SCHEMA_VERSION).expect("read rejected schema").map(|value| value.value()),
+                Some(version)
+            );
+            assert_eq!(
+                meta.get("future_schema_sentinel")
+                    .expect("read future sentinel")
+                    .map(|value| value.value()),
+                Some(97)
+            );
+            assert!(meta.get(BACKEND_ID_LO).expect("read backend low").is_none());
+            assert!(meta.get(BACKEND_ID_HI).expect("read backend high").is_none());
+        }
+    }
+
+    #[test]
+    fn missing_schema_marker_on_v2_shaped_database_fails_without_restamping() {
+        let db = test_db();
+        let backend_id = {
+            let backing = RedbSpillBacking::create(&db.path).expect("initialize v2 fixture");
+            let id = backing.reserve_record_id().expect("reserve");
+            let _receipt = backing.commit_spill(id, b"whole").expect("commit");
+            backing.backend_id
+        };
+        {
+            let database = Database::create(&db.path).expect("open v2 fixture");
+            let txn = database.begin_write().expect("v2 fixture txn");
+            {
+                let mut meta = txn.open_table(SPILL_META).expect("open metadata");
+                assert!(meta.remove(SCHEMA_VERSION).expect("remove schema marker").is_some());
+            }
+            txn.commit().expect("commit missing-marker fixture");
+        }
+
+        let error = RedbSpillBacking::create(&db.path)
+            .expect_err("v2 evidence without marker must not migrate as legacy");
+        assert!(matches!(error, MemoryError::InvalidState(_)), "got {error:?}");
+
+        let database = Database::create(&db.path).expect("reopen rejected fixture");
+        let read = database.begin_read().expect("read rejected fixture");
+        let meta = read.open_table(SPILL_META).expect("metadata survives");
+        assert!(meta.get(SCHEMA_VERSION).expect("read schema marker").is_none());
+        let persisted_backend_id = u128::from(
+            meta.get(BACKEND_ID_HI).expect("read high half").expect("high half survives").value(),
+        ) << 64
+            | u128::from(
+                meta.get(BACKEND_ID_LO).expect("read low half").expect("low half survives").value(),
+            );
+        assert_eq!(persisted_backend_id, backend_id);
+        let queue = read.open_table(SPILL_QUEUE).expect("queue survives");
+        assert_eq!(
+            queue.get(0).expect("read payload").map(|value| value.value().to_vec()),
+            Some(b"whole".to_vec())
+        );
+        let states = read.open_table(SPILL_RECORD_STATE).expect("states survive");
+        assert_eq!(
+            states.get(0).expect("read state").map(|value| value.value()),
+            Some(RecordDisposition::Queued as u8)
+        );
+    }
+
+    #[test]
+    fn missing_metadata_table_on_v2_shaped_database_fails_without_recreation() {
+        let db = test_db();
+        {
+            let backing = RedbSpillBacking::create(&db.path).expect("initialize v2 fixture");
+            let id = backing.reserve_record_id().expect("reserve");
+            let _receipt = backing.commit_spill(id, b"whole").expect("commit");
+        }
+        {
+            let database = Database::create(&db.path).expect("open v2 fixture");
+            let txn = database.begin_write().expect("v2 fixture txn");
+            assert!(txn.delete_table(SPILL_META).expect("delete metadata"));
+            txn.commit().expect("commit missing-metadata fixture");
+        }
+
+        let error = RedbSpillBacking::create(&db.path)
+            .expect_err("v2 tables without metadata must not initialize as legacy");
+        assert!(matches!(error, MemoryError::InvalidState(_)), "got {error:?}");
+
+        let database = Database::create(&db.path).expect("reopen rejected fixture");
+        let read = database.begin_read().expect("read rejected fixture");
+        assert!(matches!(read.open_table(SPILL_META), Err(redb::TableError::TableDoesNotExist(_))));
+        let queue = read.open_table(SPILL_QUEUE).expect("queue survives");
+        assert_eq!(
+            queue.get(0).expect("read payload").map(|value| value.value().to_vec()),
+            Some(b"whole".to_vec())
+        );
+        let states = read.open_table(SPILL_RECORD_STATE).expect("states survive");
+        assert_eq!(
+            states.get(0).expect("read state").map(|value| value.value()),
+            Some(RecordDisposition::Queued as u8)
+        );
+    }
+
+    #[test]
+    fn incomplete_backend_identity_fails_closed_without_replacing_surviving_half() {
+        for (low, high) in [(Some(11u64), None), (None, Some(13u64)), (None, None)] {
+            let db = test_db();
+            {
+                let database = Database::create(&db.path).expect("create identity fixture");
+                let txn = database.begin_write().expect("identity fixture txn");
+                {
+                    let mut meta = txn.open_table(SPILL_META).expect("identity fixture metadata");
+                    meta.insert(SCHEMA_VERSION, SCHEMA_VERSION_V2).expect("write current schema");
+                    if let Some(low) = low {
+                        meta.insert(BACKEND_ID_LO, low).expect("write low half");
+                    }
+                    if let Some(high) = high {
+                        meta.insert(BACKEND_ID_HI, high).expect("write high half");
+                    }
+                }
+                txn.commit().expect("commit identity fixture");
+            }
+
+            let error = RedbSpillBacking::create(&db.path)
+                .expect_err("incomplete backend identity must fail closed");
+            assert!(matches!(error, MemoryError::InvalidState(_)), "got {error:?}");
+
+            let database = Database::create(&db.path).expect("reopen rejected identity fixture");
+            assert_no_v2_initialization(&database);
+            let read = database.begin_read().expect("read rejected identity fixture");
+            let meta = read.open_table(SPILL_META).expect("identity fixture metadata survives");
+            assert_eq!(
+                meta.get(BACKEND_ID_LO).expect("read low half").map(|value| value.value()),
+                low
+            );
+            assert_eq!(
+                meta.get(BACKEND_ID_HI).expect("read high half").map(|value| value.value()),
+                high
+            );
+            assert_eq!(
+                meta.get(SCHEMA_VERSION).expect("read current schema").map(|value| value.value()),
+                Some(SCHEMA_VERSION_V2)
+            );
+        }
+    }
+
+    #[test]
+    fn schema_v2_missing_required_authority_fails_without_recreating_it() {
+        for missing in ["queue", "recovery", "state", "proof", "next_sequence"] {
+            let db = test_db();
+            drop(RedbSpillBacking::create(&db.path).expect("initialize v2 fixture"));
+            {
+                let database = Database::create(&db.path).expect("open v2 fixture");
+                let txn = database.begin_write().expect("v2 fixture txn");
+                match missing {
+                    "queue" => assert!(txn.delete_table(SPILL_QUEUE).expect("delete queue")),
+                    "recovery" => {
+                        assert!(txn.delete_table(SPILL_RECOVERY).expect("delete recovery"));
+                    }
+                    "state" => {
+                        assert!(txn.delete_table(SPILL_RECORD_STATE).expect("delete state"));
+                    }
+                    "proof" => {
+                        assert!(txn.delete_table(SPILL_FINALIZED_BY).expect("delete proof"));
+                    }
+                    "next_sequence" => {
+                        let mut meta = txn.open_table(SPILL_META).expect("open metadata");
+                        assert!(meta.remove(NEXT_SEQUENCE).expect("remove frontier").is_some());
+                    }
+                    _ => unreachable!(),
+                }
+                txn.commit().expect("commit malformed fixture");
+            }
+
+            let error = RedbSpillBacking::create(&db.path)
+                .expect_err("incomplete v2 authority must fail closed");
+            assert!(matches!(error, MemoryError::InvalidState(_)), "{missing}: {error:?}");
+
+            let database = Database::create(&db.path).expect("reopen rejected v2 fixture");
+            let read = database.begin_read().expect("read rejected v2 fixture");
+            match missing {
+                "queue" => assert!(matches!(
+                    read.open_table(SPILL_QUEUE),
+                    Err(redb::TableError::TableDoesNotExist(_))
+                )),
+                "recovery" => assert!(matches!(
+                    read.open_table(SPILL_RECOVERY),
+                    Err(redb::TableError::TableDoesNotExist(_))
+                )),
+                "state" => assert!(matches!(
+                    read.open_table(SPILL_RECORD_STATE),
+                    Err(redb::TableError::TableDoesNotExist(_))
+                )),
+                "proof" => assert!(matches!(
+                    read.open_table(SPILL_FINALIZED_BY),
+                    Err(redb::TableError::TableDoesNotExist(_))
+                )),
+                "next_sequence" => {
+                    let meta = read.open_table(SPILL_META).expect("metadata survives");
+                    assert!(meta.get(NEXT_SEQUENCE).expect("read frontier").is_none());
+                }
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    #[test]
+    fn schema_v2_payload_disposition_mismatch_fails_without_repair() {
+        for corrupted in [None, Some(RecordDisposition::Recovery as u8), Some(u8::MAX)] {
+            let db = test_db();
+            {
+                let backing = RedbSpillBacking::create(&db.path).expect("initialize v2 fixture");
+                let id = backing.reserve_record_id().expect("reserve");
+                let _receipt = backing.commit_spill(id, b"whole").expect("commit");
+            }
+            {
+                let database = Database::create(&db.path).expect("open v2 fixture");
+                let txn = database.begin_write().expect("v2 fixture txn");
+                {
+                    let mut states = txn.open_table(SPILL_RECORD_STATE).expect("open states");
+                    match corrupted {
+                        Some(raw) => {
+                            states.insert(0, raw).expect("write corrupt disposition");
+                        }
+                        None => {
+                            assert!(states.remove(0).expect("remove disposition").is_some());
+                        }
+                    }
+                }
+                txn.commit().expect("commit malformed fixture");
+            }
+
+            let error = RedbSpillBacking::create(&db.path)
+                .expect_err("payload/disposition mismatch must fail closed");
+            assert!(matches!(error, MemoryError::InvalidState(_)), "got {error:?}");
+
+            let database = Database::create(&db.path).expect("reopen rejected v2 fixture");
+            let read = database.begin_read().expect("read rejected v2 fixture");
+            let queue = read.open_table(SPILL_QUEUE).expect("queue survives");
+            assert_eq!(
+                queue.get(0).expect("read payload").map(|value| value.value().to_vec()),
+                Some(b"whole".to_vec())
+            );
+            let states = read.open_table(SPILL_RECORD_STATE).expect("states survive");
+            assert_eq!(
+                states.get(0).expect("read disposition").map(|value| value.value()),
+                corrupted
+            );
+        }
     }
 
     #[test]
@@ -3164,6 +3955,48 @@ mod tests {
         assert_eq!(recovery.candidate.bytes(), b"stable");
         backing.commit_restore(&recovery.candidate.claim).expect("recovered claim commits");
         backing.finalize_restore(&recovery.candidate.claim).expect("recovered claim finalizes");
+    }
+
+    #[test]
+    fn backend_identity_and_pending_claim_survive_cold_rename() {
+        let db = test_db();
+        let renamed = db.directory.join("renamed.redb");
+        let candidate = {
+            let backing = RedbSpillBacking::create(&db.path).expect("open original");
+            let id = backing.reserve_record_id().expect("reserve");
+            let _receipt = backing.commit_spill(id, b"rename").expect("commit");
+            backing.prepare_restore().expect("prepare").expect("candidate")
+        };
+        std::fs::rename(&db.path, &renamed).expect("cold rename");
+
+        let reopened = RedbSpillBacking::create(&renamed).expect("open renamed lineage");
+        assert_eq!(reopened.backend_id, candidate.claim.backend());
+        reopened.commit_restore(&candidate.claim).expect("pre-rename claim commits");
+        reopened.finalize_restore(&candidate.claim).expect("pre-rename claim finalizes");
+        assert_eq!(reopened.retained_count(), Ok(0));
+    }
+
+    #[test]
+    fn consistent_cold_copy_preserves_logical_lineage_identity() {
+        let db = test_db();
+        let copied = db.directory.join("copied.redb");
+        let candidate = {
+            let backing = RedbSpillBacking::create(&db.path).expect("open original");
+            let id = backing.reserve_record_id().expect("reserve");
+            let _receipt = backing.commit_spill(id, b"snapshot").expect("commit");
+            backing.prepare_restore().expect("prepare").expect("candidate")
+        };
+        std::fs::copy(&db.path, &copied).expect("copy quiesced database");
+
+        let replacement = RedbSpillBacking::create(&copied).expect("open copied lineage");
+        assert_eq!(replacement.backend_id, candidate.claim.backend());
+        replacement
+            .commit_restore(&candidate.claim)
+            .expect("same-lineage claim commits on replacement");
+        replacement
+            .finalize_restore(&candidate.claim)
+            .expect("same-lineage claim finalizes on replacement");
+        assert_eq!(replacement.retained_count(), Ok(0));
     }
 
     // Self-audit P2-1: a landed finalize is terminal. Retrying it with the

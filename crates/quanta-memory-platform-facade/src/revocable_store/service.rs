@@ -1850,6 +1850,50 @@ mod tests {
 
     #[cfg(feature = "spill-redb")]
     #[test]
+    fn oversized_encoded_record_preserves_charged_source_and_no_durable_payload() {
+        use crate::spill::backings::redb::{RedbSpillBacking, RedbSpillLimits};
+        static DB_SEQ: AtomicUsize = AtomicUsize::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "qmp-revocable-record-cap-{}-{}.redb",
+            std::process::id(),
+            DB_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_file(&path);
+        let limits = RedbSpillLimits {
+            max_record_bytes: 3,
+            max_retained_payload_bytes: 3,
+            max_inflight_restore_bytes: 6,
+            ..RedbSpillLimits::default()
+        };
+        let broker = live_broker(1_000_000);
+        let store = store_with_broker(&broker);
+        store.insert_checked("source".into(), vec![1, 2, 3, 4]).expect("insert");
+        let charged = store.committed_bytes().expect("initial charge");
+        let controller = RoutedSpillController::new(
+            RedbSpillBacking::create_with_limits(&path, limits).expect("open"),
+        );
+
+        let denied = store.spill_one_durable(&controller, |_, value| Ok(value.clone()));
+        assert!(matches!(denied, Err(MemoryError::Capacity(_))), "got {denied:?}");
+        assert_eq!(store.pending_durable_spills(), Ok(Vec::new()));
+        assert_eq!(store.committed_bytes(), Ok(charged));
+        assert_eq!(broker.ledger_snapshot().expect("ledger").total_owner_bytes(), charged);
+        assert_eq!(controller.spilled_count(), Ok(0));
+        drop(controller);
+
+        let reopened = RedbSpillBacking::create_with_limits(&path, limits).expect("cold reopen");
+        assert_eq!(reopened.retained_count(), Ok(0));
+        assert_eq!(
+            store.reclaim_one().expect("resident source"),
+            Some(("source".into(), vec![1, 2, 3, 4]))
+        );
+        assert_eq!(broker.ledger_snapshot().expect("drained").total_owner_bytes(), 0);
+        drop(reopened);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(feature = "spill-redb")]
+    #[test]
     fn redb_file_cap_denial_keeps_store_source_charged_until_exact_resolution() {
         use crate::spill::backings::redb::{RedbSpillBacking, RedbSpillLimits};
         static DB_SEQ: AtomicUsize = AtomicUsize::new(0);

@@ -186,8 +186,11 @@ impl DurableRestoreClaim {
         Self::issued(backend, generation, sequence)
     }
 
-    /// Persisted identity of the backend file that issued this claim. Stable
-    /// across renames and reopens; distinct files hold distinct identities.
+    /// Persisted logical-lineage identity of the backend that issued this
+    /// claim. Stable across renames and reopens. A consistent byte copy,
+    /// reflink, or restored snapshot preserves the same lineage and must be
+    /// treated as a replacement/backup, not as an independently writable
+    /// backend. Independently initialized backends hold distinct identities.
     #[must_use]
     pub fn backend(&self) -> u128 {
         self.backend

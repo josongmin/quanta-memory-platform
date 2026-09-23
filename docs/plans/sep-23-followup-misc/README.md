@@ -1,6 +1,6 @@
 # Sep-23 follow-up misc — 실행 계획
 
-Status: `FUP-001..007 EXACT-SOURCE CANDIDATE QUALIFIED — local repository / extraction / benchmark / host-pair GREEN; no v5 tag; separate product checklist has OPEN items`
+Status: `FUP-001..007 implementation complete on historical candidate; current Redb revision has dirty-worktree local GREEN only. Clean-source extraction, benchmark and host-pair qualification remain OPEN; no v5 tag or activation.`
 작성일: `2026-09-23`
 계획 기준 HEAD: `028448946caa95676df034481a830c1d3e3b1f33`
 계획 기준 tree: `f983669731805a330200213bad7bf1bd5573f308`
@@ -21,7 +21,9 @@ canonical repository, real extraction, full scaling verifier가 통과했다. �
 활성 sibling checkout을 빌드 입력으로 쓰지 않고 clean detached bundle을 만들어
 exact-source host-pair도 통과했다. 현재 full-followup 후보의 local qualification은
 완료했으며 v5 tag/push는 별도 승인 경계라 발행하지 않았다. 이는 별도 100항목 제품
-체크리스트의 완료가 아니며 B07/J06 및 물리/운영 경계는 OPEN이다. 정확한
+체크리스트의 완료가 아니며 B07/J06 및 물리/운영 경계는 OPEN이다. 위의
+extraction/benchmark/host-pair 결과는 후속 Redb schema/resource 변경 이전의
+후보에만 적용된다. 현재 후보는 별도로 동결·재검증해야 한다. 정확한
 source/result tuple과 잔여 경계는
 `RECEIPT.md` 및 `tickets/HOST-PAIR-RUNTIME-DEFAULT-PROVENANCE.md`가 소유한다.
 

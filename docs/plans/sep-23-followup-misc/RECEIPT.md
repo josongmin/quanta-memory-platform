@@ -1,6 +1,6 @@
 # Sep-23 follow-up qualification receipt
 
-Status: `EXACT-SOURCE CANDIDATE QUALIFIED — local repository, extraction, benchmark, and host-pair GREEN; hosted CI/deploy/activation NOT RUN; no v5 tag`
+Status: `HISTORICAL exact-source candidate qualified before later Redb changes. Current revision: dirty-worktree local rail and isolated ENOSPC oracle GREEN; clean-source extraction, benchmark, host-pair, hosted CI, deploy and activation NOT QUALIFIED; no v5 tag.`
 Scope: `full-followup` (`FUP-001` through `FUP-007`)
 Date: `2026-09-23 Asia/Seoul`
 
