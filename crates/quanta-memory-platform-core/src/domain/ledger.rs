@@ -610,6 +610,23 @@ impl AccountingLedger {
             ));
         }
 
+        // This authority bound is independent of byte budgets: admitting a
+        // zero-byte ticket still grows ticket state and per-ticket bookkeeping.
+        if self.ticket_states.len() >= crate::domain::management_limits::MAX_LIVE_TICKETS_PER_BROKER
+        {
+            return Err(MemoryError::capacity(format!(
+                "live reservation ticket limit {} reached",
+                crate::domain::management_limits::MAX_LIVE_TICKETS_PER_BROKER
+            )));
+        }
+        let owner_key_bytes = owner.len();
+        if owner_key_bytes > crate::domain::management_limits::MAX_OWNER_KEY_BYTES {
+            return Err(MemoryError::capacity(format!(
+                "owner identifier is {owner_key_bytes} bytes; maximum is {}",
+                crate::domain::management_limits::MAX_OWNER_KEY_BYTES
+            )));
+        }
+
         // --- pure checks, no mutation yet ---
         //
         // The admission engine is the single rule implementation shared with
@@ -1027,6 +1044,58 @@ mod tests {
             ChargeKind::RetainedPayload,
             bytes,
         )
+    }
+
+    #[test]
+    fn zero_byte_tickets_obey_independent_live_ticket_cap_fail_closed() {
+        let mut ledger = ledger_from_policy(ResidencyPolicy::new(1_000));
+        let mut tickets =
+            Vec::with_capacity(crate::domain::management_limits::MAX_LIVE_TICKETS_PER_BROKER);
+        for _ in 0..crate::domain::management_limits::MAX_LIVE_TICKETS_PER_BROKER {
+            tickets.push(
+                reserve(&mut ledger, MemoryClass::ArtifactCache, "zero", 0)
+                    .expect("ticket count below the independent cap"),
+            );
+        }
+        let before = ledger.snapshot();
+        assert_eq!(
+            before.live_ticket_count,
+            crate::domain::management_limits::MAX_LIVE_TICKETS_PER_BROKER
+        );
+        let denied = reserve(&mut ledger, MemoryClass::ArtifactCache, "zero", 0);
+        assert!(matches!(denied, Err(MemoryError::Capacity(_))));
+        assert_eq!(ledger.snapshot(), before, "denied zero-byte ticket must be atomic");
+
+        ledger.rollback_pending(&tickets.pop().expect("one ticket exists")).expect("free slot");
+        reserve(&mut ledger, MemoryClass::ArtifactCache, "zero", 0)
+            .expect("released ticket returns one bounded slot");
+        assert_eq!(
+            ledger.snapshot().live_ticket_count,
+            crate::domain::management_limits::MAX_LIVE_TICKETS_PER_BROKER
+        );
+    }
+
+    #[test]
+    fn owner_key_byte_limit_is_exact_and_denial_is_fail_closed() {
+        let mut ledger = ledger_from_policy(ResidencyPolicy::new(1_000));
+        let max = "x".repeat(crate::domain::management_limits::MAX_OWNER_KEY_BYTES);
+        reserve(&mut ledger, MemoryClass::ArtifactCache, &max, 0)
+            .expect("exact byte limit is admitted");
+        let before = ledger.snapshot();
+        let too_long = format!("{max}x");
+        let denied = reserve(&mut ledger, MemoryClass::ArtifactCache, &too_long, 0);
+        assert!(matches!(denied, Err(MemoryError::Capacity(_))));
+        assert_eq!(ledger.snapshot(), before, "invalid owner key must not mutate");
+
+        let mut utf8_ledger = ledger_from_policy(ResidencyPolicy::new(1_000));
+        let multibyte_exact = "é".repeat(crate::domain::management_limits::MAX_OWNER_KEY_BYTES / 2);
+        reserve(&mut utf8_ledger, MemoryClass::ArtifactCache, &multibyte_exact, 0)
+            .expect("limit counts UTF-8 storage bytes");
+        let overlong_utf8 = format!("{multibyte_exact}é");
+        assert!(matches!(
+            reserve(&mut utf8_ledger, MemoryClass::ArtifactCache, &overlong_utf8, 0),
+            Err(MemoryError::Capacity(_))
+        ));
     }
 
     // ---- #1: the global hard limit is enforced on reserve (was advisory) ----

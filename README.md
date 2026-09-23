@@ -64,6 +64,13 @@ cargo run -p quanta-memory-platform-facade --example effective_budget_report
 | Transfer | In-process and durable spill/restore preserve exactly one authority and fence uncertain durable outcomes for reconciliation. |
 | Correctness tooling | Conformance fakes, deterministic fault scenarios, allocation tracking, Loom models, feature-matrix checks, and standalone extraction checks. |
 
+Management metadata has independent public bounds because a zero-byte ticket
+still owns single-use authority: one broker admits at most
+MAX_LIVE_TICKETS_PER_BROKER live tickets, owner and resource-group identifiers
+are limited to 256 UTF-8 bytes, and deferred ticket cleanup processes at most
+MAX_DEFERRED_TICKET_DRAIN_BATCH authorities per broker-lock acquisition. These
+are logical bookkeeping bounds, not an RSS guarantee.
+
 The detailed authority map, feature choices, lifecycle transitions, failure
 semantics, and verification scope are in [README-detailed.md](README-detailed.md).
 

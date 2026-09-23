@@ -107,6 +107,10 @@ pub use domain::errors::{
     StoreWriteError,
 };
 pub use domain::ledger::{ChargeKind, LedgerSnapshot, UsageBreakdown};
+pub use domain::management_limits::{
+    MAX_DEFERRED_TICKET_DRAIN_BATCH, MAX_LIVE_TICKETS_PER_BROKER, MAX_OWNER_KEY_BYTES,
+    MAX_RESOURCE_GROUP_KEY_BYTES,
+};
 pub use domain::policy::{
     ExecutionBudget, MemoryBudgetManifest, MemoryClass, MemoryClassBudget, MemoryPreset,
     OwnerQuota, ReclaimPriority, ResidencyPolicy, ResourceGroup,

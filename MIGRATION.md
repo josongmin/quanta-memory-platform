@@ -70,6 +70,19 @@ Removing a resource group or remapping an owner while ANY live ticket
 `InvalidState`. Previously a mapping with only 0-byte tickets could be
 removed. No signature changed.
 
+### Live management metadata is bounded (behavior)
+
+Live reservation admission now rejects the ticket after
+MAX_LIVE_TICKETS_PER_BROKER simultaneous authorities, including 0-byte
+reservations. Owner and resource-group identifiers longer than their exported
+256 UTF-8-byte limits are rejected (`Capacity` for runtime owner input,
+`Config` for policy input). Deferred cleanup remains fail-closed and drains in
+batches of at most MAX_DEFERRED_TICKET_DRAIN_BATCH tickets per lock hold; a
+stuck pending cleanup is surfaced as `InvalidState` with its authority retained.
+Consumers that create more than the limit of overlapping permits must release
+or commit-and-release older permits before admitting more. These are logical
+metadata limits, not allocator/RSS limits.
+
 ## Required consumer changes
 
 - Construct live authority through `MemoryPlatformBuilder`,

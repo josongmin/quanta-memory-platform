@@ -413,3 +413,10 @@ hosted CI, deploy, activation, and physical memory-cap qualification were not
 run. Earlier v3/v4 immutable tags remain unchanged. A v5 annotated tag/push
 was not created because repository policy makes tag/release publication a
 separate approval boundary.
+
+Addendum (2026-09-23, post-v5): the mid-finalize instruction-point kill
+residual above is superseded by the DURABILITY-001 L1 rail (2/2 GREEN,
+4/4 negative mutants RED with byte-identical reverts, 20-iteration stress
+GREEN, canonical rail exit 0 with 224 selectors). The v5-candidate
+statement is preserved as history. Power loss stays UNVERIFIED (L3);
+frozen-candidate Slice D receipt is tracked in `tickets/DURABILITY-001-*`.

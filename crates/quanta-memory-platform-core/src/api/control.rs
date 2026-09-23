@@ -7,7 +7,7 @@
 //! application-layer scheduler and pressure controller. Allocator telemetry is
 //! observed only through the advisory lane and never mutates the ledger.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use crate::adapters::scratch::BrokerBoundScratchAllocator;
@@ -65,14 +65,15 @@ struct BrokerCore {
     ticket_owners: BTreeMap<u64, OwnerKey>,
     /// Committed charges whose last owning lease was dropped while the rebuild
     /// fence was closed. They remain charged until `finish_rebuild` opens the
-    /// fence and releases the complete batch atomically.
-    deferred_committed_releases: Vec<ReservationTicket>,
+    /// fence and releases bounded atomic batches. This queue is a subset of live
+    /// ticket authorities, so the ledger ticket cap also bounds its backlog.
+    deferred_committed_releases: VecDeque<ReservationTicket>,
     /// Pending tickets whose `Drop` rollback failed outside the normal path
     /// (reachable only through an internal invariant break once reconfigure
     /// guards live-ticket scope). The exact ticket authority is preserved here
     /// instead of being silently discarded, and retried on the next
     /// `finish_rebuild` or accepted reconfigure; failures stay queued.
-    deferred_pending_rollbacks: Vec<ReservationTicket>,
+    deferred_pending_rollbacks: VecDeque<ReservationTicket>,
     reclaimer: Option<Arc<dyn MemoryReclaimer>>,
     reclaim_stats: ReclaimRuntimeStats,
 }
@@ -412,8 +413,8 @@ impl LiveProcessMemoryBroker {
                 report,
                 ticket_groups: BTreeMap::new(),
                 ticket_owners: BTreeMap::new(),
-                deferred_committed_releases: Vec::new(),
-                deferred_pending_rollbacks: Vec::new(),
+                deferred_committed_releases: VecDeque::new(),
+                deferred_pending_rollbacks: VecDeque::new(),
                 reclaimer,
                 reclaim_stats: ReclaimRuntimeStats::default(),
             })),
@@ -936,6 +937,17 @@ impl LiveProcessMemoryBroker {
         bytes: u64,
         commit: bool,
     ) -> MemoryResult<ReservationTicket> {
+        // Reject oversized identifiers before preflight can invoke host reclaim
+        // callbacks or mutate diagnostic counters. `reserve_on` and the ledger
+        // repeat the check at the mutation authority boundary.
+        if owner.len() > crate::domain::management_limits::MAX_OWNER_KEY_BYTES {
+            return Err(MemoryError::capacity(format!(
+                "owner identifier is {} bytes; maximum is {}",
+                owner.len(),
+                crate::domain::management_limits::MAX_OWNER_KEY_BYTES
+            )));
+        }
+
         // Locked preflight FIRST: Blocked and Terminal verdicts return before
         // any callback is even built. A predicted failure goes straight to the
         // hard (capacity-denial) plan — a soft request is only proactive, sent
@@ -1098,7 +1110,7 @@ impl LiveProcessMemoryBroker {
         // ever happens the exact ticket is preserved in the deferred queue for a
         // later retry instead of stranding charged capacity with no owner.
         if Self::rollback_pending_on(&mut core, ticket).is_err() {
-            core.deferred_pending_rollbacks.push(ticket.clone());
+            core.deferred_pending_rollbacks.push_back(ticket.clone());
         }
     }
 
@@ -1106,13 +1118,42 @@ impl LiveProcessMemoryBroker {
     /// individually fail-closed; tickets that still fail stay queued with their
     /// authority intact. Called after `finish_rebuild` and after an accepted
     /// reconfigure (which may have restored a missing group scope).
-    fn drain_deferred_pending_rollbacks(core: &mut BrokerCore) {
-        let deferred = std::mem::take(&mut core.deferred_pending_rollbacks);
-        for ticket in deferred {
+    fn drain_deferred_pending_rollbacks_batch(core: &mut BrokerCore) -> usize {
+        // Each lock acquisition handles at most one bounded batch; queue size
+        // itself is bounded by the live-ticket admission cap.
+        let count = core
+            .deferred_pending_rollbacks
+            .len()
+            .min(crate::domain::management_limits::MAX_DEFERRED_TICKET_DRAIN_BATCH);
+        let mut resolved = 0;
+        for _ in 0..count {
+            let Some(ticket) = core.deferred_pending_rollbacks.pop_front() else {
+                break;
+            };
             if Self::rollback_pending_on(core, &ticket).is_err() {
-                core.deferred_pending_rollbacks.push(ticket);
+                core.deferred_pending_rollbacks.push_back(ticket);
+            } else {
+                resolved += 1;
             }
         }
+        resolved
+    }
+
+    fn drain_deferred_committed_releases_batch(core: &mut BrokerCore) -> MemoryResult<usize> {
+        let count = core
+            .deferred_committed_releases
+            .len()
+            .min(crate::domain::management_limits::MAX_DEFERRED_TICKET_DRAIN_BATCH);
+        let deferred: Vec<_> =
+            (0..count).filter_map(|_| core.deferred_committed_releases.pop_front()).collect();
+        if let Err(error) = Self::release_many_on(core, &deferred) {
+            // Batch release is atomic; restore exact authority and FIFO order.
+            for ticket in deferred.into_iter().rev() {
+                core.deferred_committed_releases.push_front(ticket);
+            }
+            return Err(error);
+        }
+        Ok(deferred.len())
     }
 
     /// Emergency cleanup for the last owner of a committed charge.
@@ -1127,7 +1168,7 @@ impl LiveProcessMemoryBroker {
         let bytes = ticket.bytes();
         let mut core = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         if core.ledger.rebuild_in_progress() {
-            core.deferred_committed_releases.push(ticket);
+            core.deferred_committed_releases.push_back(ticket);
             drop(core);
             self.emit(MemoryEvent::new(MemoryOperation::Release, MemoryOutcome::Busy, Some(bytes)));
             return;
@@ -1138,7 +1179,7 @@ impl LiveProcessMemoryBroker {
         // Retain the exact ticket in the deferred owner queue instead of silently
         // discarding authority if that invariant is ever violated.
         let outcome = if Self::release_on(&mut core, &ticket).is_err() {
-            core.deferred_committed_releases.push(ticket);
+            core.deferred_committed_releases.push_back(ticket);
             MemoryOutcome::InvalidState
         } else {
             MemoryOutcome::Succeeded
@@ -1202,6 +1243,14 @@ impl LiveProcessMemoryBroker {
         bytes: u64,
     ) -> MemoryResult<ReservationTicket> {
         use crate::application::scheduler::ResourceGroupScheduler;
+
+        let owner_key_bytes = owner.len();
+        if owner_key_bytes > crate::domain::management_limits::MAX_OWNER_KEY_BYTES {
+            return Err(MemoryError::capacity(format!(
+                "owner identifier is {owner_key_bytes} bytes; maximum is {}",
+                crate::domain::management_limits::MAX_OWNER_KEY_BYTES
+            )));
+        }
 
         // D: resource-group admission. An owner mapped to a group must pass the
         // weighted-fair scheduler (anti-starvation) before it can reserve.
@@ -1364,19 +1413,35 @@ impl LiveProcessMemoryBroker {
     }
 
     pub fn finish_rebuild(&self) -> MemoryResult<()> {
-        let mut core = self.lock()?;
-        core.ledger.finish_rebuild();
-        // Retry any pending authority preserved from a failed Drop rollback
-        // before draining committed releases; still-failing tickets stay queued.
-        Self::drain_deferred_pending_rollbacks(&mut core);
-        let deferred = std::mem::take(&mut core.deferred_committed_releases);
-        if let Err(error) = Self::release_many_on(&mut core, &deferred) {
-            // Batch release pre-validates before mutation. Preserve every queued
-            // authority for a later retry if an internal inconsistency is found.
-            core.deferred_committed_releases = deferred;
-            return Err(error);
+        {
+            let mut core = self.lock()?;
+            core.ledger.finish_rebuild();
         }
-        Ok(())
+        // The existing contract opens admission before deferred committed
+        // releases are applied. Keep that ordering, but release the lock between
+        // bounded batches so a large (yet ticket-bounded) backlog cannot create
+        // one unbounded critical section. Charges remain conservatively counted
+        // until their own atomic batch succeeds.
+        loop {
+            let mut core = self.lock()?;
+            if core.deferred_pending_rollbacks.is_empty()
+                && core.deferred_committed_releases.is_empty()
+            {
+                return Ok(());
+            }
+            let queued_before =
+                core.deferred_pending_rollbacks.len() + core.deferred_committed_releases.len();
+            let pending_resolved = Self::drain_deferred_pending_rollbacks_batch(&mut core);
+            let committed_released = Self::drain_deferred_committed_releases_batch(&mut core)?;
+            let queued_after =
+                core.deferred_pending_rollbacks.len() + core.deferred_committed_releases.len();
+            if queued_after >= queued_before && pending_resolved == 0 && committed_released == 0 {
+                return Err(MemoryError::InvalidState(format!(
+                    "rebuild cleanup made no progress; {} deferred ticket authorities remain",
+                    queued_after
+                )));
+            }
+        }
     }
 
     /// Current pressure classification from semantic usage (not allocator
@@ -1525,7 +1590,7 @@ impl LiveProcessMemoryBroker {
         // preserving usage counters.
         core.install_policy(validated, OverrideSource::RuntimeReconfigure)?;
         // A restored group scope may unblock preserved pending authority.
-        Self::drain_deferred_pending_rollbacks(&mut core);
+        Self::drain_deferred_pending_rollbacks_batch(&mut core);
         Ok(())
     }
 
@@ -1756,6 +1821,23 @@ mod tests {
     }
 
     #[test]
+    fn overlong_owner_is_denied_before_reclaim_or_accounting() {
+        let b = broker();
+        let before = b.ledger_snapshot().expect("before snapshot");
+        let owner = "o".repeat(crate::domain::management_limits::MAX_OWNER_KEY_BYTES + 1);
+        let result = b.reserve_owned(
+            MemoryClass::ArtifactCache,
+            owner,
+            MemoryContextKind::Request,
+            ChargeKind::RetainedPayload,
+            0,
+        );
+        assert!(matches!(result, Err(MemoryError::Capacity(_))));
+        assert_eq!(b.ledger_snapshot().expect("after snapshot"), before);
+        assert_eq!(b.reclaim_runtime_stats().expect("reclaim stats").attempts, 0);
+    }
+
+    #[test]
     fn scratch_reserve_cap_overflow_is_denied_without_mutation() {
         let mut report = report_with(ResidencyPolicy::new(u64::MAX));
         report.execution.max_execution_scratch_bytes = Some(usize::MAX);
@@ -1935,6 +2017,37 @@ mod tests {
                 bytes,
             )
             .expect("reserve managed charge")
+    }
+
+    #[test]
+    fn deferred_committed_cleanup_is_batched_and_drains_large_backlog() {
+        let b = broker();
+        let count = crate::domain::management_limits::MAX_DEFERRED_TICKET_DRAIN_BATCH * 2 + 17;
+        let charges: Vec<_> = (0..count).map(|_| managed_charge(&b, 0)).collect();
+        b.begin_rebuild().expect("begin rebuild");
+        drop(charges);
+        assert_eq!(b.inner.lock().expect("core").deferred_committed_releases.len(), count);
+
+        // Exercise the critical-section unit directly: the first pass may
+        // consume only one configured batch, leaving the exact remainder queued.
+        {
+            let mut core = b.inner.lock().expect("core");
+            core.ledger.finish_rebuild();
+            assert_eq!(
+                LiveProcessMemoryBroker::drain_deferred_committed_releases_batch(&mut core)
+                    .expect("first bounded batch"),
+                crate::domain::management_limits::MAX_DEFERRED_TICKET_DRAIN_BATCH
+            );
+            assert_eq!(
+                core.deferred_committed_releases.len(),
+                count - crate::domain::management_limits::MAX_DEFERRED_TICKET_DRAIN_BATCH
+            );
+        }
+        b.finish_rebuild().expect("finish remaining batches");
+        let snapshot = b.ledger_snapshot().expect("snapshot");
+        assert_eq!(snapshot.live_ticket_count, 0);
+        assert_eq!(snapshot.total_owner_bytes(), 0);
+        assert!(b.inner.lock().expect("core").deferred_committed_releases.is_empty());
     }
 
     #[test]
@@ -5656,21 +5769,19 @@ mod tests {
         {
             let core = b.inner.lock().expect("core");
             assert_eq!(core.deferred_pending_rollbacks.len(), 1, "Drop seeds the queue");
-            assert_eq!(core.deferred_pending_rollbacks[0].id(), foreign_id);
-            assert_eq!(core.deferred_pending_rollbacks[0].bytes(), 64);
+            assert_eq!(core.deferred_pending_rollbacks.front().unwrap().id(), foreign_id);
+            assert_eq!(core.deferred_pending_rollbacks.front().unwrap().bytes(), 64);
         }
-        // A still-failing drain retry keeps the exact ticket queued. The
-        // pending drain is deliberately silent (like the post-reconfigure
-        // retry): finish_rebuild reports Ok while authority stays preserved
-        // for a later retry — documented here, not assumed.
+        // A still-failing drain retry keeps the exact ticket queued, and
+        // finish_rebuild surfaces the lack of progress without losing authority.
         {
             let mut core = b.inner.lock().expect("core");
-            LiveProcessMemoryBroker::drain_deferred_pending_rollbacks(&mut core);
+            LiveProcessMemoryBroker::drain_deferred_pending_rollbacks_batch(&mut core);
             assert_eq!(core.deferred_pending_rollbacks.len(), 1, "drain preserves failures");
-            assert_eq!(core.deferred_pending_rollbacks[0].id(), foreign_id);
+            assert_eq!(core.deferred_pending_rollbacks.front().unwrap().id(), foreign_id);
         }
         b.begin_rebuild().expect("begin rebuild");
-        b.finish_rebuild().expect("pending drain retries silently");
+        assert!(b.finish_rebuild().is_err(), "stuck cleanup is surfaced");
         assert_eq!(
             b.inner.lock().expect("core").deferred_pending_rollbacks.len(),
             1,
@@ -5708,13 +5819,13 @@ mod tests {
         let pristine = b.ledger_snapshot().expect("snapshot");
         let foreign = sep23_audit_seed_deferred_foreign_ticket();
         let foreign_id = foreign.id();
-        b.inner.lock().expect("core").deferred_committed_releases.push(foreign);
+        b.inner.lock().expect("core").deferred_committed_releases.push_back(foreign);
         b.begin_rebuild().expect("begin rebuild");
         let drained = b.finish_rebuild();
         assert!(drained.is_err(), "a still-failing batch drain surfaces its error");
         let core = b.inner.lock().expect("core");
         assert_eq!(core.deferred_committed_releases.len(), 1, "whole batch restored");
-        assert_eq!(core.deferred_committed_releases[0].id(), foreign_id);
+        assert_eq!(core.deferred_committed_releases.front().unwrap().id(), foreign_id);
         drop(core);
         assert_eq!(b.ledger_snapshot().expect("snapshot"), pristine, "drain mutates nothing");
         let drained = b.ledger_snapshot().expect("snapshot");

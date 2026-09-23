@@ -259,6 +259,13 @@ fn validate_residency_inner(residency: &ResidencyPolicy) -> MemoryResult<()> {
     }
 
     for (owner, quota) in &residency.owner_quotas {
+        if owner.len() > crate::domain::management_limits::MAX_OWNER_KEY_BYTES {
+            return Err(MemoryError::config(format!(
+                "owner identifier is {} bytes; maximum is {}",
+                owner.len(),
+                crate::domain::management_limits::MAX_OWNER_KEY_BYTES
+            )));
+        }
         if quota.soft_cap_bytes > quota.hard_cap_bytes {
             return Err(MemoryError::config(format!(
                 "owner {owner} soft cap {} exceeds hard cap {}",
@@ -279,6 +286,13 @@ fn validate_residency_inner(residency: &ResidencyPolicy) -> MemoryResult<()> {
     // so an incoherent band would silently corrupt the scheduler's split.
     let mut total_group_reserved = 0u64;
     for (group, policy) in &residency.resource_groups {
+        if group.len() > crate::domain::management_limits::MAX_RESOURCE_GROUP_KEY_BYTES {
+            return Err(MemoryError::config(format!(
+                "resource-group identifier is {} bytes; maximum is {}",
+                group.len(),
+                crate::domain::management_limits::MAX_RESOURCE_GROUP_KEY_BYTES
+            )));
+        }
         if policy.reserved_bytes > policy.soft_cap_bytes {
             return Err(MemoryError::config(format!(
                 "resource group {group} reserved {} exceeds soft cap {}",
@@ -313,6 +327,20 @@ fn validate_residency_inner(residency: &ResidencyPolicy) -> MemoryResult<()> {
     // the scheduler would gate (or fail to gate) reservations against a group
     // that does not exist.
     for (owner, group) in &residency.owner_groups {
+        if owner.len() > crate::domain::management_limits::MAX_OWNER_KEY_BYTES {
+            return Err(MemoryError::config(format!(
+                "owner identifier is {} bytes; maximum is {}",
+                owner.len(),
+                crate::domain::management_limits::MAX_OWNER_KEY_BYTES
+            )));
+        }
+        if group.len() > crate::domain::management_limits::MAX_RESOURCE_GROUP_KEY_BYTES {
+            return Err(MemoryError::config(format!(
+                "resource-group identifier is {} bytes; maximum is {}",
+                group.len(),
+                crate::domain::management_limits::MAX_RESOURCE_GROUP_KEY_BYTES
+            )));
+        }
         if !residency.resource_groups.contains_key(group) {
             return Err(MemoryError::config(format!(
                 "owner {owner} mapped to unknown resource group {group}"
@@ -740,5 +768,45 @@ mod tests {
             )
             .with_owner_group("o", "g");
         assert!(validate_residency(&residency).is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_overlong_owner_and_resource_group_identifiers() {
+        use crate::domain::management_limits::{MAX_OWNER_KEY_BYTES, MAX_RESOURCE_GROUP_KEY_BYTES};
+        let owner = "o".repeat(MAX_OWNER_KEY_BYTES + 1);
+        let owner_policy = ResidencyPolicy::new(10_000).with_owner_quota(
+            owner,
+            crate::domain::policy::OwnerQuota { soft_cap_bytes: 1, hard_cap_bytes: 2 },
+        );
+        assert!(matches!(validate_residency(&owner_policy), Err(MemoryError::Config(_))));
+
+        let owner_group_policy = ResidencyPolicy::new(10_000)
+            .with_resource_group(
+                "valid-group",
+                crate::domain::policy::ResourceGroup {
+                    reserved_bytes: 0,
+                    soft_cap_bytes: 1,
+                    hard_cap_bytes: 2,
+                    burst_percent: 0,
+                    reclaim_priority: ReclaimPriority::Normal,
+                    admission_weight: 1,
+                },
+            )
+            .with_owner_group("o".repeat(MAX_OWNER_KEY_BYTES + 1), "valid-group");
+        assert!(matches!(validate_residency(&owner_group_policy), Err(MemoryError::Config(_))));
+
+        let group = "g".repeat(MAX_RESOURCE_GROUP_KEY_BYTES + 1);
+        let group_policy = ResidencyPolicy::new(10_000).with_resource_group(
+            group,
+            crate::domain::policy::ResourceGroup {
+                reserved_bytes: 0,
+                soft_cap_bytes: 1,
+                hard_cap_bytes: 2,
+                burst_percent: 0,
+                reclaim_priority: ReclaimPriority::Normal,
+                admission_weight: 1,
+            },
+        );
+        assert!(matches!(validate_residency(&group_policy), Err(MemoryError::Config(_))));
     }
 }

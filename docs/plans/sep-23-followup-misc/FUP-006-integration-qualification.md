@@ -179,6 +179,13 @@ digest. This does not qualify the two-test v5 source delta. Details and reopen c
 Not run: hosted CI; deploy/activation; power loss; mid-finalize
 instruction-point kill.
 
+Addendum (2026-09-23, post-v5): the mid-finalize instruction-point kill
+residual above is superseded by the DURABILITY-001 L1 rail
+(`facade/tests/spill_redb_finalize_kill.rs`, 2/2 GREEN, 4/4 negative
+mutants RED, 20-iteration stress GREEN). The v5-candidate statement is
+preserved as history; power loss stays UNVERIFIED (L3). Frozen-candidate
+receipt for the L1 source is tracked in `tickets/DURABILITY-001-*`.
+
 Promotion authority: predecessor tags `qmp-final-qualified-sep23-followup`,
 `qmp-final-qualified-sep23-followup-v2`, v3, and v4 remain immutable. The
 updated candidate is qualified only when all repository, extraction,

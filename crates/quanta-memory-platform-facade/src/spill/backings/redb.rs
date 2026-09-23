@@ -130,6 +130,74 @@ pub struct RedbSpillBacking {
     faults: RedbFaults,
 }
 
+/// Test-only finalize kill hooks (DURABILITY-001 L1). This module exists only
+/// under the non-default `durability-test-hooks` feature, which is crash-rail
+/// instrumentation — never a production callback, environment kill switch, or
+/// always-present global. Default builds compile `finalize_restore` with zero
+/// added code: both call sites are `#[cfg]`-gated statements that vanish.
+///
+/// Only the dedicated `spill_redb_finalize_kill_child` installs a hook, and it
+/// installs exactly one. Any other process linked with this feature (notably
+/// the parent test, which reopens and drains in-process) observes a cheap
+/// lock-and-`None`-check no-op when nothing is installed.
+#[cfg(feature = "durability-test-hooks")]
+#[doc(hidden)]
+pub mod finalize_kill_hooks {
+    use std::sync::Mutex;
+
+    /// The two externally visible sides of the finalize linearization point.
+    /// No hook exists before individual table mutations: those writes share
+    /// one uncommitted transaction and one externally visible state.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum FinalizeKillPoint {
+        /// Staged in the write transaction, `txn.commit()` not yet called.
+        BeforeCommit,
+        /// `txn.commit()` returned `Ok(())`; no ACK handling, probe, or caller
+        /// return has run yet.
+        AfterCommit,
+    }
+
+    impl FinalizeKillPoint {
+        /// Handshake token the child emits over the control pipe.
+        pub fn token(self) -> &'static str {
+            match self {
+                Self::BeforeCommit => "FinalizeBeforeCommit",
+                Self::AfterCommit => "FinalizeAfterCommit",
+            }
+        }
+    }
+
+    /// Installed hook: the armed point plus `fn(point, sequence, generation)`.
+    /// Function pointers (not closures) keep registration `Sync` without
+    /// allocation or lifetime plumbing.
+    pub type FinalizeKillHook = fn(FinalizeKillPoint, u64, u64);
+
+    static INSTALLED: Mutex<Option<(FinalizeKillPoint, FinalizeKillHook)>> = Mutex::new(None);
+
+    /// Arm exactly one hook. A second install is a test-tooling bug and panics
+    /// rather than silently replacing the armed point.
+    pub fn install(point: FinalizeKillPoint, hook: FinalizeKillHook) {
+        let mut installed = INSTALLED.lock().expect("finalize kill hook mutex");
+        assert!(installed.is_none(), "a finalize kill hook is already installed");
+        *installed = Some((point, hook));
+    }
+
+    /// Fire the armed hook when its point is reached. No-op when nothing is
+    /// installed or a different point is armed. The hook runs after the mutex
+    /// is released so a panicking hook cannot poison registration.
+    pub(crate) fn fire(point: FinalizeKillPoint, sequence: u64, generation: u64) {
+        let armed = INSTALLED.lock().expect("finalize kill hook mutex");
+        let hook = match *armed {
+            Some((armed_point, hook)) if armed_point == point => Some(hook),
+            _ => None,
+        };
+        drop(armed);
+        if let Some(hook) = hook {
+            hook(point, sequence, generation);
+        }
+    }
+}
+
 /// Best-effort 128-bit backend identity minted once per database file.
 ///
 /// Entropy mixes per-call random hash keys with the process id, wall-clock
@@ -1101,8 +1169,20 @@ impl DurableRestoreTarget for RedbSpillBacking {
                 }
             }
         }
+        #[cfg(feature = "durability-test-hooks")]
+        finalize_kill_hooks::fire(
+            finalize_kill_hooks::FinalizeKillPoint::BeforeCommit,
+            sequence,
+            generation,
+        );
         let commit_error = match txn.commit() {
             Ok(()) => {
+                #[cfg(feature = "durability-test-hooks")]
+                finalize_kill_hooks::fire(
+                    finalize_kill_hooks::FinalizeKillPoint::AfterCommit,
+                    sequence,
+                    generation,
+                );
                 #[cfg(test)]
                 if self.faults.lose_finalize_commit_ack.swap(false, AtomicOrdering::SeqCst) {
                     Some("injected lost redb restore-finalize acknowledgement".to_string())

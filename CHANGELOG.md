@@ -19,6 +19,10 @@
 - Restored zero-allocation scheduler admission probes after the shared
   admission engine briefly formatted denial messages on the boolean
   path; the scaling bench pins the contract.
+- Bounded management authority independently of byte budgets: live ticket
+  count and identifier-byte caps prevent zero-byte metadata growth, and
+  deferred cleanup now uses bounded batches with no-progress failures surfaced
+  while preserving exact ticket authority.
 
 ## Unreleased - 2026-09-22
 

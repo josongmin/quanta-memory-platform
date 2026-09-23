@@ -31,6 +31,11 @@ spill = []
 
 # Opt-in heavy backings (each pulls one third-party crate).
 spill-redb = ["spill", "dep:redb"]
+# Test-only finalize kill hooks (DURABILITY-001 L1). This is crash-rail
+# instrumentation, not a production capability: it stays absent from `default`,
+# `full`, and `full-backings`, and default builds compile the existing finalize
+# path with zero added code. `--all-features` still proves the surface.
+durability-test-hooks = ["spill-redb"]
 
 # `full` = every in-memory slice, deliberately WITHOUT any backing dep, so it is
 # free of copyleft transitive dependencies while still including the facade's
@@ -56,6 +61,10 @@ required-features = ["core-live-accounting"]
 [[example]]
 name = "spill_redb_crash_child"
 required-features = ["spill-redb"]
+
+[[example]]
+name = "spill_redb_finalize_kill_child"
+required-features = ["spill-redb", "durability-test-hooks"]
 
 [[bench]]
 name = "scaling"

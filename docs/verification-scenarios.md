@@ -61,6 +61,7 @@ cloning all live owner/context maps.
 - ✅ Inv 6 shared burst pool — `borrow_over_class_cap_is_bounded_by_shared_burst_pool`, `shared_burst_pool_is_shared_across_borrowing_classes`, `borrow_false_still_denies_over_cap_regardless_of_pool`.
 - ✅ Inv 7 idempotency — `double_release_of_a_cloned_ticket_is_rejected_and_does_not_corrupt`, `commit_after_release_is_rejected`.
 - ✅🔢 Zero-byte / u64 boundary / i64 cast — `zero_byte_reserve_commits_and_releases_coherently`, `snapshot_validation_rejects_unrepresentable_axis_instead_of_saturating_it`, `reserve_above_i64_max_does_not_wrap_to_negative_delta`.
+- ✅ **Independent management bounds** — `zero_byte_tickets_obey_independent_live_ticket_cap_fail_closed`, `owner_key_byte_limit_is_exact_and_denial_is_fail_closed`, `validate_rejects_overlong_owner_and_resource_group_identifiers`, `overlong_owner_is_denied_before_reclaim_or_accounting`, and `deferred_committed_cleanup_is_batched_and_drains_large_backlog`. Ticket cardinality is bounded independently of byte usage; deferred backlog is a disjoint subset of those live tickets and each lock-held cleanup batch is bounded.
 - ✅ Cross-ledger ticket — `ticket_from_one_ledger_cannot_release_on_another`; id uniqueness — `ticket_ids_are_monotonic_and_unique_across_many_reserves`.
 - ✅ Context axis balance — `context_axis_balances_with_owner_after_mixed_sequence`; wrong-kind release — `mixed_kind_release_preserves_charge_kind_partition`.
 - ✅🔬 Deterministic fuzz — `deterministic_fuzz_preserves_invariants_and_returns_to_zero` (400-step sequence, invariants 1/2/5/6 at every step, drains to 0).
@@ -204,8 +205,16 @@ check helpers that the control plane enforces (see group C/D).
   and `sep23_fup006_reserved_hole_stays_absent_across_sigkill`
   (`facade/tests/spill_redb_kill_reopen.rs`, public API only). The child
   dies by `SIGKILL` (no destructors, no flush) and the survivor reopens
-  cold. Power loss and mid-finalize instruction-point kills are NOT
-  covered (see residual boundaries in the Sep-23 receipt).
+  cold. Power loss is NOT covered; mid-finalize instruction-point kills
+  moved to the L1 rail below (see residual boundaries in the Sep-23 receipt).
+- ✅ **Finalize instruction-point kill rail (DURABILITY-001 L1)** —
+  `durability_l1_finalize_before_commit_kill_recovers_present_and_drains_exactly_once`,
+  and `durability_l1_finalize_after_commit_kill_resolves_finalized_without_resurrection`
+  (`facade/tests/spill_redb_finalize_kill.rs`, public API only, features
+  `spill-redb,durability-test-hooks`). The child blocks at a named hook on
+  one side of the finalize `txn.commit()` call, dies by `SIGKILL`, and the
+  survivor reopens cold. The two points bracket QMP's commit call; they do
+  not stop inside Redb's `pwrite`/`fsync` and do not prove power loss.
 
 **publish_pipeline is intentionally not charged.** It is a non-retaining
 *transition* stage (zero bytes held): it transforms a staged value into a

@@ -1253,7 +1253,10 @@ mod tests {
     fn many_spills_share_large_binding_identity_without_unbilled_clones() {
         const ENTRY_COUNT: usize = 128;
         let broker = live_broker(10_000_000);
-        let large_owner = "owner-".to_string() + &"o".repeat(64 * 1024);
+        // Owner identifiers now have a public 256-byte cap because they are
+        // copied into live ledger authority. Keep this binding at that valid
+        // boundary and retain the large runtime ID to test Arc-shared identity.
+        let large_owner = "o".repeat(quanta_memory_platform_core::MAX_OWNER_KEY_BYTES);
         let large_runtime = "runtime-".to_string() + &"r".repeat(64 * 1024);
         let store = SimpleRevocableStore::new_budgeted(
             StoreBindingHandle::new(
