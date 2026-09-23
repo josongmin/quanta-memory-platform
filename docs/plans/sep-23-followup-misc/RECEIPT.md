@@ -277,23 +277,27 @@ production semantics.
 
 ### Exact candidate local qualification
 
-- QMP commit/tree: `466f08648af05b7b509fb74dbfdce3c6da1c213d` /
+- Rust/test candidate commit/tree: `466f08648af05b7b509fb74dbfdce3c6da1c213d` /
   `113868d0a7d309596b82994ef56e5667675c8278`.
-- Canonical `scripts/check-workspace.sh`: exit 0 (`check-workspace: clean`) on
-  a dedicated clean target. All-feature unit/integration/doc suites passed:
+- Receipt-only follow-up commit `ca9ac79d5e6b81638329fd6e57ca91b688fc5249`
+  changed only these qualification docs; its tree is
+  `e63ed76287292e60e770e02519d52a1d9e60776a`. Canonical
+  `scripts/check-workspace.sh` was rerun on both source commits and exited 0
+  (`check-workspace: clean`) on a dedicated clean target. All-feature
+  unit/integration/doc suites passed:
   core 237, facade 282, testkit 82; Hellgate E2E 18, public API 20, SIGKILL
   reopen 3, facade doctests 28. The feature matrix compiled warning-free,
   10 advertised feature paths each executed a non-empty capability test,
   217 documentation selectors resolved, generated guidance lint and cargo-deny
   passed. Both `hello_world` and `effective_budget_report` examples ran.
-- Real extraction destination:
+- Real extraction destination for the Rust/test candidate above:
   `/private/tmp/qmp-v5-extraction.KwcKya`; canonical source/extract digest
   `aa425a8591975b5236b8c72fb4d8549cf70a89d113c5efd816a2dd13490dc915`;
   extracted bootstrap commit/tree `27d0570641989a2bb80b8eccadf2da25f56726c4` /
   `2db4b0f9e473f0d6e6aceb06bee39ff20b9ce3e6`. In-extract
   `scripts/check-workspace.sh` exited 0 and preserved the canonical digest.
 - Full `scripts/run-scaling-bench.sh`: verifier `OK (170 samples)` on that
-  commit/tree using rustc/cargo 1.92.0, Darwin 24.6.0 arm64. This is verifier
+  code/test commit/tree using rustc/cargo 1.92.0, Darwin 24.6.0 arm64. This is verifier
   qualification, not a latency or cross-machine performance claim.
 - Exact-source host-pair is **OPEN**. Read-only metadata from both Semantica
   workspace roots resolves the same QMP core/facade manifests at the candidate
