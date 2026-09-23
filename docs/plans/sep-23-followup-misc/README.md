@@ -1,6 +1,6 @@
 # Sep-23 follow-up misc — 실행 계획
 
-Status: `LOCAL REPOSITORY / EXTRACTION / BENCHMARK GREEN — exact-source host-pair OPEN; no v5 authority`
+Status: `FUP-001..007 EXACT-SOURCE CANDIDATE QUALIFIED — local repository / extraction / benchmark / host-pair GREEN; no v5 tag; separate product checklist has OPEN items`
 작성일: `2026-09-23`
 계획 기준 HEAD: `028448946caa95676df034481a830c1d3e3b1f33`
 계획 기준 tree: `f983669731805a330200213bad7bf1bd5573f308`
@@ -17,10 +17,12 @@ deny-path allocation 회귀를 lazy `GroupAdmission`으로 수정한 후, durabl
 public value도 non-`Clone`/non-`Copy`로 만들어 하나의 backend-issued lease가
 복수 caller-owned restore flow로 분할되지 않게 했다. v3/v4는 기존 source commit에
 대한 불변 attestation으로 보존한다. 신규 boundary oracle 둘을 포함한 현재 후보에서
-canonical repository, real extraction, full scaling verifier가 통과했다. Semantica와
-QIndex sibling checkout이 dirty/활성 작업 상태여서 exact-source host-pair를 안전하게
-고정하지 못했다. 그러므로 후보는 아직 v5 qualified가 아니며 v5 attestation도 발행하지
-않았다. 정확한 source/result tuple과 잔여 경계는
+canonical repository, real extraction, full scaling verifier가 통과했다. 이후 dirty한
+활성 sibling checkout을 빌드 입력으로 쓰지 않고 clean detached bundle을 만들어
+exact-source host-pair도 통과했다. 현재 full-followup 후보의 local qualification은
+완료했으며 v5 tag/push는 별도 승인 경계라 발행하지 않았다. 이는 별도 100항목 제품
+체크리스트의 완료가 아니며 B07/J06 및 물리/운영 경계는 OPEN이다. 정확한
+source/result tuple과 잔여 경계는
 `RECEIPT.md` 및 `tickets/HOST-PAIR-RUNTIME-DEFAULT-PROVENANCE.md`가 소유한다.
 
 - **실행 재현:** 실제 Redb의 동시 recovery가 같은 sequence를 두 store에 복원;

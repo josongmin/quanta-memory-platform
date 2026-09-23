@@ -1,6 +1,6 @@
 # Sep-23 follow-up qualification receipt
 
-Status: `PARTIALLY QUALIFIED — local repository, extraction, benchmark GREEN; exact-source host-pair OPEN; no v5 tag`
+Status: `EXACT-SOURCE CANDIDATE QUALIFIED — local repository, extraction, benchmark, and host-pair GREEN; hosted CI/deploy/activation NOT RUN; no v5 tag`
 Scope: `full-followup` (`FUP-001` through `FUP-007`)
 Date: `2026-09-23 Asia/Seoul`
 
@@ -13,9 +13,9 @@ git rev-parse qmp-final-qualified-sep23-followup-v5^{}
 git show --no-patch --format=fuller qmp-final-qualified-sep23-followup-v5
 ```
 
-The prospective tag annotation is the immutable source/result authority.
-Until the exact-source host-pair passes and that tag exists, this receipt is
-partial evidence only, not a release qualification.
+The prospective annotated tag remains the immutable release authority. The
+exact-source candidate gates are recorded below; no tag, push, hosted CI,
+deployment, or activation is claimed by this receipt.
 
 ## Source lineage
 
@@ -344,3 +344,72 @@ production semantics.
   checklist. Host activation, hosted CI, physical power loss, finalize-point
   kill, physical memory caps, and other explicitly conditional capabilities
   remain separate or unverified boundaries.
+
+## Final exact-source candidate gates (2026-09-23)
+
+This section supersedes earlier statements in this file that the v5 candidate
+host-pair, extraction, or benchmark was still pending. Candidate QMP commit
+`cf2a4412616f2e246ecd75bdb32ce05c55304a89` (tree
+`facb59d5c93f11cf6748d940a635af7138b02339`) was clean and exact-source for
+these runs. This receipt is now being updated by a documentation-only commit;
+the final candidate source digest and applicable gates must be rerun on that
+post-documentation commit before promotion.
+
+### Host-pair tuple and receipts
+
+All five sibling worktrees were clean and detached in
+`/private/tmp/qmp-v5-host-pair-bundle-20260923`:
+
+| Repository | Commit |
+| --- | --- |
+| `quanta-memory-platform` | `cf2a4412616f2e246ecd75bdb32ce05c55304a89` |
+| `semantica-codegraph-v2` | `0e29a45f9db1a3739b853d0bad75e33eb61fe43f` |
+| `quanta-index` | `f478f69e5e0006afb7ea36360be9b4dd7558d252` |
+| `quanta-gqlang-v2` | `daa1dfde8afb605abe42128cf5974ac6373f9fea` |
+| `quanta-taskmesh` | `1d2bb2fedcbe45ed5809d5f87e4f66560f5c7d9b` |
+
+Both Semantica Cargo metadata roots resolved QMP core/facade manifests from
+this bundle. Frozen cross-repository source snapshot digest:
+`4592db63e3f884d84edc1291c6d2774736bd910c678788278523602f60704a31`.
+Each command pinned
+`QUANTA_BUILD_EXPECTED_SOURCE_SNAPSHOT_DIGEST_V1` to that value; accepted
+receipts report matching before/after source digest.
+
+| QBC target | Run ID | Result | Raw receipt |
+| --- | --- | --- | --- |
+| `quanta-runtime-memory-compose` exact `runtime_memory_bootstrap_core_owns_production_budget_and_live_dependencies` | `20260923T044012.161834Z-11aa0636f876` | 1/1 GREEN | `/Users/songmin/Library/Caches/semantica-codegraph-v2-target/quanta-build-cli/_state/execution-roots/semantica-codegraph-v2-15454730f53e/lanes/qmp-v5-hostpair-bundle/verification-results/20260923T044012.161834Z-11aa0636f876/receipt.json` |
+| `quanta-runtime-memory-compose` exact `runtime_cutover_memory_budget_report_projects_runtime_defaults_and_code_overlay` | `20260923T044441.494126Z-184e82873ca8` | 1/1 GREEN | `/Users/songmin/Library/Caches/semantica-codegraph-v2-target/quanta-build-cli/_state/execution-roots/semantica-codegraph-v2-15454730f53e/lanes/qmp-v5-hostpair-bundle/verification-results/20260923T044441.494126Z-184e82873ca8/receipt.json` |
+| `quanta-runtime-memory-compose` whole target | `20260923T045049.285259Z-e1f78a901121` | 45/45 GREEN | `/Users/songmin/Library/Caches/semantica-codegraph-v2-target/quanta-build-cli/_state/execution-roots/semantica-codegraph-v2-15454730f53e/lanes/qmp-v5-hostpair-bundle/verification-results/20260923T045049.285259Z-e1f78a901121/receipt.json` |
+| `quanta-memory-host --tests --all-features` | `20260923T045146.387677Z-d5a936d86399` | 126/126 GREEN | `/Users/songmin/Library/Caches/semantica-codegraph-v2-target/quanta-build-cli/_state/execution-roots/semantica-codegraph-v2-15454730f53e/lanes/qmp-v5-hostpair-bundle/verification-results/20260923T045146.387677Z-d5a936d86399/receipt.json` |
+
+The two exact compose oracles prove runtime default ownership and explicit
+overlay projection on this tuple. Host all-tests proves the selected host
+suite, not deployment or activation.
+
+### Local repository, extraction, and scaling evidence on `cf2a441`
+
+- `scripts/check-workspace.sh`: exit 0, final output `check-workspace: clean`,
+  using `/Volumes/Extreme SSD 1/build-cache/qmp-v5-canonical-target`. Selected
+  counts: core 237, facade 282, testkit 82; Hellgate 18, public API 20,
+  SIGKILL 3, doctests core 13/facade 28; 217 documentation selectors, feature
+  matrix/runtime capabilities, and cargo-deny all passed.
+- Both public examples (`hello_world`, `effective_budget_report`) ran
+  successfully.
+- Real extraction: `/private/tmp/qmp-v5-final-extraction.lgm2kR`; canonical
+  source/extract digest
+  `e4915ff2ac5c6d48dafe65ed3cecd5fcc1c72936f37d3cbd02d2810a9b8bc4ec`;
+  in-extract `scripts/check-workspace.sh` exit 0.
+- `scripts/run-scaling-bench.sh`: `verify-scaling-results: OK (170 samples)`
+  on Darwin 24.6 arm64 with rustc/cargo 1.92.0. This validates the recorded
+  sample set and harness, not a latency or cross-machine performance claim.
+
+### Final disposition and residual scope
+
+FUP-001 through FUP-007 and the `full-followup` candidate gates are locally
+qualified on the pinned tuple above. The separate 100-item product checklist
+is not 100/100: B07 metadata-count admission and J06 general backlog bounds
+remain OPEN; power-loss durability, mid-finalize instruction-point kill,
+hosted CI, deploy, activation, and physical memory-cap qualification were not
+run. Earlier v3/v4 immutable tags remain unchanged. A v5 annotated tag/push
+was not created because repository policy makes tag/release publication a
+separate approval boundary.

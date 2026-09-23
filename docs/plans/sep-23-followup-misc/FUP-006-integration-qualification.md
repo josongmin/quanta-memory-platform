@@ -1,6 +1,6 @@
 # FUP-006 — 통합과 current-source qualification
 
-Status: `IN_PROGRESS — local canonical/extraction/benchmark GREEN; exact-source QBC host-pair OPEN`
+Status: `VERIFIED — full-followup exact-source local, extraction, benchmark, and QBC host-pair GREEN; hosted CI/deploy/activation NOT RUN`
 Priority: `SCOPE-SPECIFIC RELEASE GATE` (구현 결함 티켓이 아님)
 Owner: `Lane I — serial integrator`
 Depends on: core-enabled 후보는 `FUP-007`; durable-enabled 후보는 추가로 `FUP-001`, `FUP-002`; full-followup 후보는 추가로 `FUP-003`, `FUP-004`, `FUP-005`
@@ -107,6 +107,20 @@ cargo run --locked -p quanta-memory-platform-facade --example effective_budget_r
   source digest를 바꿀 수 있다. 요청된 freeze/release를 지키고 실제 tuple receipt를 확인한다.
 - 로컬 저장소 GREEN, standalone GREEN, host-pair GREEN, hosted CI, deploy, activation을
   별도 열로 기록한다. receipt/tag 생성과 외부 발행은 별도 승인이 있을 때만 수행한다.
+
+### Exact-source host-pair result (2026-09-23)
+
+Dirty, active source checkouts were not used as build inputs. A clean sibling
+bundle at `/private/tmp/qmp-v5-host-pair-bundle-20260923` pinned the QMP,
+Semantica, Quanta Index, GQLang, and Taskmesh commits listed in `RECEIPT.md`.
+Both Semantica Cargo metadata roots resolved QMP dependencies to that bundle.
+With expected snapshot digest pinned, the compose target passed 45/45 and
+`quanta-memory-host --tests --all-features` passed 126/126. Raw receipt paths,
+run IDs, and the common before/after digest are in `RECEIPT.md`.
+
+This closes the exact-source local host-pair gate only. Hosted CI, deployment,
+activation, power-loss durability, and instruction-point kill during finalize
+remain outside this proof.
 
 ## 완료 기준
 
