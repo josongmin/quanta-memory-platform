@@ -364,13 +364,14 @@ check helpers that the control plane enforces (see group C/D).
 - 🧪 **Real Linux volume ENOSPC, isolated from host data** —
   `scripts/durability/run-enospc-docker.sh` runs the
   Redb ENOSPC example on a disposable 8 MiB Docker tmpfs.
-  The example fills that filesystem to a real `ENOSPC`, checks that Redb
-  classifies a subsequent payload commit as `Capacity`, frees only the filler,
-  cold-reopens the database, then verifies the anchor and every acknowledged
-  or uncertain record is whole and drains exactly once. The runner fingerprints
-  all present source files before and after. This is a standalone Linux
-  volume-error oracle, not the consuming host's volume/quota policy, physical
-  power-loss durability, or a caller codec scratch bound.
+  Three fresh-volume modes cover spill write, restore commit, and finalize.
+  The spill and restore modes require a real `ENOSPC` to be classified as
+  `Capacity`, free only the filler, then cold-reopen and drain whole records.
+  Finalize may succeed by reusing Redb space even when the volume is full; its
+  mode checks the exact finalized or recoverable postimage after cold reopen.
+  The runner fingerprints all present source files before and after. This is a
+  standalone Linux volume-error oracle, not the consuming host's volume/quota
+  policy, physical power-loss durability, or a caller codec scratch bound.
 - 🧪 **Optional Linux syscall-error subrail (DURABILITY-001 L2 partial)** —
   `scripts/durability/run-emulated-linux.sh` calibrates the real finalize
   boundary, injects EIO into the first `pwrite64` and `fdatasync` after it, then
