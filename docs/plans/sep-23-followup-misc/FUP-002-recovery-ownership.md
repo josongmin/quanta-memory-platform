@@ -90,3 +90,45 @@ cargo test --locked -p quanta-memory-platform-facade --all-features --doc
 "동시에 호출하지 말 것"을 추가하는 수정은 완료로 인정하지 않는다.
 실제 exactly-once 사용자 callback 실행이나 process crash 후 일반 resident data의
 영속성까지 보장 범위를 확대하지 않는다.
+
+## Handoff 실제 기록 (Lane A, 2026-09-23)
+
+Changed: `DurableRestoreClaim` (backend, generation, sequence; no public
+constructor — only backends mint), per-record generation checks on
+commit/finalize/abort/reconcile, `revocable_store` lease fencing
+(`pending_restores`) with catch-unwind decode/finalize paths, sealed
+`DurableSpillTarget`/`DurableRestoreTarget` traits.
+
+API change table (to FUP-006; BREAKING for external implementers):
+
+| Before | After | Caller migration |
+| --- | --- | --- |
+| `commit/restore/finalize/abort/reconcile_restore(seq: u64)` | `...(claim: &DurableRestoreClaim)` | use `candidate.claim` from `prepare`/`recover` |
+| `DurableRestoreCandidate { sequence, bytes }` | adds `claim: DurableRestoreClaim` | read `claim.backend/generation/sequence` for identity |
+| unconditional second-claimant `Ok` | per-record proof (`SPILL_FINALIZED_BY`) | same-claimant retry still idempotent `Ok` |
+
+Host impact: none — `quanta-memory-host` enables facade `full`
+(no `spill-redb`) and imports no durable API. See `MIGRATION.md`.
+
+Lease ownership table (panic/drop/close/retry × phase):
+
+| Event | Prepared phase | Committed phase |
+| --- | --- | --- |
+| decode `Err` | abort claim, `DurableCommitFailure` preserved source | keep durable recovery, `OperationInProgress`, retry via recover |
+| decode panic | abort claim, unwind resumes, retry is a plain prepare | durable recovery untouched, unwind resumes, retry recovers |
+| finalize panic | n/a (nothing published yet) | fence published entry, unwind resumes, reconcile publishes |
+| store close with pending | close rejected (`pending close` contract) | close rejected; durable recovery survives for another store |
+| same-claimant retry | prepare again (idempotent) | commit/finalize idempotent `Ok` |
+| other-claimant retry | `OperationInProgress` / stale rejection | `Superseded` or stale rejection; loser retires provisional |
+
+Verified: `sep23_fup002` 8/8 GREEN; stale-generation mutant RED 1/8;
+barrier race exactly-one-owner with loser charge 0 and final ledger 0;
+compiler forge/reject doctests GREEN (`--doc` 24/24 incl. compile-fail).
+
+Not run: multiprocess kill of a MID-finalize transaction at the exact
+instruction point (SIGKILL rail covers commit/stream/hole kill points);
+power loss.
+
+Known risk: none open. Claim generation is a persisted `u64` counter;
+exhaustion returns a typed error (no wraparound) and is unreachable in
+practice.

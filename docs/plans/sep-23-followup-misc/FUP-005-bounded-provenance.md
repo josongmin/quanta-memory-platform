@@ -70,3 +70,26 @@ RED→GREEN 없이는 계획만으로 완료 처리하지 않는다.
 표시 또는 별도 audit export 계약을 결정한 뒤 진행한다.
 005 완료 후 control/report hash를 고정하여 003이 그 postimage에서 시작하게 한다.
 policy revision 삭제·중복 정책 update 무시·clock 기반 epoch 도입은 이 티켓의 해결책이 아니다.
+
+## Handoff 실제 기록 (Lane B, 2026-09-23)
+
+Changed: accepted live reconfigures upsert the single `residency.active`
+provenance record instead of appending; initial resolver records untouched;
+`override_provenance` rustdoc now states the bounded (non-chronological)
+contract. Control/report hash fixed for FUP-003's postimage start.
+
+Consumer check (required before truncate): `override_provenance` has NO
+readers outside core — facade, testkit, and `quanta-memory-host` sources
+contain zero references. No caller requires chronological history, so no
+bounded-history capacity marker or audit-export contract was needed.
+
+Verified: `sep23_fup005` 2/2 GREEN (10,000 accepted reconfigures keep
+`initial + 1`, revision `initial + 10,000`, active source exact, no
+duplicate active, `observe().report == effective_report()`); denied
+reconfigure preserves revision/report/provenance byte-for-byte; mutant
+always-append RED 1/2 with the correct split.
+
+Not run: absolute latency assertions (none added, per contract).
+
+Known risk: none open. Revision still counts every accepted reconfigure;
+only the history representation is bounded.

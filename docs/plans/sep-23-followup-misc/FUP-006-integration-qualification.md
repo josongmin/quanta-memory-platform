@@ -1,6 +1,6 @@
 # FUP-006 — 통합과 current-source qualification
 
-Status: `PARTIAL — QMP owner/extraction candidate GREEN; final source rerun pending; Semantica host-pair RED 1건`
+Status: `FINAL QUALIFICATION CANDIDATE — authority: qmp-final-qualified-sep23-followup-v2; host-pair CLOSED`
 Priority: `SCOPE-SPECIFIC RELEASE GATE` (구현 결함 티켓이 아님)
 Owner: `Lane I — serial integrator`
 Depends on: core-enabled 후보는 `FUP-007`; durable-enabled 후보는 추가로 `FUP-001`, `FUP-002`; full-followup 후보는 추가로 `FUP-003`, `FUP-004`, `FUP-005`
@@ -110,16 +110,16 @@ cargo run --locked -p quanta-memory-platform-facade --example effective_budget_r
 
 ## 완료 기준
 
-- [ ] 선택한 scope의 001/002/007 및 포함된 003/004/005의 regression과
+- [x] 선택한 scope의 001/002/007 및 포함된 003/004/005의 regression과
   negative proof가 같은 최종 소스에서 유효.
-- [ ] canonical rail 성공, 예제/API/feature 계약 성공.
-- [ ] `core/no-redb`이면 Redb 비활성 graph 증거. `durable-enabled`이면 legacy
+- [x] canonical rail 성공, 예제/API/feature 계약 성공.
+- [x] `core/no-redb`이면 Redb 비활성 graph 증거. `durable-enabled`이면 legacy
   migration, 배타적 recovery, 실제 process 종료/재시작의 적용 경계와 미시험
   power-loss 범위가 명시됨.
-- [ ] 필요한 extraction와 host-pair 검증 성공 또는 미검증 범위가 명시적으로 남음.
-- [ ] 저장 포맷 호환성, opaque identity/lease, 오류/receipt API의 migration 안내 완성.
-- [ ] source-before/source-after 일치; 모든 실패·미실행·잔여 위험이 receipt에 포함.
-- [ ] 코드만 VERIFIED인 상태를 deployment/activation 완료로 표기하지 않음.
+- [x] 필요한 extraction와 host-pair 검증 성공 또는 미검증 범위가 명시적으로 남음.
+- [x] 저장 포맷 호환성, opaque identity/lease, 오류/receipt API의 migration 안내 완성.
+- [x] source-before/source-after 일치; 모든 실패·미실행·잔여 위험이 receipt에 포함.
+- [x] 코드만 VERIFIED인 상태를 deployment/activation 완료로 표기하지 않음.
 
 `B07`의 0-byte metadata 개수 상한, `J06` backlog 상한, `I03/I05/I06/I09`의
 durability/physical-resource/format 계약, custom callback 재진입과 host 의미 경계는
@@ -130,3 +130,42 @@ host와 raw 결과가 없으면 미검증이다.
 `RECEIPT.md`에는 command/exit/selected count, source SHA/tree/digest, dependency tuple,
 artifact 경로를 기록한다. 최소 하나의 필수 rail이 미실행이면 전체 `QUALIFIED` 대신
 정확한 부분 상태를 사용한다. plan 문서 작성만으로 이 체크박스를 채우지 않는다.
+
+## Handoff 실제 기록 (Lane I, 2026-09-23)
+
+Scope: `full-followup`. Candidate lineage: `0284489` (plan base) →
+`beba437` (first clean implementation candidate) → `c7706d0` (peer
+review + self-audit delta, committed) → then-uncommitted workdir
+lazy-breach delta (`admission.rs` + `scheduler.rs`) at Lane I handoff.
+
+Changed (Lane I owned): reclaim×reconfigure coupling tests (2),
+SIGKILL/reopen rail (integration test + crash-child example + manifest
+entry), self-audit oracles (`sep23_audit_` 10 core + 4 facade),
+randomized preflight/attempt agreement, lazy `GroupAdmission` breach
+(zero-alloc `admits` restoration), docs (`RECEIPT.md` completion,
+`MIGRATION.md`, `CHANGELOG.md`, verification rows, all handoffs).
+
+Verified on the final workdir source: full mutant battery RED (15
+mutants incl. KILL2 identity re-mint and G1 deny-vanish); per-ticket
+selectors GREEN (001:6, 002:8, 003:7, 004:4+4, 005:2, 006:2+3, 007:8);
+`scripts/check-workspace.sh` exit 0; both public examples run;
+no-default/spill-only/full feature checks GREEN with `redb` absent from
+the `full` graph; scaling verifier OK (170 samples).
+
+Extraction: real extraction + in-extract rail GREEN on `c7706d0`
+(bootstrap `276893f`, tree `8e10fc78…`). The lazy-breach delta is
+intra-crate (no manifest/use-path change); the v2 annotated tag owns the
+repeated exact-source extraction receipt.
+
+Host-pair: the Semantica-owned default-provenance projection was repaired;
+QBC compose 45/45 and host 114+5+7 are GREEN. The v2 tag annotation owns
+the final exact-source rerun tuple; details and reopen conditions are in
+`tickets/HOST-PAIR-RUNTIME-DEFAULT-PROVENANCE.md`.
+
+Not run: hosted CI; deploy/activation; power loss; mid-finalize
+instruction-point kill.
+
+Promotion authority: predecessor tag `qmp-final-qualified-sep23-followup`
+must not move. The committed lazy-breach candidate is qualified only when
+the new annotated tag `qmp-final-qualified-sep23-followup-v2` exists and
+targets the exact clean candidate.

@@ -1,6 +1,6 @@
 # Sep-23 follow-up qualification receipt
 
-Status: `QMP QUALIFICATION CANDIDATE — final authority is annotated tag qmp-final-qualified-sep23-followup`
+Status: `FINAL QUALIFICATION CANDIDATE — authority is annotated tag qmp-final-qualified-sep23-followup-v2`
 Scope: `full-followup` (`FUP-001` through `FUP-007`)
 Date: `2026-09-23 Asia/Seoul`
 
@@ -9,8 +9,8 @@ commit ID. Resolve the annotated tag and verify that it targets the current
 candidate:
 
 ```bash
-git rev-parse qmp-final-qualified-sep23-followup^{}
-git show --no-patch --format=fuller qmp-final-qualified-sep23-followup
+git rev-parse qmp-final-qualified-sep23-followup-v2^{}
+git show --no-patch --format=fuller qmp-final-qualified-sep23-followup-v2
 ```
 
 The tag annotation is the immutable source/result authority. Absence of that
@@ -23,10 +23,16 @@ evidence.
 - First clean implementation candidate:
   `beba43760d76a60fbce7ccbf8ed97d3985aeaaf3`, tree
   `6c88d590f4b67c232098599ca99c1570c4d0a0e5`.
-- The final candidate adds only self-audit-discovered boundary hardening,
-  regression oracles, ticket state, and this receipt on top of that commit.
-- No Cargo manifest, dependency edge, public builder surface, or storage
-  schema was changed by the final self-audit delta.
+- Second clean candidate (peer review + self-audit oracles + ticket
+  state + this receipt):
+  `c7706d00b8011826533ddff55719773723535a21`, tree
+  `59bc232527cf93fac0dbf95b2a9d76867575e2fc`.
+- The final candidate adds the lazy-breach delta on top:
+  `crates/quanta-memory-platform-core/src/{domain/admission.rs,application/scheduler.rs}`
+  only (zero-alloc `admits` restoration, no manifest/use-path change).
+  The v2 tag must target the commit that contains it and this receipt.
+- No Cargo manifest (after `c7706d0`), dependency edge, public builder
+  surface, or storage schema was changed by the final self-audit delta.
 
 ## Owner-local positive proof
 
@@ -110,19 +116,16 @@ Read-only Cargo metadata from both Semantica workspace roots resolved the same
 QMP `0.2.0` manifests under
 `/Users/songmin/Documents/code-new/quanta-memory-platform`.
 
-- `quanta-memory-host --all-features --tests --locked`: GREEN,
-  `114 + 5 + 7` passed.
-- `quanta-runtime-memory-compose --tests --locked`: RED,
-  `43 passed / 1 failed`.
-- Failure:
-  `tests::runtime_memory_bootstrap_core_owns_production_budget_and_live_dependencies`;
-  actual default `override_sources=[]`, expected
-  `["runtime_defaults"]`.
-
-This is a Semantica projection defect, not a QMP broker failure. Exact owner
-file, patch boundary, paired oracle, QBC commands, and dirty-repository stop
-conditions are in
-`tickets/HOST-PAIR-RUNTIME-DEFAULT-PROVENANCE.md`.
+- The Semantica host-owned default-provenance defect was repaired in commit
+  `4767bcfec2b9e2e9269f423f2b29a3216166f4bd` and qualified in merge
+  `86e90abba4cb70d9bd7e7a4872a1ea5abce0a665`.
+- QBC `quanta-runtime-memory-compose` lib/all-features: `45 / 45` GREEN.
+- QBC `quanta-memory-host` all-tests/all-features: `114 + 5 + 7` GREEN.
+- The paired default, explicit-overlay, and explicit-inherit provenance
+  oracles are all members of the compose target. The final v2 tag annotation
+  records the exact rerun source digest against the v2 QMP target.
+- Exact owner patch, prior RED, receipts, and reopen conditions are in
+  `tickets/HOST-PAIR-RUNTIME-DEFAULT-PROVENANCE.md`.
 
 Therefore:
 
@@ -132,8 +135,8 @@ Therefore:
 | QMP canonical repository rail | tag annotation authority |
 | QMP standalone extraction | tag annotation authority |
 | Semantica dependency identity | GREEN |
-| `quanta-memory-host` raw comparison | GREEN |
-| Semantica compose/QBC host-pair | RED / OPEN |
+| `quanta-memory-host` QBC owner rail | GREEN |
+| Semantica compose/QBC host-pair | GREEN / CLOSED |
 | Hosted CI | NOT RUN |
 | Deploy / activation | NOT RUN |
 
@@ -149,3 +152,80 @@ Therefore:
   backlog admission are not part of these correctness fixes. No current host
   reachability or measured exhaustion evidence promoted them to blockers.
 - No repository qualification result is deployment or activation evidence.
+
+## Lane I completion record (final workdir source)
+
+### Corrected and completed counts
+
+- Core `sep23_audit_`: **10/10** GREEN (the 8 listed above plus
+  admitted-recharge and batch-release kind-vector exactness).
+- Facade `sep23_audit_`: 4/4 GREEN (unchanged).
+- Full per-ticket rerun on the final source: 001:6, 002:8, 003:7,
+  004:4+4, 005:2, 006:2+3, 007:8 — all GREEN, all non-zero selected.
+- `durable_` 10/10, `policy_contracts` 15/15, `public_api_surface` 7/7,
+  facade `--doc` 24/24 (incl. compile-fail), WrongChargeKindAxis 1/1,
+  property trace 1/1 GREEN.
+
+### Completed negative proof (15 mutants, final source)
+
+Beyond the six above (reproduced on the final source with the same
+RED splits):
+
+| Mutant | Target | RED |
+| --- | --- | --- |
+| freeze `policy_revision` on accepted reconfigure (M6) | coupling receipt | 1/2 |
+| swallow Drop-seed / drain re-push / committed restore (D1/D2/D3) | deferred authority | 1/1 each |
+| finalize proof-match after active-state (P2-1 old order) | idempotent retry | 1/2 (order-independent peer test passes) |
+| re-mint backend identity on every open (KILL2) | SIGKILL rail + reopen identity | 1/1 both |
+| double-callback hard plan (SF) | single-attempt contract | 1/1 both oracles |
+| suite kind verdict always-true (M4T) | fake rejection | 2/4 documented split |
+| terminal-arm removal / trigger downgrade (003A/003B) | preflight plans | 3/7, 2/7 |
+| deny-vanish `into_breach` (G1) | lazy breach | group oracle RED |
+
+Correction: the first kill-rail mutant (constant `+1` identity shift)
+was INVALID — both processes shifted together, and its one RED came
+from a stale child binary, not the mutant. It is superseded by KILL2
+(re-mint on open), which breaks the cross-process agreement the rail
+exists to prove. The rail's example-freshness build now prevents
+stale-binary artifacts.
+
+Each mutant was applied to the workdir, run, and reverted with a
+SHA-256 equality check; the tree is clean of mutants at handoff except
+the intended lazy-breach delta files.
+
+### Self-audit P1: zero-alloc `admits` regression (found by bench, fixed)
+
+The full scaling bench failed on the `c7706d0` source:
+`scheduler admission must not allocate after policy construction`
+(136,000 bytes tracked). Root cause: the FUP-003 delegation made the
+boolean `admits` probe format the denial message on every deny and
+discard it. Fix: `check_group_admission` now returns a lazy
+`GroupAdmission` decision; `into_breach` is the single message
+construction site, called only when a breach must be reported. Message
+text is byte-identical to the attempt path (verified: the attempt path
+reports the denial text for unrepresentable postimages too, because
+`admits` returns false before any overflow guard runs). The bench was
+re-run on the fixed source: exit 0, verifier OK (170 samples),
+source-bound to `c7706d0` + dirty `2cb59323`.
+
+Two more self-audit closings: the global aggregate is read with
+`checked_total` (defense-in-depth; live totals are representable by
+construction, pinned by a direct pure-function test plus a max-scale
+`u64::MAX` broker test), and `finalize_restore` checks the terminal
+proof before the active-claim state (same-claimant retry succeeds even
+while an unrelated claim is live).
+
+### Final-source gates (Lane I)
+
+- `scripts/check-workspace.sh`: exit 0 on the final workdir (and exit 0
+  on clean `c7706d0` before it).
+- Public examples `hello_world`, `effective_budget_report`: run GREEN.
+- Feature checks: `--no-default-features`, `spill`-only, `full` GREEN;
+  `redb` absent from the `full` graph (host-dependency proof).
+- Real standalone extraction of `c7706d0` + in-extract rail: exit 0
+  (bootstrap `276893f`, extracted tree `8e10fc78…`). The v2 tag annotation
+  is the authority for the repeated extraction that includes the committed
+  lazy-breach delta.
+- Host-pair is CLOSED after the host-owned provenance repair. The v2 tag
+  annotation binds the final QMP commit to the repeated Semantica QBC tuple.
+- Absolute latency assertions: none added anywhere, per contract.

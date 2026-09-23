@@ -7,6 +7,64 @@ must migrate atomically and qualify their own host composition against the exact
 QMP Git tree. No deprecated alias is retained when it would reopen an
 unbudgeted or unbounded path.
 
+## Sep-23 follow-up (`qmp-final-qualified-sep23-followup-v2`)
+
+### Durable restore calls now take a claim (BREAKING for external implementers)
+
+`commit_restore`, `finalize_restore`, `abort_restore`, and
+`reconcile_restore` previously took a bare `sequence: u64`; they now
+take `claim: &DurableRestoreClaim`. The claim binds backend identity,
+claim generation, and sequence, and only backends can mint it (no
+public constructor), so external crates cannot forge lease authority
+and stale generations are rejected instead of double-restoring.
+
+Caller migration (same flow, one identifier change):
+
+```rust
+// Before: the sequence alone authorized the permission change.
+backing.commit_restore(sequence)?;
+
+// After: authorize with the candidate's claim.
+let candidate = backing.prepare_restore()?.expect("candidate");
+backing.commit_restore(&candidate.claim)?;
+backing.finalize_restore(&candidate.claim)?;
+```
+
+`DurableRestoreCandidate` carries the claim; the active-restore
+recovery entry point mints a fresh generation after reseating
+ownership. Same-claimant ACK-loss retries of commit/finalize stay
+idempotent `Ok`. A second claimant can no longer finalize with a bare
+sequence.
+
+Host impact: none required — `quanta-memory-host` enables facade
+`full` (without `spill-redb`) and calls no durable API.
+
+### Redb storage schema v2 (automatic, fail-closed)
+
+New tables/rows: a per-record disposition table, the single-owner
+finalize-proof table, persisted backend identity and claim generations.
+Opening a v1 file migrates it in the
+same transaction: queued/recovery bytes are preserved and the
+watermark record is kept. History that cannot be classified stays an
+explicit error — the opener never deletes the file, reinterprets
+opaque bytes, or guesses a commit outcome. There is no downgrade path
+back to v1 layout; keep a file copy before first open if you need one.
+
+### Reconfigure provenance is bounded (non-breaking)
+
+`override_provenance` keeps the initial resolver records plus at most
+one current `residency.active` record; entries from accepted live
+reconfigures upsert the single `residency.active` record. It is not a
+chronological history (see the field rustdoc). No reader outside core
+exists; no caller migration needed.
+
+### Group/owner removal now consults live tickets (behavior)
+
+Removing a resource group or remapping an owner while ANY live ticket
+— including a 0-byte ticket — draws authority from it is denied with
+`InvalidState`. Previously a mapping with only 0-byte tickets could be
+removed. No signature changed.
+
 ## Required consumer changes
 
 - Construct live authority through `MemoryPlatformBuilder`,

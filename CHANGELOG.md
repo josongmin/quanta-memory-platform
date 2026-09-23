@@ -1,5 +1,24 @@
 # Changelog
 
+## Unreleased - 2026-09-23
+
+- Sep-23 follow-up hardening (FUP-001 through FUP-007): exact durable
+  record disposition with schema-v2 migration, backend-scoped
+  single-owner recovery leases (`DurableRestoreClaim` replaces bare
+  sequence permission changes), 0-byte ticket authority indexes, a
+  shared admission preflight with single-plan reclaim, per-axis kind
+  validation plus oracle matrices, and bounded reconfigure provenance.
+  See `MIGRATION.md` for the breaking claim-API change and the storage
+  migration notes.
+- Added a real SIGKILL/reopen qualification rail for the durable spill
+  tier (public API only), a randomized preflight/attempt agreement
+  oracle, reclaim/reconfigure coupling oracles, and deferred-authority
+  preservation oracles. Power loss and mid-finalize instruction-point
+  kills remain explicitly unverified.
+- Restored zero-allocation scheduler admission probes after the shared
+  admission engine briefly formatted denial messages on the boolean
+  path; the scaling bench pins the contract.
+
 ## Unreleased - 2026-09-22
 
 - Removed campaign-only ticket verification tooling and ticket-campaign

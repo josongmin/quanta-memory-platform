@@ -473,28 +473,58 @@ pub(crate) fn group_admission_ceiling(
     group.hard_cap_bytes.saturating_add(burst_allowance(shared_burst_pool_bytes, fair_share, group))
 }
 
+/// Outcome of [`check_group_admission`]: the boolean decision plus the
+/// exact denial facts — WITHOUT formatting the message. The denial message
+/// is built only by [`GroupAdmission::into_breach`], so boolean probes
+/// (`admits`, and the preflight's zero-state evaluation) never allocate on
+/// the deny path. The scaling bench pins this: scheduler admission must not
+/// allocate after policy construction.
+pub(crate) enum GroupAdmission {
+    Admitted,
+    Denied { limit: u64, after: Option<u64> },
+}
+
+impl GroupAdmission {
+    pub(crate) fn admitted(&self) -> bool {
+        matches!(self, Self::Admitted)
+    }
+
+    /// Materialize the structured breach, formatting the exact attempt-path
+    /// message. This is the ONLY place the message is built, so boolean and
+    /// error callers cannot drift. Unrepresentable postimages also report the
+    /// denial message: on the attempt path `admits` returns false for them
+    /// before any overflow guard runs, so parity demands the same text here.
+    pub(crate) fn into_breach(self, group: &str, owner: &str, bytes: u64) -> Option<LimitBreach> {
+        match self {
+            Self::Admitted => None,
+            Self::Denied { limit, after } => Some(LimitBreach::new(
+                LimitAxis::Group { group: group.to_string() },
+                limit,
+                after,
+                MemoryError::capacity(format!(
+                    "resource group {group} admission denied for owner {owner} \
+                     reserve of {bytes} bytes"
+                )),
+            )),
+        }
+    }
+}
+
 /// Scheduler-side admission for one prospective growth: the exact rule
 /// sequence of `admits` plus the `usage_after_growth` overflow guard, in
-/// attempt order. The scheduler delegates its boolean probe to this; the
-/// preflight reads the structured breach.
+/// attempt order. Returns a lazy decision — no message is formatted here.
+/// The scheduler delegates its boolean probe to this; the preflight
+/// materializes the structured breach only when it must report one.
 pub(crate) fn check_group_admission(
     groups: &BTreeMap<String, ResourceGroup>,
     shared_burst_pool_bytes: u64,
     fair_shares: &BTreeMap<String, u64>,
     current_usage: u64,
     group: &str,
-    owner: &str,
     bytes: u64,
-) -> Result<(), AdmissionFailure> {
+) -> GroupAdmission {
     let Some(budget) = groups.get(group) else {
-        return Err(AdmissionFailure::Breach(LimitBreach::new(
-            LimitAxis::Group { group: group.to_string() },
-            0,
-            Some(bytes),
-            MemoryError::capacity(format!(
-                "resource group {group} admission denied for owner {owner} reserve of {bytes} bytes"
-            )),
-        )));
+        return GroupAdmission::Denied { limit: 0, after: Some(bytes) };
     };
     let after = current_usage.checked_add(bytes);
     let admitted = after.is_some_and(|after| {
@@ -510,35 +540,17 @@ pub(crate) fn check_group_admission(
             )
     });
     if !admitted {
+        // Covers both the ceiling denial and the unrepresentable postimage
+        // (`after == None`): `admitted` is only true for `Some`, so no third
+        // arm is needed — the overflow case falls out of the same check.
         let ceiling = group_admission_ceiling(
             budget,
             shared_burst_pool_bytes,
             fair_shares.get(group).copied().unwrap_or(0),
         );
-        return Err(AdmissionFailure::Breach(LimitBreach::new(
-            LimitAxis::Group { group: group.to_string() },
-            ceiling,
-            after,
-            MemoryError::capacity(format!(
-                "resource group {group} admission denied for owner {owner} reserve of {bytes} bytes"
-            )),
-        )));
+        return GroupAdmission::Denied { limit: ceiling, after };
     }
-    // `admits` passed, so `after` is `Some` — but re-derive the overflow guard
-    // exactly as `usage_after_growth` phrases it rather than assuming.
-    current_usage.checked_add(bytes).ok_or_else(|| {
-        AdmissionFailure::Breach(LimitBreach::new(
-            LimitAxis::Group { group: group.to_string() },
-            group_admission_ceiling(
-                budget,
-                shared_burst_pool_bytes,
-                fair_shares.get(group).copied().unwrap_or(0),
-            ),
-            None,
-            MemoryError::capacity("resource-group usage exceeds u64"),
-        ))
-    })?;
-    Ok(())
+    GroupAdmission::Admitted
 }
 
 /// Scheduler-side protected-floor check for one prospective growth: the exact
@@ -656,15 +668,20 @@ pub(crate) fn check_execution_scratch(
 fn evaluate_chain(inputs: &PreflightInputs) -> Result<(), AdmissionFailure> {
     let request = &inputs.request;
     if let Some(group) = inputs.owner_group {
-        check_group_admission(
+        // The chain needs the structured breach on denial, so it materializes
+        // here; pure boolean probes (`admits`) skip `into_breach` instead.
+        if let Some(breach) = check_group_admission(
             &inputs.policy.resource_groups,
             inputs.policy.shared_burst_pool_bytes,
             inputs.fair_burst_shares,
             inputs.group_current_usage,
             group,
-            request.owner,
             request.bytes,
-        )?;
+        )
+        .into_breach(group, request.owner, request.bytes)
+        {
+            return Err(AdmissionFailure::Breach(breach));
+        }
     }
     if *request.class != MemoryClass::Headroom {
         let non_headroom_after =
@@ -839,10 +856,11 @@ mod tests {
             },
         )]);
         let shares = BTreeMap::from([("g".to_string(), 0u64)]);
-        let failure = check_group_admission(&groups, 0, &shares, 0, "missing", "owner:x", 10)
-            .expect_err("unknown group denies");
+        let decision = check_group_admission(&groups, 0, &shares, 0, "missing", 10);
+        assert!(!decision.admitted(), "unknown group denies");
+        let breach = decision.into_breach("missing", "owner:x", 10).expect("breach");
         assert_eq!(
-            failure.into_error(),
+            breach.into_error(),
             MemoryError::capacity(
                 "resource group missing admission denied for owner owner:x reserve of 10 bytes"
             )

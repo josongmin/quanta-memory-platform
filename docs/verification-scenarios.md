@@ -64,6 +64,16 @@ cloning all live owner/context maps.
 - ✅ Cross-ledger ticket — `ticket_from_one_ledger_cannot_release_on_another`; id uniqueness — `ticket_ids_are_monotonic_and_unique_across_many_reserves`.
 - ✅ Context axis balance — `context_axis_balances_with_owner_after_mixed_sequence`; wrong-kind release — `mixed_kind_release_preserves_charge_kind_partition`.
 - ✅🔬 Deterministic fuzz — `deterministic_fuzz_preserves_invariants_and_returns_to_zero` (400-step sequence, invariants 1/2/5/6 at every step, drains to 0).
+- ✅ **Per-axis kind-split validation** —
+  `sep23_fup004_honest_mixed_kind_snapshot_validates`,
+  `sep23_fup004_class_kind_swap_preserving_totals_is_rejected`,
+  `sep23_fup004_context_kind_swap_preserving_totals_is_rejected`,
+  `sep23_fup004_owner_kind_swap_preserving_totals_is_rejected`,
+  `sep23_audit_admitted_recharge_moves_kind_vectors_exactly`, and
+  `sep23_audit_batch_release_moves_kind_vectors_exactly`
+  (`core/src/domain/ledger.rs`). Scalar totals are not enough: the
+  per-kind split must agree on every axis, and recharge/batch moves it
+  exactly.
 
 ## B. Policy / config / presets — ✅ (`core/src/domain/{policy,config}.rs`)
 
@@ -107,6 +117,37 @@ check helpers that the control plane enforces (see group C/D).
   (`core/src/api/control.rs`). Scratch is a pending capacity permit: rebuild
   fences committed/live writes but permits exact rollback of incomplete pending
   authority so drop cannot strand ledger or group capacity.
+- ✅ **Shared admission preflight + single reclaim plan** —
+  `sep23_fup003_terminal_matrix_never_fires_callback`,
+  `sep23_fup003_blocked_matrix_never_fires_callback`,
+  `sep23_fup003_borrowing_class_hard_is_not_terminal_until_pool_exhausted`,
+  `sep23_fup003_predicted_failure_skips_soft_and_runs_single_hard`,
+  `sep23_fup003_hard_remeasure_still_denied_is_terminal_without_second_callback`,
+  `sep23_fup003_ticket_exhaustion_blocks_without_callback`,
+  `sep23_audit_group_denial_runs_single_hard_regardless_of_soft_crossing`,
+  `sep23_audit_wrong_victim_release_does_not_admit`,
+  `sep23_audit_forged_reclaimed_bytes_are_recorded_but_never_trusted`,
+  `sep23_audit_panicking_reclaimer_is_contained_and_broker_survives`,
+  `sep23_audit_zero_byte_reserve_fires_no_callback_even_over_soft`, and
+  `sep23_audit_max_scale_plus_one_byte_denies_clean_without_callback`
+  (`core/src/api/control.rs`). Terminal/blocked denials never fire the
+  callback; a predicted failure runs one hard plan, never soft-first.
+- ✅ 🔬 **Preflight/attempt agreement** —
+  `sep23_fup003_preflight_attempt_agreement_randomized`
+  (`core/src/api/control.rs`): 2,000 deterministic cases pin verdict and
+  byte-identical error equality plus fresh-broker terminality proofs.
+- ✅ **0-byte ticket authority + deferred preservation** —
+  `sep23_fup007_zero_byte_committed_blocks_group_removal_until_explicit_release`,
+  `sep23_fup007_zero_byte_pending_blocks_removal_explicit_rollback_unblocks`,
+  `sep23_fup007_scope_matrix_remap_cap_ungrouped_terminated`,
+  `sep23_audit_failing_pending_drain_preserves_ticket_for_retry`, and
+  `sep23_audit_failing_committed_drain_restores_whole_batch`
+  (`core/src/api/control.rs`). Zero-byte tickets pin mappings; failing
+  drains keep authority queued.
+- ✅ **Bounded provenance + reclaim/reconfigure coupling** —
+  `sep23_fup005_ten_thousand_reconfigures_keep_provenance_bounded`,
+  `sep23_fup006_accepted_reconfigure_inside_callback_remeasures_under_new_policy`
+  (`core/src/api/control.rs`).
 
 ## D. Scheduler — ✅ (`core/src/application/scheduler.rs`)
 
@@ -134,6 +175,37 @@ check helpers that the control plane enforces (see group C/D).
 - ✅ transcript per-session isolation + charged mode — `append_identity_is_partitioned_by_session`, `retention_stats_separate_active_evidence_and_session_costs`, and (charged) `exact_retry_charges_once_and_truncate_refunds_only_active_body`, `quota_denial_leaves_row_indexes_and_charge_unchanged` (`facade/src/transcript_store/service.rs`).
 - ✅ charged facade mutators are fail-closed before store mutation — `charged_remove_during_rebuild_is_fail_closed`, `charged_sweep_during_rebuild_is_fail_closed`, `reclaim_one_during_rebuild_is_fail_closed`, `reclaim_until_during_rebuild_is_fail_closed`, `truncate_refund_failure_preserves_rows_indexes_and_accounting`.
 - ✅ transcript charged breadth now matches the closeout bar — `append_identity_is_partitioned_by_session` proves session-local identity partitioning, and `truncate_refund_failure_preserves_rows_indexes_and_accounting` proves refund denial leaves both ledger and store untouched.
+- ✅ **Durable record exact terminal state** —
+  `sep23_fup001_reserved_hole_is_not_finalized_by_later_record`,
+  `sep23_fup001_reserve_only_reopen_is_not_consumed`,
+  `sep23_fup001_out_of_order_commit_finalized_reinsert_rejected`,
+  `sep23_fup001_same_bytes_retry_keeps_inventory_stable`,
+  `sep23_fup001_uncertain_commit_keeps_source_fenced_and_blocks_wrong_retire`,
+  and `sep23_fup001_legacy_watermark_file_migrates_payload_and_fails_closed`
+  (`facade/src/spill/backings/redb.rs`, `facade/src/revocable_store/service.rs`).
+  Reserved holes resolve `Absent`, never guessed; legacy files migrate
+  payload bytes and fail closed on ambiguous history.
+- ✅ **Single-owner durable recovery** —
+  `sep23_fup002_concurrent_recovery_has_exactly_one_owner`,
+  `sep23_fup002_stale_generation_rejected_after_claim_steal`,
+  `sep23_fup002_commit_ack_loss_same_claimant_publishes_on_retry`,
+  `sep23_fup002_stolen_claim_reconcile_retires_provisional_copy`,
+  `sep23_fup002_foreign_backend_claim_rejected_on_every_permission_change`,
+  `sep23_fup002_finalize_proof_is_per_record_not_last_writer`,
+  `sep23_fup002_decode_failure_and_denied_admission_preserve_durable`,
+  `sep23_fup002_backend_identity_stable_across_reopen`,
+  `sep23_audit_panicking_decode_aborts_prepared_claim_and_retries_clean`,
+  `sep23_audit_panicking_decode_preserves_committed_recovery_until_retry`,
+  and `sep23_audit_finalize_retry_succeeds_while_unrelated_claim_is_live`.
+  Exactly one recovery owner; losers keep no readable copy or charge.
+- ✅ **Real SIGKILL/reopen rail** —
+  `sep23_fup006_sigkill_after_commit_reopens_with_stable_identity_and_exact_drain`,
+  `sep23_fup006_sigkill_during_write_stream_converges_without_duplicates_or_tears`,
+  and `sep23_fup006_reserved_hole_stays_absent_across_sigkill`
+  (`facade/tests/spill_redb_kill_reopen.rs`, public API only). The child
+  dies by `SIGKILL` (no destructors, no flush) and the survivor reopens
+  cold. Power loss and mid-finalize instruction-point kills are NOT
+  covered (see residual boundaries in the Sep-23 receipt).
 
 **publish_pipeline is intentionally not charged.** It is a non-retaining
 *transition* stage (zero bytes held): it transforms a staged value into a
@@ -154,6 +226,14 @@ choice documented in `facade/src/publish_pipeline/service.rs`, not a gap.
 - ✅ **`FACADE_STORE_SUITE` runner** — the declared suite now runs through the live-broker-backed `MemoryTestKit` harness (`run_facade_store_suite`, `ConformanceSuite::run_facade_store_suite`, `fixtures::tests::testkit_runs_facade_store_suite_against_live_broker_and_passes`).
 - ✅ **Pin/Reclaim/Spill families are exercised by a running suite** — the facade suite now drives `PinDiscipline`, `ReclaimAccounting`, and `SpillRouting` through real portable stores (`payload_dedup_refund`, `pin_safe_delete`, `retained_map_refunds`, `transcript_truncate_refund`, `spill_round_trip`, `spill_unavailable_fail_closed` in `testkit/src/conformance/suites.rs`).
 - ✅ **`AllocatorAdvisory` is now a folded conformance verdict** — the broker suite classifies inert allocator observation under `AllocatorAdvisory` (`allocator_observation_is_inert` in `testkit/src/conformance/suites.rs`), and `suite_rejects_target_that_mutates_on_allocator_observation` proves the verdict bites on dishonest targets.
+- ✅ **Per-axis kind oracle** —
+  `sep23_fup004_suite_rejects_class_confined_kind_swap`,
+  `sep23_fup004_suite_rejects_context_confined_kind_swap`,
+  `sep23_fup004_suite_rejects_aggregate_preserving_bucket_swap`, and
+  `sep23_fup004_mixed_kind_trace_agrees_on_every_axis_bucket`
+  (`testkit/src/conformance/suites.rs`). Total-preserving swaps confined
+  to one axis are rejected; the mixed-kind fixed script agrees on every
+  axis bucket across reserve and release phases.
 
 ## H. Extraction / portability rails — ✅ (`scripts/`, root manifests)
 

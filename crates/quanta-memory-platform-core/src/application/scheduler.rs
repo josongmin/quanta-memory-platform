@@ -204,18 +204,18 @@ impl WeightedResourceGroupScheduler {
 
 impl ResourceGroupScheduler for WeightedResourceGroupScheduler {
     fn admits(&self, group_name: &str, requested_bytes: u64) -> bool {
-        // Delegates to the shared admission engine (FUP-003); the owner name
-        // only shapes the discarded denial message, so eliding it is exact.
+        // Delegates to the shared admission engine (FUP-003) and reads only
+        // the boolean: the denial message is never formatted here, so this
+        // probe allocates nothing on either path.
         admission::check_group_admission(
             &self.groups,
             self.shared_burst_pool_bytes,
             &self.fair_burst_shares,
             self.current_usage(group_name),
             group_name,
-            "",
             requested_bytes,
         )
-        .is_ok()
+        .admitted()
     }
 }
 

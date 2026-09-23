@@ -95,3 +95,36 @@ cargo test --locked -p quanta-memory-platform-facade --all-features durable_ -- 
   이유로 성공 처리하려면 별도 migration 계약 결정이 필요하다.
 - scope 밖 DB 삭제, opaque byte 재해석, commit 결과 추정, fail-open fallback은 금지한다.
 - 모든 구현·검증 항목은 현재 미수행. 공통 receipt를 작성한 뒤 상태를 변경한다.
+
+## Handoff 실제 기록 (Lane A, 2026-09-23)
+
+Changed: `spill/backings/redb.rs` per-record disposition
+(`SPILL_RECORD_STATE`: Reserved/Queued/Recovery/Finalized), single-owner
+proof (`SPILL_FINALIZED_BY`), same-transaction migration to schema v2,
+`revocable_store/service.rs` uncertain-commit fencing.
+
+Record-state transition table (to FUP-002, authoritative):
+
+| Persisted evidence | `resolve_record` | Note |
+| --- | --- | --- |
+| no state row, id < next-seq, no payload | `Absent` | reserved-never-committed hole; never guessed |
+| `Queued` + queue payload | `Queued` | restorable |
+| `Recovery` + recovery payload | `Recovery` | committed, needs recovery path |
+| `Finalized` + proof row | `Finalized` | terminal; proof names the generation |
+| `Finalized` without proof / payload without state | explicit `InvalidState` | contradiction; migration fills legacy rows |
+
+Verified: `sep23_fup001` 6/6 GREEN (facade all-features, final
+source); mutant Reserved→Finalized RED 3/6; legacy watermark migration
+preserves bytes and fails closed on ambiguous history.
+
+Disk cost (measured, macOS/arm64, dev profile, redb): empty schema DB and
+1,000 committed 32-byte records + 1 prepared claim are both exactly
+1,589,248 bytes — initial file allocation dominates; marginal per-record
+cost is below segment granularity at this scale. File growth is
+segment-stepped, not per-record linear. Do not extrapolate linearly.
+
+Not run: physical power loss; disk-fault injection beyond in-process
+crash points (see FUP-006 residual boundaries).
+
+Known risk: none open in this ticket's scope. Ambiguous legacy rows stay
+explicit errors by design (availability trade-off documented above).

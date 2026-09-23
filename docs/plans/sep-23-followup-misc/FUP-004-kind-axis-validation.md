@@ -78,3 +78,40 @@ cargo test --locked -p quanta-memory-platform-testkit --all-features suite_rejec
 004 검증 후 ledger hash와 lease 반환을 B에 전달해야 003을 시작할 수 있다.
 유효한 정상 state를 거절하는 새 invariant라면 요구사항을 재검토한다. 이 티켓은
 class-owner의 존재하지 않는 1:1 관계를 새 제약으로 추가하지 않는다.
+
+## Handoff 실제 기록 (Lane C, 2026-09-23)
+
+Changed: `LedgerSnapshot::validate_exact` now compares per-kind vectors
+on class/owner/context axes (`checked_kind_totals`); testkit
+`AccountingView` gains `class_kind_bytes`/`owner_kind_bytes`/
+`context_kind_bytes` matrices; suite verdict
+`observed_kind_split_agrees_across_axes` rejects axis-confined swaps.
+
+`AccountingView` compatibility (to FUP-006): three new REQUIRED `pub`
+fields. External fakes constructing the struct literally must add them;
+external fakes only READING the view are unaffected. No trait method was
+added or removed. Migration for a literal constructor:
+
+```rust
+AccountingView {
+    // ... existing scalar fields unchanged ...
+    class_kind_bytes: [[0, 0, 0], [0, 0, 0]],
+    owner_kind_bytes: [[0, 0, 0], [0, 0, 0]],
+    context_kind_bytes: [[0, 0, 0]; 5],
+}
+```
+
+Each axis must be read from that axis's own state — copying one axis
+into another defeats the oracle and the swap tests catch it.
+
+Verified: core `sep23_fup004` 4/4, testkit `sep23_fup004` 4/4;
+`suite_rejects_wrong_charge_kind_axis` 1/1;
+`property_trace_matches_independent_model` 1/1 (128 generated traces,
+full-view equality every step); mutants kind-check-skip RED 3/4,
+suite-verdict-weaken RED 2/4 with the documented split.
+
+Not run: nothing in scope. Batch/recharge kind movement is pinned by
+ledger-level exact-vector tests; the generated-trace property covers
+reserve/commit/release with full-view equality.
+
+Known risk: none open. No new 1:1 class-owner constraint was added.

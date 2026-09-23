@@ -1,6 +1,6 @@
 # Sep-23 follow-up misc — 실행 계획
 
-Status: `QMP IMPLEMENTED / OWNER-VERIFIED — repository exact-source 재검증 중; host-pair 1건 OPEN`
+Status: `FINAL QUALIFICATION CANDIDATE — authority: qmp-final-qualified-sep23-followup-v2; host-pair CLOSED`
 작성일: `2026-09-23`
 계획 기준 HEAD: `028448946caa95676df034481a830c1d3e3b1f33`
 계획 기준 tree: `f983669731805a330200213bad7bf1bd5573f308`
@@ -11,12 +11,13 @@ Status: `QMP IMPLEMENTED / OWNER-VERIFIED — repository exact-source 재검증 
 durable recovery 단일 소유권, 0-byte ticket의 scope 수명)과 P2 개선 3건을
 구현 가능한 티켓으로 분리했다. P0으로 확정된 건은 없다. FUP-001~005/007은
 현재 QMP 소스에서 구현·focused GREEN·temporary-mutant RED가 확보됐다.
-QMP repository/standalone extraction은 clean `beba437` 후보에서 GREEN이었고,
-이후 self-audit 보완을 포함한 최종 source 재검증은 `FUP-006`과
-`RECEIPT.md`가 소유한다. Semantica host-pair는 QMP 경로 해석과
-`quanta-memory-host`가 GREEN이지만 downstream default provenance 1건이 RED다.
-실제 남은 외부 작업은
-`tickets/HOST-PAIR-RUNTIME-DEFAULT-PROVENANCE.md` 한 건이다.
+QMP repository/standalone extraction은 predecessor tag
+`qmp-final-qualified-sep23-followup`에서 GREEN이었다. 그 뒤 발견된 scheduler
+deny-path allocation 회귀를 lazy `GroupAdmission`으로 수정한 최종 후보의 authority는
+새 annotated tag `qmp-final-qualified-sep23-followup-v2`다. Semantica host-pair의
+default-provenance 결함도 host owner에서 수정됐고 QBC compose 45/45 및 host
+114+5+7 GREEN으로 닫혔다. 정확한 source/result tuple과 잔여 경계는
+`RECEIPT.md` 및 `tickets/HOST-PAIR-RUNTIME-DEFAULT-PROVENANCE.md`가 소유한다.
 
 - **실행 재현:** 실제 Redb의 동시 recovery가 같은 sequence를 두 store에 복원;
   예약만 된 ID가 후속 ID의 finalize 뒤 `Finalized`로 판정됨.
@@ -56,7 +57,7 @@ QMP repository/standalone extraction은 clean `beba437` 후보에서 GREEN이었
 3. **P2 Wave:** C=004는 007이 `ledger.rs`를 반환한 뒤, B=005는 007이 `control.rs`를
    반환한 뒤 시작할 수 있다. B=003은 004/005 결과와 두 파일 lease를 인수한 뒤 시작한다.
 4. **통합:** full-followup 범위로 구현됐다. 최종 고정 source의 canonical/extraction
-   결과와 host-pair RED를 `RECEIPT.md`에 분리 기록한다.
+   결과와 host-pair GREEN을 `RECEIPT.md`와 annotated tag에 분리 기록한다.
 
 P1이 우선이다. `spill-redb`는 opt-in이므로 **사용하지 않는다는 host/dependency graph
 증거가 있을 때만** durable 미해결 상태를 기능 비활성 범위로 분리할 수 있다. 이 경우에도

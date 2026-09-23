@@ -89,3 +89,30 @@ cargo test --locked -p quanta-memory-platform-core --all-features --test public_
   상한은 이 티켓의 완료로 GREEN이 되지 않는다. host 노출과 비용을 별도 P2 범위로 판정한다.
 - 이 티켓만 VERIFIED여도 repository/extraction/host qualification, 배포·활성화는
   별개이며 FUP-006의 선택한 scope receipt가 필요하다.
+
+## Handoff 실제 기록 (Lane B0, 2026-09-23)
+
+Changed: `ticket_groups`/`ticket_owners` authority indexes record EVERY
+live ticket including 0-byte ones; group/owner remap and removal consult
+the indexes (not positive usage); pending-Drop and rebuild-Drop failures
+defer authority instead of swallowing; `control.rs`/`ledger.rs` leases
+returned to lanes C/B/B in order.
+
+Public error-meaning changes: removing a group or remapping an owner
+with ANY live ticket (even 0-byte) is now denied with `InvalidState`
+where a 0-byte-only mapping was previously removable. No signature
+changed. Host impact: none (`quanta-memory-host` never reconfigures).
+
+Live-ticket check cost (recorded): reserve/release/recharge do O(log n)
+index insert/remove per ticket; each live reconfigure scans the live
+indexes once (O(live tickets)) to build the pinned-owner set. No
+per-reserve full scan. B07/J06 cardinality caps stay OPEN by design.
+
+Verified: `sep23_fup007` 8/8 GREEN (committed/pending/Drop/rebuild
+matrix + scope matrix); mutant unrecorded-zero-byte RED 7/8 with the
+documented survivor; deferred-drain preservation mutants D1/D2/D3 RED
+1/1 each.
+
+Not run: B07/J06 exhaustion (out of scope, stays OPEN).
+
+Known risk: none open in this ticket's scope.

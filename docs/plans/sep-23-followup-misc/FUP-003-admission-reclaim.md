@@ -98,3 +98,37 @@ snapshot 전체 clone/owner 전체 scan을 매 reserve에 새로 추가하지 �
 공유와 성능 계약을 동시에 유지할 수 없다면 비용과 대안을 기록하고 범위를 재검토한다.
 지금의 reconfigure rejection이나 Hamilton 의미를 함께 바꾸지 않는다.
 I에는 전후 denial precedence, public API, policy revision, 필요한 host reclaimer 변경을 전달한다.
+
+## Handoff 실제 기록 (Lane B, 2026-09-23)
+
+Changed: `domain/admission.rs` shared engine
+(`check_ledger_postimage`, `check_group_admission`/`check_group_floor`
+with lazy `GroupAdmission` breach, `preflight`); ledger `reserve` and the
+broker preflight/attempt share it; broker plans are Admit (optional
+proactive soft) / single Hard / TerminalDenial / Blocked. No per-reserve
+snapshot clone or owner scan was added — views borrow live maps.
+
+Denial precedence (unchanged from the attempt path, now shared):
+group admission → group floor → execution scratch → rebuild fence →
+ledger postimage (global → class → owner → context → kind) → ticket
+space. Terminal = denies identically at zero usage (no callback can
+help); blocked = rebuild/unknown-class/ticket-exhaustion/internal.
+
+Public API: no signature changes. New observable counters
+`terminal_denials`/`blocked_denials` on `ReclaimRuntimeStats`.
+
+Host reclaimer changes needed: none — `quanta-memory-host` attaches no
+`MemoryReclaimer` and calls only `begin_rebuild`/`finish_rebuild`.
+
+Verified: `sep23_fup003` 7/7 GREEN (6 matrix + randomized
+preflight/attempt agreement over 2,000 cases and 80 fresh-broker
+terminality proofs); mutants terminal-arm-removal RED 3/7,
+trigger-downgrade RED 2/7, double-callback RED 1/1; scaling bench
+verifier OK (170 samples) after restoring zero-alloc `admits`
+(see self-audit P1 notes in `RECEIPT.md`).
+
+Not run: absolute latency assertions (none added, per contract).
+
+Known risk: none open. The agreement test pins preflight⟺attempt
+equality; per-axis rule correctness is pinned by the focused matrix
+tests, not by the agreement test alone.
