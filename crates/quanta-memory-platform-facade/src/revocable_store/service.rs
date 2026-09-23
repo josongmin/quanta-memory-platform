@@ -29,12 +29,13 @@ struct RevocableEntry<Key, Value> {
     charged_bytes: u64,
     /// Non-clone authority that always travels with its retained payload.
     charge: Option<ManagedCharge>,
-    /// Restore claim that produced this copy. `None` for ordinary entries;
-    /// `Some` from publication of a durable restore. A fenced provisional copy
-    /// presents this exact claimant at reconciliation; on a successful restore
-    /// the claim is inert history (the record is already consumed).
+    /// Restore claim retained only while a durable restore is fenced. `None`
+    /// for ordinary entries and successfully finalized restores. The pending
+    /// entry shares the immutable claim allocation with the in-flight
+    /// reconciliation call; the private `Arc` pins the same token across
+    /// lock-free controller calls, and no caller can clone this custody.
     #[cfg(feature = "spill")]
-    restore_claim: Option<DurableRestoreClaim>,
+    restore_claim: Option<Arc<DurableRestoreClaim>>,
 }
 
 /// In-process transfer authority. The value, its semantic cost, and the
@@ -688,7 +689,7 @@ impl<Key, Value> SimpleRevocableStore<Key, Value, Budgeted> {
                             value,
                             charged_bytes,
                             charge,
-                            restore_claim: Some(candidate.claim),
+                            restore_claim: Some(Arc::new(candidate.claim)),
                         },
                         next_committed,
                     );
@@ -706,14 +707,12 @@ impl<Key, Value> SimpleRevocableStore<Key, Value, Budgeted> {
         // crash window.
         {
             let mut state = self.lock_state_for_commit();
-            // The published copy carries its claim so a later fence preserves
-            // the exact claimant for reconciliation.
             state.entries.push_back(RevocableEntry {
                 key,
                 value,
                 charged_bytes,
                 charge,
-                restore_claim: Some(candidate.claim),
+                restore_claim: None,
             });
             state.committed_bytes = next_committed;
         }
@@ -723,14 +722,14 @@ impl<Key, Value> SimpleRevocableStore<Key, Value, Budgeted> {
         match finalized {
             Ok(Ok(())) => Ok(DurableRestoreOutcome::Restored { sequence: candidate.sequence }),
             Ok(Err(finalize_error)) => {
-                self.fence_published_restore(candidate.sequence);
+                self.fence_published_restore(candidate.sequence, Arc::new(candidate.claim));
                 Ok(DurableRestoreOutcome::RecoveryRequired {
                     sequence: candidate.sequence,
                     commit_error: Box::new(finalize_error),
                 })
             }
             Err(panic) => {
-                self.fence_published_restore(candidate.sequence);
+                self.fence_published_restore(candidate.sequence, Arc::new(candidate.claim));
                 std::panic::resume_unwind(panic)
             }
         }
@@ -773,10 +772,11 @@ impl<Key, Value> SimpleRevocableStore<Key, Value, Budgeted> {
         state.committed_bytes = next_committed;
     }
 
-    fn fence_published_restore(&self, sequence: u64) {
+    fn fence_published_restore(&self, sequence: u64, claim: Arc<DurableRestoreClaim>) {
         let mut state = self.lock_state_for_commit();
-        let entry =
+        let mut entry =
             state.entries.pop_back().expect("restore entry was published before finalization");
+        entry.restore_claim = Some(claim);
         let replaced = state.pending_restores.insert(DurableRecordId::new(sequence), entry);
         debug_assert!(replaced.is_none(), "mutation permit prevents duplicate restore fencing");
     }
@@ -809,12 +809,12 @@ impl<Key, Value> SimpleRevocableStore<Key, Value, Budgeted> {
                     record_id.get()
                 ))
             })?;
-            entry.restore_claim.ok_or_else(|| {
+            Arc::clone(entry.restore_claim.as_ref().ok_or_else(|| {
                 MemoryError::InvalidState(format!(
                     "durable record {} has a fenced restore without its claimant",
                     record_id.get()
                 ))
-            })?
+            })?)
         };
         let resolution = controller.reconcile_restore(&claim)?;
         let mut state = self.lock_state_for_commit();
@@ -852,11 +852,11 @@ impl<Key, Value> SimpleRevocableStore<Key, Value, Budgeted> {
                 match finalized {
                     Ok(Ok(())) => {}
                     Ok(Err(error)) => {
-                        self.fence_published_restore(record_id.get());
+                        self.fence_published_restore(record_id.get(), Arc::clone(&claim));
                         return Err(error);
                     }
                     Err(panic) => {
-                        self.fence_published_restore(record_id.get());
+                        self.fence_published_restore(record_id.get(), Arc::clone(&claim));
                         std::panic::resume_unwind(panic);
                     }
                 }

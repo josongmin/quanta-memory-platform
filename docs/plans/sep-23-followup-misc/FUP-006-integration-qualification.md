@@ -1,6 +1,6 @@
 # FUP-006 — 통합과 current-source qualification
 
-Status: `FINAL QUALIFICATION CANDIDATE — authority: qmp-final-qualified-sep23-followup-v2; host-pair CLOSED`
+Status: `FINAL QUALIFICATION CANDIDATE — authority: qmp-final-qualified-sep23-followup-v3; host-pair CLOSED`
 Priority: `SCOPE-SPECIFIC RELEASE GATE` (구현 결함 티켓이 아님)
 Owner: `Lane I — serial integrator`
 Depends on: core-enabled 후보는 `FUP-007`; durable-enabled 후보는 추가로 `FUP-001`, `FUP-002`; full-followup 후보는 추가로 `FUP-003`, `FUP-004`, `FUP-005`
@@ -158,14 +158,15 @@ intra-crate (no manifest/use-path change); the v2 annotated tag owns the
 repeated exact-source extraction receipt.
 
 Host-pair: the Semantica-owned default-provenance projection was repaired;
-QBC compose 45/45 and host 114+5+7 are GREEN. The v2 tag annotation owns
+QBC compose 45/45 and host 114+5+7 are GREEN. The v3 tag annotation owns
 the final exact-source rerun tuple; details and reopen conditions are in
 `tickets/HOST-PAIR-RUNTIME-DEFAULT-PROVENANCE.md`.
 
 Not run: hosted CI; deploy/activation; power loss; mid-finalize
 instruction-point kill.
 
-Promotion authority: predecessor tag `qmp-final-qualified-sep23-followup`
-must not move. The committed lazy-breach candidate is qualified only when
-the new annotated tag `qmp-final-qualified-sep23-followup-v2` exists and
-targets the exact clean candidate.
+Promotion authority: predecessor tags `qmp-final-qualified-sep23-followup`
+and `qmp-final-qualified-sep23-followup-v2` must not move. The committed
+lazy-breach plus move-only durable-claim candidate is qualified only when the
+new annotated tag `qmp-final-qualified-sep23-followup-v3` exists and targets
+the exact clean candidate.

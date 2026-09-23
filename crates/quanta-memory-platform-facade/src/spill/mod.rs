@@ -144,7 +144,22 @@ pub trait ReconciledDurableSpillController:
 /// use quanta_memory_platform_facade::DurableRestoreClaim;
 /// let forged = DurableRestoreClaim { backend: 0, generation: 0, sequence: 0 };
 /// ```
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+///
+/// Claims are deliberately non-`Clone` and non-`Copy`; duplicating the token
+/// would let one holder create multiple independently-owned restore flows:
+///
+/// ```compile_fail
+/// use quanta_memory_platform_facade::DurableRestoreClaim;
+/// fn require_clone<T: Clone>() {}
+/// require_clone::<DurableRestoreClaim>();
+/// ```
+///
+/// ```compile_fail
+/// use quanta_memory_platform_facade::DurableRestoreClaim;
+/// fn require_copy<T: Copy>() {}
+/// require_copy::<DurableRestoreClaim>();
+/// ```
+#[derive(Debug, Eq, Hash, PartialEq)]
 pub struct DurableRestoreClaim {
     backend: u128,
     generation: u64,
@@ -190,8 +205,15 @@ impl DurableRestoreClaim {
 
 /// Non-destructive durable restore candidate protected by a persisted claim.
 /// The destination remains authoritative until
-/// [`DurableRestoreController::commit_restore`] succeeds.
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// [`DurableRestoreController::commit_restore`] succeeds. It is not cloneable:
+/// move it through the restore flow and borrow its claim for retries.
+///
+/// ```compile_fail
+/// use quanta_memory_platform_facade::DurableRestoreCandidate;
+/// fn require_clone<T: Clone>() {}
+/// require_clone::<DurableRestoreCandidate>();
+/// ```
+#[derive(Debug, Eq, PartialEq)]
 pub struct DurableRestoreCandidate {
     pub sequence: u64,
     pub bytes: Vec<u8>,
@@ -219,7 +241,15 @@ pub enum DurableRestorePhase {
 }
 
 /// Restart recovery material for the single persisted restore claim.
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// Recovery material is also non-cloneable because it carries the claim. Move
+/// it into the resumed restore flow; retry operations by borrowing the claim.
+///
+/// ```compile_fail
+/// use quanta_memory_platform_facade::DurableRestoreRecovery;
+/// fn require_clone<T: Clone>() {}
+/// require_clone::<DurableRestoreRecovery>();
+/// ```
+#[derive(Debug, Eq, PartialEq)]
 pub struct DurableRestoreRecovery {
     pub candidate: DurableRestoreCandidate,
     pub phase: DurableRestorePhase,

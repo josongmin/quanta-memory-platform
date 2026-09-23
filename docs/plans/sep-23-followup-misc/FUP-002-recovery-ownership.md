@@ -94,7 +94,8 @@ cargo test --locked -p quanta-memory-platform-facade --all-features --doc
 ## Handoff 실제 기록 (Lane A, 2026-09-23)
 
 Changed: `DurableRestoreClaim` (backend, generation, sequence; no public
-constructor — only backends mint), per-record generation checks on
+constructor and no `Clone`/`Copy` — only backends mint; candidate/recovery
+envelopes are non-`Clone`), per-record generation checks on
 commit/finalize/abort/reconcile, `revocable_store` lease fencing
 (`pending_restores`) with catch-unwind decode/finalize paths, sealed
 `DurableSpillTarget`/`DurableRestoreTarget` traits.

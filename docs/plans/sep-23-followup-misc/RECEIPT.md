@@ -1,6 +1,6 @@
 # Sep-23 follow-up qualification receipt
 
-Status: `FINAL QUALIFICATION CANDIDATE — authority is annotated tag qmp-final-qualified-sep23-followup-v2`
+Status: `FINAL QUALIFICATION CANDIDATE — authority is annotated tag qmp-final-qualified-sep23-followup-v3`
 Scope: `full-followup` (`FUP-001` through `FUP-007`)
 Date: `2026-09-23 Asia/Seoul`
 
@@ -9,8 +9,8 @@ commit ID. Resolve the annotated tag and verify that it targets the current
 candidate:
 
 ```bash
-git rev-parse qmp-final-qualified-sep23-followup-v2^{}
-git show --no-patch --format=fuller qmp-final-qualified-sep23-followup-v2
+git rev-parse qmp-final-qualified-sep23-followup-v3^{}
+git show --no-patch --format=fuller qmp-final-qualified-sep23-followup-v3
 ```
 
 The tag annotation is the immutable source/result authority. Absence of that
@@ -30,7 +30,12 @@ evidence.
 - The final candidate adds the lazy-breach delta on top:
   `crates/quanta-memory-platform-core/src/{domain/admission.rs,application/scheduler.rs}`
   only (zero-alloc `admits` restoration, no manifest/use-path change).
-  The v2 tag must target the commit that contains it and this receipt.
+  The final tag must target the commit that contains it and this receipt.
+- The final public-authority delta removes `Clone`/`Copy` from
+  `DurableRestoreClaim` and `Clone` from the claim-bearing candidate/recovery
+  envelopes. Private `Arc` custody only pins the same claim across a lock-free
+  controller call under the store mutation permit; it is not exposed as a
+  second caller-owned restore authority.
 - No Cargo manifest (after `c7706d0`), dependency edge, public builder
   surface, or storage schema was changed by the final self-audit delta.
 
@@ -122,8 +127,8 @@ QMP `0.2.0` manifests under
 - QBC `quanta-runtime-memory-compose` lib/all-features: `45 / 45` GREEN.
 - QBC `quanta-memory-host` all-tests/all-features: `114 + 5 + 7` GREEN.
 - The paired default, explicit-overlay, and explicit-inherit provenance
-  oracles are all members of the compose target. The final v2 tag annotation
-  records the exact rerun source digest against the v2 QMP target.
+  oracles are all members of the compose target. The final v3 tag annotation
+  records the exact rerun source digest against the v3 QMP target.
 - Exact owner patch, prior RED, receipts, and reopen conditions are in
   `tickets/HOST-PAIR-RUNTIME-DEFAULT-PROVENANCE.md`.
 
@@ -223,9 +228,9 @@ while an unrelated claim is live).
 - Feature checks: `--no-default-features`, `spill`-only, `full` GREEN;
   `redb` absent from the `full` graph (host-dependency proof).
 - Real standalone extraction of `c7706d0` + in-extract rail: exit 0
-  (bootstrap `276893f`, extracted tree `8e10fc78…`). The v2 tag annotation
+  (bootstrap `276893f`, extracted tree `8e10fc78…`). The v3 tag annotation
   is the authority for the repeated extraction that includes the committed
   lazy-breach delta.
-- Host-pair is CLOSED after the host-owned provenance repair. The v2 tag
+- Host-pair is CLOSED after the host-owned provenance repair. The v3 tag
   annotation binds the final QMP commit to the repeated Semantica QBC tuple.
 - Absolute latency assertions: none added anywhere, per contract.

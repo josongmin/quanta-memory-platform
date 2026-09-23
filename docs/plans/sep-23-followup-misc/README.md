@@ -1,6 +1,6 @@
 # Sep-23 follow-up misc — 실행 계획
 
-Status: `FINAL QUALIFICATION CANDIDATE — authority: qmp-final-qualified-sep23-followup-v2; host-pair CLOSED`
+Status: `FINAL QUALIFICATION CANDIDATE — authority: qmp-final-qualified-sep23-followup-v3; host-pair CLOSED`
 작성일: `2026-09-23`
 계획 기준 HEAD: `028448946caa95676df034481a830c1d3e3b1f33`
 계획 기준 tree: `f983669731805a330200213bad7bf1bd5573f308`
@@ -13,8 +13,10 @@ durable recovery 단일 소유권, 0-byte ticket의 scope 수명)과 P2 개선 3
 현재 QMP 소스에서 구현·focused GREEN·temporary-mutant RED가 확보됐다.
 QMP repository/standalone extraction은 predecessor tag
 `qmp-final-qualified-sep23-followup`에서 GREEN이었다. 그 뒤 발견된 scheduler
-deny-path allocation 회귀를 lazy `GroupAdmission`으로 수정한 최종 후보의 authority는
-새 annotated tag `qmp-final-qualified-sep23-followup-v2`다. Semantica host-pair의
+deny-path allocation 회귀를 lazy `GroupAdmission`으로 수정한 후, durable claim-bearing
+public value도 non-`Clone`/non-`Copy`로 만들어 하나의 backend-issued lease가
+복수 caller-owned restore flow로 분할되지 않게 했다. 최종 authority는 새 annotated
+tag `qmp-final-qualified-sep23-followup-v3`다. Semantica host-pair의
 default-provenance 결함도 host owner에서 수정됐고 QBC compose 45/45 및 host
 114+5+7 GREEN으로 닫혔다. 정확한 source/result tuple과 잔여 경계는
 `RECEIPT.md` 및 `tickets/HOST-PAIR-RUNTIME-DEFAULT-PROVENANCE.md`가 소유한다.

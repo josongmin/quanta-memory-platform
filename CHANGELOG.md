@@ -5,7 +5,8 @@
 - Sep-23 follow-up hardening (FUP-001 through FUP-007): exact durable
   record disposition with schema-v2 migration, backend-scoped
   single-owner recovery leases (`DurableRestoreClaim` replaces bare
-  sequence permission changes), 0-byte ticket authority indexes, a
+  sequence permission changes and claim-bearing values are non-cloneable),
+  0-byte ticket authority indexes, a
   shared admission preflight with single-plan reclaim, per-axis kind
   validation plus oracle matrices, and bounded reconfigure provenance.
   See `MIGRATION.md` for the breaking claim-API change and the storage

@@ -7,7 +7,7 @@ must migrate atomically and qualify their own host composition against the exact
 QMP Git tree. No deprecated alias is retained when it would reopen an
 unbudgeted or unbounded path.
 
-## Sep-23 follow-up (`qmp-final-qualified-sep23-followup-v2`)
+## Sep-23 follow-up (`qmp-final-qualified-sep23-followup-v3`)
 
 ### Durable restore calls now take a claim (BREAKING for external implementers)
 
@@ -17,6 +17,11 @@ take `claim: &DurableRestoreClaim`. The claim binds backend identity,
 claim generation, and sequence, and only backends can mint it (no
 public constructor), so external crates cannot forge lease authority
 and stale generations are rejected instead of double-restoring.
+The claim, candidate, and recovery envelope are also deliberately
+non-`Clone`; the authority-bearing value must move through one restore flow.
+Keep a candidate or recovery envelope as the owner and borrow its claim for
+same-claimant retries. Code that previously cloned one of these values must
+restructure its flow rather than duplicate the lease.
 
 Caller migration (same flow, one identifier change):
 
