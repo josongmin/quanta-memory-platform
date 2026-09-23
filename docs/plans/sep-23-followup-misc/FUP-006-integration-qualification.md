@@ -207,3 +207,15 @@ and both public examples pass on this worktree. The earlier L2 Linux EIO run,
 extraction, scaling benchmark, and exact-source host-pair tuple predate this
 digest; they are not current-source proof. This is an integrated dirty-worktree
 check, not a new frozen-candidate qualification.
+
+Addendum (2026-09-24, Redb release scope): the user included opt-in
+`spill-redb` in this release gate. Current read-only inspection of
+`semantica-codegraph-v2/packages/analysis/quanta-v2/crates/quanta-memory-host/Cargo.toml`
+shows facade feature `full`, not `full-backings` or `spill-redb`; that host
+does not currently exercise the Redb path. The shared dirty QMP candidate now
+limits Redb logical record/payload, backing-owned restore staging, and the
+database file length. The file-length cap is not a volume-space reservation:
+actual ENOSPC, filesystem quota, caller codec scratch, and exact-source host
+activation remain unqualified. At the file cap, Redb may require a cold reopen
+and additional cap headroom before a retained record can restore. The older
+exact-source host-pair receipt does not close this durable release gate.

@@ -266,25 +266,48 @@ impl Eq for DurableRestoreCandidate {}
 /// meter arbitrary caller copies or private codec scratch.
 #[derive(Debug)]
 pub(crate) struct RestoreReadLease {
-    used: Arc<AtomicU64>,
+    used_bytes: Arc<AtomicU64>,
+    used_buffers: Arc<AtomicU64>,
     bytes: u64,
 }
 
 impl RestoreReadLease {
     #[cfg(feature = "spill-redb")]
-    pub(crate) fn acquire(used: Arc<AtomicU64>, bytes: u64, max: u64) -> MemoryResult<Self> {
-        let mut current = used.load(Ordering::Acquire);
+    pub(crate) fn acquire(
+        used_bytes: Arc<AtomicU64>,
+        used_buffers: Arc<AtomicU64>,
+        bytes: u64,
+        max_bytes: u64,
+        max_buffers: u64,
+    ) -> MemoryResult<Self> {
+        used_buffers
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                current.checked_add(1).filter(|next| *next <= max_buffers)
+            })
+            .map_err(|_| MemoryError::capacity("redb restore in-flight buffer count exhausted"))?;
+        let mut current = used_bytes.load(Ordering::Acquire);
         loop {
-            let next = current
-                .checked_add(bytes)
-                .ok_or_else(|| MemoryError::capacity("redb restore staging bytes exceed u64"))?;
-            if next > max {
-                return Err(MemoryError::capacity(format!(
-                    "redb restore staging requires {next} bytes, above configured {max}-byte in-flight limit"
-                )));
-            }
-            match used.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire) {
-                Ok(_) => return Ok(Self { used, bytes }),
+            let next = current.checked_add(bytes);
+            let next = match next {
+                Some(next) if next <= max_bytes => next,
+                _ => {
+                    let released =
+                        used_buffers.fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                            count.checked_sub(1)
+                        });
+                    debug_assert!(released.is_ok(), "restore buffer reservation underflow");
+                    return Err(MemoryError::capacity(format!(
+                        "redb restore staging exceeds configured {max_bytes}-byte in-flight limit"
+                    )));
+                }
+            };
+            match used_bytes.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Ok(Self { used_bytes, used_buffers, bytes }),
                 Err(observed) => current = observed,
             }
         }
@@ -293,8 +316,20 @@ impl RestoreReadLease {
 
 impl Drop for RestoreReadLease {
     fn drop(&mut self) {
-        let prior = self.used.fetch_sub(self.bytes, Ordering::AcqRel);
-        debug_assert!(prior >= self.bytes, "restore staging lease underflow");
+        // An impossible accounting mismatch must remain fail-closed: never
+        // wrap the counter and accidentally admit unbounded future reads.
+        let bytes_released =
+            self.used_bytes.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                current.checked_sub(self.bytes)
+            });
+        let buffers_released =
+            self.used_buffers.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                current.checked_sub(1)
+            });
+        debug_assert!(
+            bytes_released.is_ok() && buffers_released.is_ok(),
+            "restore lease underflow"
+        );
     }
 }
 

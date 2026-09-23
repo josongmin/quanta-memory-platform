@@ -160,7 +160,7 @@ It is not a switch that changes a budgeted store after construction.
 | `retained_map` | Typed key/value retention, overwrite, read, remove, targeted sweep. | Charges retained key/index/value cost; replacement is net-postimage accounting. |
 | `revocable_store` | FIFO cache or scratch-like entries that may be evicted. | `reclaim_one`/`reclaim_until` refund exact front-entry charges; failure restores FIFO state and authority. |
 | `spill` | Move revocable entries to another tier. | In-process handles move the live charge; durable operations fence uncertain writes/deletes until reconciliation. |
-| `spill-redb` | Durable spill backing. | Optional Redb implementation of the durable receipt/reconciliation contract. |
+| `spill-redb` | Durable spill backing. | Optional Redb implementation of the durable receipt/reconciliation contract. `RedbSpillLimits` bounds encoded record size, retained record count, logical retained payload bytes, Redb database file length, cache setting, and backing-owned restore staging bytes/buffers. The file cap does not reserve filesystem space or bound caller-codec scratch; an I/O error may require cold reopen and additional file capacity before restore can progress. |
 | `transcript` | Idempotent session/event transcript. | Exact replay is deterministic; evidence/session-key bytes are separately tracked; retention saturation fails closed. |
 | `publish_pipeline` | Stage/commit publication transitions. | Legacy non-retaining pipeline remains supported; retaining prepared publication uses token-owned accounting and root-aware orphan GC. |
 

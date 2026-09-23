@@ -303,6 +303,33 @@ check helpers that the control plane enforces (see group C/D).
   victim exactly once; a post-commit victim is terminal and not replayed under
   the documented revocable contract. The unrelated record restores and every
   survivor charge drains. This is still process termination, not power loss.
+- ✅ **Redb logical quota, file cap and restore staging** —
+  `limits_reject_oversized_record_before_commit_without_consuming_reserved_id`,
+  `retained_limits_count_recovery_and_refund_only_after_finalize`,
+  `retained_payload_cap_denies_next_record_without_changing_durable_authority`,
+  `in_flight_restore_budget_denial_preserves_claim_and_releases_on_candidate_drop`,
+  `zero_byte_restore_candidates_are_bounded_by_buffer_count`,
+  `concurrent_writers_at_record_cap_admit_exactly_one_transaction`,
+  `staging_denial_after_staged_remove_rolls_back_durable_payload`,
+  `tighter_reopen_rejects_existing_inventory_without_erasing_it`,
+  `persisted_payload_usage_mismatch_fails_closed_without_erasing_record`,
+  `capped_file_backend_rejects_extension_before_file_mutation`,
+  `reopening_above_database_file_cap_fails_without_erasing_payload`,
+  and `database_file_cap_denial_preserves_prior_durable_record_across_reopen`
+  (`spill/backings/redb.rs`). Limits reject writes before commit, count
+  recovery payloads until finalize, and reject smaller reopen limits without
+  erasing the only copy. The per-file cap blocks Redb file extension and
+  reports its storage-full cause as typed `Capacity`. At the
+  cap, Redb can require a cold reopen after I/O error and more file headroom
+  before all restores complete. This is not a whole-volume quota, actual
+  ENOSPC injection or caller codec scratch bound.
+- ✅ **Redb file-cap denial with live source authority** —
+  `redb_file_cap_denial_keeps_store_source_charged_until_exact_resolution`
+  (`revocable_store/service.rs`) fills the capped Redb through the charged
+  store path. A refused spill keeps the source charge; an unknown commit is
+  fenced until a cold reopen and exact record reconciliation. The final
+  source or durable authority drains without a double refund. This injects
+  QMP's file cap, not a real filesystem ENOSPC fault.
 - 🧪 **Optional Linux syscall-error subrail (DURABILITY-001 L2 partial)** —
   `scripts/durability/run-emulated-linux.sh` calibrates the real finalize
   boundary, injects EIO into the first `pwrite64` and `fdatasync` after it, then

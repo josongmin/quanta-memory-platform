@@ -553,3 +553,52 @@ at `6b258f…`.
   The prior exact-source host/QBC tuple predates this worktree. Hosted CI,
   deployment, activation, and current-source Linux L2 remain unrun/unavailable;
   physical power-loss evidence remains unverified.
+
+### Clean-snapshot closeout audit (2026-09-24)
+
+The shared checkout advanced to `5cc15c39712704f325cc849a916c3d575d5eb672`
+while another writer was editing it. To avoid treating a moving dirty tree as
+qualification, this audit copied its exact file content into clean temporary
+validation commits; these are **not** commits on the shared branch.
+
+- Final full workspace rail: snapshot `c20acad3bd29a8b490408914f30b5144eedfb5eb`,
+  tree `f6c226d4e16822e0d4a71217b13f60d9e513418c`, before/after identical,
+  `scripts/check-workspace.sh` exit 0. Core 251, facade 305, testkit 82 unit
+  tests passed; the seven SIGKILL/reopen integration tests, ten advertised
+  feature paths, 255 documented selectors, PM lint, and cargo-deny passed.
+- Full standalone extraction: prior clean snapshot
+  `7f7b812805d83d980b9778239bff1744d2eb35c3` (tree
+  `55ed73edf4885002ac31a255025ec8099fa98669`) produced canonical digest
+  `a6ba813de538b6045ad6102679fa8b896a8d02f4c3c776abaa350eca1bacb88e`.
+  The extracted workspace ran its own full `scripts/check-workspace.sh` at exit
+  0 and became clean extracted commit `864813da8abcb7e1b4f8fe5ba0ce3420b07266f9`.
+  Both public examples ran there. Its full scaling verifier passed 170 samples
+  with no comparison baseline. That proves this local structural/cardinality
+  verifier, not a host SLO or physical disk bound. An earlier full run on an
+  older snapshot failed a wall-clock growth check amid concurrent Rust builds;
+  the raw result is not silently promoted to a code regression or erased.
+- The final snapshot differs from that extracted snapshot only in Redb
+  `#[cfg(test)]` oracles and a plan document; production and benchmark inputs
+  are byte-identical. The final snapshot's clean extraction pre-flight also
+  passed. The stronger corruption/rollback tests are included in its 305
+  facade tests; no full in-extract rail is claimed for the final test-only delta.
+- Five re-applied FUP mutants (reserved-hole, foreign backend claim, class-kind
+  axis, bounded provenance, live zero-byte owner) and two new resource mutants
+  (retained payload byte cap and zero-byte in-flight buffer count) each produced
+  a behavioral assertion RED with Cargo exit 101 on the immediately preceding
+  clean source. The isolated mutant worktree was restored byte-for-byte
+  (`git diff --exit-code` and tree equality). Later snapshot differences do
+  not alter these production sites or selected oracles.
+
+This addendum is a documentation-only edit **after** the frozen runs. The
+shared branch still has other-writer uncommitted files, so it is not a clean
+release commit. Current-source Semantica host/QBC, Linux L2 fault injection,
+physical power-loss L3, hosted CI, deployment, and activation remain separate
+unverified gates; historic receipts do not close them.
+
+Postscript: after the clean-snapshot runs and this addendum, another writer
+changed production `spill/backings/redb.rs` again (a capped file backend and
+`max_database_file_bytes`). The frozen results above therefore do **not**
+qualify the subsequently moving shared checkout. Re-freeze its final content
+and rerun the affected local, extraction, scaling, and host rails before any
+release/activation claim.

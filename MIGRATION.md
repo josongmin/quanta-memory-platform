@@ -55,6 +55,29 @@ explicit error — the opener never deletes the file, reinterprets
 opaque bytes, or guesses a commit outcome. There is no downgrade path
 back to v1 layout; keep a file copy before first open if you need one.
 
+### Redb resource limits and restore bytes (current candidate)
+
+`RedbSpillBacking::create` now uses bounded defaults; production callers can
+select explicit `RedbSpillLimits` with the create_with_limits constructor. Opening a file
+whose existing payloads exceed the selected limits fails without deleting
+records. The limits cover encoded record length, queued-plus-recovery count,
+their logical payload sum, Redb database file length, Redb's configured cache,
+and backing-owned restore staging bytes/buffer count (including 0-byte
+candidates). The file-length cap includes Redb page/copy-on-write overhead,
+but does **not** reserve free space on the volume or bound filesystem metadata,
+snapshots, caller-owned copies, or private encoder/decoder scratch. After a
+file-cap or ENOSPC I/O error, close and reopen the backing before probing its
+persisted state; QMP reports the storage-full cause as `Capacity`, while a
+poisoned handle reports a reopen-required `OperationInProgress`. Restore may
+need a larger file cap to make progress. A
+production host still needs volume quota/ENOSPC qualification and a bounded
+codec contract.
+
+`DurableRestoreCandidate::bytes` is now read-only via `candidate.bytes()` so
+its backing-owned staging lease remains live until the candidate is dropped.
+Code that moved the public `Vec` out must explicitly copy into caller-owned
+memory and account for that copy under its own budget.
+
 ### Reconfigure provenance is bounded (non-breaking)
 
 `override_provenance` keeps the initial resolver records plus at most

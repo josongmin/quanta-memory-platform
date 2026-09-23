@@ -33,7 +33,6 @@ use std::time::Duration;
 
 #[cfg(feature = "revocable_store")]
 use quanta_memory_platform_core::{MemoryClass, MemoryPreset, StoreBindingHandle};
-use quanta_memory_platform_facade::spill::backings::redb::RedbSpillBacking;
 use quanta_memory_platform_facade::spill::service::{
     DurableRestoreTarget, ReconciledDurableSpillTarget,
 };
@@ -41,6 +40,7 @@ use quanta_memory_platform_facade::spill::service::{
 use quanta_memory_platform_facade::{
     MemoryPlatformBuilder, RevocableStore, RoutedSpillController, SpillReceipt,
 };
+use quanta_memory_platform_facade::{RedbSpillBacking, RedbSpillLimits};
 
 /// 32-byte self-describing payload: little-endian record index plus filler.
 fn payload(index: u64) -> Vec<u8> {
@@ -65,7 +65,8 @@ fn main() {
         );
         std::process::exit(2);
     }
-    let backing = RedbSpillBacking::create(&args[1]).expect("child open");
+    let backing = RedbSpillBacking::create_with_limits(&args[1], RedbSpillLimits::default())
+        .expect("child open");
     let mut stdout = std::io::stdout().lock();
     match args[2].as_str() {
         "fill" => {
