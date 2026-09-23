@@ -9,135 +9,69 @@ Hand edits are overwritten and will fail `pm lint`.
 ## Read First — Non-Negotiables
 
 This repo is `quanta-memory-platform`: a **portable, host-independent** memory
-budgeting / accounting library. It is consumed by the Semantica monorepo through
-a host adapter (`quanta-memory-host`) that lives **outside this repo**, and it is
-designed to be extracted into its own git repository with no rewrites.
+budgeting/accounting library designed for mechanical extraction. The Semantica
+host adapter lives outside this repository.
 
 Hard rules:
 
 - **Dependency direction is strict and acyclic:** `core <- facade <- testkit`.
-  No member depends upward. The host adapter depends on this repo, never the
-  reverse. Adding a dep that inverts this fails the extraction pre-flight.
+  The host depends on this repo, never the reverse.
 - **`domain/` and `ports/` are pure:** no `std::fs`, `std::env`, `SystemTime::now`,
   `Instant::now`, and no `crate::adapters` import. I/O and clocks live behind
   ports/adapters.
-- **Host-independent public API:** no Semantica nouns (`Semantica*`,
-  `quanta_runtime`, `codegraph`). The host hello-world lives in Semantica.
-- **Builder-first surface:** consumers use `MemoryPlatformBuilder`,
-  `PortableMemoryPresets`, and the store/pipeline builders — never raw broker
-  constructors.
+- **Public API stays host-independent and builder-first:** no Semantica nouns or
+  public raw-broker construction paths.
 - **Ledger is fail-closed:** every mutating accounting op fully succeeds or
-  leaves the ledger untouched; the invariants defined in
-  `crates/quanta-memory-platform-core/src/domain/ledger.rs` always hold;
-  allocator telemetry is advisory and never mutates counters.
-- **Conformance must bite:** the testkit suite must REJECT a broken fake, not just
-  accept honest ones.
-- **Agent guidance:** edit only `tools/pm/sources/**`, then run
-  `python3 tools/pm/pm.py sync`. Never hand-edit `AGENTS.md`, `CLAUDE.md`, or
-  `.cursorrules`.
+  leaves it untouched. Allocator telemetry is advisory. Conformance must reject
+  a broken fake, not only accept honest implementations.
+- **Generated guidance:** edit `tools/pm/sources/**` or `tools/pm/targets.json`,
+  then run `python3 tools/pm/pm.py sync`. Do not hand-edit generated outputs.
 
-## Where Things Live
+## Read Only What the Task Needs
 
-| Need | Location |
+Do not preload the full documentation stack. Open the relevant authority when
+the task enters that area:
+
+| Task | Read |
 | --- | --- |
-| Repo overview + dependency direction | `README.md` |
-| Extraction checklist (split into own repo) | `EXTRACTION.md` |
-| Pure hexagonal kernel | `crates/quanta-memory-platform-core/src/{api,application,domain,ports,adapters}/` |
-| Accounting SSOT (invariants) | `crates/quanta-memory-platform-core/src/domain/ledger.rs` |
-| Budget policy / presets / manifests | `crates/quanta-memory-platform-core/src/domain/{policy,config}.rs` |
-| Public broker surface | `crates/quanta-memory-platform-core/src/api/{broker,builder,control}.rs` |
-| Feature-sliced portable stores + pipelines | `crates/quanta-memory-platform-facade/src/<feature>/` |
-| Storage backings (feature-gated) | `crates/quanta-memory-platform-facade/src/<feature>/backings/` |
-| Conformance / chaos / alloc tooling | `crates/quanta-memory-platform-testkit/src/` |
-| Examples (compile vs real public API) | `crates/quanta-memory-platform-facade/examples/{hello_world,effective_budget_report}.rs` |
-| One-shot lint rail | `scripts/check-workspace.sh` |
-| Extraction bootstrap | `scripts/extract-to-standalone-repo.sh` |
-| Agent/operator instruction sources | `tools/pm/sources/**` |
-| Prompt manager | `tools/pm/pm.py`, `tools/pm/targets.json` |
-
-Generated docs (`AGENTS.md`, `CLAUDE.md`, `.cursorrules`) are produced from
-`tools/pm/sources/**`. Never hand-edit them.
+| Crate edges, layers, public surface | `tools/pm/sources/rules/architecture.md` |
+| Ledger, policy, reclaim, snapshots | `tools/pm/sources/rules/determinism.md` and the owning source |
+| Tests or conformance | `tools/pm/sources/rules/tests.md` |
+| Fallible Rust paths | `tools/pm/sources/rules/error-handling.md` |
+| Cargo deps or features | `tools/pm/sources/rules/dependencies.md` |
+| Known regression review | `tools/pm/sources/rules/cheatsheet.md` |
+| Workspace gate or extraction | `tools/pm/sources/rules/build.md` |
+| Repository overview | `README.md`; extraction contract: `EXTRACTION.md` |
 
 ## Working Rules
 
-Keep a **thin, inward-only boundary** across the hexagonal kernel and the
-feature-sliced facade:
-
-| Layer | Location | Responsibility |
-| --- | --- | --- |
-| **Domain** | `crates/quanta-memory-platform-core/src/domain/` | Pure budget/accounting logic: ledger, policy, config, context, stats. No I/O, no clocks. |
-| **Ports** | `crates/quanta-memory-platform-core/src/ports/` | Trait definitions: pin, scratch, store, telemetry. No adapters. |
-| **Adapters** | `crates/quanta-memory-platform-core/src/adapters/` | Port impls (hdrhistogram, metrics). Telemetry is advisory. |
-| **Application** | `crates/quanta-memory-platform-core/src/application/` | Use-case services: pressure controller, scheduler. |
-| **API** | `crates/quanta-memory-platform-core/src/api/` | Builder-first public broker surface. |
-| **Facade** | `crates/quanta-memory-platform-facade/src/<feature>/` | Portable stores + pipelines; backings under `backings/`, feature-gated. |
-| **Testkit** | `crates/quanta-memory-platform-testkit/src/` | Conformance / chaos / fixtures / doctor. Never a prod dep. |
-
-On any change:
-
-- **Ledger / accounting** → add `#[cfg(test)]` tests asserting the invariants
-  defined in `crates/quanta-memory-platform-core/src/domain/ledger.rs` and that
-  mutations are fail-closed.
-- **Policy / manifest / preset / residency** → add validation tests; update
-  `crates/quanta-memory-platform-core/tests/policy_contracts.rs` if a
-  cross-cutting contract changed.
-- **New port** → trait in `ports/`, impl in `adapters/` (or facade backing); keep
-  `domain/` free of the impl.
-- **New facade store/pipeline** → service + builder in `shared/`, backings behind
-  a feature; never reach back into `core` internals.
-- **Public API change** → update the `lib.rs` re-exports and the examples
-  (`hello_world`, `effective_budget_report`) so they still compile.
+- Preserve unrelated dirty work; inspect status before editing and verify only
+  intended paths changed.
+- Make the smallest owner-level change that proves the behavior. Do not add a
+  shim around a broken accounting or storage authority.
+- Couple behavior changes to the owning test: ledger invariants and fail-closed
+  mutations, policy validation, backing round-trips, or public API examples.
+- Put new traits in `ports/` and implementations in adapters or facade backings.
+  Keep production backings feature-gated and testkit out of production graphs.
+- For public API changes, update re-exports and the real public examples.
 
 ## Closeout Playbook
 
-Every meaningful code slice should close with the applicable items:
-
-1. The code change (smallest surface that proves the behavior).
-2. Tests in the owning crate module (`#[cfg(test)]`), asserting invariants — not
-   just `Ok`.
-3. A conformance / contract test if the slice touches accounting or a public
-   contract (and the suite still REJECTS a broken fake).
-4. Doc updates (`README.md` / `EXTRACTION.md`) if direction, surface, or build
-   steps changed.
-
-Before closeout, run:
+Run focused checks while iterating. For a meaningful code/configuration change,
+close with the canonical rail:
 
 ```bash
-# Regenerate agent docs if you edited tools/pm/sources/**
 python3 tools/pm/pm.py sync
-scripts/check-workspace.sh          # canonical static/test/feature/selector/PM/deny rail
+scripts/check-workspace.sh
 ```
 
-After the candidate source is committed and clean, run the extraction pre-flight
-if you changed any `Cargo.toml` or cross-crate use path:
+If `Cargo.toml` or a cross-crate use path changed, run the extraction dry-run on
+a committed, clean candidate:
 
 ```bash
 scripts/extract-to-standalone-repo.sh --dry-run /tmp/qmp-check
 ```
 
-Manual smoke (examples compile against the real public API):
-
-```bash
-cargo run -p quanta-memory-platform-facade --example hello_world
-cargo run -p quanta-memory-platform-facade --example effective_budget_report
-```
-
-Closeout report format:
-
-```text
-Changed:
-- ...
-
-Verified:
-- scripts/check-workspace.sh
-- extraction dry-run on the committed candidate (if Cargo.toml/use paths changed)
-
-Not run:
-- ...
-
-Known risk:
-- ...
-```
-
-Fail-closed principle: if `pm lint` fails, sync — do not patch generated files.
-If tests fail, fix behavior; do not weaken assertions to greenwash.
+Report changed paths, exact verification run, anything not run, and remaining
+risk. Do not treat focused checks as the canonical rail. If `pm lint` fails,
+sync from source; if tests fail, fix behavior rather than weaken assertions.

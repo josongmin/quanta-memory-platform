@@ -417,7 +417,21 @@ impl<Key, Value> SimpleRevocableStore<Key, Value, Budgeted> {
         }));
         let result = match committed {
             Ok(result) => result,
-            Err(panic) => std::panic::resume_unwind(panic),
+            Err(panic) => {
+                // The target may have persisted the record before panicking.
+                // Treat this exactly like an unknown commit outcome: retain
+                // the charged source, but make it unreadable until an exact
+                // record probe selects durable or resident authority.
+                let mut state = self.lock_state_for_commit();
+                let entry = state.entries.pop_front().expect("front entry was checked");
+                let replaced = state.pending_spills.insert(record_id, entry);
+                debug_assert!(
+                    replaced.is_none(),
+                    "mutation permit prevents duplicate spill fencing"
+                );
+                drop(state);
+                std::panic::resume_unwind(panic)
+            }
         };
 
         match result {
@@ -564,10 +578,12 @@ impl<Key, Value> SimpleRevocableStore<Key, Value, Budgeted> {
         self.restore_durable_candidate(controller, candidate, DurableRestorePhase::Prepared, decode)
     }
 
-    /// Resume the single persisted restore claim after process restart. This is
-    /// deliberately separate from ordinary FIFO restore: callers must invoke it
-    /// only after the previous volatile owner is gone. The redb file lock and
-    /// exclusive persisted claim prevent another ordinary restore from passing.
+    /// Resume the single persisted restore claim after its volatile owner is
+    /// gone: for example, after process restart or after a prepare callback
+    /// panicked before returning the claim token. This is deliberately separate
+    /// from ordinary FIFO restore. Do not call while another live caller still
+    /// owns the token; the redb file lock and persisted claim fence ordinary
+    /// restore, but cannot prove that an external caller has relinquished it.
     pub fn recover_active_durable_restore<C, Decode>(
         &self,
         controller: &C,
@@ -621,7 +637,7 @@ impl<Key, Value> SimpleRevocableStore<Key, Value, Budgeted> {
         Value: ByteSized,
     {
         let decoded =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| decode(&candidate.bytes)));
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| decode(candidate.bytes())));
         let (key, value) = match decoded {
             Ok(Ok(decoded)) => decoded,
             Ok(Err(error)) => {
@@ -634,12 +650,28 @@ impl<Key, Value> SimpleRevocableStore<Key, Value, Budgeted> {
                 std::panic::resume_unwind(panic)
             }
         };
-        let charged_bytes = match revocable_entry_cost(&key, &value) {
-            Ok(charged_bytes) => charged_bytes,
-            Err(error) => {
+        let measured = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            revocable_entry_cost(&key, &value)
+        }));
+        let charged_bytes = match measured {
+            Ok(Ok(charged_bytes)) => charged_bytes,
+            Ok(Err(error)) => {
                 retire_client_value(key);
                 retire_client_value(value);
                 return self.finish_failed_restore_prepare(controller, &candidate, phase, error);
+            }
+            Err(panic) => {
+                // Caller measurement is part of resident preparation. No
+                // charge or publication exists yet. Retire decoded values
+                // without letting a second client destructor panic abort the
+                // process, then apply the same claim disposition as a decode
+                // panic: abort Prepared, preserve Committed for recovery.
+                retire_client_value(key);
+                retire_client_value(value);
+                if phase == DurableRestorePhase::Prepared {
+                    let _ = controller.abort_restore(&candidate.claim);
+                }
+                std::panic::resume_unwind(panic)
             }
         };
         let next_committed = match self.lock_state()?.committed_bytes.checked_add(charged_bytes) {
@@ -667,9 +699,12 @@ impl<Key, Value> SimpleRevocableStore<Key, Value, Budgeted> {
         };
 
         if phase == DurableRestorePhase::Prepared {
-            match controller.commit_restore(&candidate.claim) {
-                Ok(()) => {}
-                Err(DurableCommitFailure::Retained(error)) => {
+            let committed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                controller.commit_restore(&candidate.claim)
+            }));
+            match committed {
+                Ok(Ok(())) => {}
+                Ok(Err(DurableCommitFailure::Retained(error))) => {
                     drop(charge);
                     retire_client_value(key);
                     retire_client_value(value);
@@ -681,7 +716,7 @@ impl<Key, Value> SimpleRevocableStore<Key, Value, Budgeted> {
                         ))),
                     };
                 }
-                Err(DurableCommitFailure::Ambiguous(commit_error)) => {
+                Ok(Err(DurableCommitFailure::Ambiguous(commit_error))) => {
                     self.fence_durable_restore(
                         DurableRecordId::new(candidate.sequence),
                         RevocableEntry {
@@ -697,6 +732,24 @@ impl<Key, Value> SimpleRevocableStore<Key, Value, Budgeted> {
                         sequence: candidate.sequence,
                         commit_error,
                     });
+                }
+                Err(panic) => {
+                    // A target can commit the delete and then panic. Keep the
+                    // provisional resident copy charged but unreadable until
+                    // the exact claim is reconciled; a pre-commit panic will
+                    // instead retire this copy and retain the durable record.
+                    self.fence_durable_restore(
+                        DurableRecordId::new(candidate.sequence),
+                        RevocableEntry {
+                            key,
+                            value,
+                            charged_bytes,
+                            charge,
+                            restore_claim: Some(Arc::new(candidate.claim)),
+                        },
+                        next_committed,
+                    );
+                    std::panic::resume_unwind(panic)
                 }
             }
         }
@@ -1646,6 +1699,105 @@ mod tests {
         assert_eq!(store.reclaim_one().expect("source").expect("entry").0, "first");
     }
 
+    #[cfg(feature = "spill")]
+    #[test]
+    fn panicking_durable_commit_fences_source_until_exact_record_resolution() {
+        struct PanicCommitTarget {
+            persist_before_panic: bool,
+            retained: Mutex<Option<Vec<u8>>>,
+        }
+
+        impl crate::spill::service::sealed::DurableSpillTarget<Vec<u8>> for PanicCommitTarget {}
+        impl SpillInventory for PanicCommitTarget {
+            fn retained_count(&self) -> MemoryResult<u64> {
+                Ok(u64::from(self.retained.lock().expect("retained").is_some()))
+            }
+        }
+        impl SpillTarget<Vec<u8>> for PanicCommitTarget {
+            fn is_available(&self) -> bool {
+                true
+            }
+            fn accept(&self, handle: Vec<u8>) -> Result<SpillReceipt, SpillFailure<Vec<u8>>> {
+                Err(SpillFailure::new(
+                    MemoryError::InvalidState("use reconciled commit path".into()),
+                    handle,
+                ))
+            }
+        }
+        impl DurableSpillTarget<Vec<u8>> for PanicCommitTarget {}
+        impl crate::spill::service::ReconciledDurableSpillTarget for PanicCommitTarget {
+            fn reserve_record_id(&self) -> MemoryResult<DurableRecordId> {
+                Ok(DurableRecordId::new(0))
+            }
+
+            fn commit_spill(
+                &self,
+                record_id: DurableRecordId,
+                bytes: &[u8],
+            ) -> Result<SpillReceipt, DurableWriteFailure> {
+                assert_eq!(record_id, DurableRecordId::new(0));
+                if self.persist_before_panic {
+                    *self.retained.lock().expect("retained") = Some(bytes.to_vec());
+                }
+                panic!("injected commit callback panic");
+            }
+
+            fn resolve_record(
+                &self,
+                record_id: DurableRecordId,
+            ) -> MemoryResult<DurableRecordResolution> {
+                assert_eq!(record_id, DurableRecordId::new(0));
+                Ok(if self.retained.lock().expect("retained").is_some() {
+                    DurableRecordResolution::Present { inventory_after: 1 }
+                } else {
+                    DurableRecordResolution::Absent
+                })
+            }
+        }
+
+        for persist_before_panic in [false, true] {
+            let broker = live_broker(1_000_000);
+            let store = store_with_broker(&broker);
+            store.insert_checked("source".into(), vec![1; 4]).expect("source insert");
+            let source_bytes = store.committed_bytes().expect("source charge");
+            let controller = RoutedSpillController::new(PanicCommitTarget {
+                persist_before_panic,
+                retained: Mutex::new(None),
+            });
+
+            let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = store.spill_one_durable(&controller, |_, _| Ok(b"source\0data".to_vec()));
+            }));
+            assert!(panic.is_err(), "commit callback panic propagates");
+            assert_eq!(
+                store.pending_durable_spills().expect("pending"),
+                vec![DurableRecordId::new(0)],
+                "uncertain commit must fence source, persist={persist_before_panic}"
+            );
+            assert!(store.reclaim_one().expect("fenced read").is_none());
+            assert_eq!(store.committed_bytes().expect("charged source"), source_bytes);
+            assert_eq!(broker.ledger_snapshot().expect("ledger").total_owner_bytes(), source_bytes);
+
+            let resolution = store
+                .reconcile_durable_spill(&controller, DurableRecordId::new(0))
+                .expect("resolve exact record");
+            assert!(store.pending_durable_spills().expect("resolved").is_empty());
+            if persist_before_panic {
+                assert_eq!(resolution, DurableRecordResolution::Present { inventory_after: 1 });
+                assert_eq!(store.committed_bytes().expect("source retired"), 0);
+                assert_eq!(broker.ledger_snapshot().expect("drained").total_owner_bytes(), 0);
+            } else {
+                assert_eq!(resolution, DurableRecordResolution::Absent);
+                assert_eq!(store.committed_bytes().expect("source restored"), source_bytes);
+                assert_eq!(
+                    store.reclaim_one().expect("restored read").expect("source").0,
+                    "source"
+                );
+                assert_eq!(broker.ledger_snapshot().expect("drained").total_owner_bytes(), 0);
+            }
+        }
+    }
+
     #[cfg(feature = "spill-redb")]
     #[test]
     fn durable_redb_round_trip_transfers_charge_exactly_once() {
@@ -2161,6 +2313,324 @@ mod tests {
         assert_eq!(store.reclaim_one().expect("entry").expect("restored").0, "first");
         assert_eq!(broker.ledger_snapshot().expect("drained").total_owner_bytes(), 0);
         assert_eq!(controller.spilled_count(), Ok(0));
+        drop(controller);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(feature = "spill-redb")]
+    struct PanicOnceMeasuredValue {
+        bytes: Vec<u8>,
+        panic_once: Arc<AtomicBool>,
+    }
+
+    #[cfg(feature = "spill-redb")]
+    impl ByteSized for PanicOnceMeasuredValue {
+        fn byte_size(&self) -> u64 {
+            if self.panic_once.swap(false, Ordering::SeqCst) {
+                panic!("injected restore measurement panic");
+            }
+            self.bytes.len() as u64
+        }
+    }
+
+    #[cfg(feature = "spill-redb")]
+    #[test]
+    fn panicking_restore_measurement_aborts_prepared_claim_and_retries_clean() {
+        use crate::spill::backings::redb::RedbSpillBacking;
+
+        static DB_SEQ: AtomicUsize = AtomicUsize::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "qmp-restore-measure-panic-{}-{}.redb",
+            std::process::id(),
+            DB_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_file(&path);
+        let controller = RoutedSpillController::new(RedbSpillBacking::create(&path).expect("redb"));
+        let record_id = controller.reserve_record_id().expect("reserve record");
+        let _receipt =
+            controller.commit_spill(record_id, b"shared\0payload").expect("commit record");
+        let broker = live_broker(1_000_000);
+        let store = SimpleRevocableStore::<String, PanicOnceMeasuredValue, Budgeted>::new_budgeted(
+            binding(),
+            broker.clone(),
+        );
+        let panic_once = Arc::new(AtomicBool::new(true));
+        let decode = |bytes: &[u8]| {
+            let (key, value) = sep23_fup002_decode(bytes)?;
+            Ok((key, PanicOnceMeasuredValue { bytes: value, panic_once: Arc::clone(&panic_once) }))
+        };
+
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = store.restore_one_durable(&controller, decode);
+        }));
+        assert!(panic.is_err(), "caller measurement panic propagates");
+        assert_eq!(controller.active_restore(), Ok(None), "prepared claim must be aborted");
+        assert_eq!(controller.spilled_count(), Ok(1), "durable copy remains");
+        assert!(store.pending_durable_restores().expect("fences").is_empty());
+        assert_eq!(store.committed_bytes().expect("resident bytes"), 0);
+        assert_eq!(broker.ledger_snapshot().expect("ledger").total_owner_bytes(), 0);
+
+        let restored = store
+            .restore_one_durable(&controller, |bytes| {
+                let (key, value) = sep23_fup002_decode(bytes)?;
+                Ok((
+                    key,
+                    PanicOnceMeasuredValue { bytes: value, panic_once: Arc::clone(&panic_once) },
+                ))
+            })
+            .expect("plain retry after prepared abort");
+        assert!(matches!(restored, DurableRestoreOutcome::Restored { sequence: 0 }));
+        let (key, value) = store.reclaim_one().expect("reclaim").expect("restored entry");
+        assert_eq!(key, "shared");
+        assert_eq!(value.bytes, b"payload");
+        assert_eq!(controller.spilled_count(), Ok(0));
+        assert_eq!(broker.ledger_snapshot().expect("drained").total_owner_bytes(), 0);
+        drop(controller);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(feature = "spill-redb")]
+    #[test]
+    fn panicking_recovery_measurement_preserves_committed_claim_for_retry() {
+        use crate::spill::backings::redb::RedbSpillBacking;
+
+        static DB_SEQ: AtomicUsize = AtomicUsize::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "qmp-recovery-measure-panic-{}-{}.redb",
+            std::process::id(),
+            DB_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_file(&path);
+        sep23_fup002_seed_committed_recovery(&path);
+        let controller =
+            RoutedSpillController::new(RedbSpillBacking::create(&path).expect("redb reopen"));
+        let broker = live_broker(1_000_000);
+        let store = SimpleRevocableStore::<String, PanicOnceMeasuredValue, Budgeted>::new_budgeted(
+            binding(),
+            broker.clone(),
+        );
+        let panic_once = Arc::new(AtomicBool::new(true));
+
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = store.recover_active_durable_restore(&controller, |bytes| {
+                let (key, value) = sep23_fup002_decode(bytes)?;
+                Ok((
+                    key,
+                    PanicOnceMeasuredValue { bytes: value, panic_once: Arc::clone(&panic_once) },
+                ))
+            });
+        }));
+        assert!(panic.is_err(), "caller measurement panic propagates");
+        assert_eq!(controller.active_restore(), Ok(Some(DurableRecordId::new(0))));
+        assert!(store.pending_durable_restores().expect("fences").is_empty());
+        assert_eq!(store.committed_bytes().expect("resident bytes"), 0);
+        assert_eq!(broker.ledger_snapshot().expect("ledger").total_owner_bytes(), 0);
+
+        let restored = store
+            .recover_active_durable_restore(&controller, |bytes| {
+                let (key, value) = sep23_fup002_decode(bytes)?;
+                Ok((
+                    key,
+                    PanicOnceMeasuredValue { bytes: value, panic_once: Arc::clone(&panic_once) },
+                ))
+            })
+            .expect("recovery retry");
+        assert!(matches!(restored, DurableRestoreOutcome::Restored { sequence: 0 }));
+        let (key, value) = store.reclaim_one().expect("reclaim").expect("restored entry");
+        assert_eq!(key, "shared");
+        assert_eq!(value.bytes, b"payload");
+        assert_eq!(controller.active_restore(), Ok(None));
+        assert_eq!(broker.ledger_snapshot().expect("drained").total_owner_bytes(), 0);
+        drop(controller);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(feature = "spill-redb")]
+    #[test]
+    fn panicking_restore_commit_fences_resident_until_redb_reconciliation() {
+        use crate::spill::backings::redb::RedbSpillBacking;
+
+        struct PanicCommitRestore<'a> {
+            inner: &'a RoutedSpillController<RedbSpillBacking>,
+            commit_before_panic: bool,
+        }
+
+        impl SpillController<Vec<u8>> for PanicCommitRestore<'_> {
+            fn spill(&self, handle: Vec<u8>) -> Result<SpillReceipt, SpillFailure<Vec<u8>>> {
+                self.inner.spill(handle)
+            }
+            fn restore(&self) -> MemoryResult<Option<Vec<u8>>> {
+                self.inner.restore()
+            }
+        }
+        impl crate::spill::DurableSpillController<Vec<u8>> for PanicCommitRestore<'_> {}
+        impl crate::spill::service::sealed::DurableSpillController<Vec<u8>> for PanicCommitRestore<'_> {}
+        impl DurableRestoreController for PanicCommitRestore<'_> {
+            fn prepare_restore(&self) -> MemoryResult<Option<DurableRestoreCandidate>> {
+                self.inner.prepare_restore()
+            }
+            fn commit_restore(
+                &self,
+                claim: &DurableRestoreClaim,
+            ) -> Result<(), DurableCommitFailure> {
+                if self.commit_before_panic {
+                    self.inner.commit_restore(claim)?;
+                }
+                panic!("injected restore commit panic");
+            }
+            fn finalize_restore(&self, claim: &DurableRestoreClaim) -> MemoryResult<()> {
+                self.inner.finalize_restore(claim)
+            }
+            fn abort_restore(&self, claim: &DurableRestoreClaim) -> MemoryResult<()> {
+                self.inner.abort_restore(claim)
+            }
+            fn reconcile_restore(
+                &self,
+                claim: &DurableRestoreClaim,
+            ) -> MemoryResult<DurableRecordResolution> {
+                self.inner.reconcile_restore(claim)
+            }
+            fn active_restore(&self) -> MemoryResult<Option<DurableRecordId>> {
+                self.inner.active_restore()
+            }
+            fn recover_active_restore(
+                &self,
+            ) -> MemoryResult<Option<crate::spill::DurableRestoreRecovery>> {
+                self.inner.recover_active_restore()
+            }
+        }
+
+        static DB_SEQ: AtomicUsize = AtomicUsize::new(0);
+        for commit_before_panic in [false, true] {
+            let path = std::env::temp_dir().join(format!(
+                "qmp-restore-commit-panic-{}-{}.redb",
+                std::process::id(),
+                DB_SEQ.fetch_add(1, Ordering::Relaxed)
+            ));
+            let _ = std::fs::remove_file(&path);
+            let controller =
+                RoutedSpillController::new(RedbSpillBacking::create(&path).expect("redb"));
+            let id = controller.reserve_record_id().expect("reserve");
+            let _receipt = controller.commit_spill(id, b"shared\0payload").expect("seed record");
+            let broker = live_broker(1_000_000);
+            let store = store_with_broker(&broker);
+            let injected = PanicCommitRestore { inner: &controller, commit_before_panic };
+
+            let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = store.restore_one_durable(&injected, sep23_fup002_decode);
+            }));
+            assert!(panic.is_err(), "commit callback panic propagates");
+            assert_eq!(
+                store.pending_durable_restores().expect("fences"),
+                vec![id],
+                "provisional resident must be fenced, committed={commit_before_panic}"
+            );
+            assert!(store.reclaim_one().expect("fenced read").is_none());
+            let charged = store.committed_bytes().expect("provisional charge");
+            assert!(charged > 0);
+            assert_eq!(broker.ledger_snapshot().expect("ledger").total_owner_bytes(), charged);
+
+            let resolution = store.reconcile_durable_restore(&controller, id).expect("reconcile");
+            assert!(store.pending_durable_restores().expect("resolved").is_empty());
+            if commit_before_panic {
+                assert_eq!(resolution, DurableRecordResolution::Finalized);
+            } else {
+                assert!(matches!(resolution, DurableRecordResolution::Present { .. }));
+                assert_eq!(store.committed_bytes().expect("retired provisional"), 0);
+                let restored = store
+                    .restore_one_durable(&controller, sep23_fup002_decode)
+                    .expect("ordinary retry");
+                assert!(matches!(restored, DurableRestoreOutcome::Restored { sequence: 0 }));
+            }
+            assert_eq!(store.reclaim_one().expect("read").expect("one entry").0, "shared");
+            assert!(store.reclaim_one().expect("no duplicate").is_none());
+            assert_eq!(controller.spilled_count(), Ok(0));
+            assert_eq!(broker.ledger_snapshot().expect("drained").total_owner_bytes(), 0);
+            drop(controller);
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    #[cfg(feature = "spill-redb")]
+    #[test]
+    fn panicking_prepare_after_persisted_claim_has_explicit_recovery_path() {
+        use crate::spill::backings::redb::RedbSpillBacking;
+
+        struct PanicAfterPrepare<'a>(&'a RoutedSpillController<RedbSpillBacking>);
+        impl SpillController<Vec<u8>> for PanicAfterPrepare<'_> {
+            fn spill(&self, handle: Vec<u8>) -> Result<SpillReceipt, SpillFailure<Vec<u8>>> {
+                self.0.spill(handle)
+            }
+            fn restore(&self) -> MemoryResult<Option<Vec<u8>>> {
+                self.0.restore()
+            }
+        }
+        impl crate::spill::DurableSpillController<Vec<u8>> for PanicAfterPrepare<'_> {}
+        impl crate::spill::service::sealed::DurableSpillController<Vec<u8>> for PanicAfterPrepare<'_> {}
+        impl DurableRestoreController for PanicAfterPrepare<'_> {
+            fn prepare_restore(&self) -> MemoryResult<Option<DurableRestoreCandidate>> {
+                assert!(self.0.prepare_restore()?.is_some(), "claim was persisted");
+                panic!("injected panic after prepare claim");
+            }
+            fn commit_restore(
+                &self,
+                claim: &DurableRestoreClaim,
+            ) -> Result<(), DurableCommitFailure> {
+                self.0.commit_restore(claim)
+            }
+            fn finalize_restore(&self, claim: &DurableRestoreClaim) -> MemoryResult<()> {
+                self.0.finalize_restore(claim)
+            }
+            fn abort_restore(&self, claim: &DurableRestoreClaim) -> MemoryResult<()> {
+                self.0.abort_restore(claim)
+            }
+            fn reconcile_restore(
+                &self,
+                claim: &DurableRestoreClaim,
+            ) -> MemoryResult<DurableRecordResolution> {
+                self.0.reconcile_restore(claim)
+            }
+            fn active_restore(&self) -> MemoryResult<Option<DurableRecordId>> {
+                self.0.active_restore()
+            }
+            fn recover_active_restore(
+                &self,
+            ) -> MemoryResult<Option<crate::spill::DurableRestoreRecovery>> {
+                self.0.recover_active_restore()
+            }
+        }
+
+        static DB_SEQ: AtomicUsize = AtomicUsize::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "qmp-prepare-panic-{}-{}.redb",
+            std::process::id(),
+            DB_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_file(&path);
+        let controller = RoutedSpillController::new(RedbSpillBacking::create(&path).expect("redb"));
+        let id = controller.reserve_record_id().expect("reserve");
+        let _receipt = controller.commit_spill(id, b"shared\0payload").expect("seed record");
+        let broker = live_broker(1_000_000);
+        let store = store_with_broker(&broker);
+
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = store.restore_one_durable(&PanicAfterPrepare(&controller), sep23_fup002_decode);
+        }));
+        assert!(panic.is_err());
+        assert_eq!(controller.active_restore(), Ok(Some(id)));
+        assert!(store.pending_durable_restores().expect("no provisional copy").is_empty());
+        assert_eq!(store.committed_bytes().expect("no resident charge"), 0);
+        assert_eq!(broker.ledger_snapshot().expect("ledger").total_owner_bytes(), 0);
+
+        let outcome = store
+            .recover_active_durable_restore(&controller, sep23_fup002_decode)
+            .expect("recovery after lost prepare response");
+        assert!(matches!(outcome, DurableRestoreOutcome::Restored { sequence: 0 }));
+        assert_eq!(store.reclaim_one().expect("read").expect("entry").0, "shared");
+        assert!(store.reclaim_one().expect("no duplicate").is_none());
+        assert_eq!(controller.active_restore(), Ok(None));
+        assert_eq!(controller.spilled_count(), Ok(0));
+        assert_eq!(broker.ledger_snapshot().expect("drained").total_owner_bytes(), 0);
         drop(controller);
         let _ = std::fs::remove_file(path);
     }

@@ -148,23 +148,25 @@ assert_facade_escape_hatch_absent \
   "feature 'full-backings'" --no-default-features --features full-backings
 
 # Crash-rail instrumentation must stay out of every consumer aggregate, same as
-# the escape hatch above: DURABILITY-001 L1 hooks are test-only and must be
-# impossible to enable through `default`, `full`, or `full-backings`.
-assert_facade_test_hooks_absent() {
+# the escape hatch above. Both the L1 hooks and the L2 syscall rail are test-only
+# and must be impossible to enable through `default`, `full`, or
+# `full-backings`. Check both names explicitly so a future dependency-edge
+# change cannot make the L1 assertion stop covering L2 transitively.
+assert_facade_durability_rails_absent() {
   local label="$1"
   shift
   local tree
   tree="$(cargo tree --locked -p "${FACADE_CRATE}" "$@" -e features -i "${FACADE_CRATE}")"
-  if rg -q 'quanta-memory-platform-facade feature "durability-test-hooks"' <<<"${tree}"; then
-    echo "feature-matrix: facade ${label} must not enable durability-test-hooks" >&2
+  if rg -q 'quanta-memory-platform-facade feature "(durability-test-hooks|durability-l2)"' <<<"${tree}"; then
+    echo "feature-matrix: facade ${label} must not enable durability-test-hooks or durability-l2" >&2
     printf '%s\n' "${tree}" >&2
     exit 1
   fi
 }
 
-assert_facade_test_hooks_absent "default features"
-assert_facade_test_hooks_absent "feature 'full'" --no-default-features --features full
-assert_facade_test_hooks_absent \
+assert_facade_durability_rails_absent "default features"
+assert_facade_durability_rails_absent "feature 'full'" --no-default-features --features full
+assert_facade_durability_rails_absent \
   "feature 'full-backings'" --no-default-features --features full-backings
 
 # Every crate's bare all-target surface was checked above. Their union is the

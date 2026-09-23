@@ -19,7 +19,10 @@ use crate::retained_map::{
 #[cfg(feature = "unbudgeted-stores")]
 use crate::shared::accounting::Unbudgeted;
 use crate::shared::accounting::{Budgeted, StoreAccounting};
-use crate::shared::lifecycle::{retire_client_value, BeginClose, DropTransition, StoreLifecycle};
+use crate::shared::lifecycle::{
+    invoke_client_read_while_locked, retire_client_value, BeginClose, DropTransition,
+    StoreLifecycle,
+};
 use crate::shared::measure::{semantic_cost_v1, ByteSized, RetainedCostV1};
 
 #[derive(Debug)]
@@ -505,7 +508,9 @@ where
 
     fn get_checked(&self, key: &Key) -> Result<Option<Value>, MemoryError> {
         let state = self.lock_for_read()?;
-        Ok(state.entries.get(key).map(|entry| entry.value.clone()))
+        Ok(invoke_client_read_while_locked(state, |state| {
+            state.entries.get(key).map(|entry| entry.value.clone())
+        }))
     }
 
     fn remove(&self, key: &Key) -> Result<Option<Value>, MemoryError> {
@@ -668,7 +673,8 @@ where
         Key: Clone + Ord,
     {
         let state = self.lock_for_read()?;
-        let mut keys: Vec<Key> = state.entries.keys().cloned().collect();
+        let mut keys: Vec<Key> =
+            invoke_client_read_while_locked(state, |state| state.entries.keys().cloned().collect());
         // Deterministic, key-sorted order independent of insertion order.
         keys.sort();
         Ok(keys)
@@ -680,8 +686,9 @@ where
         Value: Clone,
     {
         let state = self.lock_for_read()?;
-        let mut entries: Vec<(Key, Value)> =
-            state.entries.iter().map(|(key, entry)| (key.clone(), entry.value.clone())).collect();
+        let mut entries: Vec<(Key, Value)> = invoke_client_read_while_locked(state, |state| {
+            state.entries.iter().map(|(key, entry)| (key.clone(), entry.value.clone())).collect()
+        });
         // Same deterministic key order as `keys`.
         entries.sort_by(|a, b| a.0.cmp(&b.0));
         Ok(entries)
@@ -1185,7 +1192,7 @@ mod tests {
     }
 
     #[test]
-    fn checked_reads_report_typed_poison_after_owner_mutex_poison_v1() {
+    fn checked_reads_propagate_client_clone_panics_without_poisoning_owner_mutex_v1() {
         let binding =
             StoreBindingHandle::new(MemoryClass::MemoResidency, "owner-poison".to_string(), None);
         let store: UnbudgetedTestStore<String, ClonePanicsWhenArmed> =
@@ -1203,23 +1210,38 @@ mod tests {
         let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _ = store.get_checked(&key);
         }));
-        assert!(panic.is_err(), "clone panic must poison the canonical owner mutex");
+        assert!(panic.is_err(), "clone panic must remain visible to the caller");
+        armed.store(false, Ordering::SeqCst);
 
         assert!(
-            matches!(store.get_checked(&key), Err(MemoryError::Poisoned(message)) if message == "retained map lock"),
-            "checked point read must preserve the typed poison failure"
+            store
+                .get_checked(&key)
+                .expect("owner lock remains usable after caller panic")
+                .is_some(),
+            "checked point read remains available after an isolated clone panic"
         );
         assert!(
-            matches!(store.stats_checked(), Err(MemoryError::Poisoned(message)) if message == "retained map lock"),
-            "checked stats must preserve the typed poison failure"
+            store.stats_checked().is_ok(),
+            "checked stats must remain available after an isolated clone panic"
         );
         assert!(
-            matches!(store.keys_checked(), Err(MemoryError::Poisoned(message)) if message == "retained map lock"),
-            "checked key enumeration must preserve the typed poison failure"
+            store.keys_checked().is_ok(),
+            "checked key enumeration must remain available after an isolated clone panic"
         );
         assert!(
-            matches!(store.entries_checked(), Err(MemoryError::Poisoned(message)) if message == "retained map lock"),
-            "checked entry enumeration must preserve the typed poison failure"
+            store.entries_checked().is_ok(),
+            "checked entry enumeration must remain available after an isolated clone panic"
+        );
+
+        armed.store(true, Ordering::SeqCst);
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = store.entries_checked();
+        }));
+        assert!(panic.is_err(), "entry enumeration must propagate client clone panic");
+        armed.store(false, Ordering::SeqCst);
+        assert!(
+            store.stats_checked().is_ok(),
+            "entry-clone panic must release the read guard without poisoning the owner mutex"
         );
     }
 

@@ -4,7 +4,8 @@
 //! question. [`WeightedResourceGroupScheduler`] is the concrete deterministic
 //! implementation: it tracks per-group usage, enforces each group's hard cap,
 //! and grants burst (borrowing from the shared pool) only up to a weighted
-//! fair share so that one noisy owner cannot starve the others.
+//! share. This bounds burst capture; it does not guarantee throughput fairness
+//! or prevent admission starvation for groups with no protected reserved floor.
 
 use std::collections::BTreeMap;
 
@@ -18,7 +19,7 @@ pub trait ResourceGroupScheduler {
     fn admits(&self, group_name: &str, requested_bytes: u64) -> bool;
 }
 
-/// Deterministic weighted-fair scheduler.
+/// Deterministic weighted admission scheduler.
 ///
 /// Admission rule for a group requesting `delta`:
 /// 1. growth within the group's own reserved/hard cap is always admitted;

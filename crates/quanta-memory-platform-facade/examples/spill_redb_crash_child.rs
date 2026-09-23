@@ -4,9 +4,8 @@
 //! spawns this binary, waits for its `READY` handshake, kills it with
 //! [`std::process::Child::kill`] (`SIGKILL` on Unix — no destructors, no
 //! flush, no cleanup), then reopens the same database file in the parent and
-//! asserts exact recovery. It uses only the public durable spill surface, so
-//! the rail also proves a real host can drive restart recovery without
-//! crate-internal helpers.
+//! asserts exact recovery. Backing-only modes use the public durable spill
+//! surface; `store-spilled` also uses the public platform/store builders.
 //!
 //! Protocol (stdout, line buffered):
 //!
@@ -16,6 +15,8 @@
 //!   tight loop until killed.
 //! - `hole`: commit two records, reserve one id WITHOUT committing it, print
 //!   `HOLE <id>` then `READY`, sleep.
+//! - `store-spilled` (`revocable_store`): spill one charged store entry, prove
+//!   the child ledger drained, print `CHARGE 0` then `READY`, park.
 //!
 //! Any backend failure before `READY` exits non-zero WITHOUT printing `READY`,
 //! so the parent fails closed instead of qualifying an empty database.
@@ -30,9 +31,15 @@
 use std::io::Write;
 use std::time::Duration;
 
+#[cfg(feature = "revocable_store")]
+use quanta_memory_platform_core::{MemoryClass, MemoryPreset, StoreBindingHandle};
 use quanta_memory_platform_facade::spill::backings::redb::RedbSpillBacking;
 use quanta_memory_platform_facade::spill::service::{
     DurableRestoreTarget, ReconciledDurableSpillTarget,
+};
+#[cfg(feature = "revocable_store")]
+use quanta_memory_platform_facade::{
+    MemoryPlatformBuilder, RevocableStore, RoutedSpillController, SpillReceipt,
 };
 
 /// 32-byte self-describing payload: little-endian record index plus filler.
@@ -53,7 +60,9 @@ fn commit_one(backing: &RedbSpillBacking, index: u64) {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 {
-        eprintln!("usage: spill_redb_crash_child <db-path> <fill <count>|stream|hole>");
+        eprintln!(
+            "usage: spill_redb_crash_child <db-path> <fill <count>|stream|hole|store-spilled>"
+        );
         std::process::exit(2);
     }
     let backing = RedbSpillBacking::create(&args[1]).expect("child open");
@@ -88,6 +97,39 @@ fn main() {
             writeln!(stdout, "READY").expect("READY line");
             stdout.flush().expect("flush");
             std::thread::sleep(Duration::from_secs(120));
+        }
+        #[cfg(feature = "revocable_store")]
+        "store-spilled" => {
+            let platform = MemoryPlatformBuilder::new()
+                .with_preset(MemoryPreset::Development)
+                .build()
+                .expect("child platform");
+            let store = platform
+                .revocable_store_builder::<String, Vec<u8>>()
+                .bind(StoreBindingHandle::new(
+                    MemoryClass::ArtifactCache,
+                    "durability-spill-child".to_string(),
+                    None,
+                ))
+                .build()
+                .expect("child store");
+            let controller = RoutedSpillController::new(backing);
+            store.insert_checked("k0".to_string(), payload(0)).expect("child insert");
+            let receipt = store
+                .spill_one_durable(&controller, |_key, value| Ok(value.clone()))
+                .expect("child durable spill")
+                .expect("one committed record");
+            assert!(matches!(receipt, SpillReceipt::Durable { sequence: 0, .. }));
+            let charged =
+                platform.broker().ledger_snapshot().expect("child ledger").total_owner_bytes();
+            assert_eq!(charged, 0, "source charge retired after durable commit");
+            assert_eq!(controller.spilled_count().expect("durable inventory"), 1);
+            writeln!(stdout, "CHARGE {charged}").expect("CHARGE line");
+            writeln!(stdout, "READY").expect("READY line");
+            stdout.flush().expect("flush");
+            loop {
+                std::thread::park();
+            }
         }
         mode => {
             eprintln!("unknown mode: {mode}");

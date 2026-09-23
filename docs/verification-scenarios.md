@@ -62,6 +62,7 @@ cloning all live owner/context maps.
 - ✅ Inv 7 idempotency — `double_release_of_a_cloned_ticket_is_rejected_and_does_not_corrupt`, `commit_after_release_is_rejected`.
 - ✅🔢 Zero-byte / u64 boundary / i64 cast — `zero_byte_reserve_commits_and_releases_coherently`, `snapshot_validation_rejects_unrepresentable_axis_instead_of_saturating_it`, `reserve_above_i64_max_does_not_wrap_to_negative_delta`.
 - ✅ **Independent management bounds** — `zero_byte_tickets_obey_independent_live_ticket_cap_fail_closed`, `owner_key_byte_limit_is_exact_and_denial_is_fail_closed`, `validate_rejects_overlong_owner_and_resource_group_identifiers`, `overlong_owner_is_denied_before_reclaim_or_accounting`, and `deferred_committed_cleanup_is_batched_and_drains_large_backlog`. Ticket cardinality is bounded independently of byte usage; deferred backlog is a disjoint subset of those live tickets and each lock-held cleanup batch is bounded.
+- ✅ **Replacement at the ticket-count ceiling** — `committed_replacement_at_live_ticket_cap_is_a_net_zero_authority_swap` (`core/src/domain/ledger.rs`) denies an oversized replacement with an identical ledger postimage, then swaps a committed 0-byte ticket for a 1-byte ticket without exceeding the live-ticket ceiling. It rejects reuse of the consumed ticket and drains every peer.
 - ✅ Cross-ledger ticket — `ticket_from_one_ledger_cannot_release_on_another`; id uniqueness — `ticket_ids_are_monotonic_and_unique_across_many_reserves`.
 - ✅ Context axis balance — `context_axis_balances_with_owner_after_mixed_sequence`; wrong-kind release — `mixed_kind_release_preserves_charge_kind_partition`.
 - ✅🔬 Deterministic fuzz — `deterministic_fuzz_preserves_invariants_and_returns_to_zero` (400-step sequence, invariants 1/2/5/6 at every step, drains to 0).
@@ -125,6 +126,8 @@ check helpers that the control plane enforces (see group C/D).
   `sep23_fup003_predicted_failure_skips_soft_and_runs_single_hard`,
   `sep23_fup003_hard_remeasure_still_denied_is_terminal_without_second_callback`,
   `sep23_fup003_ticket_exhaustion_blocks_without_callback`,
+  `live_ticket_count_cap_runs_one_reclaim_then_remeasures`,
+  `live_ticket_count_cap_can_recover_when_host_releases_zero_byte_charge`,
   `sep23_audit_group_denial_runs_single_hard_regardless_of_soft_crossing`,
   `sep23_audit_wrong_victim_release_does_not_admit`,
   `sep23_audit_forged_reclaimed_bytes_are_recorded_but_never_trusted`,
@@ -132,7 +135,12 @@ check helpers that the control plane enforces (see group C/D).
   `sep23_audit_zero_byte_reserve_fires_no_callback_even_over_soft`, and
   `sep23_audit_max_scale_plus_one_byte_denies_clean_without_callback`
   (`core/src/api/control.rs`). Terminal/blocked denials never fire the
-  callback; a predicted failure runs one hard plan, never soft-first.
+  callback; a predicted failure runs one hard plan, never soft-first. A live
+  ticket-count cap is reclaimable when the host drops a ticket: it gets one
+  callback and a fresh ledger check, even if the callback reports zero bytes.
+  When tickets are 0-byte authorities in a zero-hard-byte class, that class
+  remains a reclaim candidate at the ticket-count ceiling.
+- ✅ **Partial callback progress followed by panic** — `reclaimer_release_then_panic_uses_remeasured_ledger_not_callback_result` (`core/src/api/control.rs`) proves a host callback can release a real victim and then panic: callback failure is counted, but admission uses the remeasured ledger. One attempt, exact postimage and full drain are required.
 - ✅ 🔬 **Preflight/attempt agreement** —
   `sep23_fup003_preflight_attempt_agreement_randomized`
   (`core/src/api/control.rs`): 2,000 deterministic cases pin verdict and
@@ -145,10 +153,21 @@ check helpers that the control plane enforces (see group C/D).
   `sep23_audit_failing_committed_drain_restores_whole_batch`
   (`core/src/api/control.rs`). Zero-byte tickets pin mappings; failing
   drains keep authority queued.
+- ✅ **Managed replacement at the ticket ceiling** — `managed_recharge_at_live_ticket_cap_keeps_broker_authority_maps_exact` (`core/src/api/control.rs`) repeats the net-zero swap through a managed charge and checks final broker owner/group/deferred maps, not only ledger counters.
 - ✅ **Bounded provenance + reclaim/reconfigure coupling** —
   `sep23_fup005_ten_thousand_reconfigures_keep_provenance_bounded`,
   `sep23_fup006_accepted_reconfigure_inside_callback_remeasures_under_new_policy`
   (`core/src/api/control.rs`).
+- ✅ **Cross-thread callback reentry is bounded** —
+  `event_sink_observation_reentry_delivers_outer_event_once`,
+  `same_broker_reclaimer_reserve_reentry_is_bounded_and_typed`,
+  `concurrent_reclaimer_reentry_does_not_start_a_callback_storm`, and
+  `independent_outer_reserves_share_one_in_flight_reclaimer`
+  (`core/src/api/control.rs`). The event sink is single-flight per broker;
+  recursive or concurrent advisory events during its callback are dropped, not
+  queued or replayed. Two independently initiated hard requests also share at
+  most one in-flight host reclaimer; the second reaches a bounded denial while
+  the first callback is deliberately held by a channel, not a sleep.
 
 ## D. Scheduler — ✅ (`core/src/application/scheduler.rs`)
 
@@ -165,8 +184,20 @@ check helpers that the control plane enforces (see group C/D).
 ## F. Facade stores — ✅ (`facade/src/*`)
 
 - ✅ payload_store round-trip/dedup/pin/delete — `canonical_put_deduplicates_and_charges_once`, `dedup_hit_preserves_first_context_and_stores_no_second_entry`, `delete_unpinned_releases_bytes_exactly_once`, `pin_is_metadata_only_and_pinned_delete_is_rejected`.
+- ✅ **Payload reference Eq panic before mutation** —
+  `reference_eq_panic_before_mutation_keeps_public_store_available`
+  (`facade/src/payload_store/service.rs`) injects a one-shot Eq panic in
+  pin/unpin/pin_count/delete, then verifies public stats, pin count, cleanup,
+  and exact ledger postimage. This covers those lookup paths, not arbitrary
+  slow or side-effecting caller code.
+- ✅ **Payload reference Clone panic before publication** —
+  `reference_clone_panic_before_publication_keeps_public_store_available`
+  (`facade/src/payload_store/service.rs`) traps the stored-reference clone in
+  `put_canonical`; the public store stays readable, no charge is acquired,
+  and a retry plus cleanup drains exactly.
 - ✅ **F#3 for payload_store** — `charged_store_bytes_flow_through_the_ledger_and_drain_to_zero`, `charged_payload_over_cap_put_is_fail_closed`, `uncharged_store_is_explicit_non_budgeted_mode` (a "charged store" mode routes bytes through the broker ledger).
 - ✅ retained_map hash-indexed point operations + accounting/order preservation — `put_get_remove_get_none_round_trip_corrects_bytes`, `equal_hash_key_duplicate_overwrites_and_does_not_double_count`, `first_and_last_key_point_operations_share_one_n_independent_probe_bound_v1`, `overwrite_preserves_original_insertion_position_for_newest_first_sweep`, `arbitrary_remove_preserves_remaining_newest_first_sweep_order`, `charged_sweep_during_rebuild_is_fail_closed`, and `keys_lists_inserted_keys_in_deterministic_sorted_order`. The public key identity law is `Eq + Hash`; exact lookup/overwrite/remove use the canonical linked hash container while enumeration remains deterministically key-sorted.
+- ✅ **Read-side client panic does not poison retained-map state** — `checked_reads_propagate_client_clone_panics_without_poisoning_owner_mutex_v1` proves a panicking value clone still propagates to the caller, then subsequent get/stats/key/entry reads remain available. This is not a callback time bound; synchronous callback latency remains caller-controlled.
 - ✅ **F#3 for retained_map** — retained_map is ledger-wired only through the typestate builder: binding produces `BoundRetainedMapStoreBuilder`, only the bound state exposes infallible `build()`, and `SimpleRetainedMapStore` has no public late-attach transition. Evidence: the two compile-fail docs plus `retained_map_platform_builder_routes_bytes_through_the_ledger`, `charged_insert_routes_bytes_through_the_ledger`, `charged_insert_over_cap_is_denied_and_fails_closed`, `charged_overwrite_denial_leaves_existing_entry_unchanged`, and `charged_sweep_refunds_reclaimed_bytes_to_the_ledger`. Internal ticket corruption is also fail-closed before refund or container mutation (`charged_remove_rejects_a_ticketless_entry_without_mutating_state`, `charged_sweep_rejects_a_ticketless_candidate_without_partial_refund_or_eviction`). The uncharged `new` path remains distinct via `uncharged_retained_map_bytes_are_not_reflected_in_a_broker_ledger_snapshot`.
 - ✅ revocable FIFO/revoke/eviction — `reclaim_one_is_fifo_and_releases_its_bytes`, `revoke_makes_entry_unretrievable_and_decrements_accounting`, `reclaim_eviction_order_is_deterministic_fifo_at_capacity_boundary`.
 - ✅ publish_pipeline commit transition — `default_pipeline_runs_stage_then_commit_each_exactly_once_no_rollback`, `failed_commit_never_publishes_and_never_increments_count`.
@@ -174,6 +205,14 @@ check helpers that the control plane enforces (see group C/D).
 - ✅ spill routing fail-closed — `routed_spill_to_available_target_succeeds_and_counts`, `spill_to_unavailable_target_fails_closed_and_does_not_count`, `routed_spill_after_target_goes_offline_fails_closed_leaving_inventory_unchanged`.
 - ✅ **spill write → restore (inverse) round-trips** — the restore inverse landed: `in_memory_target_write_then_restore_round_trips_the_payload`, `in_memory_target_restore_of_missing_handle_is_none_not_an_error`, `in_memory_target_restore_after_offline_fails_closed_leaving_retained_state_unchanged` (`facade/src/spill/service.rs`).
 - ✅ transcript per-session isolation + charged mode — `append_identity_is_partitioned_by_session`, `retention_stats_separate_active_evidence_and_session_costs`, and (charged) `exact_retry_charges_once_and_truncate_refunds_only_active_body`, `quota_denial_leaves_row_indexes_and_charge_unchanged` (`facade/src/transcript_store/service.rs`).
+- ✅ **Transcript read-planning panic availability** —
+  `session_order_panic_before_mutation_keeps_public_transcript_available`,
+  `append_preflight_order_panic_keeps_public_store_available`,
+  `append_preflight_message_order_panic_keeps_public_store_available`, and
+  `append_replay_canonical_key_panic_keeps_public_store_available`
+  (`facade/src/transcript_store/service.rs`) exercise SessionId/MessageId Ord
+  and retained CanonicalKey panics before mutation. The public load/stats/close
+  path remains available, and ledger/source postimages stay exact.
 - ✅ charged facade mutators are fail-closed before store mutation — `charged_remove_during_rebuild_is_fail_closed`, `charged_sweep_during_rebuild_is_fail_closed`, `reclaim_one_during_rebuild_is_fail_closed`, `reclaim_until_during_rebuild_is_fail_closed`, `truncate_refund_failure_preserves_rows_indexes_and_accounting`.
 - ✅ transcript charged breadth now matches the closeout bar — `append_identity_is_partitioned_by_session` proves session-local identity partitioning, and `truncate_refund_failure_preserves_rows_indexes_and_accounting` proves refund denial leaves both ledger and store untouched.
 - ✅ **Durable record exact terminal state** —
@@ -199,6 +238,38 @@ check helpers that the control plane enforces (see group C/D).
   `sep23_audit_panicking_decode_preserves_committed_recovery_until_retry`,
   and `sep23_audit_finalize_retry_succeeds_while_unrelated_claim_is_live`.
   Exactly one recovery owner; losers keep no readable copy or charge.
+- ✅ **Caller sizing panic during durable resident preparation** —
+  `panicking_restore_measurement_aborts_prepared_claim_and_retries_clean` and
+  `panicking_recovery_measurement_preserves_committed_claim_for_retry`
+  (`facade/src/revocable_store/service.rs`) distinguish the two persisted
+  restore phases. A `ByteSized` panic after successful decode propagates to
+  the caller without publishing or charging a resident copy: Prepared aborts
+  its claim so ordinary restore can retry; Committed retains its active
+  recovery claim so recovery can retry. Both paths end with one readable
+  copy and exact ledger drain.
+- ✅ **Commit callback panic is an unknown durable write outcome** —
+  `panicking_durable_commit_fences_source_until_exact_record_resolution`
+  (`facade/src/revocable_store/service.rs`) injects panic before and after a
+  target retains the record. The source stays charged but unreadable in both
+  cases until exact reconciliation: `Absent` restores FIFO authority, while
+  `Present` retires the source charge once. This owner-local fake tests the
+  store state machine; the separate Redb kill/reopen tests establish concrete
+  backing persistence boundaries.
+- ✅ **Restore delete callback panic is an unknown durable claim outcome** —
+  `panicking_restore_commit_fences_resident_until_redb_reconciliation`
+  (`facade/src/revocable_store/service.rs`) uses real Redb with an injected
+  panic before and after `commit_restore`. The provisional resident remains
+  charged but unreadable until exact claim reconciliation. A pre-commit panic
+  retires the provisional copy and allows ordinary restore; a post-commit
+  panic publishes only that copy. Each branch yields one readable entry and
+  zero final ledger charge.
+- ✅ **Prepare callback panic after persisted claim** —
+  `panicking_prepare_after_persisted_claim_has_explicit_recovery_path`
+  (`facade/src/revocable_store/service.rs`) uses real Redb: a callback panics
+  after persisting a prepared claim but before returning its token. No resident
+  copy or charge is published; explicit durable recovery on the
+  surviving store completes exactly once and drains the ledger. This is a
+  recovery path, not an automatic plain-restore retry.
 - ✅ **Real SIGKILL/reopen rail** —
   `sep23_fup006_sigkill_after_commit_reopens_with_stable_identity_and_exact_drain`,
   `sep23_fup006_sigkill_during_write_stream_converges_without_duplicates_or_tears`,
@@ -207,6 +278,14 @@ check helpers that the control plane enforces (see group C/D).
   dies by `SIGKILL` (no destructors, no flush) and the survivor reopens
   cold. Power loss is NOT covered; mid-finalize instruction-point kills
   moved to the L1 rail below (see residual boundaries in the Sep-23 receipt).
+- ✅ **Store+ledger spill process boundary** —
+  `durable_spill_store_charge_and_record_survive_process_boundary`
+  (`facade/tests/spill_redb_kill_reopen.rs`, features
+  `spill-redb,revocable_store`) uses the public platform/store builder in the
+  killed child, asserts its source charge retired after committed spill, then
+  cold-reopens with a new broker/store. Exactly one whole payload is restored
+  and the survivor ledger drains to zero. This does not inject an ACK loss or
+  stop between commit and source retirement.
 - ✅ **Finalize instruction-point kill rail (DURABILITY-001 L1)** —
   `durability_l1_finalize_before_commit_kill_recovers_present_and_drains_exactly_once`,
   and `durability_l1_finalize_after_commit_kill_resolves_finalized_without_resurrection`
@@ -215,6 +294,23 @@ check helpers that the control plane enforces (see group C/D).
   one side of the finalize `txn.commit()` call, dies by `SIGKILL`, and the
   survivor reopens cold. The two points bracket QMP's commit call; they do
   not stop inside Redb's `pwrite`/`fsync` and do not prove power loss.
+- ✅ **Store+ledger finalize process boundary** —
+  `durability_l1_store_and_ledger_recover_across_finalize_kill`
+  (`facade/tests/spill_redb_finalize_kill.rs`, features
+  `spill-redb,durability-test-hooks,revocable_store`) drives actual
+  `RevocableStore::restore_one_durable` in the killed child and proves a live
+  resident charge at each hook. A fresh platform/store restores the pre-commit
+  victim exactly once; a post-commit victim is terminal and not replayed under
+  the documented revocable contract. The unrelated record restores and every
+  survivor charge drains. This is still process termination, not power loss.
+- 🧪 **Optional Linux syscall-error subrail (DURABILITY-001 L2 partial)** —
+  `scripts/durability/run-emulated-linux.sh` calibrates the real finalize
+  boundary, injects EIO into the first `pwrite64` and `fdatasync` after it, then
+  cold-reopens and checks whole-state recovery/finalization plus exact drain.
+  Raw traces, Redb files, source digest, and SHA-256 receipt are retained in a
+  caller-selected temp artifact directory. This exercises syscall error
+  handling only; it does not inject block-device failures or simulate power
+  loss. Device-mapper L2 and physical L3 remain unqualified.
 
 **publish_pipeline is intentionally not charged.** It is a non-retaining
 *transition* stage (zero bytes held): it transforms a staged value into a

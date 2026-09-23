@@ -1,6 +1,6 @@
 # FUP-006 — 통합과 current-source qualification
 
-Status: `VERIFIED — full-followup exact-source local, extraction, benchmark, and QBC host-pair GREEN; hosted CI/deploy/activation NOT RUN`
+Status: `prior frozen-candidate local/extraction/benchmark/host-pair VERIFIED; current shared worktree canonical + examples GREEN but not frozen; extraction/benchmark/host-pair stale for current digest; hosted CI/deploy/activation NOT RUN`
 Priority: `SCOPE-SPECIFIC RELEASE GATE` (구현 결함 티켓이 아님)
 Owner: `Lane I — serial integrator`
 Depends on: core-enabled 후보는 `FUP-007`; durable-enabled 후보는 추가로 `FUP-001`, `FUP-002`; full-followup 후보는 추가로 `FUP-003`, `FUP-004`, `FUP-005`
@@ -191,3 +191,19 @@ Promotion authority: predecessor tags `qmp-final-qualified-sep23-followup`,
 updated candidate is qualified only when all repository, extraction,
 benchmark, and host-pair rails pass for its exact source digest and a new
 annotated v5 tag targets the clean candidate.
+
+Addendum (2026-09-23, DURABILITY-001 L2 syscall subrail): two Linux `strace`
+EIO injections at the first finalize `pwrite64` and `fdatasync` both reopened
+to whole valid states (source digest and retained artifacts are recorded in
+`tickets/DURABILITY-001-power-loss-finalize-kill.md`). This is syscall-error
+handling evidence only. Device-mapper/kernel-filesystem disruption and
+physical power loss remain unverified; no emulation is promoted to L3.
+
+Addendum (2026-09-23, callback/read-panic hardening): current worktree source
+digest is `185dd3329b00d685b866c992c03e50b1bcaa1f8a1097b0310275abb05d4dd2fa`
+on HEAD `edfef66c3d9dabbe4d01a98754a44d32ef9c940e` (tree
+`4f1a7299af049e7fa1c0eeefc8e683f01239d462`). The canonical workspace rail
+and both public examples pass on this worktree. The earlier L2 Linux EIO run,
+extraction, scaling benchmark, and exact-source host-pair tuple predate this
+digest; they are not current-source proof. This is an integrated dirty-worktree
+check, not a new frozen-candidate qualification.

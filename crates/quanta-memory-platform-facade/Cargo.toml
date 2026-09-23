@@ -36,6 +36,10 @@ spill-redb = ["spill", "dep:redb"]
 # `full`, and `full-backings`, and default builds compile the existing finalize
 # path with zero added code. `--all-features` still proves the surface.
 durability-test-hooks = ["spill-redb"]
+# Opt-in Linux syscall-failure qualification. Uses strace fault injection at
+# the first pwrite64/fdatasync issued by the real finalize commit; never part
+# of default/full/full-backings or the normal test rail.
+durability-l2 = ["durability-test-hooks"]
 
 # `full` = every in-memory slice, deliberately WITHOUT any backing dep, so it is
 # free of copyleft transitive dependencies while still including the facade's
@@ -65,6 +69,10 @@ required-features = ["spill-redb"]
 [[example]]
 name = "spill_redb_finalize_kill_child"
 required-features = ["spill-redb", "durability-test-hooks"]
+
+[[example]]
+name = "spill_redb_durability_l2"
+required-features = ["spill-redb", "durability-l2"]
 
 [[bench]]
 name = "scaling"

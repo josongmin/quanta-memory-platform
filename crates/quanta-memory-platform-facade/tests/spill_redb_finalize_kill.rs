@@ -42,11 +42,18 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, OnceLock};
 use std::time::Duration;
 
+#[cfg(feature = "revocable_store")]
+use quanta_memory_platform_core::{MemoryClass, MemoryPreset, StoreBindingHandle};
 use quanta_memory_platform_facade::spill::backings::redb::RedbSpillBacking;
 use quanta_memory_platform_facade::spill::service::{
     DurableRestoreTarget, ReconciledDurableSpillTarget,
 };
 use quanta_memory_platform_facade::spill::{DurableRecordId, DurableRecordResolution};
+#[cfg(feature = "revocable_store")]
+use quanta_memory_platform_facade::{
+    DurableRestoreController, DurableRestoreOutcome, MemoryPlatformBuilder,
+    ReconciledDurableSpillController, RevocableStore, RoutedSpillController,
+};
 
 static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -110,7 +117,7 @@ fn finalize_kill_child_binary() -> PathBuf {
                 .arg("-p")
                 .arg("quanta-memory-platform-facade")
                 .arg("--features")
-                .arg("spill-redb,durability-test-hooks")
+                .arg("spill-redb,durability-test-hooks,revocable_store")
                 .arg("--example")
                 .arg("spill_redb_finalize_kill_child")
                 .current_dir(&workspace_root)
@@ -133,6 +140,7 @@ struct Armed {
     point: String,
     sequence: u64,
     generation: u64,
+    charged_bytes: Option<u64>,
 }
 
 /// Spawn the child, returning its handle plus the parsed handshake. `ARMED`
@@ -158,7 +166,11 @@ fn spawn_until_armed(db: &Path, mode: &str) -> (Child, Armed) {
         }
     });
     let mut backend = None;
-    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let mut charged_bytes = None;
+    // The child performs durable writes before arming. Under a concurrent
+    // workspace build, 30 seconds can expire before it reaches the hook;
+    // retain a finite deadline without turning host load into a false crash.
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
     loop {
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         assert!(!remaining.is_zero(), "finalize-kill child never printed ARMED");
@@ -166,6 +178,8 @@ fn spawn_until_armed(db: &Path, mode: &str) -> (Child, Armed) {
             Ok(line) => {
                 if let Some(id) = line.strip_prefix("BACKEND ") {
                     backend = Some(id.parse::<u128>().expect("backend identity parses"));
+                } else if let Some(bytes) = line.strip_prefix("CHARGE ") {
+                    charged_bytes = Some(bytes.parse::<u64>().expect("resident charge parses"));
                 } else if let Some(rest) = line.strip_prefix("ARMED ") {
                     let mut parts = rest.split_whitespace();
                     let armed = Armed {
@@ -177,6 +191,7 @@ fn spawn_until_armed(db: &Path, mode: &str) -> (Child, Armed) {
                             .expect("ARMED generation")
                             .parse()
                             .expect("generation"),
+                        charged_bytes,
                     };
                     assert!(
                         parts.next().is_none(),
@@ -195,6 +210,90 @@ fn spawn_until_armed(db: &Path, mode: &str) -> (Child, Armed) {
                 );
             }
         }
+    }
+}
+
+#[cfg(feature = "revocable_store")]
+#[test]
+fn durability_l1_store_and_ledger_recover_across_finalize_kill() {
+    for (mode, expected_point) in
+        [("store-before", "FinalizeBeforeCommit"), ("store-after", "FinalizeAfterCommit")]
+    {
+        let db = ScratchDb::new(mode);
+        let (mut child, armed) = spawn_until_armed(&db.path, mode);
+        assert_eq!(armed.point, expected_point);
+        assert_eq!(armed.sequence, 0);
+        assert!(armed.charged_bytes.is_some_and(|bytes| bytes > 0));
+        sigkill_child(&mut child);
+
+        let platform = MemoryPlatformBuilder::new()
+            .with_preset(MemoryPreset::Development)
+            .build()
+            .expect("survivor platform");
+        let store = platform
+            .revocable_store_builder::<String, Vec<u8>>()
+            .bind(StoreBindingHandle::new(
+                MemoryClass::ArtifactCache,
+                "durability-store-survivor".to_string(),
+                None,
+            ))
+            .build()
+            .expect("survivor store");
+        let controller =
+            RoutedSpillController::new(RedbSpillBacking::create(&db.path).expect("cold reopen"));
+        let decode = |bytes: &[u8]| {
+            assert_eq!(bytes.len(), 32, "whole payload on restart");
+            let mut index = [0u8; 8];
+            index.copy_from_slice(&bytes[..8]);
+            let index = u64::from_le_bytes(index);
+            assert_eq!(bytes, expected_payload(index));
+            Ok((format!("k{index}"), bytes.to_vec()))
+        };
+
+        if mode == "store-before" {
+            assert!(matches!(
+                controller.resolve_record(DurableRecordId::new(0)).expect("record state"),
+                DurableRecordResolution::Present { .. }
+            ));
+            assert!(matches!(
+                store.recover_active_durable_restore(&controller, decode).expect("recover victim"),
+                DurableRestoreOutcome::Restored { sequence: 0 }
+            ));
+            assert_eq!(
+                store.reclaim_one().expect("read victim"),
+                Some(("k0".to_string(), expected_payload(0)))
+            );
+        } else {
+            assert_eq!(
+                controller.resolve_record(DurableRecordId::new(0)).expect("record state"),
+                DurableRecordResolution::Finalized,
+                "terminal revocable handoff does not replay killed resident"
+            );
+            assert!(matches!(
+                store
+                    .recover_active_durable_restore(&controller, decode)
+                    .expect("no victim replay"),
+                DurableRestoreOutcome::Empty
+            ));
+        }
+        assert!(matches!(
+            store.restore_one_durable(&controller, decode).expect("restore unrelated"),
+            DurableRestoreOutcome::Restored { sequence: 1 }
+        ));
+        assert_eq!(
+            store.reclaim_one().expect("read unrelated"),
+            Some(("k1".to_string(), expected_payload(1)))
+        );
+        assert!(matches!(
+            store.restore_one_durable(&controller, decode).expect("second drain"),
+            DurableRestoreOutcome::Empty
+        ));
+        assert_eq!(controller.spilled_count(), Ok(0));
+        assert_eq!(controller.active_restore(), Ok(None));
+        assert_eq!(
+            platform.broker().ledger_snapshot().expect("survivor ledger").total_owner_bytes(),
+            0
+        );
     }
 }
 
@@ -245,7 +344,7 @@ fn drain_all(backing: &RedbSpillBacking) -> Vec<(u64, Vec<u8>)> {
     let mut drained = Vec::new();
     while let Some(candidate) = backing.prepare_restore().expect("prepare") {
         let sequence = candidate.sequence;
-        let bytes = candidate.bytes.clone();
+        let bytes = candidate.bytes().to_vec();
         backing.commit_restore(&candidate.claim).expect("commit converges after kill");
         backing.finalize_restore(&candidate.claim).expect("finalize");
         assert_eq!(bytes.len(), 32, "no torn payload survives a kill");
@@ -268,6 +367,7 @@ fn durability_l1_finalize_before_commit_kill_recovers_present_and_drains_exactly
         let (mut handle, armed) = spawn_until_armed(&db.path, "before");
         assert_eq!(armed.point, "FinalizeBeforeCommit", "armed at the staged point");
         assert_eq!(armed.sequence, 0, "the victim is the oldest record");
+        assert_eq!(armed.charged_bytes, None, "backing-only mode has no broker charge");
         sigkill_child(&mut handle);
 
         // The survivor reopens the same file cold: the uncommitted finalize
@@ -319,6 +419,7 @@ fn durability_l1_finalize_after_commit_kill_resolves_finalized_without_resurrect
         let (mut handle, armed) = spawn_until_armed(&db.path, "after");
         assert_eq!(armed.point, "FinalizeAfterCommit", "armed at the committed point");
         assert_eq!(armed.sequence, 0, "the victim is the oldest record");
+        assert_eq!(armed.charged_bytes, None, "backing-only mode has no broker charge");
         sigkill_child(&mut handle);
 
         // The survivor reopens the same file cold: the committed finalize is

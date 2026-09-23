@@ -7,7 +7,9 @@
 //! application-layer scheduler and pressure controller. Allocator telemetry is
 //! observed only through the advisory lane and never mutates the ledger.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use crate::adapters::scratch::BrokerBoundScratchAllocator;
@@ -37,6 +39,72 @@ use crate::ports::telemetry::{
     AllocatorAdvisory, MemoryEvent, MemoryEventSink, MemoryOperation, MemoryOutcome,
 };
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BrokerCallbackKind {
+    Reclaimer,
+}
+
+thread_local! {
+    /// Synchronous host callbacks can call back into a broker on the same
+    /// thread. Track only active callback identities (not all operations), so
+    /// independent concurrent requests on other threads remain unaffected.
+    static ACTIVE_BROKER_CALLBACKS: RefCell<Vec<(BrokerCallbackKind, usize)>> = const {
+        RefCell::new(Vec::new())
+    };
+}
+
+struct BrokerCallbackScope {
+    kind: BrokerCallbackKind,
+    identity: usize,
+}
+
+impl BrokerCallbackScope {
+    fn enter(kind: BrokerCallbackKind, identity: usize) -> Option<Self> {
+        ACTIVE_BROKER_CALLBACKS.with(|active| {
+            let mut active = active.borrow_mut();
+            if active.contains(&(kind, identity)) {
+                return None;
+            }
+            active.push((kind, identity));
+            Some(Self { kind, identity })
+        })
+    }
+
+    fn is_active(kind: BrokerCallbackKind, identity: usize) -> bool {
+        ACTIVE_BROKER_CALLBACKS.with(|active| active.borrow().contains(&(kind, identity)))
+    }
+}
+
+impl Drop for BrokerCallbackScope {
+    fn drop(&mut self) {
+        ACTIVE_BROKER_CALLBACKS.with(|active| {
+            let mut active = active.borrow_mut();
+            if let Some(index) =
+                active.iter().rposition(|entry| *entry == (self.kind, self.identity))
+            {
+                active.remove(index);
+            }
+        });
+    }
+}
+
+struct CallbackPermit<'a>(&'a AtomicBool);
+
+impl CallbackPermit<'_> {
+    fn try_enter(active: &AtomicBool) -> Option<CallbackPermit<'_>> {
+        active
+            .compare_exchange(false, true, AtomicOrdering::Acquire, AtomicOrdering::Relaxed)
+            .ok()
+            .map(|_| CallbackPermit(active))
+    }
+}
+
+impl Drop for CallbackPermit<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, AtomicOrdering::Release);
+    }
+}
+
 /// A live, accounting-backed process memory broker.
 ///
 /// All mutating operations route through the [`AccountingLedger`] so the global
@@ -46,6 +114,12 @@ use crate::ports::telemetry::{
 pub struct LiveProcessMemoryBroker {
     inner: Arc<Mutex<BrokerCore>>,
     events: Arc<dyn MemoryEventSink>,
+    /// Serialize advisory sink calls across broker clones and threads. Events
+    /// arriving while a sink callback is active are dropped to bound reentry.
+    event_sink_active: Arc<AtomicBool>,
+    /// At most one external reclaim callback may execute for this broker at a
+    /// time. This cross-thread gate complements the same-thread reentry guard.
+    reclaimer_active: Arc<AtomicBool>,
 }
 
 struct BrokerCore {
@@ -419,6 +493,8 @@ impl LiveProcessMemoryBroker {
                 reclaim_stats: ReclaimRuntimeStats::default(),
             })),
             events,
+            event_sink_active: Arc::new(AtomicBool::new(false)),
+            reclaimer_active: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -431,6 +507,12 @@ impl LiveProcessMemoryBroker {
     }
 
     fn emit(&self, event: MemoryEvent) {
+        // Thread-local detection is insufficient when a sink spawns a thread
+        // that observes this broker. Serialize by broker identity across all
+        // threads; recursive/concurrent advisory events may be dropped.
+        let Some(_callback_permit) = CallbackPermit::try_enter(&self.event_sink_active) else {
+            return;
+        };
         if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.events.emit(event);
         })) {
@@ -804,12 +886,17 @@ impl LiveProcessMemoryBroker {
             }
             _ => classified,
         };
+        let ticket_count_full = core.ledger.live_ticket_limit_reached();
         let mut candidates: Vec<ReclaimCandidate> = core
             .ledger
             .policy()
             .classes
             .iter()
-            .filter(|(_, budget)| budget.hard_cap_bytes > 0)
+            // A zero-byte charge can occupy a live ticket even in a class
+            // with a zero byte cap. At the ticket-count ceiling the host may
+            // need to evict that authority, so do not hide such classes from
+            // the one bounded reclaim attempt.
+            .filter(|(_, budget)| budget.hard_cap_bytes > 0 || ticket_count_full)
             .map(|(candidate, budget)| ReclaimCandidate {
                 class: candidate.clone(),
                 priority: budget.reclaim_priority,
@@ -856,8 +943,30 @@ impl LiveProcessMemoryBroker {
     }
 
     fn run_reclaim(&self, reclaimer: Arc<dyn MemoryReclaimer>, request: &ReclaimRequest) {
+        let Some(reclaimer_permit) = CallbackPermit::try_enter(&self.reclaimer_active) else {
+            // Concurrent plans may still make progress without host work if the
+            // live postimage admits them; otherwise their normal remeasurement
+            // returns a typed denial. Never start a recursive/concurrent storm.
+            self.emit(MemoryEvent::new(
+                MemoryOperation::Reclaim,
+                MemoryOutcome::Busy,
+                Some(request.requested_bytes),
+            ));
+            return;
+        };
+        let broker_identity = Arc::as_ptr(&self.inner) as usize;
+        // The entry guard in `reserve_with_reclaim` rejects same-broker reserve
+        // reentry before it can prepare another callback. This local guard is a
+        // second boundary for future internal callers of this method.
+        let Some(callback_scope) =
+            BrokerCallbackScope::enter(BrokerCallbackKind::Reclaimer, broker_identity)
+        else {
+            return;
+        };
         let outcome =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| reclaimer.reclaim(request)));
+        drop(callback_scope);
+        drop(reclaimer_permit);
         let mut core = match self.lock() {
             Ok(core) => core,
             Err(error) => {
@@ -924,6 +1033,7 @@ impl LiveProcessMemoryBroker {
             request: AdmissionRequest { class, owner, context, kind, bytes },
             rebuild_in_progress: core.ledger.rebuild_in_progress(),
             ticket_id_space_exhausted: core.ledger.ticket_id_space_exhausted(),
+            live_ticket_limit_reached: core.ledger.live_ticket_limit_reached(),
         };
         crate::domain::admission::preflight(&inputs)
     }
@@ -937,6 +1047,13 @@ impl LiveProcessMemoryBroker {
         bytes: u64,
         commit: bool,
     ) -> MemoryResult<ReservationTicket> {
+        let broker_identity = Arc::as_ptr(&self.inner) as usize;
+        if BrokerCallbackScope::is_active(BrokerCallbackKind::Reclaimer, broker_identity) {
+            return Err(MemoryError::operation_in_progress(
+                "reentrant reserve from this broker's memory reclaimer",
+            ));
+        }
+
         // Reject oversized identifiers before preflight can invoke host reclaim
         // callbacks or mutate diagnostic counters. `reserve_on` and the ledger
         // repeat the check at the mutation authority boundary.
@@ -2172,6 +2289,48 @@ mod tests {
         assert_eq!(charge.bytes(), Some(200_000));
         drop(charge);
         assert_eq!(b.ledger_snapshot().expect("drop replacement").total_owner_bytes(), 0);
+    }
+
+    #[test]
+    fn managed_recharge_at_live_ticket_cap_keeps_broker_authority_maps_exact() {
+        let broker = LiveProcessMemoryBroker::from_report(report_with(ResidencyPolicy::new(1_000)))
+            .expect("broker");
+        let mut charges =
+            Vec::with_capacity(crate::domain::management_limits::MAX_LIVE_TICKETS_PER_BROKER);
+        for _ in 0..crate::domain::management_limits::MAX_LIVE_TICKETS_PER_BROKER {
+            charges.push(
+                broker
+                    .reserve_managed_charge(
+                        MemoryClass::ArtifactCache,
+                        "owner:cap".to_string(),
+                        MemoryContextKind::Request,
+                        ChargeKind::RetainedPayload,
+                        0,
+                    )
+                    .expect("zero-byte authority below cap"),
+            );
+        }
+        let source = charges.last_mut().expect("source charge");
+        let old_id = source.id();
+        source
+            .recharge(
+                MemoryClass::ArtifactCache,
+                "owner:cap".to_string(),
+                MemoryContextKind::Request,
+                ChargeKind::RetainedPayload,
+                1,
+            )
+            .expect("managed replacement needs no extra ticket slot");
+        assert_ne!(source.id(), old_id);
+        let snapshot = broker.ledger_snapshot().expect("snapshot");
+        snapshot.validate_exact().expect("axes after managed swap");
+        assert_eq!(
+            snapshot.live_ticket_count,
+            crate::domain::management_limits::MAX_LIVE_TICKETS_PER_BROKER
+        );
+        assert_eq!(snapshot.total_owner_bytes(), 1);
+        drop(charges);
+        sep23_assert_fully_drained(&broker);
     }
 
     #[test]
@@ -4320,6 +4479,282 @@ mod tests {
         assert_eq!(broker.ledger_snapshot().expect("ledger").total_owner_bytes(), 0);
     }
 
+    struct RecursiveObserveEventSink {
+        broker: Mutex<Option<LiveProcessMemoryBroker>>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl MemoryEventSink for RecursiveObserveEventSink {
+        fn emit(&self, _event: MemoryEvent) {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let broker = self.broker.lock().expect("broker slot").clone();
+            if let Some(broker) = broker {
+                std::thread::spawn(move || {
+                    broker.observe().expect("read observation remains available in event callback");
+                })
+                .join()
+                .expect("nested event observation thread");
+            }
+        }
+    }
+
+    #[test]
+    fn event_sink_observation_reentry_delivers_outer_event_once() {
+        let sink = Arc::new(RecursiveObserveEventSink {
+            broker: Mutex::new(None),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let broker = crate::ProcessMemoryBrokerBuilder::new()
+            .with_preset(crate::MemoryPreset::Development)
+            .with_event_sink(sink.clone())
+            .build()
+            .expect("broker");
+        *sink.broker.lock().expect("broker slot") = Some(broker.clone());
+
+        broker.record_advisory_event(MemoryEvent::new(
+            MemoryOperation::ObserveAllocator,
+            MemoryOutcome::Succeeded,
+            None,
+        ));
+
+        assert_eq!(
+            sink.calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the nested observe event must be suppressed at the same sink boundary"
+        );
+        assert_eq!(broker.ledger_snapshot().expect("ledger").total_owner_bytes(), 0);
+    }
+
+    struct RecursiveReserveReclaimer {
+        broker: Mutex<Option<LiveProcessMemoryBroker>>,
+        calls: std::sync::atomic::AtomicUsize,
+        nested_error: Mutex<Option<MemoryError>>,
+    }
+
+    impl MemoryReclaimer for RecursiveReserveReclaimer {
+        fn reclaim(
+            &self,
+            _request: &ReclaimRequest,
+        ) -> MemoryResult<crate::ports::reclaim::ReclaimOutcome> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let broker = self.broker.lock().expect("broker slot").clone();
+            if let Some(broker) = broker {
+                let nested = broker.reserve_managed_charge(
+                    MemoryClass::ArtifactCache,
+                    "nested-reclaim".into(),
+                    MemoryContextKind::Request,
+                    ChargeKind::RetainedPayload,
+                    1,
+                );
+                *self.nested_error.lock().expect("nested error") = nested.err();
+            }
+            Ok(crate::ports::reclaim::ReclaimOutcome::default())
+        }
+    }
+
+    #[test]
+    fn same_broker_reclaimer_reserve_reentry_is_bounded_and_typed() {
+        let reclaimer = Arc::new(RecursiveReserveReclaimer {
+            broker: Mutex::new(None),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            nested_error: Mutex::new(None),
+        });
+        let policy = ResidencyPolicy::new(100)
+            .with_class_budget(MemoryClass::ArtifactCache, class_budget(0, 100, 100, false));
+        let broker = LiveProcessMemoryBroker::from_report_with_reclaimer(
+            report_with(policy),
+            Some(reclaimer.clone()),
+        )
+        .expect("broker");
+        *reclaimer.broker.lock().expect("broker slot") = Some(broker.clone());
+        let baseline = broker
+            .reserve_managed_charge(
+                MemoryClass::ArtifactCache,
+                "outer".into(),
+                MemoryContextKind::Request,
+                ChargeKind::RetainedPayload,
+                100,
+            )
+            .expect("fill hard cap");
+
+        let denied = broker.reserve_managed_charge(
+            MemoryClass::ArtifactCache,
+            "outer".into(),
+            MemoryContextKind::Request,
+            ChargeKind::RetainedPayload,
+            1,
+        );
+        assert!(matches!(denied, Err(MemoryError::Capacity(_))));
+        assert_eq!(reclaimer.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(matches!(
+            reclaimer.nested_error.lock().expect("nested error").as_ref(),
+            Some(MemoryError::OperationInProgress(_))
+        ));
+        assert_eq!(broker.ledger_snapshot().expect("ledger").total_owner_bytes(), 100);
+        drop(baseline);
+        assert_eq!(broker.ledger_snapshot().expect("drained").total_owner_bytes(), 0);
+    }
+
+    struct ThreadSpawnReclaimer {
+        broker: Mutex<Option<LiveProcessMemoryBroker>>,
+        calls: std::sync::atomic::AtomicUsize,
+        nested_error: Mutex<Option<MemoryError>>,
+    }
+
+    impl MemoryReclaimer for ThreadSpawnReclaimer {
+        fn reclaim(
+            &self,
+            _request: &ReclaimRequest,
+        ) -> MemoryResult<crate::ports::reclaim::ReclaimOutcome> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let broker = self.broker.lock().expect("broker slot").clone();
+            if let Some(broker) = broker {
+                let nested = std::thread::spawn(move || {
+                    broker.reserve_managed_charge(
+                        MemoryClass::ArtifactCache,
+                        "thread-reentry".into(),
+                        MemoryContextKind::Request,
+                        ChargeKind::RetainedPayload,
+                        1,
+                    )
+                })
+                .join()
+                .expect("nested reserve thread");
+                *self.nested_error.lock().expect("nested error") = nested.err();
+            }
+            Ok(crate::ports::reclaim::ReclaimOutcome::default())
+        }
+    }
+
+    #[test]
+    fn concurrent_reclaimer_reentry_does_not_start_a_callback_storm() {
+        let reclaimer = Arc::new(ThreadSpawnReclaimer {
+            broker: Mutex::new(None),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            nested_error: Mutex::new(None),
+        });
+        let policy = ResidencyPolicy::new(100)
+            .with_class_budget(MemoryClass::ArtifactCache, class_budget(0, 100, 100, false));
+        let broker = LiveProcessMemoryBroker::from_report_with_reclaimer(
+            report_with(policy),
+            Some(reclaimer.clone()),
+        )
+        .expect("broker");
+        *reclaimer.broker.lock().expect("broker slot") = Some(broker.clone());
+        let baseline = broker
+            .reserve_managed_charge(
+                MemoryClass::ArtifactCache,
+                "outer".into(),
+                MemoryContextKind::Request,
+                ChargeKind::RetainedPayload,
+                100,
+            )
+            .expect("fill hard cap");
+
+        let denied = broker.reserve_managed_charge(
+            MemoryClass::ArtifactCache,
+            "outer".into(),
+            MemoryContextKind::Request,
+            ChargeKind::RetainedPayload,
+            1,
+        );
+        assert!(matches!(denied, Err(MemoryError::Capacity(_))));
+        assert_eq!(reclaimer.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(matches!(
+            reclaimer.nested_error.lock().expect("nested error").as_ref(),
+            Some(MemoryError::Capacity(_))
+        ));
+        assert_eq!(broker.ledger_snapshot().expect("ledger").total_owner_bytes(), 100);
+        drop(baseline);
+        assert_eq!(broker.ledger_snapshot().expect("drained").total_owner_bytes(), 0);
+    }
+
+    #[test]
+    fn independent_outer_reserves_share_one_in_flight_reclaimer() {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        struct HeldReclaimer {
+            entered: mpsc::Sender<()>,
+            release: Mutex<mpsc::Receiver<()>>,
+            calls: AtomicUsize,
+        }
+        impl MemoryReclaimer for HeldReclaimer {
+            fn reclaim(
+                &self,
+                _request: &ReclaimRequest,
+            ) -> MemoryResult<crate::ports::reclaim::ReclaimOutcome> {
+                self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+                self.entered.send(()).expect("parent observes callback entry");
+                self.release
+                    .lock()
+                    .expect("release channel")
+                    .recv()
+                    .expect("parent releases callback");
+                Ok(crate::ports::reclaim::ReclaimOutcome::default())
+            }
+        }
+
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let reclaimer = Arc::new(HeldReclaimer {
+            entered: entered_tx,
+            release: Mutex::new(release_rx),
+            calls: AtomicUsize::new(0),
+        });
+        let policy = ResidencyPolicy::new(100)
+            .with_class_budget(MemoryClass::ArtifactCache, class_budget(0, 100, 100, false));
+        let broker = LiveProcessMemoryBroker::from_report_with_reclaimer(
+            report_with(policy),
+            Some(reclaimer.clone()),
+        )
+        .expect("broker");
+        let baseline = broker
+            .reserve_managed_charge(
+                MemoryClass::ArtifactCache,
+                "owner:outer".into(),
+                MemoryContextKind::Request,
+                ChargeKind::RetainedPayload,
+                100,
+            )
+            .expect("fill hard cap");
+
+        let first_broker = broker.clone();
+        let first = std::thread::spawn(move || {
+            first_broker.reserve_managed_charge(
+                MemoryClass::ArtifactCache,
+                "owner:first".into(),
+                MemoryContextKind::Request,
+                ChargeKind::RetainedPayload,
+                1,
+            )
+        });
+        entered_rx.recv_timeout(Duration::from_secs(5)).expect("first callback entered");
+        let (second_tx, second_rx) = mpsc::channel();
+        let second_broker = broker.clone();
+        let second = std::thread::spawn(move || {
+            let result = second_broker.reserve_managed_charge(
+                MemoryClass::ArtifactCache,
+                "owner:second".into(),
+                MemoryContextKind::Request,
+                ChargeKind::RetainedPayload,
+                1,
+            );
+            second_tx.send(result).expect("parent receives second outcome");
+        });
+        let second_while_first_held = second_rx.recv_timeout(Duration::from_secs(5));
+        release_tx.send(()).expect("release first callback even on failed second outcome");
+        let first_result = first.join().expect("first thread");
+        second.join().expect("second thread");
+        assert!(matches!(second_while_first_held, Ok(Err(MemoryError::Capacity(_)))));
+        assert!(matches!(first_result, Err(MemoryError::Capacity(_))));
+        assert_eq!(reclaimer.calls.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(broker.ledger_snapshot().expect("unchanged").total_owner_bytes(), 100);
+        drop(baseline);
+        sep23_assert_fully_drained(&broker);
+    }
+
     #[test]
     fn forged_snapshot_has_fallible_totals_without_panicking() {
         let mut snapshot = LedgerSnapshot::default();
@@ -5477,6 +5912,7 @@ mod tests {
             },
             rebuild_in_progress: false,
             ticket_id_space_exhausted: true,
+            live_ticket_limit_reached: false,
         };
         assert_eq!(
             crate::domain::admission::preflight(&inputs),
@@ -5486,6 +5922,163 @@ mod tests {
             AdmissionBlock::TicketIdSpaceExhausted.into_error(),
             MemoryError::InvalidState("reservation ticket id space exhausted".into())
         );
+    }
+
+    #[test]
+    fn live_ticket_count_cap_runs_one_reclaim_then_remeasures() {
+        for with_group in [false, true] {
+            let reclaimer = Arc::new(RecordingReclaimer::default());
+            let mut policy = ResidencyPolicy::new(1_000)
+                .with_class_budget(MemoryClass::ArtifactCache, class_budget(0, 90, 100, false));
+            if with_group {
+                policy = policy
+                    .with_resource_group(
+                        "g",
+                        ResourceGroup {
+                            reserved_bytes: 0,
+                            soft_cap_bytes: 90,
+                            hard_cap_bytes: 100,
+                            burst_percent: 0,
+                            reclaim_priority: ReclaimPriority::Normal,
+                            admission_weight: 1,
+                        },
+                    )
+                    .with_owner_group("owner:cap", "g");
+            }
+            let broker = LiveProcessMemoryBroker::from_report_with_reclaimer(
+                report_with(policy),
+                Some(reclaimer.clone()),
+            )
+            .expect("broker");
+            let baseline = broker
+                .reserve_managed_charge(
+                    MemoryClass::ArtifactCache,
+                    "owner:cap".into(),
+                    MemoryContextKind::Request,
+                    ChargeKind::RetainedPayload,
+                    80,
+                )
+                .expect("baseline");
+            let mut zero_tickets = Vec::with_capacity(
+                crate::domain::management_limits::MAX_LIVE_TICKETS_PER_BROKER - 1,
+            );
+            for _ in 1..crate::domain::management_limits::MAX_LIVE_TICKETS_PER_BROKER {
+                zero_tickets.push(
+                    broker
+                        .reserve_managed_charge(
+                            MemoryClass::ArtifactCache,
+                            "owner:cap".into(),
+                            MemoryContextKind::Request,
+                            ChargeKind::RetainedPayload,
+                            0,
+                        )
+                        .expect("zero-byte ticket below cap"),
+                );
+            }
+            let before = broker.ledger_snapshot().expect("before");
+            assert_eq!(
+                before.live_ticket_count,
+                crate::domain::management_limits::MAX_LIVE_TICKETS_PER_BROKER
+            );
+            assert!(reclaimer.requests.lock().expect("requests").is_empty());
+
+            // No-op reclaim may run once, but the unchanged ledger must still
+            // deny. The group case also exercises mixed admission limits.
+            let denied = broker.reserve_managed_charge(
+                MemoryClass::ArtifactCache,
+                "owner:cap".into(),
+                MemoryContextKind::Request,
+                ChargeKind::RetainedPayload,
+                30,
+            );
+            assert!(matches!(denied, Err(MemoryError::Capacity(_))), "{denied:?}");
+            if !with_group {
+                assert_eq!(
+                    denied.err(),
+                    Some(MemoryError::capacity(format!(
+                        "live reservation ticket limit {} reached",
+                        crate::domain::management_limits::MAX_LIVE_TICKETS_PER_BROKER
+                    )))
+                );
+            }
+            assert_eq!(
+                reclaimer.requests.lock().expect("requests").len(),
+                1,
+                "group={with_group}: one bounded reclaim attempt"
+            );
+            assert_eq!(broker.ledger_snapshot().expect("after"), before);
+
+            drop(zero_tickets);
+            drop(baseline);
+            sep23_assert_fully_drained(&broker);
+        }
+    }
+
+    #[test]
+    fn live_ticket_count_cap_can_recover_when_host_releases_zero_byte_charge() {
+        let reclaimer = Arc::new(RecordingReclaimer::default());
+        let policy = ResidencyPolicy::new(1_000)
+            .with_class_budget(MemoryClass::ArtifactCache, class_budget(0, 0, 0, false));
+        let mut report = report_with(policy);
+        *report.residency.classes.get_mut(&MemoryClass::ArtifactCache).expect("configured class") =
+            class_budget(0, 0, 0, false);
+        let broker =
+            LiveProcessMemoryBroker::from_report_with_reclaimer(report, Some(reclaimer.clone()))
+                .expect("broker");
+        *reclaimer.charge_to_release.lock().expect("reclaimable charge") = Some(
+            broker
+                .reserve_managed_charge(
+                    MemoryClass::ArtifactCache,
+                    "owner:reclaimable".into(),
+                    MemoryContextKind::Request,
+                    ChargeKind::RetainedPayload,
+                    0,
+                )
+                .expect("host-owned zero-byte charge"),
+        );
+        let mut retained =
+            Vec::with_capacity(crate::domain::management_limits::MAX_LIVE_TICKETS_PER_BROKER - 1);
+        for _ in 1..crate::domain::management_limits::MAX_LIVE_TICKETS_PER_BROKER {
+            retained.push(
+                broker
+                    .reserve_managed_charge(
+                        MemoryClass::ArtifactCache,
+                        "owner:retained".into(),
+                        MemoryContextKind::Request,
+                        ChargeKind::RetainedPayload,
+                        0,
+                    )
+                    .expect("fill authority cap"),
+            );
+        }
+        let admitted = broker
+            .reserve_managed_charge(
+                MemoryClass::ArtifactCache,
+                "owner:new".into(),
+                MemoryContextKind::Request,
+                ChargeKind::RetainedPayload,
+                0,
+            )
+            .expect("callback released one live ticket");
+        let requests = reclaimer.requests.lock().expect("requests");
+        assert_eq!(requests.len(), 1);
+        assert!(
+            requests[0]
+                .candidates
+                .iter()
+                .any(|candidate| candidate.class == MemoryClass::ArtifactCache),
+            "zero-byte ticket owners must be eligible victims at the ticket-count cap"
+        );
+        drop(requests);
+        let after = broker.ledger_snapshot().expect("after");
+        assert_eq!(
+            after.live_ticket_count,
+            crate::domain::management_limits::MAX_LIVE_TICKETS_PER_BROKER
+        );
+        assert_eq!(after.total_owner_bytes(), 0);
+        drop(admitted);
+        drop(retained);
+        sep23_assert_fully_drained(&broker);
     }
 
     #[test]
@@ -6120,6 +6713,69 @@ mod tests {
         assert!(matches!(denied, Err(MemoryError::Capacity(_))), "got {denied:?}");
         assert_eq!(*reclaimer.calls.lock().expect("calls"), 2);
         drop(baseline);
+        sep23_assert_fully_drained(&broker);
+    }
+
+    #[test]
+    fn reclaimer_release_then_panic_uses_remeasured_ledger_not_callback_result() {
+        struct ReleaseThenPanic {
+            victim: Mutex<Option<ManagedCharge>>,
+            calls: std::sync::atomic::AtomicUsize,
+        }
+
+        impl MemoryReclaimer for ReleaseThenPanic {
+            fn reclaim(
+                &self,
+                _request: &ReclaimRequest,
+            ) -> MemoryResult<crate::ports::reclaim::ReclaimOutcome> {
+                self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+                let mut victim = self.victim.lock().expect("victim slot").take().expect("victim");
+                victim.release().expect("callback releases real ledger authority");
+                panic!("callback fails after making progress");
+            }
+        }
+
+        let reclaimer = Arc::new(ReleaseThenPanic {
+            victim: Mutex::new(None),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let policy = ResidencyPolicy::new(10_000)
+            .with_class_budget(MemoryClass::ArtifactCache, class_budget(0, 90, 100, false));
+        let broker = LiveProcessMemoryBroker::from_report_with_reclaimer(
+            report_with(policy),
+            Some(reclaimer.clone()),
+        )
+        .expect("broker");
+        let victim = broker
+            .reserve_managed_charge(
+                MemoryClass::ArtifactCache,
+                "victim".to_string(),
+                MemoryContextKind::Request,
+                ChargeKind::RetainedPayload,
+                80,
+            )
+            .expect("victim charge");
+        *reclaimer.victim.lock().expect("victim slot") = Some(victim);
+
+        let admitted = broker
+            .reserve_managed_charge(
+                MemoryClass::ArtifactCache,
+                "request".to_string(),
+                MemoryContextKind::Request,
+                ChargeKind::RetainedPayload,
+                30,
+            )
+            .expect("post-callback ledger, not callback success, determines admission");
+        assert_eq!(reclaimer.calls.load(AtomicOrdering::SeqCst), 1);
+        let stats = broker.reclaim_runtime_stats().expect("stats");
+        assert_eq!(stats.attempts, 1);
+        assert_eq!(stats.failures, 1, "panic remains observable as callback failure");
+        assert_eq!(stats.terminal_denials, 0);
+        let snapshot = broker.ledger_snapshot().expect("snapshot");
+        snapshot.validate_exact().expect("post-callback axes balance");
+        assert_eq!(snapshot.total_owner_bytes(), 30);
+        assert_eq!(snapshot.live_ticket_count, 1);
+        drop(admitted);
         sep23_assert_fully_drained(&broker);
     }
 

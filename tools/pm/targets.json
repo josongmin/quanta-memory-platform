@@ -1,8 +1,13 @@
 {
+  "retired_outputs": [
+    ".cursorrules"
+  ],
   "targets": {
     "agents": {
       "output": "AGENTS.md",
       "title": "quanta-memory-platform — Agent Operating Guide",
+      "max_lines": 120,
+      "max_bytes": 10000,
       "sections": [
         "sources/operational/agent-router.md",
         "sources/operational/agent-core.md",
@@ -11,25 +16,103 @@
     },
     "claude": {
       "output": "CLAUDE.md",
-      "title": "quanta-memory-platform — Claude Code Guide",
+      "title": "quanta-memory-platform — Claude Code Entry Point",
+      "max_lines": 30,
+      "max_bytes": 3000,
       "sections": [
-        "sources/operational/agent-router.md",
-        "sources/operational/agent-core.md",
-        "sources/rules/cheatsheet.md",
-        "sources/operational/agent-playbook.md"
+        "sources/operational/claude-entry.md"
       ]
     },
-    "cursor_rules": {
-      "output": ".cursorrules",
-      "title": "quanta-memory-platform — Cursor Rules",
+    "cursor_architecture": {
+      "output": ".cursor/rules/architecture.mdc",
+      "title": "Architecture and crate boundaries",
+      "max_lines": 120,
+      "max_bytes": 12000,
+      "frontmatter": {
+        "description": "Use when changing crate boundaries, public APIs, storage backings, or host portability.",
+        "alwaysApply": false
+      },
       "sections": [
-        "sources/rules/architecture.md",
-        "sources/rules/cheatsheet.md",
-        "sources/rules/build.md",
-        "sources/rules/tests.md",
-        "sources/rules/determinism.md",
-        "sources/rules/error-handling.md",
+        "sources/rules/architecture.md"
+      ]
+    },
+    "cursor_build": {
+      "output": ".cursor/rules/build.mdc",
+      "title": "Build, verification, and extraction",
+      "max_lines": 100,
+      "max_bytes": 10000,
+      "frontmatter": {
+        "description": "Use when running repository-wide verification, changing build tooling, or preparing extraction.",
+        "alwaysApply": false
+      },
+      "sections": [
+        "sources/rules/build.md"
+      ]
+    },
+    "cursor_dependencies": {
+      "output": ".cursor/rules/dependencies.mdc",
+      "title": "Dependency policy",
+      "max_lines": 90,
+      "max_bytes": 9000,
+      "frontmatter": {
+        "description": "Use when adding, removing, upgrading, or reviewing Cargo dependencies or features.",
+        "globs": "**/Cargo.toml,Cargo.lock,deny.toml",
+        "alwaysApply": false
+      },
+      "sections": [
         "sources/rules/dependencies.md"
+      ]
+    },
+    "cursor_determinism": {
+      "output": ".cursor/rules/determinism.mdc",
+      "title": "Determinism and accounting invariants",
+      "max_lines": 100,
+      "max_bytes": 10000,
+      "frontmatter": {
+        "description": "Use when changing ledger accounting, budget policy, snapshots, reclaim, conformance, or fault scenarios.",
+        "alwaysApply": false
+      },
+      "sections": [
+        "sources/rules/determinism.md"
+      ]
+    },
+    "cursor_errors": {
+      "output": ".cursor/rules/error-handling.mdc",
+      "title": "Error handling",
+      "max_lines": 90,
+      "max_bytes": 9000,
+      "frontmatter": {
+        "description": "Use when changing fallible Rust paths, MemoryError mapping, or backing error propagation.",
+        "alwaysApply": false
+      },
+      "sections": [
+        "sources/rules/error-handling.md"
+      ]
+    },
+    "cursor_rust_review": {
+      "output": ".cursor/rules/rust-review.mdc",
+      "title": "Rust regression review cheatsheet",
+      "max_lines": 100,
+      "max_bytes": 12000,
+      "frontmatter": {
+        "description": "Use when reviewing Rust changes for known QMP regression patterns or machine-enforced constraints.",
+        "alwaysApply": false
+      },
+      "sections": [
+        "sources/rules/cheatsheet.md"
+      ]
+    },
+    "cursor_tests": {
+      "output": ".cursor/rules/tests.mdc",
+      "title": "Test topology",
+      "max_lines": 80,
+      "max_bytes": 8000,
+      "frontmatter": {
+        "description": "Use when adding, moving, or reviewing tests and conformance coverage.",
+        "alwaysApply": false
+      },
+      "sections": [
+        "sources/rules/tests.md"
       ]
     }
   }

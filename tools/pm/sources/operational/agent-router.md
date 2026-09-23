@@ -1,51 +1,36 @@
 ## Read First — Non-Negotiables
 
 This repo is `quanta-memory-platform`: a **portable, host-independent** memory
-budgeting / accounting library. It is consumed by the Semantica monorepo through
-a host adapter (`quanta-memory-host`) that lives **outside this repo**, and it is
-designed to be extracted into its own git repository with no rewrites.
+budgeting/accounting library designed for mechanical extraction. The Semantica
+host adapter lives outside this repository.
 
 Hard rules:
 
 - **Dependency direction is strict and acyclic:** `core <- facade <- testkit`.
-  No member depends upward. The host adapter depends on this repo, never the
-  reverse. Adding a dep that inverts this fails the extraction pre-flight.
+  The host depends on this repo, never the reverse.
 - **`domain/` and `ports/` are pure:** no `std::fs`, `std::env`, `SystemTime::now`,
   `Instant::now`, and no `crate::adapters` import. I/O and clocks live behind
   ports/adapters.
-- **Host-independent public API:** no Semantica nouns (`Semantica*`,
-  `quanta_runtime`, `codegraph`). The host hello-world lives in Semantica.
-- **Builder-first surface:** consumers use `MemoryPlatformBuilder`,
-  `PortableMemoryPresets`, and the store/pipeline builders — never raw broker
-  constructors.
+- **Public API stays host-independent and builder-first:** no Semantica nouns or
+  public raw-broker construction paths.
 - **Ledger is fail-closed:** every mutating accounting op fully succeeds or
-  leaves the ledger untouched; the invariants defined in
-  `crates/quanta-memory-platform-core/src/domain/ledger.rs` always hold;
-  allocator telemetry is advisory and never mutates counters.
-- **Conformance must bite:** the testkit suite must REJECT a broken fake, not just
-  accept honest ones.
-- **Agent guidance:** edit only `tools/pm/sources/**`, then run
-  `python3 tools/pm/pm.py sync`. Never hand-edit `AGENTS.md`, `CLAUDE.md`, or
-  `.cursorrules`.
+  leaves it untouched. Allocator telemetry is advisory. Conformance must reject
+  a broken fake, not only accept honest implementations.
+- **Generated guidance:** edit `tools/pm/sources/**` or `tools/pm/targets.json`,
+  then run `python3 tools/pm/pm.py sync`. Do not hand-edit generated outputs.
 
-## Where Things Live
+## Read Only What the Task Needs
 
-| Need | Location |
+Do not preload the full documentation stack. Open the relevant authority when
+the task enters that area:
+
+| Task | Read |
 | --- | --- |
-| Repo overview + dependency direction | `README.md` |
-| Extraction checklist (split into own repo) | `EXTRACTION.md` |
-| Pure hexagonal kernel | `crates/quanta-memory-platform-core/src/{api,application,domain,ports,adapters}/` |
-| Accounting SSOT (invariants) | `crates/quanta-memory-platform-core/src/domain/ledger.rs` |
-| Budget policy / presets / manifests | `crates/quanta-memory-platform-core/src/domain/{policy,config}.rs` |
-| Public broker surface | `crates/quanta-memory-platform-core/src/api/{broker,builder,control}.rs` |
-| Feature-sliced portable stores + pipelines | `crates/quanta-memory-platform-facade/src/<feature>/` |
-| Storage backings (feature-gated) | `crates/quanta-memory-platform-facade/src/<feature>/backings/` |
-| Conformance / chaos / alloc tooling | `crates/quanta-memory-platform-testkit/src/` |
-| Examples (compile vs real public API) | `crates/quanta-memory-platform-facade/examples/{hello_world,effective_budget_report}.rs` |
-| One-shot lint rail | `scripts/check-workspace.sh` |
-| Extraction bootstrap | `scripts/extract-to-standalone-repo.sh` |
-| Agent/operator instruction sources | `tools/pm/sources/**` |
-| Prompt manager | `tools/pm/pm.py`, `tools/pm/targets.json` |
-
-Generated docs (`AGENTS.md`, `CLAUDE.md`, `.cursorrules`) are produced from
-`tools/pm/sources/**`. Never hand-edit them.
+| Crate edges, layers, public surface | `tools/pm/sources/rules/architecture.md` |
+| Ledger, policy, reclaim, snapshots | `tools/pm/sources/rules/determinism.md` and the owning source |
+| Tests or conformance | `tools/pm/sources/rules/tests.md` |
+| Fallible Rust paths | `tools/pm/sources/rules/error-handling.md` |
+| Cargo deps or features | `tools/pm/sources/rules/dependencies.md` |
+| Known regression review | `tools/pm/sources/rules/cheatsheet.md` |
+| Workspace gate or extraction | `tools/pm/sources/rules/build.md` |
+| Repository overview | `README.md`; extraction contract: `EXTRACTION.md` |

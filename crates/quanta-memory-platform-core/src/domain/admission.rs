@@ -16,7 +16,7 @@
 //! when the same check passes against zero usage (freeing memory can fix it),
 //! and a [`AdmissionVerdict::TerminalDenial`] when it still breaches at zero
 //! (no callback can help). [`AdmissionVerdict::Blocked`] covers non-capacity
-//! refusals (rebuild fence, unknown class, exhausted ticket space, internal
+//! refusals (rebuild fence, unknown class, exhausted ticket ID space, internal
 //! inconsistency), which never fire a callback either.
 
 use std::collections::BTreeMap;
@@ -45,6 +45,7 @@ pub(crate) struct LimitBreach {
 /// reproduce the attempt path's exact denial message.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum LimitAxis {
+    LiveTicketCount,
     Global,
     Class { class: MemoryClass },
     SharedBorrowPool,
@@ -131,6 +132,7 @@ pub(crate) struct PreflightInputs<'a> {
     pub request: AdmissionRequest<'a>,
     pub rebuild_in_progress: bool,
     pub ticket_id_space_exhausted: bool,
+    pub live_ticket_limit_reached: bool,
 }
 
 impl LimitBreach {
@@ -664,7 +666,7 @@ pub(crate) fn check_execution_scratch(
 
 /// Evaluate the full admission chain once, in exact attempt order:
 /// group admission, non-headroom floor, execution scratch, rebuild fence,
-/// ledger postimage, ticket space.
+/// live-ticket count, ledger postimage, ticket ID space.
 fn evaluate_chain(inputs: &PreflightInputs) -> Result<(), AdmissionFailure> {
     let request = &inputs.request;
     if let Some(group) = inputs.owner_group {
@@ -721,6 +723,15 @@ fn evaluate_chain(inputs: &PreflightInputs) -> Result<(), AdmissionFailure> {
     if inputs.rebuild_in_progress {
         return Err(AdmissionFailure::Block(AdmissionBlock::RebuildInProgress));
     }
+    if inputs.live_ticket_limit_reached {
+        let limit = crate::domain::management_limits::MAX_LIVE_TICKETS_PER_BROKER as u64;
+        return Err(AdmissionFailure::Breach(LimitBreach::new(
+            LimitAxis::LiveTicketCount,
+            limit,
+            Some(limit + 1),
+            MemoryError::capacity(format!("live reservation ticket limit {limit} reached")),
+        )));
+    }
     check_ledger_postimage(inputs.policy, &inputs.usage, request)?;
     if inputs.ticket_id_space_exhausted {
         return Err(AdmissionFailure::Block(AdmissionBlock::TicketIdSpaceExhausted));
@@ -759,6 +770,7 @@ pub(crate) fn preflight(inputs: &PreflightInputs) -> AdmissionVerdict {
                 unused_group_floors: zero_floors,
                 rebuild_in_progress: false,
                 ticket_id_space_exhausted: false,
+                live_ticket_limit_reached: false,
                 ..*inputs
             };
             match evaluate_chain(&zero) {

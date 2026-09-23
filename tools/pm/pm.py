@@ -5,9 +5,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
+from typing import Union
 
 
 PM_DIR = Path(__file__).resolve().parent
@@ -25,12 +27,24 @@ class PmError(Exception):
     """Raised for invalid configuration, paths, or usage."""
 
 
+FrontmatterValue = Union[str, bool, tuple[str, ...]]
+
+
 @dataclass(frozen=True)
 class Target:
     name: str
     output: str
     title: str
     sections: tuple[str, ...]
+    frontmatter: tuple[tuple[str, FrontmatterValue], ...] = ()
+    max_lines: int | None = None
+    max_bytes: int | None = None
+
+
+@dataclass(frozen=True)
+class Manifest:
+    targets: dict[str, Target]
+    retired_outputs: tuple[str, ...]
 
 
 def _safe_relative_path(value: object, *, field: str, target: str) -> str:
@@ -48,7 +62,45 @@ def _safe_relative_path(value: object, *, field: str, target: str) -> str:
     return value
 
 
-def load_targets(targets_path: Path) -> dict[str, Target]:
+def _frontmatter(
+    value: object, *, target: str
+) -> tuple[tuple[str, FrontmatterValue], ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, dict) or not value:
+        raise PmError(f"target '{target}' frontmatter must be a non-empty mapping")
+
+    normalized: list[tuple[str, FrontmatterValue]] = []
+    for key, raw in value.items():
+        if not isinstance(key, str) or re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]*", key) is None:
+            raise PmError(f"target '{target}' has invalid frontmatter key: {key!r}")
+        if isinstance(raw, bool):
+            normalized.append((key, raw))
+        elif isinstance(raw, str) and raw and "\n" not in raw:
+            normalized.append((key, raw))
+        elif (
+            isinstance(raw, list)
+            and raw
+            and all(isinstance(item, str) and item and "\n" not in item for item in raw)
+        ):
+            normalized.append((key, tuple(raw)))
+        else:
+            raise PmError(
+                f"target '{target}' frontmatter values must be booleans, "
+                "non-empty strings, or non-empty string lists"
+            )
+    return tuple(normalized)
+
+
+def _optional_positive_int(value: object, *, field: str, target: str) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise PmError(f"target '{target}' {field} must be a positive integer")
+    return value
+
+
+def load_manifest(targets_path: Path) -> Manifest:
     if not targets_path.is_file():
         raise PmError(f"targets file not found: {targets_path}")
     try:
@@ -87,7 +139,28 @@ def load_targets(targets_path: Path) -> dict[str, Target]:
             raise PmError(f"duplicate generated output: {output}")
         outputs.add(output)
         referenced_sources.update(safe_sections)
-        targets[name] = Target(name, output, title, safe_sections)
+        targets[name] = Target(
+            name,
+            output,
+            title,
+            safe_sections,
+            _frontmatter(spec.get("frontmatter"), target=name),
+            _optional_positive_int(spec.get("max_lines"), field="max_lines", target=name),
+            _optional_positive_int(spec.get("max_bytes"), field="max_bytes", target=name),
+        )
+
+    retired_raw = raw.get("retired_outputs", [])
+    if not isinstance(retired_raw, list):
+        raise PmError("'retired_outputs' must be a list")
+    retired_outputs = tuple(
+        _safe_relative_path(value, field="retired output", target="manifest")
+        for value in retired_raw
+    )
+    if len(set(retired_outputs)) != len(retired_outputs):
+        raise PmError("retired_outputs contains duplicates")
+    overlap = sorted(outputs.intersection(retired_outputs))
+    if overlap:
+        raise PmError(f"active and retired outputs overlap: {', '.join(overlap)}")
 
     source_root = targets_path.parent / "sources"
     source_paths = list(source_root.rglob("*.md"))
@@ -103,7 +176,12 @@ def load_targets(targets_path: Path) -> dict[str, Target]:
     orphaned = sorted(actual_sources - referenced_sources)
     if orphaned:
         raise PmError(f"orphaned source file(s): {', '.join(orphaned)}")
-    return targets
+    return Manifest(targets, retired_outputs)
+
+
+def load_targets(targets_path: Path) -> dict[str, Target]:
+    """Compatibility helper for callers that need active targets only."""
+    return load_manifest(targets_path).targets
 
 
 def _read_sections(pm_dir: Path, target: Target) -> str:
@@ -122,7 +200,30 @@ def _read_sections(pm_dir: Path, target: Target) -> str:
 
 
 def render_target(target: Target, pm_dir: Path = PM_DIR) -> str:
-    return f"{BANNER}# {target.title}\n\n{_read_sections(pm_dir, target)}"
+    frontmatter = ""
+    if target.frontmatter:
+        lines = ["---"]
+        for key, value in target.frontmatter:
+            if isinstance(value, bool):
+                rendered = "true" if value else "false"
+            else:
+                rendered = json.dumps(value, ensure_ascii=False)
+            lines.append(f"{key}: {rendered}")
+        lines.append("---")
+        frontmatter = "\n".join(lines) + "\n"
+
+    rendered = f"{frontmatter}{BANNER}# {target.title}\n\n{_read_sections(pm_dir, target)}"
+    line_count = len(rendered.splitlines())
+    byte_count = len(rendered.encode("utf-8"))
+    if target.max_lines is not None and line_count > target.max_lines:
+        raise PmError(
+            f"target '{target.name}' exceeds max_lines: {line_count} > {target.max_lines}"
+        )
+    if target.max_bytes is not None and byte_count > target.max_bytes:
+        raise PmError(
+            f"target '{target.name}' exceeds max_bytes: {byte_count} > {target.max_bytes}"
+        )
+    return rendered
 
 
 def output_path(target: Target, repo_root: Path = REPO_ROOT) -> Path:
@@ -132,6 +233,14 @@ def output_path(target: Target, repo_root: Path = REPO_ROOT) -> Path:
         raise PmError(f"target '{target.name}': generated output may not be a symlink: {out}")
     if not out.parent.resolve().is_relative_to(root):
         raise PmError(f"target '{target.name}': generated output escapes repository: {out}")
+    return out
+
+
+def retired_output_path(value: str, repo_root: Path = REPO_ROOT) -> Path:
+    root = repo_root.resolve()
+    out = repo_root / value
+    if not out.parent.resolve().is_relative_to(root):
+        raise PmError(f"retired output escapes repository: {out}")
     return out
 
 
@@ -150,22 +259,38 @@ def check_drift(target: Target, pm_dir: Path = PM_DIR, repo_root: Path = REPO_RO
 
 
 def cmd_sync(args: argparse.Namespace) -> int:
-    for name, target in sorted(load_targets(args.targets).items()):
+    manifest = load_manifest(args.targets)
+    for value in manifest.retired_outputs:
+        out = retired_output_path(value, args.repo_root)
+        if out.is_dir() and not out.is_symlink():
+            raise PmError(f"retired output is a directory; refusing to remove it: {out}")
+        if out.exists() or out.is_symlink():
+            out.unlink()
+            print(f"removed retired output -> {out}")
+    for name, target in sorted(manifest.targets.items()):
         print(f"synced {name} -> {sync_target(target, args.pm_dir, args.repo_root)}")
     return 0
 
 
 def cmd_lint(args: argparse.Namespace) -> int:
-    targets = load_targets(args.targets)
+    manifest = load_manifest(args.targets)
+    targets = manifest.targets
     drifted = [
         f"{name} ({state}) -> {target.output}"
         for name, target in sorted(targets.items())
         if (state := check_drift(target, args.pm_dir, args.repo_root)) != "ok"
     ]
-    if drifted:
+    retired_present = [
+        value
+        for value in manifest.retired_outputs
+        if (path := retired_output_path(value, args.repo_root)).exists() or path.is_symlink()
+    ]
+    if drifted or retired_present:
         print("pm lint FAILED: generated docs are out of date.", file=sys.stderr)
         for line in drifted:
             print(f"  - {line}", file=sys.stderr)
+        for value in retired_present:
+            print(f"  - retired output still exists -> {value}", file=sys.stderr)
         print("run `python3 tools/pm/pm.py sync`", file=sys.stderr)
         return 1
     print(f"pm lint OK: {len(targets)} target(s) up to date")
@@ -173,10 +298,15 @@ def cmd_lint(args: argparse.Namespace) -> int:
 
 
 def cmd_status(args: argparse.Namespace) -> int:
-    targets = load_targets(args.targets)
+    manifest = load_manifest(args.targets)
+    targets = manifest.targets
     print(f"{'TARGET':<14} {'STATE':<8} OUTPUT")
     for name, target in sorted(targets.items()):
         print(f"{name:<14} {check_drift(target, args.pm_dir, args.repo_root):<8} {target.output}")
+    for value in manifest.retired_outputs:
+        path = retired_output_path(value, args.repo_root)
+        state = "present" if path.exists() or path.is_symlink() else "absent"
+        print(f"{'retired':<14} {state:<8} {value}")
     return 0
 
 

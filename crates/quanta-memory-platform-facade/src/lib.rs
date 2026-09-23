@@ -102,6 +102,8 @@ pub use revocable_store::{RevocableStore, RevocableStoreBuilder, SimpleRevocable
 pub use shared::builder::PreparedPublicationServiceBuilder;
 #[cfg(feature = "transcript")]
 pub use shared::builder::SessionTranscriptStoreBuilder;
+#[cfg(feature = "spill-redb")]
+pub use spill::backings::redb::{RedbSpillBacking, RedbSpillLimits};
 #[cfg(feature = "spill")]
 pub use spill::{
     DurableCommitFailure, DurableRecordId, DurableRecordResolution, DurableRestoreCandidate,

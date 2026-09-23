@@ -55,6 +55,33 @@ class PromptManagerTest(unittest.TestCase):
         self.assertIn("# Demo", rendered)
         self.assertIn("alpha\n\nbeta", rendered)
 
+    def test_frontmatter_precedes_generated_banner(self) -> None:
+        config = json.loads(self.targets_path.read_text(encoding="utf-8"))
+        config["targets"]["demo"]["frontmatter"] = {
+            "description": "Use for demos.",
+            "globs": ["src/**", "tests/**"],
+            "alwaysApply": False,
+        }
+        self.targets_path.write_text(json.dumps(config), encoding="utf-8")
+        rendered = pm.render_target(self.target(), self.pm_dir)
+        self.assertTrue(rendered.startswith("---\n"))
+        self.assertIn('globs: ["src/**", "tests/**"]', rendered)
+        self.assertIn("alwaysApply: false\n---\n<!--", rendered)
+
+    def test_invalid_frontmatter_is_rejected(self) -> None:
+        config = json.loads(self.targets_path.read_text(encoding="utf-8"))
+        config["targets"]["demo"]["frontmatter"] = {"bad key": "value"}
+        self.targets_path.write_text(json.dumps(config), encoding="utf-8")
+        with self.assertRaisesRegex(pm.PmError, "invalid frontmatter key"):
+            pm.load_targets(self.targets_path)
+
+    def test_render_budget_is_enforced(self) -> None:
+        config = json.loads(self.targets_path.read_text(encoding="utf-8"))
+        config["targets"]["demo"]["max_lines"] = 1
+        self.targets_path.write_text(json.dumps(config), encoding="utf-8")
+        with self.assertRaisesRegex(pm.PmError, "exceeds max_lines"):
+            pm.render_target(self.target(), self.pm_dir)
+
     def test_missing_source_is_rejected(self) -> None:
         target = self.target()
         (self.pm_dir / "sources/a.md").unlink()
@@ -76,6 +103,13 @@ class PromptManagerTest(unittest.TestCase):
         self.targets_path.write_text(json.dumps(config), encoding="utf-8")
         with self.assertRaisesRegex(pm.PmError, "duplicate generated output"):
             pm.load_targets(self.targets_path)
+
+    def test_active_and_retired_output_overlap_is_rejected(self) -> None:
+        config = json.loads(self.targets_path.read_text(encoding="utf-8"))
+        config["retired_outputs"] = ["out/DEMO.md"]
+        self.targets_path.write_text(json.dumps(config), encoding="utf-8")
+        with self.assertRaisesRegex(pm.PmError, "active and retired outputs overlap"):
+            pm.load_manifest(self.targets_path)
 
     def test_path_escape_is_rejected(self) -> None:
         config = json.loads(self.targets_path.read_text(encoding="utf-8"))
@@ -147,6 +181,33 @@ class PromptManagerTest(unittest.TestCase):
         sync_args = parser.parse_args(base + ["sync"])
         with redirect_stdout(StringIO()):
             self.assertEqual(sync_args.func(sync_args), 0)
+            self.assertEqual(lint_args.func(lint_args), 0)
+
+    def test_retired_output_is_removed_by_sync_and_rejected_by_lint(self) -> None:
+        config = json.loads(self.targets_path.read_text(encoding="utf-8"))
+        config["retired_outputs"] = ["legacy.md"]
+        self.targets_path.write_text(json.dumps(config), encoding="utf-8")
+        legacy = self.repo / "legacy.md"
+        legacy.write_text("old", encoding="utf-8")
+
+        parser = pm.build_parser()
+        base = [
+            "--targets",
+            str(self.targets_path),
+            "--pm-dir",
+            str(self.pm_dir),
+            "--repo-root",
+            str(self.repo),
+        ]
+        lint_args = parser.parse_args(base + ["lint"])
+        with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+            self.assertEqual(lint_args.func(lint_args), 1)
+
+        sync_args = parser.parse_args(base + ["sync"])
+        with redirect_stdout(StringIO()):
+            self.assertEqual(sync_args.func(sync_args), 0)
+        self.assertFalse(legacy.exists())
+        with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
             self.assertEqual(lint_args.func(lint_args), 0)
 
     def test_preview_is_read_only(self) -> None:

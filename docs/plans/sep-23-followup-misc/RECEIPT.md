@@ -420,3 +420,136 @@ residual above is superseded by the DURABILITY-001 L1 rail (2/2 GREEN,
 GREEN, canonical rail exit 0 with 224 selectors). The v5-candidate
 statement is preserved as history. Power loss stays UNVERIFIED (L3);
 frozen-candidate Slice D receipt is tracked in `tickets/DURABILITY-001-*`.
+
+Management-bound clarification (2026-09-23, `edfef66`): the candidate adds
+independent live-ticket, identifier-byte, and deferred-drain batch bounds. This
+closes those concrete zero-byte/deferred authority cases only. The broader B07
+policy/metadata cardinality and J06 general backlog rows remain OPEN where no
+family-specific cap or replay-horizon contract exists. In particular, durable
+record-state/finalize-proof retention is an explicit safety-over-space policy;
+it is not a correctness failure, and it must not be garbage-collected without a
+persisted replay horizon and typed stale-token semantics.
+
+Addendum (2026-09-23, DURABILITY-001 L2 syscall subrail): `pwrite64` and
+`fdatasync` EIO were injected by strace at the first matching syscall after
+the staged finalize marker. Both cold-reopen oracles converged (2/2); this
+does not qualify a block device, filesystem crash-recovery path, or power loss.
+Exact dirty source digest, raw artifact hashes, and residual scope are in
+`tickets/DURABILITY-001-power-loss-finalize-kill.md`.
+
+### Current callback/read-panic hardening pass (2026-09-23)
+
+Candidate identity: HEAD `edfef66c3d9dabbe4d01a98754a44d32ef9c940e`, tree
+`4f1a7299af049e7fa1c0eeefc8e683f01239d462`; L2 executable-input digest
+`185dd3329b00d685b866c992c03e50b1bcaa1f8a1097b0310275abb05d4dd2fa`.
+The checkout remains dirty/shared; this is an integrated-worktree result, not a
+tagged or release-qualified source tuple.
+
+- Hardened same-broker reclaimer single-flight and typed synchronous reentry;
+  event sinks are single-flight across threads and drop overlapping advisory
+  events rather than queueing/replaying. Read-side caller `Clone`/`Ord`/identity
+  panics still propagate, but only after the guard is normally unlocked. Slow
+  callback bounds and caller interior side effects remain open boundaries.
+- `scripts/check-workspace.sh`: exit 0. Core 245, facade 282, testkit 82,
+  facade E2E 18, policy contracts 15, facade public surface 20, core public
+  surface 7, finalize-hook kill 2, SIGKILL/reopen 3, facade conformance 4,
+  testkit public surface 1, and 10 non-zero feature-capability paths passed.
+  Doc selector validation: 228/228; feature matrix, PM lint, cargo-deny passed.
+- Both public examples ran successfully. `cargo fmt --all -- --check` and
+  `git diff --check` passed.
+- Five re-applied ticket mutants RED: Reserved misclassified Finalized (FUP-001);
+  foreign backend claim accepted (FUP-002); class-axis kind swap accepted
+  (FUP-004); 10,000 provenance records appended (FUP-005); and live zero-byte
+  ticket owner ignored during group removal (FUP-007).
+- Two new boundary mutants RED: omitting guard release before panic propagation
+  caused the panic-read regression to observe `Poisoned`; omitting the
+  `payload_store` feature from the helper gate caused the payload-only build to
+  fail. Every production file was restored byte-identically to its pre-mutation
+  SHA-256: Redb `d7d44c1d71fa9ba788dae963ab6347d530f817386f331894434d5c6dfdf8e554`,
+  ledger `4750d6a428a5fe8974a706226b611cf983e5f40302056de94ca4a2b8e5a2ce29`,
+  broker `4fde67275bcc1f31a0e9c35748fa1e09df159d2f2f15515248c42c36e82c5b24`,
+  and lifecycle `c69bbaec096a1db1e870458e0ecf8acbb7fa89967d4affd9f0533e61d855b0ee`.
+- The Linux L2 receipt at executable digest `add1f907…` predates this pass and
+  is not current-source evidence. Clean extraction, scaling verifier, exact
+  host/QBC pair, current-source Linux L2, hosted CI, deploy, and activation are
+  not established by this entry. Device-mapper L2 and physical L3 remain open.
+
+### Final source-capture check (2026-09-23)
+
+The shared worktree intentionally deletes tracked `.cursorrules` while moving
+guidance to `.cursor/rules`. `scripts/durability/run-emulated-linux.sh` used
+`git ls-files -co`, which includes deleted tracked paths; hashing them made the
+current-source receipt fail before test execution. The digest filter now binds
+only existing, non-excluded candidate inputs. Its current digest is
+`51433fd5d80f61348a288bf17d2947b4a3cd8ca0278c757de9c0279215d8b1a6`.
+ShellCheck, `bash -n`, `git diff --check`, and `cargo fmt --all -- --check`
+pass; executing the L2 runner on Darwin exits 77 with its documented Linux-only
+unavailable result. No current-source L2 injection is claimed. A clean isolated
+validation snapshot at `9b14a332c07afd9002d6c1ec06b6cf7899a2a8a3` (tree
+`ea575ce01f43e511442e972f85fa0edd2f2e7276`) passed standalone extraction and
+the full extracted `scripts/check-workspace.sh`; canonical extraction digest
+was `45a22536e4bb5422fbf3ba341b5303c0389f76523a89af1e9cd8406c6f56c819`.
+`scripts/run-scaling-bench.sh --smoke` verified 33 samples. The snapshot is a
+temporary validation commit, not a commit to the shared branch. Physical L3,
+block-device L2, host/QBC, CI, deploy, and activation remain outside this local
+proof.
+
+### Session-hardening follow-up (2026-09-23)
+
+Review found that the Linux L2 example copied trace/database artifacts into the
+reported artifact directory but left the duplicate work directory under the
+system temp root. Added explicit cleanup after artifact copy plus a best-effort
+RAII fallback on early return. The updated executable-input digest is
+`ef0484f9776a4e51da9ba33dacda9a3dbd5a954485ed0adc08c77c34d0813ad7`.
+Validation snapshot `e4b97393f0d984dd6f9fce6afcaf21b5da38207b` (tree
+`c13632baa95cef4d0c24725bb23c3fba2ca2060e`) passed standalone extraction and
+the full extracted workspace rail; canonical extraction digest was
+`07d17bee1f15caea44761e3644ed6bd3a364429c50aecb008cc0fde04ce0f6fd`.
+Scaling smoke verified 33 samples. Linux-only L2 example behavior remains
+unexecuted on this Darwin host; cleanup has static/format proof only. The
+snapshot is temporary validation state, not a shared-branch commit.
+
+### Independent session-hardening audit rerun (2026-09-24)
+
+The checkout remains dirty/shared: `HEAD` is
+`edfef66c3d9dabbe4d01a98754a44d32ef9c940e`, tree
+`4f1a7299af049e7fa1c0eeefc8e683f01239d462`, with 44 paths in
+`git status --short`. The executable-input digest used by the L2 runner's
+filter (docs/tickets excluded) changed during the canonical run from
+`72d056152f12cc2433b04904c7ea3a4f9857c8c02788f9fcc042652d6401328f` to
+`6b258febdb6e8503ab87575506b0c8a2e8967eb35d8658ba2f8170c76984a7d3`.
+The canonical rail exited 0, but its mixed pre/post-change result is not
+source-frozen qualification. The later owner-selector, panic-path, and example
+runs below were each guarded by matching before/after executable-input digests
+at `6b258f…`.
+
+- Canonical `scripts/check-workspace.sh`: exit 0, `check-workspace: clean`;
+  observed 251 core, 292 facade, 82 testkit unit tests; policy contracts 15,
+  Hellgate 18, public API 20, finalize-kill 3, SIGKILL/reopen 4, facade
+  conformance 4, testkit public surface 1, core/facade doctests 13/28;
+  10 advertised feature-capability selectors ran non-zero; 246 documented
+  selectors resolved; feature matrix, PM lint, and cargo-deny passed. Because
+  the input digest drifted, these totals describe the run and not one exact
+  full-candidate source tuple.
+- On stable executable digest `6b258f…`, workspace selector reruns selected
+  `sep23_fup`: core 23, facade 14, kill/reopen integration 3, testkit 4; all
+  passed. `sep23_audit_` selected core 10 and facade 4; all passed. Newly added
+  durable commit/restore-panic reconciliation tests each passed 1/1, and
+  `hello_world` plus `effective_budget_report` both ran successfully.
+- `cargo fmt --all -- --check`, `git diff --check`, and PM lint passed. The
+  selector rerun and examples had matching before/after executable-input
+  digests; this does not freeze the wider shared checkout or establish an
+  extraction/release tuple.
+- Five ticket mutants and two boundary mutants from the prior callback/read-
+  panic pass were not re-applied here. Their recorded SHA/revert results and
+  the original 15-mutant battery remain historical evidence, not fresh mutant
+  results against digest `6b258f…`. Post-run owner hashes confirm Redb
+  (`d7d44c1d…`) and shared lifecycle (`c69bbaec…`) still match the recorded
+  mutant preimages; ledger (`3e3e5654…`), broker (`df13b546…`), and admission
+  (`d936cf8e…`) do not match their recorded mutant preimages, so the FUP-004,
+  FUP-005, FUP-007, and G1 mutation results are stale for this source.
+- The scaling harness explicitly rejects a dirty source tree; the standalone
+  extractor requires clean canonical inputs. Neither is current-source GREEN.
+  The prior exact-source host/QBC tuple predates this worktree. Hosted CI,
+  deployment, activation, and current-source Linux L2 remain unrun/unavailable;
+  physical power-loss evidence remains unverified.

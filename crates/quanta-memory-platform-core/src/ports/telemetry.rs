@@ -122,7 +122,10 @@ impl MemoryEvent {
 
 /// Advisory event sink. Implementations must not own or mutate semantic
 /// accounting state. Broker implementations invoke this only after releasing
-/// their internal mutex and contain callback panics.
+/// their internal mutex and contain callback panics. Calls are single-flight per
+/// broker: a recursive or concurrent event observed while the callback is
+/// active is dropped, bounding cross-thread as well as same-thread reentry.
+/// Events are advisory and are not queued or replayed after a dropped delivery.
 pub trait MemoryEventSink: Send + Sync {
     fn emit(&self, event: MemoryEvent);
 }

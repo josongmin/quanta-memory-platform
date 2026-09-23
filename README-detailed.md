@@ -279,6 +279,10 @@ cache/storage systems, but it is not an allocation profiler. `ByteSized` is
 caller-supplied; `size_of`, allocator slack, system RSS, and temporary cloning
 are explicitly out of scope. Changing a formula is a policy/API change and
 requires a new version rather than silently reinterpret old receipts.
+The reported semantic cost is captured at admission and is not polled later. A
+custom `ByteSized` implementation for shared or interior-mutable data must
+remain a conservative upper bound for the retained lifetime, or callers must
+perform an explicit recharge/replacement when that retained cost changes.
 
 ### 5.4 Identity, replay, and collision handling
 

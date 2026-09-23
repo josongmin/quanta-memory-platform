@@ -412,6 +412,11 @@ impl AccountingLedger {
         self.next_ticket_id.is_none()
     }
 
+    #[must_use]
+    pub(crate) fn live_ticket_limit_reached(&self) -> bool {
+        self.ticket_states.len() >= crate::domain::management_limits::MAX_LIVE_TICKETS_PER_BROKER
+    }
+
     /// Swap the active residency policy in place, preserving all live usage
     /// counters. This is the live-reconfiguration primitive: the caller is
     /// responsible for having already validated that the new policy does not
@@ -612,8 +617,7 @@ impl AccountingLedger {
 
         // This authority bound is independent of byte budgets: admitting a
         // zero-byte ticket still grows ticket state and per-ticket bookkeeping.
-        if self.ticket_states.len() >= crate::domain::management_limits::MAX_LIVE_TICKETS_PER_BROKER
-        {
+        if self.live_ticket_limit_reached() {
             return Err(MemoryError::capacity(format!(
                 "live reservation ticket limit {} reached",
                 crate::domain::management_limits::MAX_LIVE_TICKETS_PER_BROKER
@@ -1073,6 +1077,59 @@ mod tests {
             ledger.snapshot().live_ticket_count,
             crate::domain::management_limits::MAX_LIVE_TICKETS_PER_BROKER
         );
+    }
+
+    #[test]
+    fn committed_replacement_at_live_ticket_cap_is_a_net_zero_authority_swap() {
+        let mut ledger = ledger_from_policy(ResidencyPolicy::new(1_000));
+        let mut tickets =
+            Vec::with_capacity(crate::domain::management_limits::MAX_LIVE_TICKETS_PER_BROKER);
+        for _ in 0..crate::domain::management_limits::MAX_LIVE_TICKETS_PER_BROKER {
+            let ticket = reserve(&mut ledger, MemoryClass::ArtifactCache, "zero", 0)
+                .expect("fill ticket cap with zero-byte authority");
+            ledger.commit(&ticket).expect("commit ticket");
+            tickets.push(ticket);
+        }
+
+        let old = tickets.pop().expect("replacement source");
+        let before_denial = ledger.snapshot();
+        let denied = ledger.replace_committed(
+            &old,
+            MemoryClass::ArtifactCache,
+            "replacement".to_string(),
+            MemoryContextKind::Request,
+            ChargeKind::RetainedPayload,
+            1_001,
+        );
+        assert!(matches!(denied, Err(MemoryError::Capacity(_))));
+        assert_eq!(ledger.snapshot(), before_denial, "denied swap restores the old ticket");
+        let replacement = ledger
+            .replace_committed(
+                &old,
+                MemoryClass::ArtifactCache,
+                "replacement".to_string(),
+                MemoryContextKind::Request,
+                ChargeKind::RetainedPayload,
+                1,
+            )
+            .expect("replacement does not transiently require another ticket slot");
+        let snap = ledger.snapshot();
+        snap.validate_exact().expect("replacement preserves all ledger axes");
+        assert_eq!(
+            snap.live_ticket_count,
+            crate::domain::management_limits::MAX_LIVE_TICKETS_PER_BROKER
+        );
+        assert_eq!(snap.total_owner_bytes(), 1);
+        assert!(matches!(ledger.release(&old), Err(MemoryError::InvalidState(_))));
+
+        ledger.release(&replacement).expect("release replacement");
+        for ticket in tickets {
+            ledger.release(&ticket).expect("release peer");
+        }
+        let drained = ledger.snapshot();
+        drained.validate_exact().expect("drained ledger validates");
+        assert_eq!(drained.live_ticket_count, 0);
+        assert_eq!(drained.total_owner_bytes(), 0);
     }
 
     #[test]

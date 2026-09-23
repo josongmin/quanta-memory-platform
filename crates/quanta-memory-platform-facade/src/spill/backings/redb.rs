@@ -7,13 +7,16 @@
 //! surface (boundary rule: no backing-specific nouns leak out of the slice).
 
 use std::path::Path;
+use std::sync::atomic::AtomicU64;
 #[cfg(test)]
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::sync::Arc;
 
 use quanta_memory_platform_core::{MemoryError, MemoryResult};
 use redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition};
 
 use crate::spill::service::ReconciledDurableSpillTarget;
+use crate::spill::RestoreReadLease;
 use crate::spill::{
     DurableCommitFailure, DurableRecordId, DurableRecordResolution, DurableRestoreCandidate,
     DurableRestoreClaim, DurableRestorePhase, DurableRestoreRecovery, DurableRestoreTarget,
@@ -39,6 +42,10 @@ const SPILL_RECORD_STATE: TableDefinition<'static, u64, u8> =
 /// identity, otherwise a stale restore token can delete a later record (ABA).
 const SPILL_META: TableDefinition<'static, &str, u64> = TableDefinition::new("qmp_spill_meta");
 const NEXT_SEQUENCE: &str = "next_sequence";
+/// Sum of the payload lengths in the queue and recovery slot. Updated in the
+/// same transaction as a new payload or finalization; legacy files seed it by
+/// scanning the two payload tables once at open.
+const RETAINED_PAYLOAD_BYTES: &str = "retained_payload_bytes";
 const ACTIVE_RESTORE_SEQUENCE: &str = "active_restore_sequence";
 /// Generation of the current active restore claim (FUP-002). Present exactly
 /// when [`ACTIVE_RESTORE_SEQUENCE`] is present on files written by claim-aware
@@ -117,11 +124,73 @@ fn unresolved_record_error(record_id: u64) -> MemoryError {
     ))
 }
 
+/// Logical payload, retained-record and Redb cache limits. They do not bound
+/// physical database-file growth or private allocations inside caller codecs.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RedbSpillLimits {
+    /// Maximum encoded bytes in one retained record. Does not bound the
+    /// caller's encoder or decoder's private scratch allocations.
+    pub max_record_bytes: u64,
+    /// Maximum number of queued plus recovery records.
+    pub max_retained_records: u64,
+    /// Maximum sum of queued plus recovery payload lengths. Redb page,
+    /// tombstone, copy-on-write and filesystem overhead are NOT included.
+    pub max_retained_payload_bytes: u64,
+    /// Redb's own configured cache size, in bytes.
+    pub cache_bytes: usize,
+    /// Sum of backing-owned restore candidate and transactional copy buffers.
+    /// Caller clones and codec scratch are outside this budget.
+    pub max_inflight_restore_bytes: u64,
+}
+
+impl Default for RedbSpillLimits {
+    fn default() -> Self {
+        Self {
+            max_record_bytes: 16 * 1024 * 1024,
+            max_retained_records: 100_000,
+            max_retained_payload_bytes: 1024 * 1024 * 1024,
+            cache_bytes: 32 * 1024 * 1024,
+            max_inflight_restore_bytes: 64 * 1024 * 1024,
+        }
+    }
+}
+
+impl RedbSpillLimits {
+    fn validate(self) -> MemoryResult<Self> {
+        if self.max_retained_records == 0
+            || self.max_record_bytes > self.max_retained_payload_bytes
+            || self
+                .max_record_bytes
+                .checked_mul(2)
+                .is_none_or(|minimum| self.max_inflight_restore_bytes < minimum)
+        {
+            return Err(MemoryError::config(
+                "redb spill limits require a positive record count, max_record_bytes <= max_retained_payload_bytes, and an in-flight budget for a candidate plus transactional copy",
+            ));
+        }
+        Ok(self)
+    }
+
+    fn check_record(self, len: usize) -> MemoryResult<u64> {
+        let bytes = u64::try_from(len)
+            .map_err(|_| MemoryError::capacity("redb spill record length exceeds u64"))?;
+        if bytes > self.max_record_bytes {
+            return Err(MemoryError::capacity(format!(
+                "redb spill record requires {bytes} bytes, above configured {}-byte record limit",
+                self.max_record_bytes
+            )));
+        }
+        Ok(bytes)
+    }
+}
+
 /// A durable spill backing over `redb`. Implements [`SpillTarget<Vec<u8>>`]; the
 /// `redb` database is fully encapsulated.
 #[derive(Debug)]
 pub struct RedbSpillBacking {
     database: Database,
+    limits: RedbSpillLimits,
+    restore_budget_used: Arc<AtomicU64>,
     /// Cached copy of the persisted [`BACKEND_ID_LO`]/[`BACKEND_ID_HI`]
     /// identity, loaded once at open. Claim validation compares the presented
     /// backend against this value without extra reads.
@@ -246,7 +315,21 @@ impl RedbSpillBacking {
     /// backend failure is surfaced as a neutral [`MemoryError`], never a leaked
     /// `redb` error type.
     pub fn create(path: impl AsRef<Path>) -> MemoryResult<Self> {
-        let database = Database::create(path)
+        Self::create_with_limits(path, RedbSpillLimits::default())
+    }
+
+    /// Open with explicit logical payload/record and Redb cache limits. These
+    /// are not a physical database-file quota: production deployments must
+    /// separately bound the backing filesystem and qualify ENOSPC behavior.
+    pub fn create_with_limits(
+        path: impl AsRef<Path>,
+        limits: RedbSpillLimits,
+    ) -> MemoryResult<Self> {
+        let limits = limits.validate()?;
+        let mut builder = redb::Builder::new();
+        builder.set_cache_size(limits.cache_bytes);
+        let database = builder
+            .create(path)
             .map_err(|e| MemoryError::build(format!("redb spill backing open failed: {e}")))?;
         let txn = database.begin_write().map_err(|e| {
             MemoryError::build(format!("redb spill metadata transaction failed: {e}"))
@@ -271,6 +354,62 @@ impl RedbSpillBacking {
             let _finalized_by = txn.open_table(SPILL_FINALIZED_BY).map_err(|e| {
                 MemoryError::build(format!("redb finalize proof initialization failed: {e}"))
             })?;
+            let records = queue
+                .len()
+                .and_then(|queued| recovery.len().map(|recovering| (queued, recovering)))
+                .map_err(|e| MemoryError::build(format!("redb retained count failed: {e}")))?;
+            let count = records
+                .0
+                .checked_add(records.1)
+                .ok_or_else(|| MemoryError::capacity("redb retained record count exceeds u64"))?;
+            if count > limits.max_retained_records {
+                return Err(MemoryError::capacity(format!(
+                    "existing redb spill inventory has {count} records, above configured {}-record limit",
+                    limits.max_retained_records
+                )));
+            }
+            // Verify every persisted payload before adopting the configured
+            // per-record limit. The scan is bounded by max_retained_records
+            // above and does not copy payloads into process memory. It also
+            // checks the transactional usage counter rather than trusting a
+            // stale or corrupted value to authorize later writes.
+            let mut payload_bytes = 0u64;
+            for table in [&queue, &recovery] {
+                for entry in table.iter().map_err(|e| {
+                    MemoryError::build(format!("redb payload usage scan failed: {e}"))
+                })? {
+                    let (_, value) = entry.map_err(|e| {
+                        MemoryError::build(format!("redb payload usage scan failed: {e}"))
+                    })?;
+                    let len = limits.check_record(value.value().len())?;
+                    payload_bytes = payload_bytes.checked_add(len).ok_or_else(|| {
+                        MemoryError::capacity("redb retained payload bytes exceed u64")
+                    })?;
+                    if payload_bytes > limits.max_retained_payload_bytes {
+                        return Err(MemoryError::capacity(format!(
+                            "existing redb spill inventory has {payload_bytes} payload bytes, above configured {}-byte limit",
+                            limits.max_retained_payload_bytes
+                        )));
+                    }
+                }
+            }
+            let recorded_payload_bytes = meta
+                .get(RETAINED_PAYLOAD_BYTES)
+                .map_err(|e| MemoryError::build(format!("redb payload usage read failed: {e}")))?
+                .map(|value| value.value());
+            match recorded_payload_bytes {
+                Some(recorded) if recorded != payload_bytes => {
+                    return Err(MemoryError::InvalidState(format!(
+                        "redb retained payload usage {recorded} disagrees with scanned {payload_bytes} bytes"
+                    )));
+                }
+                None => {
+                    meta.insert(RETAINED_PAYLOAD_BYTES, payload_bytes).map_err(|e| {
+                        MemoryError::build(format!("redb payload usage seed failed: {e}"))
+                    })?;
+                }
+                _ => {}
+            }
             if meta
                 .get(NEXT_SEQUENCE)
                 .map_err(|e| MemoryError::build(format!("redb spill metadata read failed: {e}")))?
@@ -370,10 +509,27 @@ impl RedbSpillBacking {
             .map_err(|e| MemoryError::build(format!("redb spill metadata commit failed: {e}")))?;
         Ok(Self {
             database,
+            limits,
+            restore_budget_used: Arc::new(AtomicU64::new(0)),
             backend_id,
             #[cfg(test)]
             faults: RedbFaults::default(),
         })
+    }
+
+    fn copy_restore_bytes(&self, bytes: &[u8]) -> MemoryResult<(Vec<u8>, RestoreReadLease)> {
+        let len = self.limits.check_record(bytes.len())?;
+        let lease = RestoreReadLease::acquire(
+            Arc::clone(&self.restore_budget_used),
+            len,
+            self.limits.max_inflight_restore_bytes,
+        )?;
+        let mut copy = Vec::new();
+        copy.try_reserve_exact(bytes.len()).map_err(|error| {
+            MemoryError::capacity(format!("redb restore staging allocation failed: {error}"))
+        })?;
+        copy.extend_from_slice(bytes);
+        Ok((copy, lease))
     }
 
     #[cfg(test)]
@@ -486,6 +642,22 @@ impl RedbSpillBacking {
             let mut meta = txn.open_table(SPILL_META).map_err(|e| {
                 MemoryError::report(format!("redb spill metadata table failed: {e}"))
             })?;
+            let current_bytes = meta
+                .get(RETAINED_PAYLOAD_BYTES)
+                .map_err(|e| MemoryError::report(format!("redb payload usage read failed: {e}")))?
+                .map(|value| value.value())
+                .ok_or_else(|| {
+                    MemoryError::InvalidState(
+                        "redb retained payload usage authority is missing".into(),
+                    )
+                })?;
+            let added = u64::try_from(value.len())
+                .map_err(|_| MemoryError::capacity("redb test payload length exceeds u64"))?;
+            let after = current_bytes.checked_add(added).ok_or_else(|| {
+                MemoryError::capacity("redb test retained payload bytes exceed u64")
+            })?;
+            meta.insert(RETAINED_PAYLOAD_BYTES, after)
+                .map_err(|e| MemoryError::report(format!("redb payload usage seed failed: {e}")))?;
             meta.insert(NEXT_SEQUENCE, key).map_err(|e| {
                 MemoryError::report(format!("redb spill metadata seed failed: {e}"))
             })?;
@@ -585,6 +757,7 @@ impl ReconciledDurableSpillTarget for RedbSpillBacking {
         bytes: &[u8],
     ) -> Result<SpillReceipt, DurableWriteFailure> {
         let not_committed = |error| DurableWriteFailure::NotCommitted(Box::new(error));
+        let record_bytes = self.limits.check_record(bytes.len()).map_err(not_committed)?;
         #[cfg(test)]
         if self.faults.fail_write_before_transaction.swap(false, AtomicOrdering::SeqCst) {
             return Err(not_committed(MemoryError::report(
@@ -598,7 +771,10 @@ impl ReconciledDurableSpillTarget for RedbSpillBacking {
             let mut table = txn.open_table(SPILL_QUEUE).map_err(|e| {
                 not_committed(MemoryError::report(format!("redb spill table open failed: {e}")))
             })?;
-            let meta = txn.open_table(SPILL_META).map_err(|e| {
+            let recovery = txn.open_table(SPILL_RECOVERY).map_err(|e| {
+                not_committed(MemoryError::report(format!("redb recovery table open failed: {e}")))
+            })?;
+            let mut meta = txn.open_table(SPILL_META).map_err(|e| {
                 not_committed(MemoryError::report(format!("redb spill metadata table failed: {e}")))
             })?;
             let mut states = txn.open_table(SPILL_RECORD_STATE).map_err(|e| {
@@ -652,35 +828,97 @@ impl ReconciledDurableSpillTarget for RedbSpillBacking {
                     ))));
                 }
                 RecordDisposition::Queued => {
-                    let existing_bytes = table
+                    let existing = table
                         .get(record_id.get())
                         .map_err(|e| {
                             not_committed(MemoryError::report(format!(
                                 "redb spill idempotency read failed: {e}"
                             )))
                         })?
-                        .map(|existing| existing.value().to_vec())
                         .ok_or_else(|| {
                             not_committed(MemoryError::InvalidState(format!(
                                 "durable record {} is queued but its payload is missing",
                                 record_id.get()
                             )))
                         })?;
-                    if existing_bytes != bytes {
+                    // Compare the borrowed Redb value: an idempotency probe
+                    // must not allocate a second unbudgeted payload copy.
+                    if existing.value() != bytes {
                         return Err(not_committed(MemoryError::InvalidState(format!(
                             "durable record {} already contains different bytes",
                             record_id.get()
                         ))));
                     }
-                    table.len().map_err(|e| {
+                    let queued = table.len().map_err(|e| {
                         not_committed(MemoryError::report(format!(
                             "redb spill inventory read failed: {e}"
                         )))
+                    })?;
+                    let recovering = recovery.len().map_err(|e| {
+                        not_committed(MemoryError::report(format!(
+                            "redb recovery inventory read failed: {e}"
+                        )))
+                    })?;
+                    queued.checked_add(recovering).ok_or_else(|| {
+                        not_committed(MemoryError::capacity("redb spill inventory exceeds u64"))
                     })?
                 }
                 RecordDisposition::Reserved => {
+                    let retained_records = table
+                        .len()
+                        .and_then(|queued| recovery.len().map(|recovering| (queued, recovering)))
+                        .map_err(|e| {
+                            not_committed(MemoryError::report(format!(
+                                "redb retained count failed: {e}"
+                            )))
+                        })?;
+                    let after_count = retained_records
+                        .0
+                        .checked_add(retained_records.1)
+                        .and_then(|count| count.checked_add(1))
+                        .ok_or_else(|| {
+                            not_committed(MemoryError::capacity(
+                                "redb retained record count exceeds u64",
+                            ))
+                        })?;
+                    if after_count > self.limits.max_retained_records {
+                        return Err(not_committed(MemoryError::capacity(format!(
+                            "redb spill would retain {after_count} records, above configured {}-record limit",
+                            self.limits.max_retained_records
+                        ))));
+                    }
+                    let retained_bytes = meta
+                        .get(RETAINED_PAYLOAD_BYTES)
+                        .map_err(|e| {
+                            not_committed(MemoryError::report(format!(
+                                "redb payload usage read failed: {e}"
+                            )))
+                        })?
+                        .map(|value| value.value())
+                        .ok_or_else(|| {
+                            not_committed(MemoryError::InvalidState(
+                                "redb retained payload usage authority is missing".into(),
+                            ))
+                        })?;
+                    let after_bytes =
+                        retained_bytes.checked_add(record_bytes).ok_or_else(|| {
+                            not_committed(MemoryError::capacity(
+                                "redb retained payload bytes exceed u64",
+                            ))
+                        })?;
+                    if after_bytes > self.limits.max_retained_payload_bytes {
+                        return Err(not_committed(MemoryError::capacity(format!(
+                            "redb spill would retain {after_bytes} payload bytes, above configured {}-byte limit",
+                            self.limits.max_retained_payload_bytes
+                        ))));
+                    }
                     table.insert(record_id.get(), bytes).map_err(|e| {
                         not_committed(MemoryError::report(format!("redb spill insert failed: {e}")))
+                    })?;
+                    meta.insert(RETAINED_PAYLOAD_BYTES, after_bytes).map_err(|e| {
+                        not_committed(MemoryError::report(format!(
+                            "redb payload usage update failed: {e}"
+                        )))
                     })?;
                     states.insert(record_id.get(), RecordDisposition::Queued as u8).map_err(
                         |e| {
@@ -689,11 +927,7 @@ impl ReconciledDurableSpillTarget for RedbSpillBacking {
                             )))
                         },
                     )?;
-                    table.len().map_err(|e| {
-                        not_committed(MemoryError::report(format!(
-                            "redb spill post-insert inventory failed: {e}"
-                        )))
-                    })?
+                    after_count
                 }
             }
         };
@@ -895,6 +1129,7 @@ impl DurableRestoreTarget for RedbSpillBacking {
             let Some((sequence, bytes)) = first else {
                 return Ok(None);
             };
+            let (read_bytes, lease) = self.copy_restore_bytes(bytes.value())?;
             // Mint the next claim generation in the SAME transaction that
             // publishes the active claimant: exactly one caller owns each
             // generation, and concurrent preparers serialize here.
@@ -915,11 +1150,12 @@ impl DurableRestoreTarget for RedbSpillBacking {
             meta.insert(ACTIVE_RESTORE_GENERATION, generation).map_err(|e| {
                 MemoryError::report(format!("redb restore claim write failed: {e}"))
             })?;
-            DurableRestoreCandidate {
-                sequence: sequence.value(),
-                bytes: bytes.value().to_vec(),
-                claim: DurableRestoreClaim::issued(self.backend_id, generation, sequence.value()),
-            }
+            DurableRestoreCandidate::from_redb(
+                sequence.value(),
+                read_bytes,
+                DurableRestoreClaim::issued(self.backend_id, generation, sequence.value()),
+                lease,
+            )
         };
         match txn.commit() {
             Ok(()) => Ok(Some(candidate)),
@@ -1047,12 +1283,13 @@ impl DurableRestoreTarget for RedbSpillBacking {
                         "redb spill exact remove failed: {e}"
                     )))
                 })?
-                .map(|bytes| bytes.value().to_vec())
                 .ok_or_else(|| {
                     DurableCommitFailure::retained(MemoryError::InvalidState(
                         "durable restore candidate vanished before commit".into(),
                     ))
                 })?;
+            let (removed, _move_lease) =
+                self.copy_restore_bytes(removed.value()).map_err(DurableCommitFailure::retained)?;
             recovery.insert(sequence, removed.as_slice()).map_err(|e| {
                 DurableCommitFailure::retained(MemoryError::report(format!(
                     "redb recovery payload write failed: {e}"
@@ -1115,10 +1352,13 @@ impl DurableRestoreTarget for RedbSpillBacking {
                 .get(sequence)
                 .map_err(|e| MemoryError::report(format!("redb finalize proof read failed: {e}")))?
                 .map(|value| value.value());
-            let recovery_present = recovery
+            let recovery_len = recovery
                 .get(sequence)
                 .map_err(|e| MemoryError::report(format!("redb recovery read failed: {e}")))?
-                .is_some();
+                .map(|payload| u64::try_from(payload.value().len()))
+                .transpose()
+                .map_err(|_| MemoryError::capacity("redb recovery payload length exceeds u64"))?;
+            let recovery_present = recovery_len.is_some();
             // Terminal proof first: this generation's finalize already landed
             // (proof and payload removal share one transaction), so the retry
             // succeeds exactly — regardless of which unrelated claim is live
@@ -1135,8 +1375,29 @@ impl DurableRestoreTarget for RedbSpillBacking {
                 (Some(active), Some(active_gen), true)
                     if active == sequence && active_gen == generation =>
                 {
+                    let retained_bytes = meta
+                        .get(RETAINED_PAYLOAD_BYTES)
+                        .map_err(|e| {
+                            MemoryError::report(format!("redb payload usage read failed: {e}"))
+                        })?
+                        .map(|value| value.value())
+                        .ok_or_else(|| {
+                            MemoryError::InvalidState(
+                                "redb retained payload usage authority is missing".into(),
+                            )
+                        })?;
+                    let after_bytes = retained_bytes
+                        .checked_sub(recovery_len.expect("matched recovery payload"))
+                        .ok_or_else(|| {
+                            MemoryError::InvalidState(
+                                "redb retained payload usage is below finalized record".into(),
+                            )
+                        })?;
                     recovery.remove(sequence).map_err(|e| {
                         MemoryError::report(format!("redb recovery payload clear failed: {e}"))
+                    })?;
+                    meta.insert(RETAINED_PAYLOAD_BYTES, after_bytes).map_err(|e| {
+                        MemoryError::report(format!("redb payload usage update failed: {e}"))
                     })?;
                     meta.remove(ACTIVE_RESTORE_SEQUENCE).map_err(|e| {
                         MemoryError::report(format!("redb active restore clear failed: {e}"))
@@ -1471,15 +1732,17 @@ impl DurableRestoreTarget for RedbSpillBacking {
             let queue = txn
                 .open_table(SPILL_QUEUE)
                 .map_err(|e| MemoryError::report(format!("redb spill table open failed: {e}")))?;
-            let (bytes, phase) =
+            let (bytes, lease, phase) =
                 if let Some(payload) = recovery_table.get(sequence).map_err(|e| {
                     MemoryError::report(format!("redb recovery payload read failed: {e}"))
                 })? {
-                    (payload.value().to_vec(), DurableRestorePhase::Committed)
+                    let (bytes, lease) = self.copy_restore_bytes(payload.value())?;
+                    (bytes, lease, DurableRestorePhase::Committed)
                 } else if let Some(payload) = queue.get(sequence).map_err(|e| {
                     MemoryError::report(format!("redb spill payload read failed: {e}"))
                 })? {
-                    (payload.value().to_vec(), DurableRestorePhase::Prepared)
+                    let (bytes, lease) = self.copy_restore_bytes(payload.value())?;
+                    (bytes, lease, DurableRestorePhase::Prepared)
                 } else {
                     return Err(MemoryError::InvalidState(format!(
                         "active restore {sequence} has neither queued nor recovery payload"
@@ -1499,11 +1762,12 @@ impl DurableRestoreTarget for RedbSpillBacking {
             meta.insert(ACTIVE_RESTORE_GENERATION, generation)
                 .map_err(|e| MemoryError::report(format!("redb active claim write failed: {e}")))?;
             DurableRestoreRecovery {
-                candidate: DurableRestoreCandidate {
+                candidate: DurableRestoreCandidate::from_redb(
                     sequence,
                     bytes,
-                    claim: DurableRestoreClaim::issued(self.backend_id, generation, sequence),
-                },
+                    DurableRestoreClaim::issued(self.backend_id, generation, sequence),
+                    lease,
+                ),
                 phase,
             }
         };
@@ -1559,7 +1823,7 @@ mod tests {
         let Some(candidate) = backing.prepare_restore()? else {
             return Ok(None);
         };
-        let bytes = candidate.bytes;
+        let bytes = candidate.bytes().to_vec();
         backing.commit_restore(&candidate.claim).map_err(|failure| match failure {
             DurableCommitFailure::Retained(error) | DurableCommitFailure::Ambiguous(error) => {
                 *error
@@ -1575,7 +1839,7 @@ mod tests {
         let Some(candidate) = controller.prepare_restore()? else {
             return Ok(None);
         };
-        let bytes = candidate.bytes;
+        let bytes = candidate.bytes().to_vec();
         controller.commit_restore(&candidate.claim).map_err(|failure| match failure {
             DurableCommitFailure::Retained(error) | DurableCommitFailure::Ambiguous(error) => {
                 *error
@@ -1745,7 +2009,7 @@ mod tests {
             backing.recover_active_restore().expect("read recovery").expect("persisted recovery");
         assert_eq!(recovery.phase, DurableRestorePhase::Committed);
         assert_eq!(recovery.candidate.sequence, 0);
-        assert_eq!(recovery.candidate.bytes, b"crash-safe");
+        assert_eq!(recovery.candidate.bytes(), b"crash-safe");
         assert!(matches!(backing.prepare_restore(), Err(MemoryError::OperationInProgress(_))));
 
         backing
@@ -1825,7 +2089,7 @@ mod tests {
         assert!(matches!(error, MemoryError::Unsupported(_)));
         assert_eq!(backing.retained_count(), Ok(1));
         assert_eq!(
-            backing.prepare_restore().expect("prepare").expect("candidate").bytes,
+            backing.prepare_restore().expect("prepare").expect("candidate").bytes(),
             b"only-copy"
         );
     }
@@ -1957,7 +2221,7 @@ mod tests {
         // record actually existed.
         let candidate = backing.prepare_restore().expect("prepare").expect("candidate");
         assert_eq!(candidate.sequence, 1);
-        assert_eq!(candidate.bytes, b"second");
+        assert_eq!(candidate.bytes(), b"second");
         backing.commit_restore(&candidate.claim).expect("commit restore");
         assert!(
             matches!(backing.resolve_record(second), Ok(DurableRecordResolution::Present { .. })),
@@ -2070,6 +2334,161 @@ mod tests {
         assert!(matches!(backing.resolve_record(id), Ok(DurableRecordResolution::Present { .. })));
     }
 
+    fn tiny_limits() -> RedbSpillLimits {
+        RedbSpillLimits {
+            max_record_bytes: 4,
+            max_retained_records: 2,
+            max_retained_payload_bytes: 6,
+            cache_bytes: 4 * 1024 * 1024,
+            max_inflight_restore_bytes: 8,
+        }
+    }
+
+    #[test]
+    fn limits_reject_oversized_record_before_commit_without_consuming_reserved_id() {
+        let db = test_db();
+        let backing = RedbSpillBacking::create_with_limits(&db.path, tiny_limits()).expect("open");
+        let id = backing.reserve_record_id().expect("reserve");
+        let failure = backing.commit_spill(id, b"12345").expect_err("record cap");
+        assert!(matches!(failure, DurableWriteFailure::NotCommitted(error)
+            if matches!(*error, MemoryError::Capacity(_))));
+        assert_eq!(backing.resolve_record(id), Ok(DurableRecordResolution::Absent));
+        assert_eq!(backing.retained_count(), Ok(0));
+        let _ = backing.commit_spill(id, b"1234").expect("same reserved id remains writable");
+        assert_eq!(restore_backing(&backing).expect("restore"), Some(b"1234".to_vec()));
+        assert_eq!(backing.retained_count(), Ok(0));
+    }
+
+    #[test]
+    fn retained_limits_count_recovery_and_refund_only_after_finalize() {
+        let db = test_db();
+        let backing = RedbSpillBacking::create_with_limits(&db.path, tiny_limits()).expect("open");
+        let _ = spill_backing(&backing, b"abc").expect("first");
+        let _ = spill_backing(&backing, b"def").expect("exact total byte and record caps");
+        let candidate = backing.prepare_restore().expect("prepare").expect("first");
+        backing.commit_restore(&candidate.claim).expect("move to recovery");
+        let denied_id = backing.reserve_record_id().expect("reserve third");
+        let denial = backing.commit_spill(denied_id, b"x").expect_err("recovery still counts");
+        assert!(matches!(denial, DurableWriteFailure::NotCommitted(error)
+            if matches!(*error, MemoryError::Capacity(_))));
+        assert_eq!(backing.resolve_record(denied_id), Ok(DurableRecordResolution::Absent));
+        assert_eq!(backing.retained_count(), Ok(2));
+        backing.finalize_restore(&candidate.claim).expect("finalize first");
+        let _ = backing.commit_spill(denied_id, b"xy").expect("finalize refunds capacity");
+        assert_eq!(backing.retained_count(), Ok(2));
+        drop(backing);
+        let reopened =
+            RedbSpillBacking::create_with_limits(&db.path, tiny_limits()).expect("reopen");
+        assert_eq!(restore_backing(&reopened).expect("second"), Some(b"def".to_vec()));
+        assert_eq!(restore_backing(&reopened).expect("third"), Some(b"xy".to_vec()));
+        assert_eq!(reopened.retained_count(), Ok(0));
+    }
+
+    #[test]
+    fn retained_payload_cap_denies_next_record_without_changing_durable_authority() {
+        let db = test_db();
+        let limits = RedbSpillLimits { max_retained_records: 3, ..tiny_limits() };
+        let backing = RedbSpillBacking::create_with_limits(&db.path, limits).expect("open");
+        let _ = spill_backing(&backing, b"abc").expect("first");
+        let _ = spill_backing(&backing, b"def").expect("exact byte cap");
+        let denied = backing.reserve_record_id().expect("reserve third");
+        let failure = backing.commit_spill(denied, b"x").expect_err("byte cap");
+        assert!(matches!(failure, DurableWriteFailure::NotCommitted(error)
+            if matches!(*error, MemoryError::Capacity(_))));
+        assert_eq!(backing.resolve_record(denied), Ok(DurableRecordResolution::Absent));
+        assert_eq!(backing.retained_count(), Ok(2));
+        assert_eq!(restore_backing(&backing).expect("first"), Some(b"abc".to_vec()));
+        let _ = backing.commit_spill(denied, b"x").expect("finalize frees byte quota");
+        assert_eq!(restore_backing(&backing).expect("second"), Some(b"def".to_vec()));
+        assert_eq!(restore_backing(&backing).expect("third"), Some(b"x".to_vec()));
+    }
+
+    #[test]
+    fn spill_receipt_inventory_includes_other_records_in_recovery_slot() {
+        let db = test_db();
+        let backing = RedbSpillBacking::create_with_limits(&db.path, tiny_limits()).expect("open");
+        let _ = spill_backing(&backing, b"a").expect("first");
+        let candidate = backing.prepare_restore().expect("prepare").expect("first");
+        backing.commit_restore(&candidate.claim).expect("recovery slot");
+        let second = backing.reserve_record_id().expect("reserve second");
+        let receipt = backing.commit_spill(second, b"b").expect("second");
+        assert_eq!(receipt.inventory_after(), 2);
+        let retry = backing.commit_spill(second, b"b").expect("idempotent retry");
+        assert_eq!(retry.inventory_after(), 2);
+        assert_eq!(backing.retained_count(), Ok(2));
+        backing.finalize_restore(&candidate.claim).expect("first finalize");
+        assert_eq!(backing.retained_count(), Ok(1));
+    }
+
+    #[test]
+    fn in_flight_restore_budget_denial_preserves_claim_and_releases_on_candidate_drop() {
+        let db = test_db();
+        let backing = RedbSpillBacking::create_with_limits(&db.path, tiny_limits()).expect("open");
+        let _ = spill_backing(&backing, b"four").expect("persist");
+        let first = backing.prepare_restore().expect("prepare").expect("first candidate");
+        let second = backing.recover_active_restore().expect("steal").expect("second candidate");
+        assert_eq!(second.candidate.bytes(), b"four");
+        assert!(matches!(backing.recover_active_restore(), Err(MemoryError::Capacity(_))));
+        assert_eq!(backing.active_restore(), Ok(Some(DurableRecordId::new(0))));
+        assert_eq!(backing.retained_count(), Ok(1));
+        drop(first);
+        let third = backing
+            .recover_active_restore()
+            .expect("retry after lease drop")
+            .expect("third candidate");
+        drop(second);
+        backing.commit_restore(&third.candidate.claim).expect("commit under bounded staging");
+        backing.finalize_restore(&third.candidate.claim).expect("finalize");
+        drop(third);
+        assert_eq!(backing.retained_count(), Ok(0));
+        assert_eq!(backing.restore_budget_used.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn tighter_reopen_rejects_existing_inventory_without_erasing_it() {
+        let db = test_db();
+        let original = tiny_limits();
+        {
+            let backing = RedbSpillBacking::create_with_limits(&db.path, original).expect("open");
+            let _ = spill_backing(&backing, b"four").expect("persist");
+        }
+        let tightened =
+            RedbSpillLimits { max_retained_payload_bytes: 3, max_record_bytes: 3, ..original };
+        let failure = RedbSpillBacking::create_with_limits(&db.path, tightened)
+            .expect_err("existing payload exceeds tighter policy");
+        assert!(matches!(failure, MemoryError::Capacity(_)));
+        let reopened = RedbSpillBacking::create_with_limits(&db.path, original).expect("reopen");
+        assert_eq!(restore_backing(&reopened).expect("payload survived"), Some(b"four".to_vec()));
+    }
+
+    #[test]
+    fn per_record_limit_is_checked_on_reopen_even_when_total_still_fits() {
+        let db = test_db();
+        let original = tiny_limits();
+        {
+            let backing = RedbSpillBacking::create_with_limits(&db.path, original).expect("open");
+            let _ = spill_backing(&backing, b"four").expect("persist");
+        }
+        let tighter = RedbSpillLimits { max_record_bytes: 3, ..original };
+        assert!(matches!(
+            RedbSpillBacking::create_with_limits(&db.path, tighter),
+            Err(MemoryError::Capacity(_))
+        ));
+        let reopened = RedbSpillBacking::create_with_limits(&db.path, original).expect("reopen");
+        assert_eq!(restore_backing(&reopened).expect("payload survived"), Some(b"four".to_vec()));
+    }
+
+    #[test]
+    fn invalid_limits_reject_before_creating_database_file() {
+        let db = test_db();
+        let invalid = RedbSpillLimits { max_retained_records: 0, ..tiny_limits() };
+        assert!(matches!(
+            RedbSpillBacking::create_with_limits(&db.path, invalid),
+            Err(MemoryError::Config(_))
+        ));
+        assert!(!db.path.exists(), "invalid policy must not create a durable file");
+    }
+
     #[test]
     fn sep23_fup001_legacy_watermark_file_migrates_payload_and_fails_closed() {
         let db = test_db();
@@ -2109,7 +2528,7 @@ mod tests {
         assert_eq!(backing.retained_count().expect("migrated inventory"), 2);
         let candidate = backing.prepare_restore().expect("prepare").expect("candidate");
         assert_eq!(candidate.sequence, 5);
-        assert_eq!(candidate.bytes, b"five");
+        assert_eq!(candidate.bytes(), b"five");
         backing.commit_restore(&candidate.claim).expect("commit migrated restore");
         backing.finalize_restore(&candidate.claim).expect("finalize migrated restore");
         assert_eq!(
@@ -2172,7 +2591,7 @@ mod tests {
         let stolen = backing.recover_active_restore().expect("recover").expect("recovery");
         assert_eq!(stolen.phase, DurableRestorePhase::Prepared);
         assert_eq!(stolen.candidate.sequence, 0);
-        assert_eq!(stolen.candidate.bytes, b"owned");
+        assert_eq!(stolen.candidate.bytes(), b"owned");
         assert_eq!(stolen.candidate.claim.generation(), 2);
         assert_eq!(stolen.candidate.claim.backend(), first.claim.backend());
 
@@ -2285,7 +2704,7 @@ mod tests {
         let backing = RedbSpillBacking::create(&db.path).expect("open 2");
         let recovery = backing.recover_active_restore().expect("recover").expect("recovery");
         assert_eq!(recovery.candidate.claim.backend(), before, "identity survives reopen");
-        assert_eq!(recovery.candidate.bytes, b"stable");
+        assert_eq!(recovery.candidate.bytes(), b"stable");
         backing.commit_restore(&recovery.candidate.claim).expect("recovered claim commits");
         backing.finalize_restore(&recovery.candidate.claim).expect("recovered claim finalizes");
     }
@@ -2316,7 +2735,7 @@ mod tests {
             Some(DurableRecordId::new(1)),
             "the retry leaves the live claim untouched"
         );
-        assert_eq!(second.bytes, b"second", "the live candidate is intact");
+        assert_eq!(second.bytes(), b"second", "the live candidate is intact");
         backing.abort_restore(&second.claim).expect("abort the live claim");
         backing
             .finalize_restore(&first.claim)

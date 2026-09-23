@@ -83,6 +83,22 @@ Consumers that create more than the limit of overlapping permits must release
 or commit-and-release older permits before admitting more. These are logical
 metadata limits, not allocator/RSS limits.
 
+Synchronous reentrant reservation from a broker's own reclaim callback now
+returns `OperationInProgress`; release and legal reconfiguration remain
+available. Concurrent reclaim plans on the same broker do not start a second
+callback while the first is active; the skipped plan re-evaluates against live
+usage. Telemetry sink calls are single-flight per broker across threads. A
+recursive or concurrent advisory event observed while the callback is active
+is dropped rather than queued or replayed; this bounds callback reentry but is
+not a lossless event stream.
+
+Read-side facade operations may invoke caller-supplied `Clone`, `Ord`, or
+canonical-identity code while observing a stable container image. If that code
+panics, QMP still propagates the original panic, but first releases the store
+mutex normally so later operations are not rejected solely because that read
+poisoned the lock. This does not bound callback duration or roll back
+caller-owned interior side effects.
+
 ## Required consumer changes
 
 - Construct live authority through `MemoryPlatformBuilder`,

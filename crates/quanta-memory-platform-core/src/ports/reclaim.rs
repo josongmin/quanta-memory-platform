@@ -3,7 +3,11 @@
 //! The broker prepares an immutable request while holding its internal lock,
 //! drops that lock, and only then calls this port. Implementations may evict or
 //! close stores that release broker-bound charges. The broker always remeasures
-//! semantic usage before the final admission decision.
+//! semantic usage before the final admission decision. A synchronous reserve
+//! reentered on the same broker from this callback fails with
+//! `OperationInProgress`; release and legal reconfiguration remain available.
+//! The broker executes at most one reclaim callback concurrently per broker;
+//! a competing reclaim plan skips the callback and re-evaluates admission.
 
 use crate::{MemoryClass, MemoryResult, PressureState, ReclaimPriority, ReclaimRung};
 

@@ -1,5 +1,7 @@
 # QMP memory/state substrate — 100항목 점수 평가
 
+**이 문서는 `0284489` 기준점이다.** 이후 clean `edfef66`의 40개 ID 점수 상승과 나머지 ID 유지 판정은 [재감사 결과](memory-state-substrate-score-reaudit-2026-09-23-edfef66.md)를 참조한다. 두 문서를 합쳐 100개 ID의 최신 clean-HEAD 점수를 읽는다. 미커밋 작업트리는 그 결과에 포함되지 않는다.
+
 평가일: 2026-09-23. 대상: `main@028448946caa95676df034481a830c1d3e3b1f33` (tree `f983669731805a330200213bad7bf1bd5573f308`). 기준: [100항목 체크리스트](memory-state-substrate-review-checklist.md), SHA-256 `a92f16aa840ac31bfee3ce35235af625832ca7e2ae480f6a5d1dda66fb1c43d1`. 항목별 source 위치와 실행 기록은 [1차 감사](memory-state-substrate-parallel-audit-2026-09-23.md) 및 [재감사](memory-state-substrate-gap-reaudit-2026-09-23.md)에 있다. 이 문서가 두 감사의 상태 분류를 **점수 판정으로 대체**한다. 제품 코드는 수정하지 않았다.
 
 ## 채점 기준

@@ -11,7 +11,10 @@ use quanta_memory_platform_core::{
 #[cfg(feature = "unbudgeted-stores")]
 use crate::shared::accounting::Unbudgeted;
 use crate::shared::accounting::{Budgeted, StoreAccounting};
-use crate::shared::lifecycle::{retire_client_value, BeginClose, DropTransition, StoreLifecycle};
+use crate::shared::lifecycle::{
+    invoke_client_read_while_locked, retire_client_value, BeginClose, DropTransition,
+    StoreLifecycle,
+};
 use crate::shared::measure::{semantic_cost_v1, ByteSized, CanonicalKey, RetainedCostV1};
 use crate::transcript_store::{
     SessionTranscriptStore, TranscriptAppendDispositionV1, TranscriptAppendErrorV1,
@@ -485,6 +488,21 @@ where
             ));
         }
 
+        // Resolve caller-controlled Ord before the state-mutation lock. The
+        // enclosing mutation permit keeps this ordinal stable until commit.
+        let session_ordinal = invoke_client_read_while_locked(self.lock_state()?, |state| {
+            state.sessions.keys().position(|candidate| candidate.cmp(session_id).is_eq())
+        });
+        let Some(session_ordinal) = session_ordinal else {
+            return if retained.is_empty() {
+                Ok(())
+            } else {
+                Err(MemoryError::InvalidState(
+                    "transcript retain selector references a missing session".to_string(),
+                ))
+            };
+        };
+
         let (
             mut dropped,
             session_ordinal,
@@ -495,20 +513,6 @@ where
             next_active_bytes,
         ) = {
             let mut state = self.lock_state()?;
-            // Find the canonical session before detaching any row or charge.
-            // Later recovery/publication must not compare a client-supplied
-            // SessionId: Ord may panic and strand detached accounting authority.
-            let Some(session_ordinal) =
-                state.sessions.keys().position(|candidate| candidate.cmp(session_id).is_eq())
-            else {
-                return if retained.is_empty() {
-                    Ok(())
-                } else {
-                    Err(MemoryError::InvalidState(
-                        "transcript retain selector references a missing session".to_string(),
-                    ))
-                };
-            };
             let session = state
                 .sessions
                 .values()
@@ -632,19 +636,22 @@ where
         session_id: &SessionId,
     ) -> MemoryResult<TranscriptSnapshotV1<MessageId, Message>> {
         let state = self.lock_read()?;
-        let version = state.sessions.get(session_id).map_or(0, |session| session.version);
-        let records = state.sessions.get(session_id).map_or_else(Vec::new, |session| {
-            session
-                .rows
-                .values()
-                .map(|entry| TranscriptRecordV1 {
-                    sequence: entry.sequence,
-                    message_id: entry.message_id.clone(),
-                    body: entry.body.clone(),
-                })
-                .collect()
+        let snapshot = invoke_client_read_while_locked(state, |state| {
+            let version = state.sessions.get(session_id).map_or(0, |session| session.version);
+            let records = state.sessions.get(session_id).map_or_else(Vec::new, |session| {
+                session
+                    .rows
+                    .values()
+                    .map(|entry| TranscriptRecordV1 {
+                        sequence: entry.sequence,
+                        message_id: entry.message_id.clone(),
+                        body: entry.body.clone(),
+                    })
+                    .collect()
+            });
+            TranscriptSnapshotV1 { version, records }
         });
-        Ok(TranscriptSnapshotV1 { version, records })
+        Ok(snapshot)
     }
 
     /// Retain rows only if no append or retention mutation occurred after the
@@ -656,8 +663,9 @@ where
         retained_sequences: &[u64],
     ) -> MemoryResult<TranscriptRetainDispositionV1> {
         let _mutation = self.lifecycle.begin_mutation()?;
-        let actual_version =
-            self.lock_state()?.sessions.get(session_id).map_or(0, |session| session.version);
+        let actual_version = invoke_client_read_while_locked(self.lock_state()?, |state| {
+            state.sessions.get(session_id).map_or(0, |session| session.version)
+        });
         if actual_version != expected_version {
             return Ok(TranscriptRetainDispositionV1::StaleSnapshot {
                 expected_version,
@@ -665,8 +673,9 @@ where
             });
         }
         self.retain_sequences_owned(session_id, retained_sequences)?;
-        let version =
-            self.lock_state()?.sessions.get(session_id).map_or(0, |session| session.version);
+        let version = invoke_client_read_while_locked(self.lock_state()?, |state| {
+            state.sessions.get(session_id).map_or(0, |session| session.version)
+        });
         Ok(TranscriptRetainDispositionV1::Applied { version })
     }
 }
@@ -700,20 +709,20 @@ where
             .map_err(TranscriptAppendErrorV1::Accounting)?;
         let key_bytes = session_key_cost(session_id.byte_size())
             .map_err(TranscriptAppendErrorV1::Accounting)?;
-        let (
-            next_total,
-            next_session_bytes,
-            next_version,
-            new_session,
-            next_active_row_count,
-            next_active_bytes,
-            next_evidence_count,
-            next_evidence_bytes,
-            next_session_key_bytes,
-        ) = {
-            let state = self.lock_state().map_err(TranscriptAppendErrorV1::Storage)?;
-            let existing = state.sessions.get(&session_id);
-            if let Some(session) = existing {
+        // Identity comparison and replay decoding invoke caller Ord and
+        // CanonicalKey. Finish that read-only work and release the guard before
+        // any panic can unwind; the mutation permit keeps its result stable.
+        enum ExistingSession {
+            New,
+            Present { retained_bytes: u64, version: u64 },
+            Replay,
+        }
+        let prior = invoke_client_read_while_locked(
+            self.lock_state().map_err(TranscriptAppendErrorV1::Storage)?,
+            |state| -> Result<ExistingSession, TranscriptAppendErrorV1> {
+                let Some(session) = state.sessions.get(&session_id) else {
+                    return Ok(ExistingSession::New);
+                };
                 if let Some(evidence) = session.sequence_evidence.get(&sequence) {
                     if evidence.message_id != message_id {
                         return Err(TranscriptAppendErrorV1::SequenceConflict { sequence });
@@ -722,10 +731,11 @@ where
                         || evidence.body_digest == body_digest,
                         |row| row.body.canonical_key() == body_key,
                     );
-                    if exact_replay {
-                        return Ok(TranscriptAppendDispositionV1::Replayed);
-                    }
-                    return Err(TranscriptAppendErrorV1::PayloadConflict { sequence });
+                    return if exact_replay {
+                        Ok(ExistingSession::Replay)
+                    } else {
+                        Err(TranscriptAppendErrorV1::PayloadConflict { sequence })
+                    };
                 }
                 if let Some(evidence) = session.message_evidence.get(&message_id) {
                     if evidence.sequence != sequence {
@@ -738,8 +748,27 @@ where
                         "message-id index exists without sequence evidence".to_string(),
                     )));
                 }
-            }
-
+                Ok(ExistingSession::Present {
+                    retained_bytes: session.retained_bytes,
+                    version: session.version,
+                })
+            },
+        )?;
+        if matches!(prior, ExistingSession::Replay) {
+            return Ok(TranscriptAppendDispositionV1::Replayed);
+        }
+        let (
+            next_total,
+            next_session_bytes,
+            next_version,
+            new_session,
+            next_active_row_count,
+            next_active_bytes,
+            next_evidence_count,
+            next_evidence_bytes,
+            next_session_key_bytes,
+        ) = {
+            let state = self.lock_state().map_err(TranscriptAppendErrorV1::Storage)?;
             let next_evidence_count = state.evidence_count.checked_add(1).ok_or_else(|| {
                 TranscriptAppendErrorV1::Accounting(MemoryError::capacity(
                     "transcript evidence count overflow",
@@ -770,7 +799,7 @@ where
                 return Err(error);
             }
 
-            let new_session = existing.is_none();
+            let new_session = matches!(prior, ExistingSession::New);
             let increment = active_bytes
                 .checked_add(evidence_bytes)
                 .and_then(|sum| sum.checked_add(if new_session { key_bytes } else { 0 }))
@@ -784,21 +813,28 @@ where
                     "transcript retained-byte counter overflow",
                 ))
             })?;
-            let next_session_bytes = existing
-                .map_or(0, |session| session.retained_bytes)
-                .checked_add(increment)
-                .ok_or_else(|| {
-                    TranscriptAppendErrorV1::Accounting(MemoryError::capacity(
-                        "transcript session-byte counter overflow",
-                    ))
-                })?;
-            let next_version = existing.map_or(Ok(1), |session| {
-                session.version.checked_add(1).ok_or_else(|| {
-                    TranscriptAppendErrorV1::Storage(MemoryError::capacity(
-                        "transcript session version overflow",
-                    ))
-                })
+            let next_session_bytes = match prior {
+                ExistingSession::New => 0,
+                ExistingSession::Present { retained_bytes, .. } => retained_bytes,
+                ExistingSession::Replay => unreachable!("replay returned before planning"),
+            }
+            .checked_add(increment)
+            .ok_or_else(|| {
+                TranscriptAppendErrorV1::Accounting(MemoryError::capacity(
+                    "transcript session-byte counter overflow",
+                ))
             })?;
+            let next_version = match prior {
+                ExistingSession::New => Ok(1),
+                ExistingSession::Present { version, .. } => {
+                    version.checked_add(1).ok_or_else(|| {
+                        TranscriptAppendErrorV1::Storage(MemoryError::capacity(
+                            "transcript session version overflow",
+                        ))
+                    })
+                }
+                ExistingSession::Replay => unreachable!("replay returned before planning"),
+            }?;
             let next_active_row_count = state.active_row_count.checked_add(1).ok_or_else(|| {
                 TranscriptAppendErrorV1::Accounting(MemoryError::capacity(
                     "transcript active-row count overflow",
@@ -983,16 +1019,18 @@ where
         Message: Clone,
     {
         let state = self.lock_read()?;
-        Ok(state.sessions.get(session_id).map_or_else(Vec::new, |session| {
-            session
-                .rows
-                .values()
-                .map(|entry| TranscriptRecordV1 {
-                    sequence: entry.sequence,
-                    message_id: entry.message_id.clone(),
-                    body: entry.body.clone(),
-                })
-                .collect()
+        Ok(invoke_client_read_while_locked(state, |state| {
+            state.sessions.get(session_id).map_or_else(Vec::new, |session| {
+                session
+                    .rows
+                    .values()
+                    .map(|entry| TranscriptRecordV1 {
+                        sequence: entry.sequence,
+                        message_id: entry.message_id.clone(),
+                        body: entry.body.clone(),
+                    })
+                    .collect()
+            })
         }))
     }
 
@@ -1007,11 +1045,11 @@ where
 
     fn truncate_to(&self, session_id: &SessionId, max_messages: usize) -> MemoryResult<()> {
         let _mutation = self.lifecycle.begin_mutation()?;
-        let state = self.lock_state()?;
-        let retained_sequences = state.sessions.get(session_id).map_or_else(Vec::new, |session| {
-            session.rows.keys().copied().take(max_messages).collect()
+        let retained_sequences = invoke_client_read_while_locked(self.lock_state()?, |state| {
+            state.sessions.get(session_id).map_or_else(Vec::new, |session| {
+                session.rows.keys().copied().take(max_messages).collect()
+            })
         });
-        drop(state);
         self.retain_sequences_owned(session_id, &retained_sequences)
     }
 
@@ -2263,6 +2301,142 @@ mod tests {
         }
 
         #[test]
+        fn append_preflight_order_panic_keeps_public_store_available() {
+            let broker = broker(1_000_000);
+            let trap = ComparisonTrap::new();
+            let old_id = OrderedSessionId { name: "old", trap: Arc::clone(&trap) };
+            let store = SimpleSessionTranscriptStore::<
+                OrderedSessionId,
+                String,
+                String,
+                Budgeted,
+            >::new_budgeted(
+                StoreBindingHandle::new(
+                    MemoryClass::SessionTranscript,
+                    "transcript-append-preflight-panic".to_string(),
+                    None,
+                ),
+                TranscriptRetentionPolicyV2::default(),
+                broker.clone(),
+            );
+            store
+                .append(TranscriptAppendRequestV1::new(
+                    TranscriptAppendIdentityV1::new(old_id.clone(), 0, "m0".to_string()),
+                    "body".to_string(),
+                ))
+                .expect("seed session");
+            let before = broker.ledger_snapshot().expect("before");
+            let calls = trap.calls.load(AtomicOrdering::SeqCst);
+            trap.panic_at.store(calls + 1, AtomicOrdering::SeqCst);
+            let new_id = OrderedSessionId { name: "new", trap: Arc::clone(&trap) };
+            let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = store.append(TranscriptAppendRequestV1::new(
+                    TranscriptAppendIdentityV1::new(new_id.clone(), 0, "m1".to_string()),
+                    "other".to_string(),
+                ));
+            }));
+            assert!(panicked.is_err(), "Ord trap must fire in read-only preflight");
+            trap.disarm();
+            assert_eq!(broker.ledger_snapshot().expect("after"), before);
+            assert_eq!(store.load(&old_id).expect("old row remains").len(), 1);
+            assert!(store.load(&new_id).expect("new row absent").is_empty());
+            store.close().expect("public close after panic");
+            assert_eq!(broker.ledger_snapshot().expect("drained").total_owner_bytes(), 0);
+        }
+
+        #[test]
+        fn append_preflight_message_order_panic_keeps_public_store_available() {
+            let broker = broker(1_000_000);
+            let store = callback_store(&broker);
+            let clones = CallbackTrap::new();
+            let comparisons = CallbackTrap::new();
+            store
+                .append(TranscriptAppendRequestV1::new(
+                    TranscriptAppendIdentityV1::new(
+                        "s".to_string(),
+                        0,
+                        callback_id("m0", &clones, &comparisons),
+                    ),
+                    "one".to_string(),
+                ))
+                .expect("seed row");
+            let before = broker.ledger_snapshot().expect("before");
+            comparisons.arm_after(1);
+            let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = store.append(TranscriptAppendRequestV1::new(
+                    TranscriptAppendIdentityV1::new(
+                        "s".to_string(),
+                        1,
+                        callback_id("m1", &clones, &comparisons),
+                    ),
+                    "two".to_string(),
+                ));
+            }));
+            assert!(panicked.is_err(), "MessageId Ord trap must fire in preflight");
+            comparisons.disarm();
+            assert_eq!(broker.ledger_snapshot().expect("after"), before);
+            assert_eq!(store.load(&"s".to_string()).expect("public load after panic").len(), 1);
+            store.close().expect("public close after panic");
+            assert_eq!(broker.ledger_snapshot().expect("drained").total_owner_bytes(), 0);
+        }
+
+        #[test]
+        fn append_replay_canonical_key_panic_keeps_public_store_available() {
+            #[derive(Clone)]
+            struct Body {
+                bytes: Vec<u8>,
+                trap: Arc<CallbackTrap>,
+            }
+            impl ByteSized for Body {
+                fn byte_size(&self) -> u64 {
+                    self.bytes.len() as u64
+                }
+            }
+            impl CanonicalKey for Body {
+                fn canonical_key(&self) -> Vec<u8> {
+                    self.trap.hit();
+                    self.bytes.clone()
+                }
+            }
+
+            let broker = broker(1_000_000);
+            let trap = CallbackTrap::new();
+            let store =
+                SimpleSessionTranscriptStore::<String, String, Body, Budgeted>::new_budgeted(
+                    StoreBindingHandle::new(
+                        MemoryClass::SessionTranscript,
+                        "transcript-canonical-panic".to_string(),
+                        None,
+                    ),
+                    TranscriptRetentionPolicyV2::default(),
+                    broker.clone(),
+                );
+            let body = Body { bytes: b"body".to_vec(), trap: Arc::clone(&trap) };
+            store
+                .append(TranscriptAppendRequestV1::new(
+                    TranscriptAppendIdentityV1::new("s".to_string(), 0, "m0".to_string()),
+                    body.clone(),
+                ))
+                .expect("seed row");
+            let before = broker.ledger_snapshot().expect("before");
+            // Incoming body canonicalization is outside the mutex; the second
+            // call checks the retained row while resolving an exact replay.
+            trap.arm_after(2);
+            let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = store.append(TranscriptAppendRequestV1::new(
+                    TranscriptAppendIdentityV1::new("s".to_string(), 0, "m0".to_string()),
+                    body.clone(),
+                ));
+            }));
+            assert!(panicked.is_err(), "retained CanonicalKey trap must fire");
+            trap.disarm();
+            assert_eq!(broker.ledger_snapshot().expect("after"), before);
+            assert_eq!(store.load(&"s".to_string()).expect("public load after panic").len(), 1);
+            store.close().expect("public close after panic");
+            assert_eq!(broker.ledger_snapshot().expect("drained").total_owner_bytes(), 0);
+        }
+
+        #[test]
         fn panicking_message_id_order_at_publication_leaves_append_atomic() {
             let broker = broker(1_000_000);
             let store = callback_store(&broker);
@@ -2581,6 +2755,61 @@ mod tests {
             );
             drop(store);
             assert_eq!(broker.ledger_snapshot().expect("drop cleanup").total_owner_bytes(), 0);
+        }
+
+        #[test]
+        fn session_order_panic_before_mutation_keeps_public_transcript_available() {
+            for operation in ["retain", "truncate", "versioned retain"] {
+                let broker = broker(1_000_000);
+                let trap = ComparisonTrap::new();
+                let id = OrderedSessionId { name: "session", trap: Arc::clone(&trap) };
+                let store = SimpleSessionTranscriptStore::<
+                    OrderedSessionId,
+                    String,
+                    String,
+                    Budgeted,
+                >::new_budgeted(
+                    StoreBindingHandle::new(
+                        MemoryClass::SessionTranscript,
+                        "transcript-public-panic-test".to_string(),
+                        None,
+                    ),
+                    TranscriptRetentionPolicyV2::default(),
+                    broker.clone(),
+                );
+                for sequence in 0..2 {
+                    store
+                        .append(TranscriptAppendRequestV1::new(
+                            TranscriptAppendIdentityV1::new(
+                                id.clone(),
+                                sequence,
+                                format!("m{sequence}"),
+                            ),
+                            format!("body{sequence}"),
+                        ))
+                        .expect("seed row");
+                }
+                let version = store.load_versioned_snapshot(&id).expect("version").version;
+                let before = broker.ledger_snapshot().expect("before");
+                let calls = trap.calls.load(AtomicOrdering::SeqCst);
+                trap.panic_at.store(calls + 1, AtomicOrdering::SeqCst);
+                let panicked =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match operation {
+                        "retain" => store.retain_sequences(&id, &[0]),
+                        "truncate" => store.truncate_to(&id, 1),
+                        "versioned retain" => {
+                            store.retain_sequences_if_version(&id, version, &[0]).map(|_| ())
+                        }
+                        _ => unreachable!(),
+                    }));
+                assert!(panicked.is_err(), "{operation}: Ord trap must fire");
+                trap.disarm();
+                assert_eq!(broker.ledger_snapshot().expect("after"), before);
+                assert_eq!(store.load(&id).expect("public load after panic").len(), 2);
+                assert_eq!(store.stats().expect("public stats after panic").item_count, 2);
+                store.close().expect("public close after panic");
+                assert_eq!(broker.ledger_snapshot().expect("drained").total_owner_bytes(), 0);
+            }
         }
 
         #[test]

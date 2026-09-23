@@ -2,7 +2,18 @@
 
 `tools/pm` is the source of truth for generated agent/operator guidance.
 Markdown sections under `sources/**` are assembled according to `targets.json`.
-The renderer uses only the Python standard library.
+The renderer uses only the Python standard library and enforces output budgets,
+frontmatter shape, drift, and retired-output removal.
+
+The loading model is deliberately progressive:
+
+- `AGENTS.md` is a short cross-agent entry point and task router.
+- `CLAUDE.md` imports that shared entry point with `@AGENTS.md`; broad additional
+  imports are prohibited because imports also consume startup context.
+- Cursor uses focused `.cursor/rules/*.mdc` files with short relevance
+  descriptions. No Cursor rule is always applied.
+- Detailed rule sources stay under `sources/rules/` and are loaded only when the
+  task or file scope requires them.
 
 ## Source-of-truth rule
 
@@ -11,12 +22,20 @@ The renderer uses only the Python standard library.
 - Never hand-edit generated outputs. `pm lint` rejects drift and missing files.
 - Every Markdown source must be referenced by a target; orphan sources, duplicate
   outputs, and paths escaping the repo are rejected.
+- Keep `max_lines` and `max_bytes` on every target. A source change that bloats a
+  generated entry point fails closed.
+- Put Cursor metadata in the target's `frontmatter` mapping. PM emits it before
+  the generated-file banner so Cursor can parse the rule.
+- List obsolete generated files in `retired_outputs`; `sync` removes files and
+  `lint` rejects their reintroduction.
 
-| Target | Output |
+| Target family | Output |
 | --- | --- |
 | `agents` | `AGENTS.md` |
 | `claude` | `CLAUDE.md` |
-| `cursor_rules` | `.cursorrules` |
+| `cursor_*` | `.cursor/rules/*.mdc` |
+
+The legacy root `.cursorrules` file is retired and must remain absent.
 
 ## Commands
 

@@ -13,7 +13,10 @@ use crate::payload_store::PayloadStore;
 #[cfg(feature = "unbudgeted-stores")]
 use crate::shared::accounting::Unbudgeted;
 use crate::shared::accounting::{Budgeted, StoreAccounting};
-use crate::shared::lifecycle::{retire_client_value, BeginClose, DropTransition, StoreLifecycle};
+use crate::shared::lifecycle::{
+    invoke_client_read_while_locked, retire_client_value, BeginClose, DropTransition,
+    StoreLifecycle,
+};
 use crate::shared::measure::{semantic_cost_v1, ByteSized, CanonicalKey, RetainedCostV1};
 
 fn canonical_digest(key: &[u8]) -> u64 {
@@ -63,6 +66,18 @@ struct PayloadState<PayloadRef, Bytes> {
     live_entries: usize,
     next_ref: u64,
     charged_total: u64,
+}
+
+fn find_reference_slot<PayloadRef: Eq, Bytes>(
+    state: &PayloadState<PayloadRef, Bytes>,
+    digest: u64,
+    payload_ref: &PayloadRef,
+) -> Option<usize> {
+    state.reference_index.get(&digest).and_then(|slots| {
+        slots.iter().copied().find(|slot| {
+            state.entries[*slot].as_ref().is_some_and(|entry| &entry.payload_ref == payload_ref)
+        })
+    })
 }
 
 /// Canonical payload store branded by its construction-time accounting mode.
@@ -219,18 +234,12 @@ where
     pub fn pin(&self, payload_ref: &PayloadRef) -> MemoryResult<()> {
         let _permit = self.lifecycle.begin_mutation()?;
         let digest = reference_digest(payload_ref);
+        let index = invoke_client_read_while_locked(self.lock()?, |state| {
+            find_reference_slot(state, digest, payload_ref)
+        })
+        .ok_or_else(|| MemoryError::InvalidState("pin: payload not found".to_string()))?;
+        // The mutation permit excludes writers between lookup and this lock.
         let mut state = self.lock()?;
-        let index = state
-            .reference_index
-            .get(&digest)
-            .and_then(|slots| {
-                slots.iter().copied().find(|slot| {
-                    state.entries[*slot]
-                        .as_ref()
-                        .is_some_and(|entry| &entry.payload_ref == payload_ref)
-                })
-            })
-            .ok_or_else(|| MemoryError::InvalidState("pin: payload not found".to_string()))?;
         let entry = state.entries[index].as_mut().expect("reference index points to live slot");
         entry.pin_count = entry
             .pin_count
@@ -242,18 +251,11 @@ where
     pub fn unpin(&self, payload_ref: &PayloadRef) -> MemoryResult<()> {
         let _permit = self.lifecycle.begin_mutation()?;
         let digest = reference_digest(payload_ref);
+        let index = invoke_client_read_while_locked(self.lock()?, |state| {
+            find_reference_slot(state, digest, payload_ref)
+        })
+        .ok_or_else(|| MemoryError::InvalidState("unpin: payload not found".to_string()))?;
         let mut state = self.lock()?;
-        let index = state
-            .reference_index
-            .get(&digest)
-            .and_then(|slots| {
-                slots.iter().copied().find(|slot| {
-                    state.entries[*slot]
-                        .as_ref()
-                        .is_some_and(|entry| &entry.payload_ref == payload_ref)
-                })
-            })
-            .ok_or_else(|| MemoryError::InvalidState("unpin: payload not found".to_string()))?;
         let entry = state.entries[index].as_mut().expect("reference index points to live slot");
         entry.pin_count = entry
             .pin_count
@@ -264,12 +266,9 @@ where
 
     pub fn pin_count(&self, payload_ref: &PayloadRef) -> MemoryResult<u64> {
         let digest = reference_digest(payload_ref);
-        let state = self.lock_read()?;
-        Ok(state.reference_index.get(&digest).map_or(0, |slots| {
-            slots
-                .iter()
-                .filter_map(|slot| state.entries[*slot].as_ref())
-                .find(|entry| &entry.payload_ref == payload_ref)
+        Ok(invoke_client_read_while_locked(self.lock_read()?, |state| {
+            find_reference_slot(state, digest, payload_ref)
+                .and_then(|index| state.entries[index].as_ref())
                 .map_or(0, |entry| entry.pin_count)
         }))
     }
@@ -294,15 +293,28 @@ where
         let canonical_key = value.bytes.canonical_key();
         let digest = canonical_digest(&canonical_key);
 
+        let existing = {
+            let state = self.lock()?;
+            invoke_client_read_while_locked(state, |state| {
+                state
+                    .canonical_index
+                    .get(&digest)
+                    .and_then(|slots| {
+                        slots.iter().filter_map(|slot| state.entries[*slot].as_ref()).find(
+                            |entry| {
+                                entry.canonical_digest == digest
+                                    && entry.bytes.canonical_key() == canonical_key
+                            },
+                        )
+                    })
+                    .map(|entry| entry.payload_ref.clone())
+            })
+        };
+        if let Some(existing) = existing {
+            return Ok(PublishedPayload::new(existing));
+        }
         let (payload_ref_text, next_ref) = {
             let state = self.lock()?;
-            if let Some(existing) = state.canonical_index.get(&digest).and_then(|slots| {
-                slots.iter().filter_map(|slot| state.entries[*slot].as_ref()).find(|entry| {
-                    entry.canonical_digest == digest && entry.bytes.canonical_key() == canonical_key
-                })
-            }) {
-                return Ok(PublishedPayload::new(existing.payload_ref.clone()));
-            }
             let next_ref = state
                 .next_ref
                 .checked_add(1)
@@ -331,6 +343,11 @@ where
             .checked_add(charged_bytes)
             .ok_or_else(|| MemoryError::capacity("payload byte counter overflow"))?;
 
+        // PayloadRef::Clone is caller code. Prepare the stored identity before
+        // charging or holding the publication lock so its panic cannot poison
+        // the container or leave a provisional accounting lease behind.
+        let stored_payload_ref = payload_ref.clone();
+
         let charge = self.accounting.charge(
             self.binding.class.clone(),
             self.binding.owner.clone(),
@@ -347,7 +364,7 @@ where
             }
         };
         let entry = PayloadEntry {
-            payload_ref: payload_ref.clone(),
+            payload_ref: stored_payload_ref,
             canonical_digest: digest,
             charged_bytes,
             pin_count: 0,
@@ -377,21 +394,12 @@ where
     fn delete_if_unpinned(&self, payload_ref: &PayloadRef) -> Result<(), StoreDeleteError> {
         let _permit = self.lifecycle.begin_mutation()?;
         let reference_digest = reference_digest(payload_ref);
+        let index = invoke_client_read_while_locked(self.lock()?, |state| {
+            find_reference_slot(state, reference_digest, payload_ref)
+        })
+        .ok_or_else(|| MemoryError::InvalidState("delete: payload not found".to_string()))?;
         let (index, canonical_digest, next_total, mut charge) = {
             let mut state = self.lock()?;
-            let index = state
-                .reference_index
-                .get(&reference_digest)
-                .and_then(|slots| {
-                    slots.iter().copied().find(|slot| {
-                        state.entries[*slot]
-                            .as_ref()
-                            .is_some_and(|entry| &entry.payload_ref == payload_ref)
-                    })
-                })
-                .ok_or_else(|| {
-                    MemoryError::InvalidState("delete: payload not found".to_string())
-                })?;
             let entry = state.entries[index].as_mut().expect("reference index points to live slot");
             if entry.pin_count > 0 {
                 return Err(MemoryError::InvalidState(format!(
@@ -1004,6 +1012,131 @@ mod tests {
         store.unpin(published.payload_ref()).expect("unpin again");
         store.delete_if_unpinned(published.payload_ref()).expect("delete");
         assert_eq!(broker.ledger_snapshot().expect("ledger").total_owner_bytes(), 0);
+    }
+
+    #[test]
+    fn reference_eq_panic_before_mutation_keeps_public_store_available() {
+        use std::sync::atomic::AtomicBool;
+
+        static PANIC_NEXT_EQ: AtomicBool = AtomicBool::new(false);
+
+        #[derive(Clone, Debug)]
+        struct Ref(String);
+        impl From<String> for Ref {
+            fn from(value: String) -> Self {
+                Self(value)
+            }
+        }
+        impl ByteSized for Ref {
+            fn byte_size(&self) -> u64 {
+                self.0.len() as u64
+            }
+        }
+        impl Hash for Ref {
+            fn hash<H: Hasher>(&self, state: &mut H) {
+                self.0.hash(state);
+            }
+        }
+        impl PartialEq for Ref {
+            fn eq(&self, other: &Self) -> bool {
+                if PANIC_NEXT_EQ.swap(false, Ordering::SeqCst) {
+                    panic!("injected reference Eq panic");
+                }
+                self.0 == other.0
+            }
+        }
+        impl Eq for Ref {}
+
+        for operation in ["pin", "unpin", "pin_count", "delete"] {
+            let broker = live_broker(1_000_000, 600_000);
+            let store = SimplePayloadStore::<Ref, Vec<u8>, Budgeted>::new_budgeted(
+                binding(),
+                None,
+                broker.clone(),
+            );
+            let published = store.put_canonical(envelope(b"payload")).expect("put");
+            if operation == "unpin" {
+                store.pin(published.payload_ref()).expect("seed pin");
+            }
+            let before = broker.ledger_snapshot().expect("before");
+            let pins_before = store.pin_count(published.payload_ref()).expect("pins before");
+            PANIC_NEXT_EQ.store(true, Ordering::SeqCst);
+            let panicked =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match operation {
+                    "pin" => {
+                        let _ = store.pin(published.payload_ref());
+                    }
+                    "unpin" => {
+                        let _ = store.unpin(published.payload_ref());
+                    }
+                    "pin_count" => {
+                        let _ = store.pin_count(published.payload_ref());
+                    }
+                    "delete" => {
+                        let _ = store.delete_if_unpinned(published.payload_ref());
+                    }
+                    _ => unreachable!(),
+                }));
+            assert!(panicked.is_err(), "{operation}: Eq trap must fire");
+            assert_eq!(broker.ledger_snapshot().expect("after"), before);
+            assert_eq!(store.stats().expect("public stats after panic").item_count, 1);
+            assert_eq!(
+                store.pin_count(published.payload_ref()).expect("public pin count"),
+                pins_before
+            );
+            if pins_before > 0 {
+                store.unpin(published.payload_ref()).expect("unpin after panic");
+            }
+            store.delete_if_unpinned(published.payload_ref()).expect("delete after panic");
+            assert_eq!(broker.ledger_snapshot().expect("drained").total_owner_bytes(), 0);
+        }
+    }
+
+    #[test]
+    fn reference_clone_panic_before_publication_keeps_public_store_available() {
+        use std::sync::atomic::AtomicBool;
+
+        static PANIC_NEXT_CLONE: AtomicBool = AtomicBool::new(false);
+
+        #[derive(Debug, PartialEq, Eq, Hash)]
+        struct Ref(String);
+        impl From<String> for Ref {
+            fn from(value: String) -> Self {
+                Self(value)
+            }
+        }
+        impl Clone for Ref {
+            fn clone(&self) -> Self {
+                if PANIC_NEXT_CLONE.swap(false, Ordering::SeqCst) {
+                    panic!("injected reference Clone panic");
+                }
+                Self(self.0.clone())
+            }
+        }
+        impl ByteSized for Ref {
+            fn byte_size(&self) -> u64 {
+                self.0.len() as u64
+            }
+        }
+
+        let broker = live_broker(1_000_000, 600_000);
+        let store = SimplePayloadStore::<Ref, Vec<u8>, Budgeted>::new_budgeted(
+            binding(),
+            None,
+            broker.clone(),
+        );
+        PANIC_NEXT_CLONE.store(true, Ordering::SeqCst);
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = store.put_canonical(envelope(b"payload"));
+        }));
+        assert!(panicked.is_err(), "Clone trap must fire before publication");
+        assert_eq!(broker.ledger_snapshot().expect("after panic").total_owner_bytes(), 0);
+        assert_eq!(store.stats().expect("public stats after panic").item_count, 0);
+
+        let published = store.put_canonical(envelope(b"payload")).expect("retry after panic");
+        assert_eq!(store.stats().expect("published stats").item_count, 1);
+        store.delete_if_unpinned(published.payload_ref()).expect("cleanup");
+        assert_eq!(broker.ledger_snapshot().expect("drained").total_owner_bytes(), 0);
     }
 
     #[test]

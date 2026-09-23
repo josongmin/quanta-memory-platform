@@ -1,6 +1,11 @@
 pub mod backings;
 pub mod service;
 
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+
+#[cfg(feature = "spill-redb")]
+use quanta_memory_platform_core::MemoryError;
 use quanta_memory_platform_core::MemoryResult;
 
 pub use service::{
@@ -213,20 +218,83 @@ impl DurableRestoreClaim {
 /// fn require_clone<T: Clone>() {}
 /// require_clone::<DurableRestoreCandidate>();
 /// ```
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug)]
 pub struct DurableRestoreCandidate {
     pub sequence: u64,
-    pub bytes: Vec<u8>,
+    bytes: Vec<u8>,
     /// Single-owner lease authorizing this candidate's permission changes.
     /// Mirrors `sequence`; the backend validates the claim, never the bare id.
     pub claim: DurableRestoreClaim,
+    /// Keeps the backing-owned restore staging bytes charged until this
+    /// candidate is retired. The caller's own copies and codec allocations
+    /// remain the caller's responsibility.
+    _read_lease: Option<RestoreReadLease>,
 }
 
 impl DurableRestoreCandidate {
+    #[must_use]
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    #[cfg(feature = "spill-redb")]
+    pub(crate) fn from_redb(
+        sequence: u64,
+        bytes: Vec<u8>,
+        claim: DurableRestoreClaim,
+        lease: RestoreReadLease,
+    ) -> Self {
+        Self { sequence, bytes, claim, _read_lease: Some(lease) }
+    }
+
     /// Test-only candidate for in-crate fake targets.
     #[cfg(all(test, feature = "revocable_store"))]
     pub(crate) fn for_test(sequence: u64, bytes: Vec<u8>, claim: DurableRestoreClaim) -> Self {
-        Self { sequence, bytes, claim }
+        Self { sequence, bytes, claim, _read_lease: None }
+    }
+}
+
+impl PartialEq for DurableRestoreCandidate {
+    fn eq(&self, other: &Self) -> bool {
+        self.sequence == other.sequence && self.bytes == other.bytes && self.claim == other.claim
+    }
+}
+
+impl Eq for DurableRestoreCandidate {}
+
+/// Tracks only byte buffers allocated and retained by this backing. It cannot
+/// meter arbitrary caller copies or private codec scratch.
+#[derive(Debug)]
+pub(crate) struct RestoreReadLease {
+    used: Arc<AtomicU64>,
+    bytes: u64,
+}
+
+impl RestoreReadLease {
+    #[cfg(feature = "spill-redb")]
+    pub(crate) fn acquire(used: Arc<AtomicU64>, bytes: u64, max: u64) -> MemoryResult<Self> {
+        let mut current = used.load(Ordering::Acquire);
+        loop {
+            let next = current
+                .checked_add(bytes)
+                .ok_or_else(|| MemoryError::capacity("redb restore staging bytes exceed u64"))?;
+            if next > max {
+                return Err(MemoryError::capacity(format!(
+                    "redb restore staging requires {next} bytes, above configured {max}-byte in-flight limit"
+                )));
+            }
+            match used.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => return Ok(Self { used, bytes }),
+                Err(observed) => current = observed,
+            }
+        }
+    }
+}
+
+impl Drop for RestoreReadLease {
+    fn drop(&mut self) {
+        let prior = self.used.fetch_sub(self.bytes, Ordering::AcqRel);
+        debug_assert!(prior >= self.bytes, "restore staging lease underflow");
     }
 }
 

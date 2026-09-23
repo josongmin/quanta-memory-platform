@@ -81,12 +81,22 @@ impl RetainedCostV1 {
     }
 }
 
-/// A value that can report the number of bytes it will charge when retained.
+/// A value that reports its semantic byte charge when retained.
+///
+/// The returned number is captured at admission; stores do not poll it or
+/// automatically adjust a live charge. Implementations for values with
+/// interior-mutability/shared backing must either report a conservative upper
+/// bound for every state reachable while retained, or require callers to use an
+/// explicit recharge/replacement operation when retained cost changes. This is
+/// a caller contract, not a physical allocation or RSS measurement.
 ///
 /// Blanket impls cover the common portable byte carriers. Callers with a custom
 /// payload type implement this once and every facade store charges it correctly.
 pub trait ByteSized {
-    /// Number of bytes this value charges against a store's accounting axis.
+    /// Number of semantic bytes to charge at admission.
+    ///
+    /// Keep this estimate valid until release, or conservatively bound
+    /// subsequent interior-mutable states as described on [`ByteSized`].
     fn byte_size(&self) -> u64;
 }
 

@@ -11,8 +11,10 @@
 //! storage device mid-sector-write, so power-loss durability stays
 //! `UNVERIFIED` in the FUP-006 receipt.
 //!
-//! Every test drives recovery through the public
-//! [`ReconciledDurableSpillTarget`] / [`DurableRestoreTarget`] surface only.
+//! Backing-only cases drive recovery through the public
+//! [`ReconciledDurableSpillTarget`] / [`DurableRestoreTarget`] surface. The
+//! `revocable_store` case also drives the public platform/store builders and
+//! charged restore path.
 //! The exercised interruption boundaries are explicit:
 //!
 //! - after committed records plus a persisted restore claim;
@@ -38,13 +40,26 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, OnceLock};
 use std::time::Duration;
 
+#[cfg(feature = "revocable_store")]
+use quanta_memory_platform_core::{MemoryClass, MemoryPreset, StoreBindingHandle};
 use quanta_memory_platform_facade::spill::backings::redb::RedbSpillBacking;
 use quanta_memory_platform_facade::spill::service::{
     DurableRestoreTarget, ReconciledDurableSpillTarget,
 };
 use quanta_memory_platform_facade::spill::{DurableRecordId, DurableRecordResolution};
+#[cfg(feature = "revocable_store")]
+use quanta_memory_platform_facade::{
+    DurableRestoreOutcome, MemoryPlatformBuilder, RevocableStore, RoutedSpillController,
+};
 
 static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(feature = "revocable_store")]
+fn expected_payload(index: u64) -> Vec<u8> {
+    let mut bytes = vec![0xA5u8; 32];
+    bytes[..8].copy_from_slice(&index.to_le_bytes());
+    bytes
+}
 
 /// Unique scratch database path removed on drop, even on assertion failure.
 struct ScratchDb {
@@ -99,7 +114,7 @@ fn crash_child_binary() -> PathBuf {
                 .arg("-p")
                 .arg("quanta-memory-platform-facade")
                 .arg("--features")
-                .arg("spill-redb")
+                .arg("spill-redb,revocable_store")
                 .arg("--example")
                 .arg("spill_redb_crash_child")
                 .current_dir(&workspace_root)
@@ -202,7 +217,7 @@ fn drain_all(backing: &RedbSpillBacking) -> Vec<(u64, u64)> {
     let mut drained = Vec::new();
     while let Some(candidate) = backing.prepare_restore().expect("prepare") {
         let sequence = candidate.sequence;
-        let bytes = candidate.bytes.clone();
+        let bytes = candidate.bytes().to_vec();
         backing.commit_restore(&candidate.claim).expect("commit converges after kill");
         backing.finalize_restore(&candidate.claim).expect("finalize");
         assert_eq!(bytes.len(), 32, "no torn payload survives a kill");
@@ -324,4 +339,48 @@ fn sep23_fup006_reserved_hole_stays_absent_across_sigkill() {
     let drained = drain_all(&backing);
     assert_eq!(drained, vec![(0, 0), (1, 1)], "only committed records drain");
     assert_eq!(backing.retained_count().expect("count"), 0, "exact drain");
+}
+
+#[cfg(feature = "revocable_store")]
+#[test]
+fn durable_spill_store_charge_and_record_survive_process_boundary() {
+    let db = ScratchDb::new("store-spilled");
+    let (mut child, lines) = spawn_until_ready(&db.path, &["store-spilled"]);
+    assert!(lines.iter().any(|line| line == "CHARGE 0"));
+    sigkill_child(&mut child);
+
+    let platform = MemoryPlatformBuilder::new()
+        .with_preset(MemoryPreset::Development)
+        .build()
+        .expect("survivor platform");
+    let store = platform
+        .revocable_store_builder::<String, Vec<u8>>()
+        .bind(StoreBindingHandle::new(
+            MemoryClass::ArtifactCache,
+            "durability-spill-survivor".to_string(),
+            None,
+        ))
+        .build()
+        .expect("survivor store");
+    let controller =
+        RoutedSpillController::new(RedbSpillBacking::create(&db.path).expect("cold reopen"));
+    let decode = |bytes: &[u8]| {
+        assert_eq!(bytes, expected_payload(0), "committed payload survives whole");
+        Ok(("k0".to_string(), bytes.to_vec()))
+    };
+    assert!(matches!(
+        store.restore_one_durable(&controller, decode).expect("restore committed record"),
+        DurableRestoreOutcome::Restored { sequence: 0 }
+    ));
+    assert!(platform.broker().ledger_snapshot().expect("resident ledger").total_owner_bytes() > 0);
+    assert_eq!(
+        store.reclaim_one().expect("read restored"),
+        Some(("k0".to_string(), expected_payload(0)))
+    );
+    assert!(matches!(
+        store.restore_one_durable(&controller, decode).expect("second restore"),
+        DurableRestoreOutcome::Empty
+    ));
+    assert_eq!(controller.spilled_count(), Ok(0));
+    assert_eq!(platform.broker().ledger_snapshot().expect("drained").total_owner_bytes(), 0);
 }

@@ -23,6 +23,16 @@
   count and identifier-byte caps prevent zero-byte metadata growth, and
   deferred cleanup now uses bounded batches with no-progress failures surfaced
   while preserving exact ticket authority.
+- Bounded callback recursion: same-broker reserve reentry from a reclaimer now
+  returns `OperationInProgress`; only one reclaimer callback runs concurrently
+  per broker. Event-sink callbacks are single-flight across threads; recursive
+  or concurrent advisory events during an active callback are dropped, not
+  queued.
+- Read-side facade callbacks that must clone or compare caller-owned values
+  now release the store mutex before propagating a panic. This preserves the
+  caller-visible panic while preventing an otherwise intact store from becoming
+  permanently unavailable due only to mutex poisoning; callback execution time
+  remains caller-controlled.
 
 ## Unreleased - 2026-09-22
 

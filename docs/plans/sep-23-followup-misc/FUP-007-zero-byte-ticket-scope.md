@@ -116,3 +116,14 @@ documented survivor; deferred-drain preservation mutants D1/D2/D3 RED
 Not run: B07/J06 exhaustion (out of scope, stays OPEN).
 
 Known risk: none open in this ticket's scope.
+
+### Post-edfef66 management-bound clarification
+
+Commit `edfef66` closes the zero-byte authority subcases that motivated this
+ticket: live reservation tickets have an independent count cap, owner/resource
+group identifiers have byte limits, and deferred ticket cleanup is processed in
+bounded batches. Those limits do not close the broader B07/J06 checklist rows.
+Policy-map cardinality, durable per-record replay evidence, and any other
+lifetime metadata family still need their own workload contract and admission
+or replay-horizon decision. Do not report the README's ticket/deferred bounds as
+proof that every metadata or backlog family is globally bounded.
