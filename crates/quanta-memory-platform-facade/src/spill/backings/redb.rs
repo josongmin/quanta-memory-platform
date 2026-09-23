@@ -1614,9 +1614,10 @@ impl DurableRestoreTarget for RedbSpillBacking {
                 }
                 Ok(())
             }
-            Err(error) => Err(DurableCommitFailure::ambiguous(MemoryError::report(format!(
-                "redb spill restore commit outcome is ambiguous: {error}"
-            )))),
+            Err(error) => Err(DurableCommitFailure::ambiguous(redb_storage_error(
+                "redb spill restore commit outcome is ambiguous",
+                error,
+            ))),
         }
     }
 
@@ -3397,8 +3398,17 @@ mod tests {
         let _receipt = backing.commit_spill(id, b"four").expect("commit");
         let candidate = backing.prepare_restore().expect("prepare").expect("candidate");
         armed.store(true, AtomicOrdering::SeqCst);
-        let _failure =
+        let failure =
             backing.commit_restore(&candidate.claim).expect_err("partial restore-commit I/O fault");
+        assert!(
+            matches!(
+                failure,
+                DurableCommitFailure::Retained(ref error)
+                    | DurableCommitFailure::Ambiguous(ref error)
+                    if matches!(**error, MemoryError::Capacity(_))
+            ),
+            "storage-full restore error must be typed capacity: {failure:?}"
+        );
         assert!(observed.load(AtomicOrdering::SeqCst));
         let attempted = attempted_bytes.load(AtomicOrdering::SeqCst);
         let written = written_bytes.load(AtomicOrdering::SeqCst);

@@ -30,18 +30,27 @@ source_before="$(source_digest)"
 echo "ENOSPC source_head=${source_head} source_digest=${source_before}"
 echo "ENOSPC mechanism=Linux tmpfs size=8MiB; no host-volume or power-loss claim"
 
-docker run --rm --network none \
-  --mount "type=bind,src=${repo_root},dst=/workspace,readonly" \
-  --mount "type=bind,src=${cargo_registry},dst=/usr/local/cargo/registry,readonly" \
-  --tmpfs /qmp-volume:rw,size=8m,mode=1777 \
-  -w /workspace \
-  -e QMP_ENOSPC_ISOLATED_TMPFS=1 \
-  -e RUSTUP_TOOLCHAIN=1.92.0 \
-  -e CARGO_TARGET_DIR=/tmp/qmp-linux-target \
-  rust:1.92-bookworm \
-  cargo run --offline --locked -p quanta-memory-platform-facade \
-    --features spill-redb --example spill_redb_enospc_volume -- \
-    /qmp-volume/spill.redb
+run_status=0
+for mode in spill restore finalize; do
+  echo "ENOSPC scenario=${mode}"
+  if docker run --rm --network none \
+    --mount "type=bind,src=${repo_root},dst=/workspace,readonly" \
+    --mount "type=bind,src=${cargo_registry},dst=/usr/local/cargo/registry,readonly" \
+    --tmpfs /qmp-volume:rw,size=8m,mode=1777 \
+    -w /workspace \
+    -e QMP_ENOSPC_ISOLATED_TMPFS=1 \
+    -e RUSTUP_TOOLCHAIN=1.92.0 \
+    -e CARGO_TARGET_DIR=/tmp/qmp-linux-target \
+    rust:1.92-bookworm \
+    cargo run --offline --locked -p quanta-memory-platform-facade \
+      --features spill-redb --example spill_redb_enospc_volume -- \
+      "/qmp-volume/${mode}.redb" "${mode}"; then
+    :
+  else
+    run_status=$?
+    break
+  fi
+done
 
 source_after="$(source_digest)"
 if [[ "${source_before}" != "${source_after}" || "${source_head}" != "$(git -C "${repo_root}" rev-parse HEAD)" ]]; then
@@ -49,3 +58,4 @@ if [[ "${source_before}" != "${source_after}" || "${source_head}" != "$(git -C "
   exit 2
 fi
 echo "ENOSPC source_stable=true"
+exit "${run_status}"
