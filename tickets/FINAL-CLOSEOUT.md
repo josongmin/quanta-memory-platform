@@ -1,6 +1,6 @@
 # Final Closeout SSOT
 
-Status: `OPEN: canonical and extraction dry-run pass at the prior candidate; two exact-source full benchmarks failed under concurrent host load; no current qualification tag exists`.
+Status: `Current local qualification is recorded only when a qmp-local-qualified-* annotated tag peels to HEAD; host adoption and deployment remain separate`.
 The bare `qmp-final-qualified` tag (`014eb65`) covers only its own source.
 The newest annotated `qmp-final-qualified-*` tag observed at the clean
 `db0b03c` audit base is `qmp-final-qualified-sep23-followup-v5`, targeting

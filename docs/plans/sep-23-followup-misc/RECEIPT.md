@@ -14,9 +14,11 @@ git show --no-patch --format=fuller qmp-final-qualified-sep23-followup-v5
 ```
 
 The v5 annotated tag exists and covers only its named Sep-23 source. The
-2026-09-24 pair below has no successor tag. Neither qualifies the current
-`db0b03c` audit base, which changed the scaling verifier after the pair run.
-Hosted CI, deployment, and activation are not claimed here.
+2026-09-24 pair below is historical and does not qualify the later `db0b03c`
+audit base, which changed the scaling verifier after the pair run. A later
+QMP-local qualification is recorded in the exact-target
+`qmp-local-qualified-*` tag; resolve it against HEAD before using it. Hosted
+CI, deployment, and activation are not claimed here.
 
 ## Source lineage
 
@@ -694,6 +696,23 @@ active on this shared Mac and observed load averages were approximately
 90–143. That concurrency could confound timing, but does not establish the
 cause; these results are neither a product regression finding nor a passing
 qualification. No benchmark threshold or implementation was changed, and no
-`qmp-local-qualified-*` tag was created. Requalification remains open pending
-a fresh full run on the final clean documentation candidate after competing
-builds stop. Host-pair, hosted CI, deployment and activation remain separate.
+`qmp-local-qualified-*` tag was created for these failed attempts. A later
+clean candidate passed the full benchmark and was qualified locally; the
+exact-target tag annotation is authoritative for its run identities and
+artifact hashes. These earlier failures remain historical and do not override
+a newer exact-head receipt. Host-pair, hosted CI, deployment and activation
+remain separate.
+
+### Subsequent exact-source local qualification (2026-09-24)
+
+The annotated tag `qmp-local-qualified-267cdc9` qualified source
+`267cdc9d2aaa4f383f59326ea3d0e2362de03a1e`, tree
+`f90ef97a1f8eb4ca8b081282ce0e5c20c3ca9271`. Its canonical workspace rail,
+extraction dry-run, and fresh full benchmark all passed on that exact source.
+The benchmark verifier accepted 220 samples; its raw artifact SHA-256 was
+`ce5be25d5766961f522aa4ca4fa1b50f3a991bd32baaa84e6f6dff2dbe69b558`, and the
+extraction manifest SHA-256 was
+`aa80f173577f8816b8249439396b0b8eecbcc24aa73e4be3ef391dd4bd752a40`.
+This tag proves local repository qualification for its target only. Any
+subsequent commit requires resolving a newer exact-target tag before claiming
+current qualification.

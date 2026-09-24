@@ -13,9 +13,10 @@
 - Two fresh full runs at `fdf34cf` emitted 220 rows but failed the revocable
   fill/drain growth verifier at 9.80x and 12.25x versus a 4.0x allowance while
   other Rust builds were active on the shared host. The artifacts and hashes
-  are recorded in the qualification receipt. Cause is unproven; no code or
-  threshold change follows from these runs, and current-source qualification
-  remains open pending an isolated retry.
+  are recorded in the qualification receipt. Cause was not established, and no
+  code or threshold change followed from those runs. A later exact-source full
+  benchmark passed; qualification status is determined by the tag that peels
+  to current HEAD.
 
 ## Unreleased - 2026-09-23
 
