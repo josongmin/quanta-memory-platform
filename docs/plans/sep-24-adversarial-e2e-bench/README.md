@@ -15,6 +15,26 @@ it must bind the fresh canonical rail, full benchmark, and extraction dry-run
 to one clean candidate. See the
 [plan status index](../README.md) and [FUP-006 receipt](../sep-23-followup-misc/RECEIPT.md).
 
+### Current-source full-run attempts (2026-09-24)
+
+Both attempts used clean source `fdf34cf057087226c64cea59966e152c8ed2a369`
+(tree `7cc3209ff9d7c12b27af8b2d609b87b993f81a85`) and emitted all 220 rows.
+The verifier rejected the `revocable_fill_and_drain` 1k→10k growth ratio:
+
+| Raw artifact | SHA-256 | Result |
+| --- | --- | --- |
+| `target/scaling-results/qmp-scaling.pCLPBs/results.jsonl` | `e16b7531020099db4fa24460fe487b5a977ff6f36f8568832ad2642afdefb0b3` | 9.80x; allowed 4.0x |
+| `target/scaling-results/qmp-scaling.tNisZk/results.jsonl` | `5ef094c22a29c82b67f020653236821e20d3386a41348fecb5bf6c448c0a39b3` | 12.25x; allowed 4.0x |
+
+Both run-end records report `source_clean=true` and unchanged HEAD/tree. During
+the attempts the shared host had concurrent RustRover analysis and Cargo/rustc
+builds; load averages were observed around 90–143. This is a plausible
+measurement confounder, not proof that host contention caused either failure
+or proof of a product regression. Preserve both artifacts; do not loosen the
+verifier threshold on this evidence. Rerun the full bench on the final clean
+candidate after competing builds stop. Until a fresh run passes alongside the
+canonical and extraction rails, no `qmp-local-qualified-*` tag is issued.
+
 The active plan excludes Redb-backed durable spill, its codec, and disk
 fault/recovery qualification. The 2026-09-24 candidate based on
 `b6d162650edba4f2b32e5020c8f0ac707efb0c22` produced historical QMP-only

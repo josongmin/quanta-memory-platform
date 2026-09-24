@@ -90,6 +90,7 @@ let config = MemoryConfig::builder()
             .hard(MemorySize::gib(4)?),
     )
     .owner(owner.clone(), OwnerPolicy::new().group(group))
+    .context_kind(ContextKindId::parse("app.request")?)
     .build()?;
 
 let platform = MemoryPlatform::builder(config).build()?;
@@ -131,6 +132,7 @@ let payloads = scope.payload_store::<ArtifactId, Vec<u8>>()
     .name("artifacts")?
     .owner(owner.clone())
     .class(class.clone())
+    .context(ContextKindId::parse("app.request")?)
     .build()?;
 ```
 
@@ -149,6 +151,14 @@ policy stays on that store's builder. A caller never attaches a broker, raw
 ticket, or accounting sink. Store handles have stable feature-specific names,
 not a generic store trait without a generic caller.
 
+Context kind is an attribution axis, not a quota or privilege. A scope defaults
+to the QMP-owned `ContextKindId::runtime()`; every store builder and custom
+consumer inherits it unless `.context(kind)` selects a declared host kind.
+A store that supports per-item context may override its builder default through
+typed item metadata; that override must be declared and is validated before
+admission. No store silently substitutes `Request`, `Session`, or another
+feature-specific kind. Runtime kind remains a separate optional diagnostic ID.
+
 The in-memory slices are payload, retained map, revocable store, transcript,
 and prepared publication.
 
@@ -158,7 +168,7 @@ and prepared publication.
 let consumer = scope.consumer("vector-index")?
     .owner(owner)
     .class(class.clone())
-    .context(MemoryContextKind::Request)
+    .context(ContextKindId::parse("app.request")?)
     .build()?;
 
 let max_size = MemorySize::mib(16)?;
@@ -188,8 +198,18 @@ scratch/temporary work and reserve measured retained cost before publication.
 QMP cannot infer the physical allocation size of arbitrary `T`.
 
 The committed `MemoryReservation` is non-cloneable and broker-bound.
-`try_release` and `try_resize` preserve caller-owned authority on failure;
-resize retains the current recharge API's explicit recovery-required outcome.
+On an ordinary `try_release` or `try_resize` error, the same reservation still
+owns the exact unchanged ticket and is usable for retry. An exceptional
+`RecoveryRequired` result is permitted only if the exact ticket remains in a
+non-usable, inspectable recovery state owned by the reservation; it must never
+mean an untracked or silently released charge. `try_recover()` restores the
+unchanged active ticket or leaves that recovery state unchanged on failure.
+Alternatively, the caller destroys the retained value and calls `try_release()`;
+a failed release still owns the exact ticket. `try_resize()` is unavailable in
+the recovery state. The broker must not automatically queue this live-value
+ticket for release. A call on an already released reservation is
+`InvalidState`, not `RecoveryRequired`; a missing old ticket is
+an invariant failure, not a normal capacity denial.
 `Drop` attempts bounded deferred cleanup but cannot return an error.
 Components must destroy retained data before or with its charge. Built-in
 stores enforce that lifecycle internally.
@@ -254,18 +274,35 @@ shared burst pool, pressure thresholds, class budgets, owner quotas,
 resource-group budgets, and owner/group bindings. Store options remain with
 their store. Validation checks `reserved <= soft <= hard`, global headroom
 and floor sums, checked arithmetic, referential integrity, feature
-availability, and bounded class/owner/group/mapping counts.
-Top-level registration methods add classes, owners, and resource groups;
-scalar budget fields live in their typed policies. `OwnerPolicy` owns an
+availability, and bounded class/owner/group/mapping/context-kind counts.
+Top-level registration methods add classes, owners, resource groups, and
+diagnostic context kinds; scalar budget fields live in their typed policies.
+`OwnerPolicy` owns an
 optional group binding and quota, avoiding separate `owner_group`,
-`owner_quota`, and future owner-setting methods. An owner with no policy
-entry remains valid under global/class limits but has no owner/group cap.
+`owner_quota`, and future owner-setting methods. By default an owner with no
+policy entry is rejected before reservation, including zero-byte reservation.
+`UnregisteredOwnerPolicy::GlobalOnly` is an explicit build-time opt-in for
+trusted integrations that intentionally admit arbitrary owners under only
+global/class limits; these owners receive no owner/group cap or fair-group
+share. It is never inferred from an empty owner map or a selected profile.
+Changing this mode requires a new platform, not a runtime patch. Owner IDs are
+attribution supplied by trusted host code, not an authentication boundary:
+QMP cannot prevent a caller from deliberately selecting another registered
+owner. Hosts must bind untrusted identities to owner IDs outside the SDK.
 
 Deployment and workload profiles are separate, explicitly versioned IDs.
 They provide portable defaults, never hidden admission exceptions or a
 machine-independent capacity. They cannot assign budgets to host classes
 unknown to QMP. A changed default gets a new profile ID. Host-specific
 profiles are host code that builds ordinary `MemoryConfig` values.
+The two profile axes have no implicit ordering: if both supply the same
+canonical policy leaf, `resolve` rejects the collision even when values are
+equal, unless the explicit baseline sets that leaf and therefore resolves it.
+An explicit baseline leaf overrides either profile default; omitted leaves
+inherit nonconflicting defaults. Map entries are compared by typed ID and leaf
+path, not insertion order. This composition rule and each profile's leaf set
+are versioned with its ID. A profile cannot set capacity, owner-registration
+mode, or host-defined class/owner/context registrations.
 
 QMP defines two construction layers—versioned profile defaults and the
 explicit typed baseline—and one runtime override overlay.
@@ -291,12 +328,19 @@ file watching, and source-precedence logic are not part of 0.3.
 
 ### IDs and privileged roles
 
-`MemoryClassId`, `OwnerId`, `ResourceGroupId`, `RuntimeId`,
+`MemoryClassId`, `OwnerId`, `ResourceGroupId`, `ContextKindId`, `RuntimeId`,
 `RuntimeKindId`, and `ConsumerName` have private fields, bounded UTF-8
 grammar, and fallible `parse`. Class IDs are extensible host taxonomy, but
 a class must be declared in validated policy before admission. QMP-owned IDs
 are limited to semantics QMP actually implements; the `qmp.` namespace is
 reserved.
+Host context kinds are declared at build time and capped in number; unknown
+kinds are rejected before a ticket is created. The QMP-owned runtime kind is
+always available, cannot be removed, and has no admission privilege. Context
+usage is aggregated by kind, not arbitrary per-request IDs, so dynamic request
+IDs do not become unbounded ledger or metric keys. The closed 0.2
+`MemoryContextKind` enum is replaced by this diagnostic taxonomy; migration
+must preserve the meaning of existing store charges explicitly.
 
 The existing `MemoryClass::Headroom` is a privileged admission role, not
 an ordinary class string. Migration must keep that role non-forgeable and
@@ -347,7 +391,8 @@ slices, and Redb remains opt-in/out of this release target.
 No promise of zero breaking changes is made for pre-1.0. Instead, changes to
 identifier grammar, profile defaults, serialized document shape, or feature
 defaults require explicit versioning/migration. `ConfigFingerprint` identifies
-the effective policy, excluding source/provenance and telemetry. It requires a
+the effective policy plus build-only admission mode and declared context kinds,
+excluding source/provenance and telemetry. It requires a
 versioned canonical encoding and golden vectors before release;
 cross-version comparability is not implied.
 
@@ -374,8 +419,12 @@ observation, and reconfiguration. Negative compile tests
 reject raw authority construction, unset builders, disabled features, and
 forged headroom. Behavioral tests prove pending rollback, measured-commit
 surplus/over-bound/zero-byte behavior, authority conservation across
-release/resize/transfer failures, unique owner→group attribution, overlay
-`Clear`, live-remap rejection, stale/no-op reconfiguration, coherent
+release/resize/transfer failures, default rejection of undeclared owners
+(including zero-byte tickets), explicit global-only opt-in, unique owner→group
+attribution, profile collision rejection independent of insertion order,
+baseline resolution of profile collisions, context default/override and
+unknown-kind rejection, overlay `Clear`, live-remap rejection, stale/no-op
+reconfiguration, coherent
 semantic snapshots, advisory telemetry separation, and a conformance fake
 that is deliberately rejected.
 The two construction paths must produce identical effective fingerprints
@@ -386,7 +435,10 @@ Add fault-injection coverage for deferred cleanup failure: exact ticket
 authority remains retained, the backlog/error is publicly observable, bounded
 retry can finish, and shutdown cannot report a false zero. Prove that an
 independent host can use its own runtime-kind ID without mandatory
-host-specific enum variants.
+host-specific enum variants. For resize/release faults, distinguish ordinary
+unchanged-and-retryable failure from `RecoveryRequired`: assert exact ticket
+ownership, prohibit mutation of a non-usable recovery state, and prohibit
+automatic release while its retained value remains live.
 
 On a committed clean candidate, run `python3 tools/pm/pm.py sync`,
 `scripts/check-workspace.sh`, strict rustdoc, public API baseline, and the

@@ -666,3 +666,34 @@ claiming current local qualification. Host QBC, hosted CI, deploy and
 activation remain separate. This document describes the receipt contract;
 the tag annotation carries each run's source identity, command, exit, counts
 and artifact hashes.
+
+### Post-reconciliation qualification attempts (2026-09-24)
+
+The documentation/RFC candidate was committed as
+`fdf34cf057087226c64cea59966e152c8ed2a369` (tree
+`7cc3209ff9d7c12b27af8b2d609b87b993f81a85`). The canonical
+`scripts/check-workspace.sh` rail passed with exit 0 (`check-workspace: clean`),
+including PM lint, all-feature tests, feature matrix, cargo-deny and documented
+selector validation. Extraction preflight
+`scripts/extract-to-standalone-repo.sh --dry-run /tmp/qmp-extract-preflight.dUwJDz`
+passed with exit 0; the extracted manifest SHA-256 was
+`1d6b1c4898eed42a4048c5fe8639ebd9a6ba8193029f192aa9414286aa869283`.
+This is a dry run, not a standalone extracted build.
+
+Two fresh full benchmark attempts at that same clean source each emitted 220
+rows but failed the verifier's 4.0x `revocable_fill_and_drain` growth limit:
+
+| Raw artifact | SHA-256 | Verifier result |
+| --- | --- | --- |
+| `target/scaling-results/qmp-scaling.pCLPBs/results.jsonl` | `e16b7531020099db4fa24460fe487b5a977ff6f36f8568832ad2642afdefb0b3` | 9.80x from 1k to 10k entries; maximum 4.0x |
+| `target/scaling-results/qmp-scaling.tNisZk/results.jsonl` | `5ef094c22a29c82b67f020653236821e20d3386a41348fecb5bf6c448c0a39b3` | 12.25x from 1k to 10k entries; maximum 4.0x |
+
+Both run-end records state `source_clean=true` with unchanged HEAD/tree. At the
+time, unrelated Quanta-index/Semantica Rust builds and RustRover analysis were
+active on this shared Mac and observed load averages were approximately
+90–143. That concurrency could confound timing, but does not establish the
+cause; these results are neither a product regression finding nor a passing
+qualification. No benchmark threshold or implementation was changed, and no
+`qmp-local-qualified-*` tag was created. Requalification remains open pending
+a fresh full run on the final clean documentation candidate after competing
+builds stop. Host-pair, hosted CI, deployment and activation remain separate.

@@ -1,6 +1,6 @@
 # Final Closeout SSOT
 
-Status: `HISTORICAL FINAL TAGS; LOCAL SOURCE QUALIFICATION IS DEFINED BY AN EXACT-HEAD qmp-local-qualified-* TAG`.
+Status: `OPEN: canonical and extraction dry-run pass at the prior candidate; two exact-source full benchmarks failed under concurrent host load; no current qualification tag exists`.
 The bare `qmp-final-qualified` tag (`014eb65`) covers only its own source.
 The newest annotated `qmp-final-qualified-*` tag observed at the clean
 `db0b03c` audit base is `qmp-final-qualified-sep23-followup-v5`, targeting

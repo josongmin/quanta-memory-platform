@@ -10,6 +10,12 @@
   candidate. The current status is recorded in the annotated
   `qmp-local-qualified-*` tag only after canonical, full benchmark, and
   extraction dry-run gates pass.
+- Two fresh full runs at `fdf34cf` emitted 220 rows but failed the revocable
+  fill/drain growth verifier at 9.80x and 12.25x versus a 4.0x allowance while
+  other Rust builds were active on the shared host. The artifacts and hashes
+  are recorded in the qualification receipt. Cause is unproven; no code or
+  threshold change follows from these runs, and current-source qualification
+  remains open pending an isolated retry.
 
 ## Unreleased - 2026-09-23
 
