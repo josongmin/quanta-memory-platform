@@ -57,6 +57,28 @@ Correctness is managed as **tests**; benchmarks answer a different question
   per-operation p95 across repetitions (maximum 4×). Wall elapsed and throughput
   remain reported and baseline-comparable, but are not used for that complexity
   gate because host scheduling gaps between calls are not store-operation cost.
+  The historical standard profile remains 48 smoke / 220 full rows. The
+  opt-in `--profile=in-memory-pressure` profile uses the in-memory `full`
+  feature set (no Redb) and requires 9 smoke / 40 full rows: one-byte
+  cap denial→refund→readmission with separate admitted/denied tails, plus
+  two charged stores writing through one broker at 1/8/32 threads. The
+  pressure-cycle wall throughput includes the untimed refund between measured
+  admission calls; it is not a pure reserve-only throughput figure.
+
+  Ordinary JSONL validation proves measurement shape and absolute guards, not
+  an approved performance SLO. For a release performance comparison, collect
+  **three independent full-process receipts per baseline and candidate** using
+  `scripts/run-scaling-bench.sh --profile=in-memory-pressure` (or the unchanged
+  standard profile), then invoke `scripts/verify-scaling-results.py --release`
+  with three `--baseline` and three `--input` paths. Supply every
+  `--release-*` limit explicitly from the consumer's approved policy. The
+  verifier rejects mixed source/toolchain/feature/machine runs, missing or
+  reused run IDs, incomplete rows, accounting drift, and threshold violations.
+  Recorded per-CPU host load or cross-process timing spread above policy yields
+  exit 2 (`INCONCLUSIVE`), never GREEN. Exit 1 is invalid evidence or a
+  measured regression; exit 0 covers only the selected local performance
+  profile, not host activation or correctness E2E. Daily correctness remains
+  owner-local/E2E; the release benchmark is a separate clean-source rail.
 
 ---
 

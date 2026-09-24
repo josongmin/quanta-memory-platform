@@ -11,8 +11,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use quanta_memory_platform_core::{
-    ChargeKind, ManagedCharge, MemoryClass, MemoryContextKind, MemoryError, ReclaimPriority,
-    ResourceGroup, ResourceGroupScheduler, RetainedEnvelope, StoreBindingHandle,
+    ChargeKind, ExecutionBudget, ManagedCharge, MemoryBudgetManifest, MemoryClass,
+    MemoryClassBudget, MemoryContextKind, MemoryError, MemoryPreset, ReclaimPriority,
+    ResidencyPolicy, ResourceGroup, ResourceGroupScheduler, RetainedEnvelope, StoreBindingHandle,
     WeightedResourceGroupScheduler,
 };
 use quanta_memory_platform_facade::{
@@ -112,6 +113,13 @@ struct Options {
     sizes: Vec<usize>,
     threads: Vec<usize>,
     repetitions: usize,
+    profile: BenchProfile,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BenchProfile {
+    Standard,
+    InMemoryPressure,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -188,23 +196,44 @@ impl OperationCounts {
 }
 
 fn options() -> Options {
-    let mut options =
-        Options { sizes: vec![1_000, 10_000], threads: vec![1, 2, 8, 32], repetitions: 5 };
+    let mut profile = BenchProfile::Standard;
+    let mut smoke = false;
+    let mut sizes = None;
+    let mut threads = None;
+    let mut repetitions = None;
     for argument in std::env::args().skip(1) {
-        if argument == "--smoke" {
-            options.sizes = vec![1_000];
-            options.threads = vec![1, 2];
-            options.repetitions = 3;
+        if argument == "--bench" {
+            // Cargo passes this to harness=false bench targets.
+            continue;
+        } else if argument == "--smoke" {
+            smoke = true;
         } else if let Some(raw) = argument.strip_prefix("--sizes=") {
-            options.sizes = parse_usize_list(raw, "--sizes");
+            sizes = Some(parse_usize_list(raw, "--sizes"));
         } else if let Some(raw) = argument.strip_prefix("--threads=") {
-            options.threads = parse_usize_list(raw, "--threads");
-            assert!(options.threads.iter().all(|threads| *threads > 0), "threads must be > 0");
+            threads = Some(parse_usize_list(raw, "--threads"));
         } else if let Some(raw) = argument.strip_prefix("--repetitions=") {
-            options.repetitions = raw.parse().expect("--repetitions must be a usize");
-            assert!(options.repetitions >= 3, "at least three repetitions are required");
+            repetitions = Some(raw.parse().expect("--repetitions must be a usize"));
+        } else if argument == "--profile=in-memory-pressure" {
+            profile = BenchProfile::InMemoryPressure;
+        } else {
+            panic!("unknown benchmark argument {argument}");
         }
     }
+    let default_threads = match (profile, smoke) {
+        (BenchProfile::Standard, false) => vec![1, 2, 8, 32],
+        (BenchProfile::Standard, true) => vec![1, 2],
+        (BenchProfile::InMemoryPressure, false) => vec![1, 8, 32],
+        (BenchProfile::InMemoryPressure, true) => vec![1, 8],
+    };
+    let options = Options {
+        sizes: sizes.unwrap_or_else(|| if smoke { vec![1_000] } else { vec![1_000, 10_000] }),
+        threads: threads.unwrap_or(default_threads),
+        repetitions: repetitions.unwrap_or(if smoke { 3 } else { 5 }),
+        profile,
+    };
+    assert!(options.sizes.iter().all(|entries| *entries > 0), "entries must be > 0");
+    assert!(options.threads.iter().all(|threads| *threads > 0), "threads must be > 0");
+    assert!(options.repetitions >= 3, "at least three repetitions are required");
     options
 }
 
@@ -355,6 +384,19 @@ fn main() {
     let options = options();
     warm_up_process_runtime();
     let allocations = &ALLOCATION_COUNTERS;
+    if options.profile == BenchProfile::InMemoryPressure {
+        for entries in options.sizes {
+            for repetition in 0..options.repetitions {
+                broker_pressure_cycle(entries, repetition, allocations);
+            }
+            for threads in &options.threads {
+                for repetition in 0..options.repetitions {
+                    dual_store_write_contention(entries, *threads, repetition, allocations);
+                }
+            }
+        }
+        return;
+    }
     for entries in options.sizes {
         for repetition in 0..options.repetitions {
             payload_unique_fill_and_dedup_put(entries, repetition, allocations);
@@ -413,6 +455,238 @@ fn new_platform() -> quanta_memory_platform_facade::LiveMemoryPlatform {
         .with_manifest(PortableMemoryPresets::production())
         .build()
         .expect("production platform")
+}
+
+/// One live byte exactly fills the global/class cap. Each iteration measures
+/// one typed denial and one admission after an untimed refund; wall throughput
+/// includes the refund needed to make the next admission possible.
+fn broker_pressure_cycle(entries: usize, repetition: usize, allocations: &AllocationCounters) {
+    let class_budget = MemoryClassBudget {
+        reserved_bytes: 0,
+        soft_cap_bytes: 1,
+        hard_cap_bytes: 1,
+        borrow_from_shared_pool: false,
+        reclaim_priority: ReclaimPriority::Normal,
+    };
+    begin_allocation_epoch(allocations);
+    let manifest = MemoryBudgetManifest::new(
+        MemoryPreset::Production,
+        ExecutionBudget::default(),
+        ResidencyPolicy::new(1).with_class_budget(MemoryClass::ArtifactCache, class_budget),
+    );
+    let platform =
+        MemoryPlatformBuilder::new().with_manifest(manifest).build().expect("pressure platform");
+    let broker = platform.broker();
+    let owner = "bench:pressure".to_string();
+    let mut charge = broker
+        .reserve_managed_charge(
+            MemoryClass::ArtifactCache,
+            owner.clone(),
+            MemoryContextKind::Request,
+            ChargeKind::RetainedPayload,
+            1,
+        )
+        .expect("prefill cap");
+    let mut latencies = Vec::with_capacity(entries.checked_mul(2).expect("operation count"));
+    let mut admitted = Vec::with_capacity(entries);
+    let mut denied = Vec::with_capacity(entries);
+    let started = Instant::now();
+    for _ in 0..entries {
+        let operation = Instant::now();
+        assert!(matches!(
+            broker.reserve_managed_charge(
+                MemoryClass::ArtifactCache,
+                owner.clone(),
+                MemoryContextKind::Request,
+                ChargeKind::RetainedPayload,
+                1,
+            ),
+            Err(MemoryError::Capacity(_))
+        ));
+        let elapsed = operation.elapsed().as_nanos() as u64;
+        latencies.push(elapsed);
+        denied.push(elapsed);
+
+        charge.release().expect("refund one-byte authority");
+        let operation = Instant::now();
+        charge = broker
+            .reserve_managed_charge(
+                MemoryClass::ArtifactCache,
+                owner.clone(),
+                MemoryContextKind::Request,
+                ChargeKind::RetainedPayload,
+                1,
+            )
+            .expect("readmit after refund");
+        let elapsed = operation.elapsed().as_nanos() as u64;
+        latencies.push(elapsed);
+        admitted.push(elapsed);
+    }
+    let elapsed = started.elapsed();
+    let snapshot = broker.ledger_snapshot().expect("pressure peak snapshot");
+    assert_eq!(snapshot.total_owner_bytes(), 1);
+    assert_eq!(snapshot.live_ticket_count, 1);
+    drop(snapshot);
+    charge.release().expect("final pressure refund");
+    drop(charge);
+    let after = broker.ledger_snapshot().expect("pressure final snapshot");
+    assert_eq!(after.live_ticket_count, 0);
+    let semantic_after = after.total_owner_bytes();
+    drop(after);
+    drop(owner);
+    drop(platform);
+    let latency = summarize_latencies(latencies);
+    let outcome_latencies = (summarize_latencies(admitted), summarize_latencies(denied));
+    let allocation = end_allocation_epoch(allocations);
+    emit(
+        "broker_pressure_cycle",
+        "single-thread",
+        entries,
+        1,
+        repetition,
+        elapsed,
+        latency,
+        1,
+        semantic_after,
+        allocation,
+        OperationCounts {
+            successful: entries,
+            denied: entries,
+            outcome_latencies: Some(outcome_latencies),
+        },
+        0,
+    );
+}
+
+/// Two different charged stores publish through one broker. This isolates the
+/// cross-store accounting lock from single-store payload contention without
+/// pretending that a synthetic write mix is a host workload.
+fn dual_store_write_contention(
+    entries: usize,
+    threads: usize,
+    repetition: usize,
+    allocations: &AllocationCounters,
+) {
+    begin_allocation_epoch(allocations);
+    let platform = new_platform();
+    let map = Arc::new(
+        platform
+            .retained_map_store_builder::<String, Vec<u8>>()
+            .bind(StoreBindingHandle::new(
+                MemoryClass::MemoResidency,
+                "bench:dual-map".into(),
+                None,
+            ))
+            .build(),
+    );
+    let payload = Arc::new(
+        platform
+            .payload_store_builder::<String, Vec<u8>>()
+            .bind(StoreBindingHandle::new(
+                MemoryClass::ArtifactCache,
+                "bench:dual-payload".into(),
+                None,
+            ))
+            .build()
+            .expect("dual-store payload"),
+    );
+    let barrier = Arc::new(Barrier::new(threads + 1));
+    let mut handles = Vec::with_capacity(threads);
+    for thread_id in 0..threads {
+        let map = Arc::clone(&map);
+        let payload = Arc::clone(&payload);
+        let barrier = Arc::clone(&barrier);
+        let count = entries / threads + usize::from(thread_id < entries % threads);
+        handles.push(thread::spawn(move || {
+            let mut latencies = Vec::with_capacity(count);
+            let mut busy_retries = 0u64;
+            barrier.wait();
+            for operation_id in 0..count {
+                if operation_id % 2 == 0 {
+                    let key = format!("key-{thread_id}-{operation_id}");
+                    let value = vec![0; 8];
+                    let operation = Instant::now();
+                    loop {
+                        match map.insert_checked(key.clone(), value.clone()) {
+                            Ok(()) => break,
+                            Err(MemoryError::OperationInProgress(_)) => {
+                                busy_retries = busy_retries.checked_add(1).expect("retry count");
+                                thread::yield_now();
+                            }
+                            Err(error) => panic!("dual-store map write: {error}"),
+                        }
+                    }
+                    latencies.push(operation.elapsed().as_nanos() as u64);
+                } else {
+                    let unique = ((thread_id as u64) << 32) | (operation_id as u64 + 1);
+                    let payload_bytes = unique.to_be_bytes().to_vec();
+                    let operation = Instant::now();
+                    loop {
+                        match payload.put_canonical(RetainedEnvelope::new(payload_bytes.clone())) {
+                            Ok(published) => {
+                                black_box(published);
+                                break;
+                            }
+                            Err(MemoryError::OperationInProgress(_)) => {
+                                busy_retries = busy_retries.checked_add(1).expect("retry count");
+                                thread::yield_now();
+                            }
+                            Err(error) => panic!("dual-store payload write: {error}"),
+                        }
+                    }
+                    latencies.push(operation.elapsed().as_nanos() as u64);
+                }
+            }
+            WorkerSample { latencies, busy_retries }
+        }));
+    }
+    let started = Instant::now();
+    barrier.wait();
+    let mut latencies = Vec::with_capacity(entries);
+    let mut busy_retries = 0u64;
+    for handle in handles {
+        let worker = handle.join().expect("dual-store worker");
+        latencies.extend(worker.latencies);
+        busy_retries = busy_retries.checked_add(worker.busy_retries).expect("retry count");
+    }
+    let elapsed = started.elapsed();
+    assert_eq!(latencies.len(), entries);
+    let map_items: usize = (0..threads)
+        .map(|thread_id| {
+            let count = entries / threads + usize::from(thread_id < entries % threads);
+            count.div_ceil(2)
+        })
+        .sum();
+    assert_eq!(map.stats_checked().expect("dual map stats").item_count, map_items);
+    assert_eq!(payload.stats().expect("dual payload stats").item_count, entries - map_items);
+    let semantic_peak =
+        platform.broker().ledger_snapshot().expect("dual peak ledger").total_owner_bytes();
+    assert!(semantic_peak > 0);
+    map.close().expect("close dual map");
+    payload.close().expect("close dual payload");
+    drop(map);
+    drop(payload);
+    drop(barrier);
+    let after = platform.broker().ledger_snapshot().expect("dual final ledger");
+    assert_eq!(after.live_ticket_count, 0);
+    let semantic_after = after.total_owner_bytes();
+    drop(platform);
+    let latency = summarize_latencies(latencies);
+    let allocation = end_allocation_epoch(allocations);
+    emit(
+        "dual_store_write_contention",
+        "shared-broker",
+        entries,
+        threads,
+        repetition,
+        elapsed,
+        latency,
+        semantic_peak,
+        semantic_after,
+        allocation,
+        OperationCounts::all_successful(entries),
+        busy_retries,
+    );
 }
 
 fn payload_unique_fill_and_dedup_put(

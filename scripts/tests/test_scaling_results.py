@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import copy
+import contextlib
+import io
 import importlib.util
+import unittest.mock
 import tempfile
 import unittest
 from pathlib import Path
@@ -29,8 +32,11 @@ def sample(
 ) -> dict[str, object]:
     timed = entries * (2 if operation in {
         "revocable_fill_and_drain", "scheduler_admission_group_cardinality",
+        "broker_pressure_cycle",
     } else 1)
-    successful = entries if operation == "scheduler_admission_group_cardinality" else timed
+    successful = entries if operation in {
+        "scheduler_admission_group_cardinality", "broker_pressure_cycle",
+    } else timed
     result = {
         "schema": MODULE.SAMPLE_SCHEMA,
         "operation": operation,
@@ -55,7 +61,7 @@ def sample(
         "allocator_underflowed": False,
         "busy_retries": 0,
     }
-    if operation == "scheduler_admission_group_cardinality":
+    if operation in {"scheduler_admission_group_cardinality", "broker_pressure_cycle"}:
         result.update({
             "admitted_p50_ns": 8, "admitted_p95_ns": 16, "admitted_p99_ns": 24,
             "denied_p50_ns": 12, "denied_p95_ns": 22, "denied_p99_ns": 32,
@@ -70,10 +76,14 @@ def valid_records(
     repetitions: int | None = None,
 ) -> list[dict[str, object]]:
     benchmark_args = list(benchmark_args or [])
+    pressure = "--profile=in-memory-pressure" in benchmark_args
     if sizes is None:
         sizes = (1_000,) if "--smoke" in benchmark_args else (1_000, 10_000)
     if threads is None:
-        threads = (1, 2) if "--smoke" in benchmark_args else (1, 2, 8, 32)
+        if pressure:
+            threads = (1, 8) if "--smoke" in benchmark_args else (1, 8, 32)
+        else:
+            threads = (1, 2) if "--smoke" in benchmark_args else (1, 2, 8, 32)
     if repetitions is None:
         repetitions = 3 if "--smoke" in benchmark_args else 5
     records: list[dict[str, object]] = [{
@@ -83,7 +93,7 @@ def valid_records(
         "rustc": "rustc test",
         "cargo": "cargo test",
         "machine": "test-machine",
-        "feature_set": "all-features",
+        "feature_set": "full" if pressure else "all-features",
         "feature_graph_sha256": "f" * 64,
         "dependency_lock_sha256": "e" * 64,
         "package": "quanta-memory-platform-facade",
@@ -92,6 +102,13 @@ def valid_records(
     }]
     for entries in sizes:
         for repetition in range(repetitions):
+            if pressure:
+                records.append(sample("broker_pressure_cycle", "single-thread", entries, 1, repetition))
+                records.extend(
+                    sample("dual_store_write_contention", "shared-broker", entries, worker_count, repetition)
+                    for worker_count in threads
+                )
+                continue
             records.extend(sample(operation, "single-thread", entries, 1, repetition) for operation in SINGLE)
             records.extend(
                 sample("retained_map_point_read", mode, entries, 1, repetition)
@@ -114,15 +131,181 @@ def valid_records(
     return records
 
 
+def release_receipts(
+    benchmark_args: list[str] | None = None,
+) -> tuple[list[list[dict[str, object]]], list[list[dict[str, object]]]]:
+    def group(prefix: str, sha: str) -> list[list[dict[str, object]]]:
+        runs = []
+        for index in range(3):
+            records = valid_records(benchmark_args)
+            records[0]["source_sha"] = records[-1]["source_sha"] = sha
+            records[0]["run_id"] = records[-1]["run_id"] = f"{prefix}-{index}"
+            records[0]["logical_cpus"] = 8
+            records[0]["load_per_cpu_start"] = 0.1
+            records[-1]["load_per_cpu_end"] = 0.1
+            runs.append(records)
+        return runs
+
+    return group("candidate", "c" * 40), group("baseline", "a" * 40)
+
+
+RELEASE_POLICY = MODULE.ReleasePolicy(
+    max_p99_ns=1_000_000_000,
+    max_throughput_regression_percent=10,
+    max_p99_regression_percent=20,
+    p99_noise_floor_ns=10,
+    max_busy_retries_per_operation=1,
+    max_run_noise_percent=20,
+    max_load_per_cpu=1,
+)
+
+
 class ScalingResultTests(unittest.TestCase):
     def test_complete_default_and_smoke_matrix(self) -> None:
         self.assertEqual(MODULE.validate(valid_records()), 220)
         self.assertEqual(MODULE.validate(valid_records(["--smoke"])), 48)
+        self.assertEqual(MODULE.validate(valid_records(["--profile=in-memory-pressure"])), 40)
+        self.assertEqual(
+            MODULE.validate(valid_records(["--profile=in-memory-pressure", "--smoke"])), 9,
+        )
+
+    def test_release_requires_independent_full_compatible_runs(self) -> None:
+        candidates, baselines = release_receipts()
+        self.assertEqual(MODULE.validate_release(candidates, baselines, RELEASE_POLICY), 220)
+        candidates[1][0]["run_id"] = candidates[1][-1]["run_id"] = "candidate-0"
+        with self.assertRaisesRegex(MODULE.ValidationError, "reused a run identity"):
+            MODULE.validate_release(candidates, baselines, RELEASE_POLICY)
+        candidates, baselines = release_receipts()
+        candidates[1][0]["source_sha"] = candidates[1][-1]["source_sha"] = "d" * 40
+        with self.assertRaisesRegex(MODULE.ValidationError, "candidate runs disagree on source_sha"):
+            MODULE.validate_release(candidates, baselines, RELEASE_POLICY)
+        with self.assertRaisesRegex(MODULE.ValidationError, "three candidate"):
+            MODULE.validate_release(candidates[:2], baselines, RELEASE_POLICY)
+
+    def test_release_rejects_real_regression_and_busy_storm(self) -> None:
+        candidates, baselines = release_receipts()
+        for records in candidates:
+            for row in records:
+                if row.get("operation") == "payload_unique_fill" and row.get("entries") == 1_000:
+                    row["elapsed_ns"] *= 2
+                    row["throughput_ops_per_sec"] = round(
+                        int(row["timed_operations"]) * 1_000_000_000 / int(row["elapsed_ns"])
+                    )
+        with self.assertRaisesRegex(MODULE.ValidationError, "release throughput regressed"):
+            MODULE.validate_release(candidates, baselines, RELEASE_POLICY)
+        candidates, baselines = release_receipts()
+        for records in candidates:
+            for row in records:
+                if row.get("operation") == "payload_unique_fill" and row.get("entries") == 1_000:
+                    row["p99_ns"] = 100
+        with self.assertRaisesRegex(MODULE.ValidationError, "release p99 regressed"):
+            MODULE.validate_release(candidates, baselines, RELEASE_POLICY)
+        candidates, baselines = release_receipts()
+        for records in candidates:
+            for row in records:
+                if row.get("operation") == "payload_contention" and row.get("mode") == "write-heavy":
+                    row["busy_retries"] = int(row["timed_operations"]) * 2
+        with self.assertRaisesRegex(MODULE.ValidationError, "Busy retries per operation exceeded"):
+            MODULE.validate_release(candidates, baselines, RELEASE_POLICY)
+
+    def test_release_classifies_noisy_or_loaded_host_as_inconclusive(self) -> None:
+        candidates, baselines = release_receipts()
+        for row in candidates[0]:
+            if row.get("operation") == "payload_unique_fill" and row.get("entries") == 1_000:
+                row["elapsed_ns"] *= 2
+                row["throughput_ops_per_sec"] = round(
+                    int(row["timed_operations"]) * 1_000_000_000 / int(row["elapsed_ns"])
+                )
+        with self.assertRaisesRegex(MODULE.InconclusiveError, "varies beyond run-noise"):
+            MODULE.validate_release(candidates, baselines, RELEASE_POLICY)
+        candidates, baselines = release_receipts()
+        candidates[0][0]["load_per_cpu_start"] = 2.0
+        with self.assertRaisesRegex(MODULE.InconclusiveError, "host load exceeded"):
+            MODULE.validate_release(candidates, baselines, RELEASE_POLICY)
+
+    def test_release_requires_explicit_policy_and_pressure_outcomes(self) -> None:
+        candidates, baselines = release_receipts(["--profile=in-memory-pressure"])
+        self.assertEqual(MODULE.validate_release(candidates, baselines, RELEASE_POLICY), 40)
+        del baselines[0][1]["denied_p99_ns"]
+        with self.assertRaisesRegex(MODULE.ValidationError, "incomplete admission outcome"):
+            MODULE.validate_release(candidates, baselines, RELEASE_POLICY)
+        with self.assertRaisesRegex(MODULE.ValidationError, "invalid release throughput regression"):
+            MODULE.validate_release(candidates, baselines, RELEASE_POLICY._replace(
+                max_throughput_regression_percent=90 + 10,
+            ))
+
+    def test_release_cli_does_not_default_unapproved_limits(self) -> None:
+        output = io.StringIO()
+        with unittest.mock.patch("sys.argv", ["verify-scaling-results.py", "--release", "--input", "missing.jsonl"]):
+            with contextlib.redirect_stderr(output):
+                self.assertEqual(MODULE.main(), 1)
+        self.assertIn("requires every explicit release limit", output.getvalue())
+
+    def test_release_cli_reports_green_and_inconclusive_distinctly(self) -> None:
+        candidates, baselines = release_receipts(["--profile=in-memory-pressure"])
+        paths = {
+            **{f"candidate-{index}.jsonl": records for index, records in enumerate(candidates)},
+            **{f"baseline-{index}.jsonl": records for index, records in enumerate(baselines)},
+        }
+        argv = ["verify-scaling-results.py", "--release"]
+        for index in range(3):
+            argv.extend(("--input", f"candidate-{index}.jsonl"))
+            argv.extend(("--baseline", f"baseline-{index}.jsonl"))
+        argv.extend((
+            "--release-max-p99-ns", "1000000000",
+            "--release-max-throughput-regression-percent", "10",
+            "--release-max-p99-regression-percent", "20",
+            "--release-p99-noise-floor-ns", "10",
+            "--release-max-busy-retries-per-operation", "1",
+            "--release-max-run-noise-percent", "20",
+            "--release-max-load-per-cpu", "1",
+        ))
+        with unittest.mock.patch("sys.argv", argv), unittest.mock.patch.object(
+            MODULE, "load_jsonl", side_effect=lambda path: paths[str(path)],
+        ):
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(MODULE.main(), 0)
+            candidates[0][0]["load_per_cpu_start"] = 2.0
+            output = io.StringIO()
+            with contextlib.redirect_stderr(output):
+                self.assertEqual(MODULE.main(), 2)
+            self.assertIn("INCONCLUSIVE", output.getvalue())
 
     def test_custom_args_matrix(self) -> None:
         args = ["--sizes=25,250", "--threads=1,4", "--repetitions=3"]
         records = valid_records(args, (25, 250), (1, 4), 3)
         self.assertEqual(MODULE.validate(records), 96)
+
+    def test_pressure_profile_is_independent_and_fail_closed(self) -> None:
+        args = ["--smoke", "--profile=in-memory-pressure"]
+        records = valid_records(args)
+        self.assertEqual(MODULE.validate(records), 9)
+        self.assertEqual(
+            MODULE.parse_benchmark_args(list(reversed(args))),
+            MODULE.parse_benchmark_args(args),
+        )
+        missing = copy.deepcopy(records)
+        missing.pop(2)
+        with self.assertRaisesRegex(MODULE.ValidationError, "matrix is incomplete"):
+            MODULE.validate(missing)
+        wrong_feature = copy.deepcopy(records)
+        wrong_feature[0]["feature_set"] = "all-features"
+        with self.assertRaisesRegex(MODULE.ValidationError, "requires feature_set full"):
+            MODULE.validate(wrong_feature)
+        wrong_outcome = copy.deepcopy(records)
+        pressure = next(
+            row for row in wrong_outcome if row.get("operation") == "broker_pressure_cycle"
+        )
+        pressure["denied_operations"] = 0
+        with self.assertRaisesRegex(MODULE.ValidationError, "counts disagree"):
+            MODULE.validate(wrong_outcome)
+        missing_split = copy.deepcopy(records)
+        pressure = next(
+            row for row in missing_split if row.get("operation") == "broker_pressure_cycle"
+        )
+        del pressure["denied_p99_ns"]
+        with self.assertRaisesRegex(MODULE.ValidationError, "incomplete admission outcome latency"):
+            MODULE.validate(missing_split)
 
     def test_default_metadata_with_smoke_only_rows_is_rejected(self) -> None:
         records = valid_records([], (1_000,), (1, 2), 3)
@@ -231,7 +414,7 @@ class ScalingResultTests(unittest.TestCase):
 
     def test_scheduler_outcome_latency_is_required_and_bounded(self) -> None:
         for field, value, message in (
-            ("denied_p99_ns", None, "incomplete scheduler outcome latency"),
+            ("denied_p99_ns", None, "incomplete admission outcome latency"),
             ("admitted_p95_ns", 25, "admitted latency distribution"),
             ("denied_p99_ns", 1_000_000_001, "denied latency distribution"),
             ("admitted_p50_ns", True, "must be an integer"),
@@ -258,7 +441,7 @@ class ScalingResultTests(unittest.TestCase):
                     for field in fields:
                         del record[field]
         self.assertEqual(MODULE.validate(current, baseline), 48)
-        with self.assertRaisesRegex(MODULE.ValidationError, "incomplete scheduler outcome latency"):
+        with self.assertRaisesRegex(MODULE.ValidationError, "incomplete admission outcome latency"):
             MODULE.validate(baseline)
 
     def test_mixed_baseline_outcome_generations_are_rejected(self) -> None:
@@ -270,7 +453,7 @@ class ScalingResultTests(unittest.TestCase):
         for fields in MODULE.OUTCOME_LATENCY_FIELDS.values():
             for field in fields:
                 del scheduler[field]
-        with self.assertRaisesRegex(MODULE.ValidationError, "mixed scheduler outcome latency generations"):
+        with self.assertRaisesRegex(MODULE.ValidationError, "mixed scheduler_admission_group_cardinality outcome latency generations"):
             MODULE.validate(valid_records(["--smoke"]), baseline)
 
     def test_outcome_specific_p99_regressions_are_rejected(self) -> None:
@@ -321,7 +504,11 @@ class ScalingResultTests(unittest.TestCase):
             with self.subTest(field=field):
                 baseline = valid_records(["--smoke"])
                 baseline[0][field] = "incompatible"
-                with self.assertRaisesRegex(MODULE.ValidationError, f"baseline incompatible {field}"):
+                message = (
+                    "requires feature_set all-features" if field == "feature_set"
+                    else f"baseline incompatible {field}"
+                )
+                with self.assertRaisesRegex(MODULE.ValidationError, message):
                     MODULE.validate(current, baseline)
         with self.assertRaisesRegex(MODULE.ValidationError, "baseline benchmark matrix differs"):
             MODULE.validate(current, valid_records())
