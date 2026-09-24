@@ -1,6 +1,7 @@
 # TO-07 — Exercise Reclaimer Wiring through the Builder-First API
 
 Status: `IMPLEMENTED; owner proof recorded; included in historical qmp-final-qualified-sep23-followup-v5 source; current HEAD qualification separate`
+The problem and edit plan below are a pre-implementation snapshot; the owner proof and v5 receipt govern the historical result.
 Priority: `P1`
 Depends on: none
 

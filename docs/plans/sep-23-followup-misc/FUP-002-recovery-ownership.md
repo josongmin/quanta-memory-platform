@@ -1,6 +1,8 @@
 # FUP-002 — Backend 범위의 single-owner recovery
 
 Status: `HISTORICAL VERIFIED — excluded from the current Redb-free product plan; owner-local GREEN + temporary-mutant RED, not an active FUP-006 gate`
+The problem and planned commands below describe the pre-fix `0284489` source;
+the actual post-fix proof is in the handoff and [receipt](RECEIPT.md).
 Priority: `historical P1; no current product priority`
 Owner: `Lane A`
 Depends on: `FUP-001`의 persisted state와 migration 계약
@@ -79,7 +81,7 @@ cargo test --locked -p quanta-memory-platform-facade --all-features durable_ -- 
 cargo test --locked -p quanta-memory-platform-facade --all-features --doc
 ```
 
-`sep23_fup002`는 예정 selector다. 구현 후 `--list`와 selected count를 확인한다.
+`sep23_fup002`는 원래 계획의 selector였다. 실제 selected count와 결과는 아래 handoff/receipt에 기록됐다.
 기존 단일 store drop/reopen GREEN은 동시 recovery의 음성 oracle를 대신하지 못한다.
 
 ## Handoff / stop 조건

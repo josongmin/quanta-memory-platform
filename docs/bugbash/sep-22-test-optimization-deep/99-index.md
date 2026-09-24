@@ -3,6 +3,9 @@
 Status: audit complete. This is a source-audit and prioritization record, not
 an implementation receipt. It does not authorize weakening an oracle, deleting
 a test before its keeper is strengthened, or claiming a runtime qualification.
+The recommendations below belong to the historical audited source; they are
+not an active backlog without current-source reproduction. See the
+[current plan status](../../plans/README.md) for live qualification boundaries.
 
 ## Audit closure
 
@@ -26,7 +29,7 @@ Timing evidence is retained in `timing/top40.md` and `timing/full.txt`. The
 original v1 audit is retained in the sibling directory as its shorter,
 source-citation-first companion.
 
-## Prioritized implementation backlog
+## Historical prioritized implementation backlog
 
 ### P0 — strengthen semantic oracles before removing anything
 

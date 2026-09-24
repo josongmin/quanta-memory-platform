@@ -1,6 +1,8 @@
 # FUP-001 — Durable record의 정확한 terminal state
 
 Status: `HISTORICAL VERIFIED — excluded from the current Redb-free product plan; owner-local GREEN + temporary-mutant RED, not an active FUP-006 gate`
+The problem and planned commands below describe the pre-fix `0284489` source;
+the actual post-fix proof is in the handoff and [receipt](RECEIPT.md).
 Priority: `historical P1; no current product priority`
 Owner: `Lane A`
 Depends on: 실행 인덱스의 source freeze
@@ -84,8 +86,8 @@ cargo test --locked -p quanta-memory-platform-facade --all-features sep23_fup001
 cargo test --locked -p quanta-memory-platform-facade --all-features durable_ -- --nocapture
 ```
 
-위 `sep23_fup001`은 신규 테스트의 예정 prefix다. 실행 전에 `--list`로 존재/선택
-건수를 확인한다. 임시 clone의 테스트를 공유 checkout에 복사했다는 사실만으로
+위 `sep23_fup001`은 원래 계획 시점의 신규 테스트 prefix였다. 실행 전에 `--list`로 존재/선택
+건수를 확인한다는 조건은 실제 handoff/receipt에서 검증됐다. 임시 clone의 테스트를 공유 checkout에 복사했다는 사실만으로
 고정 source의 GREEN이 되는 것은 아니다.
 
 ## Handoff / stop 조건
@@ -94,7 +96,7 @@ cargo test --locked -p quanta-memory-platform-facade --all-features durable_ -- 
 - 기존 DB 상태를 안전하게 분류할 방법이 없으면 보수적 오류를 유지한다. 이를 가용성
   이유로 성공 처리하려면 별도 migration 계약 결정이 필요하다.
 - scope 밖 DB 삭제, opaque byte 재해석, commit 결과 추정, fail-open fallback은 금지한다.
-- 모든 구현·검증 항목은 현재 미수행. 공통 receipt를 작성한 뒤 상태를 변경한다.
+- 원래 계획 시점에는 모든 구현·검증 항목이 미수행이었다. 아래 handoff와 공통 receipt가 이후 결과를 기록한다.
 
 ## Handoff 실제 기록 (Lane A, 2026-09-23)
 

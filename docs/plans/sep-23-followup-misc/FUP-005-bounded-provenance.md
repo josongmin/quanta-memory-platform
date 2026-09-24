@@ -1,6 +1,8 @@
 # FUP-005 — Reconfigure provenance의 bounded representation
 
 Status: `VERIFIED — 10k bounded oracle + temporary append-mutant RED`
+The problem and planned commands below describe the pre-fix `0284489` source;
+the actual post-fix proof is in the handoff and [receipt](RECEIPT.md).
 Priority: `P2 — 운영 비용, 장애 임계치 미측정`
 Owner: `Lane B`
 Depends on: source freeze와 `FUP-007`의 `control.rs` lease 반환
@@ -60,8 +62,8 @@ cargo test --locked -p quanta-memory-platform-core --all-features sep23_fup005 -
 cargo test --locked -p quanta-memory-platform-core --all-features --test policy_contracts
 ```
 
-`sep23_fup005`는 신규 예정 selector다. 선택 건수와 entry-count oracle의
-RED→GREEN 없이는 계획만으로 완료 처리하지 않는다.
+`sep23_fup005`는 원래 계획의 신규 selector였다. 선택 건수와 entry-count
+oracle의 RED→GREEN은 아래 handoff/receipt에 기록됐다.
 
 ## Handoff / stop 조건
 

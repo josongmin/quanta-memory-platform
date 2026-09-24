@@ -1,6 +1,6 @@
 # QMP memory/state substrate — non-implemented items re-audit
 
-**Latest result:** The [100-ID scored review](memory-state-substrate-scored-review-2026-09-23.md) replaces this document's categorical verdicts for the same HEAD. This document remains the detailed reproduction and source-evidence record.
+**Historical `0284489` snapshot:** The [100-ID scored review](memory-state-substrate-scored-review-2026-09-23.md) replaced this document's categorical verdicts for that source. This document remains a reproduction and source-evidence record, not a live defect queue. See the [2026-09-24 score re-audit](memory-state-substrate-score-reaudit-2026-09-24-db0b03c.md) for newer source-specific scores. All “current HEAD” wording below refers only to `0284489`.
 
 Date: 2026-09-23. Shared source: `main@028448946caa95676df034481a830c1d3e3b1f33`, tree `f983669731805a330200213bad7bf1bd5573f308`. Checklist SHA-256: `a92f16aa840ac31bfee3ce35235af625832ca7e2ae480f6a5d1dda66fb1c43d1`. Previous 100-ID matrix preimage SHA-256: `5cd56208879715f953be65c89cec5d858603fff0738a333bc6d80a2a6db9a5d8`.
 

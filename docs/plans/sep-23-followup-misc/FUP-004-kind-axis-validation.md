@@ -1,6 +1,8 @@
 # FUP-004 — 축별 kind 검증과 독립 oracle 확장
 
 Status: `VERIFIED — defensive oracle closure + temporary-mutant RED`
+The problem and planned commands below describe the pre-fix `0284489` source;
+the actual post-fix proof is in the handoff and [receipt](RECEIPT.md).
 Priority: `P2 — 방어 강화, reachable corruption 미입증`
 Owner: `Lane C`
 Depends on: source freeze와 `FUP-007`의 `ledger.rs` lease 반환
@@ -67,9 +69,9 @@ cargo test --locked -p quanta-memory-platform-testkit --all-features property_tr
 cargo test --locked -p quanta-memory-platform-testkit --all-features suite_rejects_wrong_charge_kind_axis
 ```
 
-`sep23_fup004`는 아직 없는 예정 selector다. 추가한 negative fake가 실제
-축별 kind 오류를 만들고 기존 production helper를 oracle로 재사용하지 않는지
-검토한 뒤, `--list`/selected count와 mutant RED를 기록한다.
+`sep23_fup004`는 원래 계획 시점의 예정 selector였다. 추가한 negative fake의
+축별 kind 오류, 독립 oracle, `--list`/selected count와 mutant RED는 아래
+handoff/receipt에서 검증됐다.
 
 ## Handoff / stop 조건
 

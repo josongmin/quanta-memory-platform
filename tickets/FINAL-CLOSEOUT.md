@@ -7,8 +7,8 @@ The newest annotated `qmp-final-qualified-*` tag observed at the clean
 `f637d42`. A later clean QMP `7f1c2f8` / Semantica `a71e3e9` pair has
 local canonical, extraction dry-run, benchmark, ENOSPC, and host QBC evidence
 in [FUP-006](../docs/plans/sep-23-followup-misc/RECEIPT.md), but no successor
-tag. Current QMP `db0b03c` changes the scaling verifier after that pair;
-neither earlier receipt qualifies its whole tree. Deployment and activation
+tag. The `db0b03c` audit base changes the scaling verifier after that pair;
+neither earlier receipt qualifies it or a later documentation-only successor. Deployment and activation
 remain separate and unclaimed.
 
 ## Scope and non-goals
@@ -29,8 +29,8 @@ later `db0b03c` tree or a documentation-only successor.
 | FINAL-001 source freeze | File ownership, generated-doc authority, direction/purity/public-surface review, clean diff check | Complete for the source named by the newest annotated receipt. |
 | FINAL-002 repository qualification | PM, canonical workspace rail, locked fmt/clippy/test/deny on one clean source | Complete for the source named by the newest annotated receipt. |
 | FINAL-003 exact-HEAD freeze | Clean `main`, source SHA/tree recorded after qualification | Complete for the source named by the newest annotated receipt. |
-| FINAL-004 standalone extraction | Clean-source dry run and real extraction; extracted locked qualification and matching manifest | Complete for the source named by the newest annotated receipt. |
-| FINAL-005 host adoption | Exact QMP/host pair, root and nested locked resolution, host adapter tests and hello-world | Complete only for the host pair named by the newest annotated receipt. |
+| FINAL-004 standalone extraction | Clean-source dry run and real extraction; extracted locked qualification and matching manifest | Dry-run reran on tagged `f637d42`; real extraction was inherited from code-identical `cf2a441`, as stated in the v5 annotation. Not an exact-commit real-extraction rerun on `f637d42`. |
+| FINAL-005 host adoption | Exact QMP/host pair, root and nested locked resolution, host adapter tests; host example if claimed | The `cf2a441` QMP / `0e29a45` Semantica pair has recorded 45/45 compose and 126/126 host tests, inherited by the code-identical v5 tag. Its host hello-world rerun is not recorded in that receipt; the recorded `hello_world` is a QMP public example. The later `7f1c2f8` / `a71e3e9` pair has separate local proof in FUP-006. Neither is an exact-current-HEAD host run. |
 | FINAL-006 closeout | This SSOT, cleanup disposition, reproducible commands, residual-risk boundary | This document is ready; the immutable tag annotation is the final receipt. |
 
 ## FINAL-001 audit result
@@ -63,11 +63,15 @@ not executable campaign tooling or a qualification receipt. The inventory in
 
 ## Receipt binding
 
-For tagged historical sources, the executable and extraction receipt is the
-newest immutable annotated local tag matching `qmp-final-qualified-*` that
-actually targets the source under review. Its annotation carries the exact QMP
-SHA/tree, canonical source manifest, extracted SHA/tree, host SHA, commands,
-and outcome. A newer HEAD does not inherit that receipt. Resolve tags with:
+For tagged historical sources, the receipt is an annotated local tag matching
+`qmp-final-qualified-*` that actually targets the source under review. The v5
+annotation binds its QMP SHA/tree and summarizes the exact-HEAD canonical and
+dry-run results; it explicitly inherits real extraction, benchmark and host
+evidence from code-identical `cf2a441`. Detailed source manifests, extracted
+and host identities, commands and outcomes must be checked in the linked
+historical [receipt](../docs/plans/sep-23-followup-misc/RECEIPT.md), not
+assumed to be embedded in the tag annotation. A newer HEAD does not inherit
+that receipt. Resolve tags with:
 
 ```text
 git tag --list 'qmp-final-qualified-*' --sort=-creatordate | head -1

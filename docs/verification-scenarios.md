@@ -523,7 +523,8 @@ New invariants promoted to the public API boundary:
   overwrite via `recharge`, and refund-bearing delete/reclaim/truncate paths via
   fallible refund-before-mutate APIs.
 - Live reconfigure preserves scheduler truth for accepted raises and rejects
-  owner-group remaps while the owner still holds live bytes.
+  owner-group remaps while the owner holds live tickets, including pending or
+  committed 0-byte authority.
 - `AccountingLedger` is intentionally non-`Clone`, so tickets stay bound to one
   live ledger epoch.
 

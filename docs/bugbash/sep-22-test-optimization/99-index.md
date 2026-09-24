@@ -2,7 +2,11 @@
 
 Snapshot audited: `main@101781c2ea6122602b4acd9aa69ebfc13fda958f`.
 
-## Remaining work only
+Historical issue index, not current remaining work. TO-10 was resolved before
+the TO-01..09 execution wave; the latter has owner proofs and a historical v5
+qualification. See the [current plan status](../../plans/README.md).
+
+## Remaining work at the audited snapshot
 
 | Priority | ID | Problem | Evidence | Required fix |
 |---|---|---|---|---|

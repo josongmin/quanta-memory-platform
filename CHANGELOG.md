@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased - 2026-09-24
+
+- Added two in-memory cross-store accounting E2E cases and strengthened the
+  scaling-result verifier to reject inconsistent success/denial outcome counts.
+  Existing 48-row smoke and 220-row full artifacts passed the revised verifier;
+  fresh benchmark generation and repository-wide qualification on the newer
+  source remain separate.
+
 ## Unreleased - 2026-09-23
 
 - Sep-23 follow-up hardening (FUP-001 through FUP-007): exact durable

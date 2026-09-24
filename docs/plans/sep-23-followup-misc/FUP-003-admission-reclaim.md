@@ -1,6 +1,8 @@
 # FUP-003 — 공유 admission preflight와 단일 reclaim 계획
 
 Status: `VERIFIED — behavioral closure + randomized agreement + temporary-mutant RED`
+The problem and planned commands below describe the pre-fix `0284489` source;
+the actual post-fix proof is in the handoff and [receipt](RECEIPT.md).
 Priority: `P2`
 Owner: `Lane B`
 Depends on: `FUP-007`의 `control.rs`/`ledger.rs` lease 반환, `FUP-004` ledger lease 반환, `FUP-005` control/report 변경 반영
@@ -88,8 +90,8 @@ cargo test --locked -p quanta-memory-platform-core --all-features --test policy_
 cargo test --locked -p quanta-memory-platform-core --all-features --test public_api_surface
 ```
 
-`sep23_fup003`은 신규 테스트의 예정 prefix다. 실제 `--list` 선택 건수와
-negative assertion의 RED→GREEN을 receipt에 남긴다. 위 public probe의 정상
+`sep23_fup003`은 원래 계획의 신규 테스트 prefix였다. 실제 `--list` 선택 건수와
+negative assertion의 RED→GREEN은 아래 handoff/receipt에 기록됐다. 위 public probe의 정상
 종료(exit 0)는 **버그 관찰**이지 수정본의 PASS가 아니다.
 
 ## Handoff / stop 조건

@@ -2,8 +2,13 @@
 
 Snapshot audited: `main@101781c2ea6122602b4acd9aa69ebfc13fda958f`.
 
-This directory is a remediation queue, not a census of everything that could be
-made shorter. An item remains only when current source establishes an oracle or
+Historical Sep-22 execution plan. TO-01..10 were later implemented or
+resolved; this is not a current work queue. See the
+[current plan status](../../plans/README.md) and
+[TO execution record](../../../tickets/TEST-OPTIMIZATION-EXECUTION.md).
+
+At the audited snapshot, this directory was a remediation queue, not a census
+of everything that could be made shorter. An item remained only when that source established an oracle or
 isolation defect, or a warm test-binary measurement establishes material cost.
 
 ## Execution order

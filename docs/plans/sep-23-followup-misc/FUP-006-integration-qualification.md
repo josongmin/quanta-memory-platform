@@ -126,8 +126,15 @@ remain outside this proof.
 
 ## 완료 기준
 
-- [x] 선택한 in-memory scope의 007 및 포함된 003/004/005의 regression과
-  negative proof가 같은 최종 소스에서 유효.
+아래 체크는 여러 소스 스냅샷에 걸친 FUP-006 캠페인의 역사적 완료 기준이다.
+owner negative proof는 앞선 스냅샷에서 기록됐고, `7f1c2f8` QMP /
+`a71e3e9` Semantica 로컬 페어는 별도로 canonical·benchmark·host rail을
+통과했다. 현 QMP 후보의 canonical·fresh benchmark와 새 host-pair 주장은
+아직 열려 있으며, 상단 status와 [receipt](RECEIPT.md)를 따른다.
+
+- [x] 선택한 in-memory scope의 007 및 포함된 003/004/005의 regression이
+  후보 canonical rail에 포함됐다. owner negative proof는 receipt에 명시된
+  앞선 스냅샷의 증거이며 `7f1c2f8`에서 mutant 재실행을 주장하지 않는다.
 - [x] canonical rail 성공, 예제/API/feature 계약 성공.
 - [x] `core/no-redb` 및 host `full`에서 Redb 비활성 graph 증거.
 - [x] 필요한 extraction와 host-pair 검증 성공 또는 미검증 범위가 명시적으로 남음.

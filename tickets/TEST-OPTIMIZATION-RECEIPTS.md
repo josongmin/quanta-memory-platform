@@ -1,6 +1,6 @@
 # Test-Optimization Wave — Integrator Receipts
 
-Status: `HISTORICAL INTEGRATOR OBSERVATION at 41faf05; later owner proofs and v5 qualification closed that source; current db0b03c qualification separate`.
+Status: `HISTORICAL INTEGRATOR OBSERVATION at 41faf05; later owner proofs and v5 qualification closed that source; post-v5 qualification separate`.
 Sections 1–10 record the incomplete `41faf05` observation. Sections 11–15
 record subsequent owner proof and review corrections. The annotated
 `qmp-final-qualified-sep23-followup-v5` tag later qualified a clean source

@@ -1,6 +1,6 @@
 # QMP memory/state substrate parallel audit
 
-**Latest result:** The [100-ID scored review](memory-state-substrate-scored-review-2026-09-23.md) is the current per-ID verdict for this HEAD. This first-pass status matrix is retained only as source-path evidence. The [non-implemented-items re-audit](memory-state-substrate-gap-reaudit-2026-09-23.md) records the corrected findings and executed probes.
+**Historical `0284489` snapshot:** This first-pass matrix is retained as source-path evidence, not the current per-ID verdict. The [non-implemented-items re-audit](memory-state-substrate-gap-reaudit-2026-09-23.md) records its corrected findings; the [2026-09-24 score re-audit](memory-state-substrate-score-reaudit-2026-09-24-db0b03c.md) is the newer source-specific score. All “current HEAD” wording below refers only to the audited `0284489` source.
 
 Audit date: 2026-09-23. Source: `main@028448946caa95676df034481a830c1d3e3b1f33`. Checklist: `memory-state-substrate-review-checklist.md`, SHA-256 `a92f16aa840ac31bfee3ce35235af625832ca7e2ae480f6a5d1dda66fb1c43d1`.
 

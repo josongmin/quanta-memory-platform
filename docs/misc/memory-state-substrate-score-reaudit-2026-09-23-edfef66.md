@@ -1,12 +1,18 @@
 # Memory/state substrate 체크리스트 점수 재감사 — `edfef66`
 
+**역사적 `edfef66` 스냅샷:** 아래의 “현재 HEAD”, “최신 작업트리”, 열린 결함 및
+점수는 2026-09-23 당시 소스와 임시 overlay에만 적용된다. 이후 수정·테스트와
+적용 범위는 [2026-09-24 재채점](memory-state-substrate-score-reaudit-2026-09-24-db0b03c.md),
+현행 qualification 경계는 [계획 상태](../plans/README.md)를 따른다. 이 문서의
+당시 점수나 임시 작업트리 결과를 새 HEAD의 receipt로 승격하지 않는다.
+
 기준: [100항목 체크리스트](memory-state-substrate-review-checklist.md), SHA-256 `a92f16aa840ac31bfee3ce35235af625832ca7e2ae480f6a5d1dda66fb1c43d1`. 비교 대상: [최초 점수표](memory-state-substrate-scored-review-2026-09-23.md)의 `028448946caa95676df034481a830c1d3e3b1f33`. 재감사 source: 커밋 `edfef66c3d9dabbe4d01a98754a44d32ef9c940e`, tree `4f1a7299af049e7fa1c0eeefc8e683f01239d462`, annotated tag `qmp-durability-l1-qualified`가 가리키는 **clean commit**. 날짜: 2026-09-23.
 
-현재 공유 작업트리에는 별도 미커밋 코드/문서 변경이 있다. 이 문서의 **확정 점수는 HEAD blob만** 대상으로 한다. 미커밋 변경은 아래에 별도 잠정 평가하며 합계에 넣지 않는다. 감사 중 실행 입력 digest가 기존 L2 receipt의 `add1f907…`와 달라진 것을 확인했다. 최근 L2 receipt를 현재 작업트리 전체의 자격으로 대체하지 않는다.
+감사 당시 공유 작업트리에는 별도 미커밋 코드/문서 변경이 있었다. 이 문서의 **확정 점수는 `edfef66` HEAD blob만** 대상으로 한다. 미커밋 변경은 아래에 별도 잠정 평가하며 합계에 넣지 않는다. 감사 중 실행 입력 digest가 기존 L2 receipt의 `add1f907…`와 달라진 것을 확인했다. 당시 L2 receipt를 그 작업트리 전체의 자격으로 대체하지 않는다.
 
 ## 방법과 판정 경계
 
-- 최초 100개 ID를 전부 대조했다. 아래 표의 ID만 새 점수로 교체하고, **나머지 ID는 최초 점수를 유지**한다. 따라서 최초 점수표와 이 변경표를 합치면 100개 ID의 현재 clean-HEAD 점수가 결정된다. `범위외` 12개는 계속 평균에서 제외한다.
+- 최초 100개 ID를 전부 대조했다. 아래 표의 ID만 새 점수로 교체하고, **나머지 ID는 최초 점수를 유지**한다. 따라서 최초 점수표와 이 변경표를 합치면 100개 ID의 당시 `edfef66` 점수가 결정된다. `범위외` 12개는 계속 평균에서 제외한다.
 - 점수는 동일한 [0–100 rubric](memory-state-substrate-scored-review-2026-09-23.md#채점-기준)을 쓴다. 테스트 존재, focused GREEN, clean-source canonical/extraction/scaling, host-pair, deploy/activation을 구별한다. 한 root defect가 여러 ID를 개선해도 독립 결함 여러 건을 고친 것처럼 세지 않는다.
 - 근거: [FUP-001~007 완료 기록](../plans/sep-23-followup-misc/README.md), [통합 receipt](../plans/sep-23-followup-misc/RECEIPT.md), `qmp-durability-l1-qualified` tag annotation, [DURABILITY-001](../../tickets/DURABILITY-001-power-loss-finalize-kill.md). 특히 tag는 이 HEAD의 L1 2/2, canonical rail, real extraction, scaling 170 samples와 4/4 negative mutants를 기록한다. `cf2a441`의 host-QBC tuple은 **이 HEAD보다 오래된 소스**이므로 M09의 current-source host GREEN으로 승격하지 않는다.
 - 이 재감사는 변경 owner의 코드·테스트·receipt를 대조한 **점수 재판정**이다. HEAD의 전체 rail을 새로 실행한 것이 아니며, 기존 tag/receipt의 raw artifact 전체를 독립 재실행한 것도 아니다. 미커밋 focused 실행은 아래에 따로 적는다.
@@ -110,9 +116,9 @@
 
 ## 남은 낮은 점수와 gate
 
-- **현재 clean HEAD의 열린 결함:** F06 reclaimer와 L04 event-sink 재진입은 bounded 실행으로 재현된 경계다. E02/E05 read-side caller panic/lock 경계는 소스 수준 판정이다. 미커밋 overlay에 수정이 있으나 아직 release-quality evidence가 아님.
+- **`edfef66` 당시 clean HEAD의 열린 결함:** F06 reclaimer와 L04 event-sink 재진입은 당시 bounded 실행으로 재현된 경계다. E02/E05 read-side caller panic/lock 경계는 당시 소스 수준 판정이다. 이후 수정·테스트는 위의 2026-09-24 재채점을 따른다.
 - **선택 기능 계약:** I05 disk/record/I/O/codec budget, I06 decode/copy scratch peak, I09 content integrity/length bound. L1 SIGKILL GREEN은 이들을 닫지 않는다.
 - **host 의미·운영:** A05/B06 caller-reported cost, F01/H01 victim eligibility, D06/D08 close/pin/owner shutdown, M07 장시간 phase-change soak가 남는다. 실제 host 사용 여부에 따라 우선순위를 정한다.
-- **current-source host:** 이 HEAD의 exact QMP/host tuple QBC, hosted CI, 배포·활성화는 미검증. `cf2a441` receipt를 `edfef66`로 복사하지 않는다.
+- **`edfef66`-source host:** 당시 HEAD의 exact QMP/host tuple QBC, hosted CI, 배포·활성화는 미검증. `cf2a441` receipt를 `edfef66`로 복사하지 않는다.
 
 따라서 이 재감사는 기존 P1 세 root가 해결되고 상당한 점수 상승이 있음을 인정하지만, **100/100이나 host activation**을 주장하지 않는다.

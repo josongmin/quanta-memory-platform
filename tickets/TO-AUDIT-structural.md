@@ -1,6 +1,6 @@
 # TO-AUDIT-structural — Structural Audit Assembly
 
-Status: `HISTORICAL AUDIT at d370529; its gaps were subsequently resolved for the v5 source; current db0b03c qualification is separate`.
+Status: `HISTORICAL AUDIT at d370529; its gaps were subsequently resolved for the v5 source; post-v5 qualification is separate`.
 Authority: [FINAL-CLOSEOUT.md](FINAL-CLOSEOUT.md) and the annotated
 `qmp-final-qualified-sep23-followup-v5` receipt. The verdicts and unchecked
 gap list below record this audit's earlier observation, not today's queue.
@@ -14,8 +14,10 @@ qualification; see the [plan index](../docs/plans/README.md).
 Current resolution: TO-01..09 implementation and ticket-local evidence are
 recorded in their owner handoffs and [receipts §§11–15](TEST-OPTIMIZATION-RECEIPTS.md).
 The annotated v5 tag qualifies the past source containing them. No row in the
-historical verdict table below is an open TO implementation assignment; only
-the later source-wide qualification boundary remains open.
+historical verdict table below is an open TO implementation assignment.
+Post-v5 changes to owner files need their own evidence and a new source-wide
+qualification boundary; historical mutant proofs are not inherited by changed
+behavior.
 
 ## Assembly provenance
 

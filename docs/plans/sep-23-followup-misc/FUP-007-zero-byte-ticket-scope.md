@@ -1,6 +1,8 @@
 # FUP-007 — 0-byte ticket의 group 수명과 최종 반환
 
 Status: `VERIFIED — committed/pending/Drop/rebuild matrix GREEN + temporary-mutant RED`
+The problem and planned commands below describe the pre-fix `0284489` source;
+the actual post-fix proof is in the handoff and [receipt](RECEIPT.md).
 Priority: `P1 — core authority/lifecycle correctness`
 Owner: `Lane B0` (`api/control.rs` 단독 writer)
 Depends on: source freeze
@@ -70,7 +72,8 @@ ledger invariant/cleanup 위반이다. 비제로 byte leak이나 외부 입력 �
    release authority가 될 수 없다.
 
 예정 selector는 구현자가 신규 테스트에 붙인 뒤 `--list`/selected count로 실재를
-확인한다. 아래 명령은 **현재 아직 PASS 증거가 아니다**.
+확인한다. 아래 명령은 원래 계획의 실행 예시이며, 그 자체는 PASS 증거가
+아니다. 실제 실행 결과는 아래 handoff와 [receipt](RECEIPT.md)에 있다.
 
 ```bash
 cargo test --locked -p quanta-memory-platform-core --all-features sep23_fup007 -- --nocapture

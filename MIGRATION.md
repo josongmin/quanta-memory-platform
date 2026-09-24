@@ -55,7 +55,10 @@ explicit error — the opener never deletes the file, reinterprets
 opaque bytes, or guesses a commit outcome. There is no downgrade path
 back to v1 layout; keep a file copy before first open if you need one.
 
-### Redb resource limits and restore bytes (current candidate)
+### Redb resource limits and restore bytes (existing optional capability)
+
+This migration applies only to callers enabling the opt-in Redb backing; it is
+not a requirement of the current in-memory host release scope.
 
 `RedbSpillBacking::create` now uses bounded defaults; production callers can
 select explicit `RedbSpillLimits` with the create_with_limits constructor. Opening a file

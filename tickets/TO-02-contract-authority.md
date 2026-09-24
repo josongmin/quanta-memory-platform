@@ -1,6 +1,7 @@
 # TO-02 — Replace Source/Text Greps with Executable Contract Authorities
 
 Status: `IMPLEMENTED; owner proof recorded; included in historical qmp-final-qualified-sep23-followup-v5 source; current HEAD qualification separate`
+The problem and edit plan below are a pre-implementation snapshot; the owner proof and v5 receipt govern the historical result.
 Priority: `P0`
 Depends on: `TO-03` for `scaling.rs`
 
