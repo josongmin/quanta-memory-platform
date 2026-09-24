@@ -2,7 +2,7 @@
 
 기준: [100항목 체크리스트](memory-state-substrate-review-checklist.md), 2026-09-24. 평가 소스는 clean commit `db0b03cd3e58a53dd5439a6578bb3b3d86eac593` (tree `388598df45c1f93a9ce4c8acc7b047fe43a30091`)이다. 감사 도중 HEAD가 문서·티켓만 바꾼 `83b1bd9`로 이동했으며 `db0b03c..83b1bd9`에는 Rust/Cargo/benchmark 코드 변경이 없다. 이 문서와 동시에 공유 작업트리에 생긴 다른 편집은 점수에 넣지 않았다. 점수는 확률이나 출하 허가가 아니라 [기존 rubric](memory-state-substrate-scored-review-2026-09-23.md#채점-기준)에 따른 계약·증거 강도다. 100은 관련 계약, 독립 음성 oracle, 동일 소스의 운영·host 증거까지 요구한다.
 
-최신 committed base는 `65f57d5f844973e43b6dd40b4f9879c043294000` (tree `16781f7c6a771f3e062fcfb9469c879359871cbd`)이며, `db0b03c` 이후의 Cargo/Rust 변경은 주석뿐이다. 이 후속 커밋에 대해 점수를 다시 산정하거나 qualification을 실행하지 않았다. 현재 shared worktree의 RFC 미커밋 편집은 이 재채점에 포함되지 않는다. 이 파일은 계속 `db0b03c` snapshot의 점수 기록이다.
+이후 `65f57d5`와 문서 정리 commit은 guidance/RFC 및 Cargo/Rust 주석만 바꾸어 실행 동작은 바꾸지 않았다. 이 후속 소스에 대해 점수를 다시 산정하지 않았다. 이 파일은 계속 `db0b03c` snapshot의 점수 기록이며, qualification receipt를 대신하지 않는다.
 
 ## 계산과 적용 범위
 

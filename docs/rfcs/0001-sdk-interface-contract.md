@@ -98,8 +98,8 @@ let platform = MemoryPlatform::builder(config).build()?;
 `MemorySize` is a public byte newtype with a private `u64` field:
 `bytes(u64)` is explicit, `mib`/`gib` and `try_from_usize` check conversion
 and multiplication, and `as_bytes` exposes the canonical value. It does not
-implement unchecked arithmetic operators. Public
-budgets, reservations, and byte-valued error getters use it; the ledger may
+implement unchecked arithmetic operators. Public budgets, reservations, and
+byte-valued error getters use it; the ledger may
 continue to use `u64` internally. No implicit unit conversion or blanket
 integer extension trait is required. Every platform, including development,
 requires explicit host-supplied capacity.
@@ -184,9 +184,8 @@ remains owned for bounded deferred retry. The caller discards the
 unpublishable value. Dropping an uncommitted reservation also rolls it back.
 A zero-byte commit still owns one live ticket until release. If a useful
 upper bound cannot be known, the component must budget construction as
-scratch/temporary work and
-reserve measured retained cost before publication. QMP cannot infer the
-physical allocation size of arbitrary `T`.
+scratch/temporary work and reserve measured retained cost before publication.
+QMP cannot infer the physical allocation size of arbitrary `T`.
 
 The committed `MemoryReservation` is non-cloneable and broker-bound.
 `try_release` and `try_resize` preserve caller-owned authority on failure;
@@ -194,6 +193,7 @@ resize retains the current recharge API's explicit recovery-required outcome.
 `Drop` attempts bounded deferred cleanup but cannot return an error.
 Components must destroy retained data before or with its charge. Built-in
 stores enforce that lifecycle internally.
+
 Do not add a generic `Retained<T>` wrapper to 0.3: without prohibiting
 mutation and value escape it cannot prove that `T` still matches its charge.
 A restricted wrapper may be added for a demonstrated caller.
@@ -231,8 +231,8 @@ removes that override, revealing the validated baseline. Map `Remove` is a
 separate runtime tombstone that hides an effective item only if no live
 authority depends on it, including zero-byte tickets. Clearing the tombstone
 reveals the baseline item; field patches against a tombstoned item are
-rejected. Runtime writes always
-carry an expected revision. Stale revision, below-usage cap, live owner/group
+rejected. Runtime writes always carry an expected revision. Stale revision,
+below-usage cap, live owner/group
 remap, missing feature, or invalid postimage rejects without changing policy,
 revision, fingerprint, or ledger.
 
@@ -294,8 +294,9 @@ file watching, and source-precedence logic are not part of 0.3.
 `MemoryClassId`, `OwnerId`, `ResourceGroupId`, `RuntimeId`,
 `RuntimeKindId`, and `ConsumerName` have private fields, bounded UTF-8
 grammar, and fallible `parse`. Class IDs are extensible host taxonomy, but
-a class must be declared in validated policy before admission. QMP-owned IDs are limited
-to semantics QMP actually implements; the `qmp.` namespace is reserved.
+a class must be declared in validated policy before admission. QMP-owned IDs
+are limited to semantics QMP actually implements; the `qmp.` namespace is
+reserved.
 
 The existing `MemoryClass::Headroom` is a privileged admission role, not
 an ordinary class string. Migration must keep that role non-forgeable and
@@ -391,8 +392,8 @@ On a committed clean candidate, run `python3 tools/pm/pm.py sync`,
 `scripts/check-workspace.sh`, strict rustdoc, public API baseline, and the
 standalone extraction dry-run. The dry-run is preflight, not a real standalone
 export qualification. If standalone qualification is claimed, perform real
-extraction and its locked
-rail on the same frozen source. Repo-local checks qualify only the library;
+extraction and its locked rail on the same frozen source. Repo-local checks
+qualify only the library;
 host adoption requires a separate exact dependency/source receipt. Merge,
 deployment, and activation are separate states. This RFC alone closes none
 of those gates.

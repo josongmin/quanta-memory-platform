@@ -1,21 +1,20 @@
 # Final Closeout SSOT
 
-Status: `HISTORICAL QUALIFIED SOURCES; CURRENT HEAD QUALIFICATION OPEN`.
+Status: `HISTORICAL FINAL TAGS; LOCAL SOURCE QUALIFICATION IS DEFINED BY AN EXACT-HEAD qmp-local-qualified-* TAG`.
 The bare `qmp-final-qualified` tag (`014eb65`) covers only its own source.
 The newest annotated `qmp-final-qualified-*` tag observed at the clean
 `db0b03c` audit base is `qmp-final-qualified-sep23-followup-v5`, targeting
-`f637d42`. Latest committed base is `65f57d5f844973e43b6dd40b4f9879c043294000`
-(tree `16781f7c6a771f3e062fcfb9469c879359871cbd`), equal to `origin/main`.
+`f637d42`. The current local candidate is the commit containing this receipt
+contract; its exact SHA/tree must match the target of a new annotated
+`qmp-local-qualified-*` tag before local qualification is called complete.
 A later clean QMP `7f1c2f8` / Semantica `a71e3e9` pair has
 local canonical, extraction dry-run, benchmark, ENOSPC, and host QBC evidence
 in [FUP-006](../docs/plans/sep-23-followup-misc/RECEIPT.md), but no successor
 tag. The `db0b03c` audit base changes the scaling verifier after that pair;
-later commits through `65f57d5` add documentation and comments only, but none
-of the receipts qualifies that exact commit. No current-HEAD canonical rail,
-fresh full benchmark, extraction, or host-pair receipt is recorded. The shared
-worktree now has a separate uncommitted RFC edit, so it is not a clean
-qualification candidate. Deployment and activation remain separate and
-unclaimed.
+later commits add documentation and comments only. The current local receipt
+must record canonical, fresh full benchmark, and extraction dry-run on one
+clean exact source. Host-pair, deployment and activation remain separate and
+unclaimed unless explicitly qualified.
 
 ## Scope and non-goals
 
@@ -27,8 +26,8 @@ extraction, host-pair qualification, and deployment activation.
 
 ## Completion gates
 
-The results in this table describe the historically tagged source, not the
-later `db0b03c` audit base or current `65f57d5` commit.
+The results in this table describe the historically tagged source; current
+local qualification is recorded only by a new exact-target local receipt tag.
 
 | Gate | Required evidence | Result |
 | --- | --- | --- |
@@ -68,6 +67,20 @@ not executable campaign tooling or a qualification receipt. The inventory in
 `FINAL-001-file-inventory.md` remains the path-level ownership record.
 
 ## Receipt binding
+
+The current library-local closeout uses an annotated `qmp-local-qualified-<sha>`
+tag targeting the exact candidate. Its annotation records the canonical
+`scripts/check-workspace.sh` result, fresh full benchmark artifact hash, and
+clean-source extraction dry-run result. This tag qualifies the repository
+locally; it does not claim a real standalone export, exact Semantica host-pair,
+hosted CI, deployment, or activation. Resolve it and compare its peeled target
+with `HEAD` before claiming current local qualification:
+
+```text
+git tag --list 'qmp-local-qualified-*' --sort=-creatordate | head -1
+git rev-parse <resolved-tag>^{}
+git show --no-patch --format=fuller <resolved-tag>
+```
 
 For tagged historical sources, the receipt is an annotated local tag matching
 `qmp-final-qualified-*` that actually targets the source under review. The v5

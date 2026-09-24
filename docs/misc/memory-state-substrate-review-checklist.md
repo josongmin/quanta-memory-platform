@@ -6,7 +6,7 @@
 
 성격: 13개 영역, 100개 계약의 **리뷰 도구**. 점수표나 현재 구현의 합격 판정이 아니다.
 
-가장 최근 항목별 점수·적용 범위·증거 상한은 [2026-09-24 `db0b03c` 재채점](memory-state-substrate-score-reaudit-2026-09-24-db0b03c.md)이며, `db0b03c` 소스 snapshot에 한정된다. 최신 committed base는 `65f57d5`; 이후 Cargo/Rust 변경은 주석이고 실행 동작은 바뀌지 않았지만, 점수 재산정이나 current-HEAD qualification은 하지 않았다. 현재 shared worktree에는 별도의 미커밋 RFC 편집이 있다. 이 체크리스트의 미체크 박스는 점수나 구현 상태를 뜻하지 않는다.
+가장 최근 항목별 점수·적용 범위·증거 상한은 [2026-09-24 `db0b03c` 재채점](memory-state-substrate-score-reaudit-2026-09-24-db0b03c.md)이며, 해당 source snapshot에 한정된다. 이후 Cargo/Rust 변경은 주석이고 실행 동작은 바뀌지 않았지만, 이 체크리스트의 점수는 재산정하지 않았다. 현재-source qualification은 정확한 HEAD를 대상으로 한 별도 receipt를 따른다. 이 체크리스트의 미체크 박스는 점수나 구현 상태를 뜻하지 않는다.
 
 ## 사용 원칙
 

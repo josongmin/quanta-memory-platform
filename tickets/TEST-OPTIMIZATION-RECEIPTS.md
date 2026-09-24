@@ -423,7 +423,8 @@ and BTreeMap restoration were committed, and the annotated
 Therefore §§1–10 `UNRESOLVED` rows and §16's `DONE` prohibition must not be
 read as the current ticket queue. The clean `db0b03c` audit base is newer
 than the tag and includes a benchmark verifier change. Later committed base
-`65f57d5` adds docs and comments but no executable behavior change. No
-same-source canonical or fresh full benchmark was run on `65f57d5`; the current
-shared worktree also has an uncommitted RFC edit. Historical owner proofs and
-the v5 tag remain historical evidence, not a receipt for the latest commit.
+`65f57d5` adds docs and comments but no executable behavior change. This
+reconciliation commit defines the receipt rule: current-source repository
+qualification requires an annotated `qmp-local-qualified-*` tag targeting the
+exact source after canonical and fresh full benchmark runs. Historical owner
+proofs and the v5 tag remain evidence for their named source only.

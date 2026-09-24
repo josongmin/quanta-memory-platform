@@ -1,6 +1,6 @@
 # Sep-23 follow-up qualification receipt
 
-Status: `Historical v5 receipt and QMP 7f1c2f8 / Semantica a71e3e9 local pair below. Verifier delta/focused checks are bound to db0b03c; latest committed base is 65f57d5 with no current-HEAD canonical or fresh full benchmark receipt. Current worktree is dirty from a separate RFC edit. Extraction/host-pair are separate; hosted CI, deploy, activation and physical power loss NOT QUALIFIED.`
+Status: `Historical v5 receipt and QMP 7f1c2f8 / Semantica a71e3e9 local pair below. Focused verifier evidence is bound to db0b03c. Current local closeout is authoritative only when an annotated qmp-local-qualified-* tag targets exact HEAD and records canonical, fresh full benchmark, and extraction dry-run results. Host-pair, hosted CI, deploy, activation and physical power loss are separate.`
 Scope: historical `full-followup` (`FUP-001` through `FUP-007`); 2026-09-24 addendum qualifies the in-memory consumer pair, with optional Redb evidence recorded separately
 Date: `2026-09-24 Asia/Seoul` (historical entries retain their original dates)
 
@@ -656,12 +656,13 @@ revised verifier accepted the prior 48 smoke and 220 full samples. A clean
 `db0b03c` smoke artifact separately passed 48/48 with SHA-256
 `502f6e70a2009f6e1c725a72a9167db8895a25117bb4facfc738fd7532b4f8a4`.
 
-Latest committed base is `65f57d5f844973e43b6dd40b4f9879c043294000`
-(tree `16781f7c6a771f3e062fcfb9469c879359871cbd`), equal to `origin/main`.
-Changes after `db0b03c` include plan/receipt/RFC and product-scope wording;
-the Cargo and Rust changes are comments only and do not alter executable
-behavior. The focused results above remain evidence for the named `db0b03c`
-snapshot, not a source-bound receipt for `65f57d5`. No `scripts/check-workspace.sh`,
-new full benchmark generation, extraction, or host QBC run is recorded on
-`65f57d5`. The shared worktree currently contains a separate uncommitted RFC
-edit. This addendum is status reconciliation, not a qualification receipt.
+The later committed base `65f57d5` changes documentation and Cargo/Rust
+comments only; it does not change executable behavior. This reconciliation
+commit freezes the current qualification candidate, but does not itself prove
+the gates. The exact-target `qmp-local-qualified-*` annotated tag is the
+immutable receipt authority for repository canonical, fresh full benchmark,
+and extraction dry-run. Resolve it and verify its target against HEAD before
+claiming current local qualification. Host QBC, hosted CI, deploy and
+activation remain separate. This document describes the receipt contract;
+the tag annotation carries each run's source identity, command, exit, counts
+and artifact hashes.

@@ -1,6 +1,6 @@
 # FUP-006 — 통합과 current-source qualification
 
-Status: `PRIOR PAIR VERIFIED at QMP 7f1c2f8 / Semantica a71e3e9; current committed base 65f57d5 has no same-source canonical/fresh full benchmark receipt; extraction and host-pair are separate gates; hosted CI/deploy/activation NOT RUN`
+Status: `Prior pair verified at QMP 7f1c2f8 / Semantica a71e3e9. Current local qualification is defined by an annotated qmp-local-qualified-* tag targeting exact HEAD; it covers repository canonical, fresh full benchmark, and extraction dry-run. Host-pair, hosted CI/deploy/activation remain separate.`
 Priority: `SCOPE-SPECIFIC LOCAL GATE` (현재 in-memory scope; durable branch는 historical)
 Owner: `Lane I — serial integrator`
 Depends on: 현재 core/no-redb 후보는 `FUP-007`; in-memory full-followup은 추가로 `FUP-003`, `FUP-004`, `FUP-005`. 아래 durable-enabled 분기는 과거/별도 제안에만 적용.
@@ -253,15 +253,12 @@ This is local qualification, not hosted CI, deploy or activation. README-only
 edits present when this pair was frozen were not silently included in its
 proof.
 
-Current-source correction (2026-09-24): the verifier change is at `db0b03c`.
-On that clean audit base the Python suite passed 20/20, the two cross-store
-E2E cases passed 2/2, and previous 48/220-row artifacts passed the revised
-verifier. The later committed `65f57d5` changes README/RFC/qualification
-guidance and adds only comments to Cargo/Rust files; it does not change
-executable behavior. Those `db0b03c` focused checks are not a current-HEAD
-canonical run or a newly generated full benchmark. The worktree also has an
-uncommitted RFC edit, so qualification must wait for that edit's disposition
-and a clean frozen candidate. Run the canonical workspace rail and fresh full
-benchmark on that candidate before recording FUP-006 local completion.
-Extraction belongs to the chosen source when claimed; host QBC is needed only
-for an exact current QMP/host pair claim.
+Current-source correction (2026-09-24): the verifier change and focused
+results are bound to `db0b03c`: Python contracts 20/20, cross-store E2E 2/2,
+and replay of the prior artifacts through the revised verifier. Those results
+do not qualify a later exact HEAD. Run the repository canonical rail, fresh
+full benchmark, and extraction dry-run on one clean committed candidate; then
+record exact SHA/tree, commands, exits, counts and artifact hashes in the
+annotated `qmp-local-qualified-*` receipt tag. Host QBC is needed only to
+claim an exact current QMP/host pair. Hosted CI, deploy and activation are
+outside this local qualification.

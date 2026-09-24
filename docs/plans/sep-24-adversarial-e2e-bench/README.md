@@ -8,13 +8,11 @@ produced at `7f1c2f8`; `db0b03c` changes verifier outcome-count validation.
 A later local clean `db0b03c` smoke artifact at
 `target/scaling-results/qmp-scaling.KorxZf/results.jsonl` passed the revised
 verifier 48/48 (SHA-256 `502f6e70a2009f6e1c725a72a9167db8895a25117bb4facfc738fd7532b4f8a4`).
-It is ignored local evidence, not a durable full-run receipt. Latest committed
-base is `65f57d5f844973e43b6dd40b4f9879c043294000` (tree
-`16781f7c6a771f3e062fcfb9469c879359871cbd`). Its changes after `db0b03c` do
-not alter executable behavior, but no canonical rail or fresh full benchmark
-was run on that exact commit. The worktree also has a separate uncommitted RFC
-edit. A same-source canonical record and fresh clean full benchmark remain
-necessary before a new source-bound qualification claim. See the
+It is ignored local evidence, not a durable full-run receipt. Later committed
+changes after `db0b03c` do not alter executable behavior. Current source-wide
+status is defined by the exact-target annotated `qmp-local-qualified-*` tag;
+it must bind the fresh canonical rail, full benchmark, and extraction dry-run
+to one clean candidate. See the
 [plan status index](../README.md) and [FUP-006 receipt](../sep-23-followup-misc/RECEIPT.md).
 
 The active plan excludes Redb-backed durable spill, its codec, and disk

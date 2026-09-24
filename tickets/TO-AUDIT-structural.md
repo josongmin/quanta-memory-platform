@@ -8,10 +8,10 @@ Later owner mutant proofs appear in
 [TEST-OPTIMIZATION-RECEIPTS.md](TEST-OPTIMIZATION-RECEIPTS.md)
 §§11–15 and the TO-01..09 ticket handoffs. The clean v5 source included the
 implemented queue and passed its recorded repository, extraction, and host
-rails. The verifier delta and focused evidence are at `db0b03c`; latest
-committed base is `65f57d5`, with non-behavioral docs/comments after that audit.
-No exact-HEAD canonical or fresh full benchmark receipt exists, and the shared
-worktree has a separate uncommitted RFC edit. See the
+rails. The verifier delta and focused evidence are at `db0b03c`; later
+committed docs/comments do not change executable behavior. Current repository
+qualification is recorded only by a `qmp-local-qualified-*` tag targeting the
+exact candidate after canonical and fresh full benchmark runs. See the
 [plan index](../docs/plans/README.md).
 
 Current resolution: TO-01..09 implementation and ticket-local evidence are
