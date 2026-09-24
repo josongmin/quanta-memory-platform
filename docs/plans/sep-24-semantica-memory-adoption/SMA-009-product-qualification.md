@@ -75,19 +75,25 @@ scripts/quanta-build-cli owner resolve --package quanta-runtime-memory-compose -
 scripts/quanta-build-cli owner resolve --package quanta-sdk-runtime-composition-owner --target-kind lib --selector-mode exact --selector types::no_persist_composition_tests::sdk_memo_capacity_denial_is_typed_and_leaves_session_usable_v1 --compile-policy package-all-features --json
 ```
 
-`quanta-runtime/src/orchestration/observation_feedback_runtime/product_bound_runtime.rs`
-의 SQL-family shadow leg는 별도 in-memory artifact/evidence/memo store를 만들고,
-SDK installed broker 밖이라고 명시한다. 해당 함수는
-`sql-family-product-runtime` 공개 surface로 re-export된다. 이는 test/probe
-전용이 아니다. `quanta-cli-ingress-runtime`의 `sql-family-runtime-activation`
-(`dist-full` 포함)과 별도 프로세스 `quanta-sql-rulepack-worker`가 baseline 및
-candidate leg를 실제로 생성한다. 현재 두 production caller 모두 packet에
-예산 authority를 전달하지 않는다. 따라서 각 프로세스의 설치된 예산과
-shadow leg의 실사용량 사이에 연결이 없다. worker와 CLI는 프로세스가
-달라 하나의 in-process broker를 공유할 수 없으며, 각 프로세스에서
-baseline/candidate가 공유하는 bounded domain을 설치하거나 별도 domain의
-명시적 한도 및 제품 범위 계약을 정의해야 한다. 이 경로를 SDK G6 통과로
-합산하지 않는다.
+Earlier G8 finding (before Semantica `10413dfe6c8`): the public
+`sql-family-product-runtime` builder created unbudgeted in-memory
+artifact/evidence/memo stores. `quanta-cli-ingress-runtime`의
+`sql-family-runtime-activation` (`dist-full` 포함)과 별도 프로세스
+`quanta-sql-rulepack-worker`가 이 경로를 실제로 사용했다. 이 발견은 아래
+구현으로 소스상 수정됐지만 실행 증거가 아직 없다. SQL 경로를 SDK G6
+통과로 합산하지 않는다.
+
+2026-09-25 implementation update: Semantica main `95fe5446aed`에는 CLI와
+rulepack worker가 각각 프로세스 로컬 singleton `RuntimeCutoverMemoryDeps`를
+통해 SQL 전용 QMP production preset domain을 설치하고, 매 baseline/candidate
+leg마다 분리된 artifact/evidence store와 broker-backed memo table을 발급하는
+변경이 들어갔다. SQL domain은 SDK installed domain과 **별개**이며, QMP
+production preset의 4 GiB global hard limit을 각 프로세스에 별도로 적용한다.
+따라서 두 domain의 합산 프로세스 RSS를 4 GiB로 보장하지 않는다. Composer에는
+두 leg의 memo charge 합산·개별 환급과 shared-pool peer denial→release→retry
+oracle이 작성됐다. 이 단락은 구현·테스트 소스 상태이지 G8 GREEN이 아니다.
+QBC compiler/owner, CLI `dist-full`, worker process 제품 실행과 실제
+거절·해제 관측을 고정된 최종 소스에서 별도로 판정한다.
 
 ## 최소 proof matrix
 
