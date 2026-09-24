@@ -144,6 +144,12 @@ no-runtime-persist 질의에는 같은 실행의 pre-digest artifact를 재사�
 최종 고정 소스에서 GREEN으로 만들어야 G8을 닫을 수 있다. 브랜치의
 owner-local 신규 테스트는 아직 실행되지 않았다. RED 브랜치를 main으로
 병합하거나 예전 composer GREEN을 최종 qualification으로 재사용하지 않는다.
+임시 계수 진단을 넣은 같은 worker 테스트의 재실행에서는
+`sql_canary.product_sql_execute` → `sqlite3.connect` packet 행에 대해
+해당 caller edge 0개였고, 그래프 전체에서도 같은 callsite ID 또는 origin의
+edge가 각각 0개였다. 이는 PTA의 이름 비교만 느슨하게 해서 해결할 문제가
+아니라 call-graph packet/edge 생성·전달의 불일치다. 임시 진단 코드는
+출하 브랜치에 남기지 않았다.
 
 ## 최소 proof matrix
 
