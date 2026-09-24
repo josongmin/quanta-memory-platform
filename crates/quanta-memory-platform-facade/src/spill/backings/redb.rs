@@ -86,7 +86,7 @@ const BACKEND_ID_HI: &str = "backend_id_hi";
 /// consult it for disposition; the value is preserved untouched for forensic
 /// readability and ignored by all resolution paths. Retained so legacy-format
 /// fixtures and forensic readers can name the key.
-#[allow(dead_code)]
+#[allow(dead_code, reason = "schema key remains reserved for durable format compatibility")]
 const FINALIZED_THROUGH: &str = "finalized_through";
 /// Schema version of the durable spill format. Absent means schema 1
 /// (watermark-only history, possibly ambiguous); 2 means every record carries

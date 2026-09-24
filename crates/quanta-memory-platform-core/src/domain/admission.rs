@@ -558,7 +558,7 @@ pub(crate) fn check_group_admission(
 /// Scheduler-side protected-floor check for one prospective growth: the exact
 /// rule sequence of `protected_floor_fits_after_growth`, with all state
 /// passed explicitly so both live and zero evaluations share it.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, reason = "admission request axes are explicit at this owner boundary")]
 pub(crate) fn check_group_floor(
     groups: &BTreeMap<String, ResourceGroup>,
     unused_floors: u128,

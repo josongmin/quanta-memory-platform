@@ -819,7 +819,14 @@ impl LiveProcessMemoryBroker {
             // Unreachable on this single-lock path (the ticket is live and no
             // rebuild can interleave), but stay fail-closed: undo the reservation
             // and its group bookkeeping rather than strand the bytes.
-            let _ = Self::release_on(core, &ticket);
+            if let Err(rollback_error) = Self::release_on(core, &ticket) {
+                // Keep the exact pending authority for a later retry if even
+                // the defensive rollback fails.
+                core.deferred_pending_rollbacks.push_back(ticket);
+                return Err(MemoryError::InvalidState(format!(
+                    "reservation commit failed ({err}); rollback also failed ({rollback_error})"
+                )));
+            }
             return Err(err);
         }
         Ok(ticket)

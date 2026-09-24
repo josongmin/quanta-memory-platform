@@ -163,7 +163,11 @@ impl fmt::Debug for ScratchReservation {
 impl Drop for ScratchReservation {
     fn drop(&mut self) {
         if !self.released {
-            let _ = self.release();
+            if self.release().is_err() {
+                // The authority remains owned here. Its own Drop retries the
+                // pending rollback and queues the exact ticket if necessary.
+                debug_assert!(self.authority.is_some());
+            }
         }
     }
 }

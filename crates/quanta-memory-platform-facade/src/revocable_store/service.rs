@@ -849,7 +849,7 @@ impl<Key, Value> SimpleRevocableStore<Key, Value, Budgeted> {
             }
             Err(panic) => {
                 if phase == DurableRestorePhase::Prepared {
-                    let _ = controller.abort_restore(&candidate.claim);
+                    self.abort_prepared_restore_on_panic(controller, &candidate, phase);
                 }
                 std::panic::resume_unwind(panic)
             }
@@ -863,7 +863,7 @@ impl<Key, Value> SimpleRevocableStore<Key, Value, Budgeted> {
             }
             Err(panic) => {
                 if phase == DurableRestorePhase::Prepared {
-                    let _ = controller.abort_restore(&candidate.claim);
+                    self.abort_prepared_restore_on_panic(controller, &candidate, phase);
                 }
                 std::panic::resume_unwind(panic)
             }
@@ -887,7 +887,7 @@ impl<Key, Value> SimpleRevocableStore<Key, Value, Budgeted> {
                 retire_client_value(key);
                 retire_client_value(value);
                 if phase == DurableRestorePhase::Prepared {
-                    let _ = controller.abort_restore(&candidate.claim);
+                    self.abort_prepared_restore_on_panic(controller, &candidate, phase);
                 }
                 std::panic::resume_unwind(panic)
             }
@@ -1030,6 +1030,25 @@ impl<Key, Value> SimpleRevocableStore<Key, Value, Budgeted> {
                 self.fence_published_restore(candidate.sequence, Arc::new(candidate.claim));
                 std::panic::resume_unwind(panic)
             }
+        }
+    }
+
+    fn abort_prepared_restore_on_panic<C>(
+        &self,
+        controller: &C,
+        candidate: &crate::spill::DurableRestoreCandidate,
+        phase: DurableRestorePhase,
+    ) where
+        C: DurableRestoreController,
+    {
+        if phase == DurableRestorePhase::Prepared {
+            // The caller's panic remains primary. On abort failure the durable
+            // claim stays persisted for recover_active_restore.
+            #[expect(
+                clippy::let_underscore_must_use,
+                reason = "panic unwind must preserve the original payload; failed abort retains the persisted claim"
+            )]
+            let _ = controller.abort_restore(&candidate.claim);
         }
     }
 
