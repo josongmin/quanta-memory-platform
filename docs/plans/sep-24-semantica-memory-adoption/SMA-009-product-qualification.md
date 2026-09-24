@@ -15,6 +15,63 @@ Source/worktree: [README](README.md). 001/002/003은 Semantica main
 3. 최종 main에서 001/002/003의 API cutover와 memo admission/lease/runtime
    error closure를 검증한다. Rust/QBC는 용량 gate를 충족한 뒤 실행한다.
 
+2026-09-24 current-source note: Semantica main `1d17286`의 SDK composition
+owner-local test에 설치된 `memo_residency=0` 정책을 통한 실제 query 거절,
+typed budget reason, rollback postimage, 같은 세션의 후속 no-persist 요청
+oracle을 추가했다. 이는 **작성된 테스트**이며 QBC 미실행이다. 현재 내부
+볼륨은 persona preflight의 16 GiB floor를 충족하지 못했다. 직접
+`invalidate_scope`를 호출하는 기존 SDK test도 coordinated invalidation/GC,
+cancel/close/deferred drain 증거로 확대하지 않는다.
+
+The denial test now compares the complete installed class/owner usage vectors
+and retained-payload/metadata/scratch counters before and after failure, in
+addition to total bytes, memo row absence, and artifact inventory. Once run,
+these assertions can detect a same-total charge transfer in that fixture; they do not prove
+ticket-count closure or a high-level `Code::query()` product route. On the
+preceding `ff634f7` main with unrelated dirty paths, both the direct persona check and canonical
+bootstrap recovery returned `quota_preflight_denied` (roughly 1 GiB free,
+16 GiB floor). No QBC test executed after this assertion change.
+
+The composer `installed_artifact_cap_rejects_product_publication_without_changing_ledger`
+test now exercises a real host-backed artifact row at the independent
+`32 MiB - 72 byte` payload boundary: exact shared-pool charge, checked
+inventory, deletion/refund, then a one-byte-over request with unchanged
+ledger. The 72-byte expectation is written as key/index/entry-state literals,
+not read back from the production cost helper. The test is committed in
+Semantica `1d17286`. A subsequent owner-local extension, committed in
+Semantica `7d6333b`, sets the
+artifact and evidence class caps to zero, verifies that one real artifact row
+exhausts their shared pool, rejects a peer evidence publication without a
+ledger/store postimage, then admits and refunds the evidence owner after the
+artifact is removed. It also verifies that the same artifact owner can publish
+and refund a smaller row after a cap+1 denial. The extension passed formatting
+and diff checks on the working-tree precursor; it is not an executed QBC result or a public
+`Code::query()` proof.
+
+2026-09-25 verification update: Semantica `ea9b9e9` retains the committed
+test unchanged. The direct persona preflight still returned
+`quota_preflight_denied`: roughly 8 GiB free against a 16 GiB floor. No
+owner QBC or product E2E was launched under that failed preflight. This is an
+environment block, not a test failure or a current-source GREEN receipt.
+
+Read-only QBC owner resolution on that checkout identified the exact lib-test
+selectors below. Resolution is not compilation or test discovery; run them
+only after the quota preflight passes, and require one executed test each:
+
+```sh
+scripts/quanta-build-cli owner resolve --package quanta-runtime-memory-compose --target-kind lib --selector-mode exact --selector tests::installed_artifact_cap_rejects_product_publication_without_changing_ledger --compile-policy package-all-features --json
+scripts/quanta-build-cli owner resolve --package quanta-sdk-runtime-composition-owner --target-kind lib --selector-mode exact --selector types::no_persist_composition_tests::sdk_memo_capacity_denial_is_typed_and_leaves_session_usable_v1 --compile-policy package-all-features --json
+```
+
+`quanta-runtime/src/orchestration/observation_feedback_runtime/product_bound_runtime.rs`
+의 SQL-family shadow leg는 별도 in-memory artifact/evidence/memo store를 만들고,
+SDK installed broker 밖이라고 명시한다. 해당 함수는
+`sql-family-product-runtime` 공개 surface로 re-export된다. 현재 내부 호출
+census에는 test/probe 호출만 있었으나 외부 consumer closure는 미확인이다.
+전체 product process budget을 주장하려면 같은 domain 설치 또는 독립
+domain의 한도·범위 제외 계약을 먼저 결정해야 한다. 이 경로를 조용히
+SDK G6 통과로 합산하지 않는다.
+
 ## 최소 proof matrix
 
 | Gate | 재사용할 경계 | 통과 조건 |
