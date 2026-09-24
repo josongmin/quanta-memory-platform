@@ -5,8 +5,9 @@
 - Added two in-memory cross-store accounting E2E cases and strengthened the
   scaling-result verifier to reject inconsistent success/denial outcome counts.
   Existing 48-row smoke and 220-row full artifacts passed the revised verifier;
-  fresh benchmark generation and repository-wide qualification on the newer
-  source remain separate.
+  a clean `db0b03c` smoke subsequently passed 48/48. Fresh full benchmark
+  generation and repository-wide qualification on the newer source remain
+  separate.
 
 ## Unreleased - 2026-09-23
 

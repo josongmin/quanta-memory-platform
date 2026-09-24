@@ -20,6 +20,9 @@ reclaim, and in-process transfer; existing optional Redb code is unchanged.
 
 ## 목적과 증거 범위
 
+아래는 v5 발행 전 handoff 시점의 기록이다. “현 HEAD”, “현재 후보” 및
+“v5 tag 미발행”은 당시 스냅샷에만 적용된다.
+
 현 HEAD 감사에서 확인한 **P1 독립 근본 원인 3건**(durable record 상태,
 durable recovery 단일 소유권, 0-byte ticket의 scope 수명)과 P2 개선 3건을
 구현 가능한 티켓으로 분리했다. P0으로 확정된 건은 없다. FUP-001~005/007은

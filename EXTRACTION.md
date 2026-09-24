@@ -24,7 +24,8 @@ dependency direction. Not prose: every step is a command or a verifiable gate.
 
 ## Step-by-step
 
-1. Dry-run the bootstrap (no writes):
+1. Dry-run the bootstrap (no repository or destination writes; temporary
+   manifest files are created and removed under `/tmp`):
 
    ```bash
    scripts/extract-to-standalone-repo.sh --dry-run /tmp/qmp-extracted
