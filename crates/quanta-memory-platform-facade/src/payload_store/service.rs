@@ -1347,6 +1347,118 @@ mod tests {
         assert!(matches!(store.stats(), Err(MemoryError::Poisoned(_))));
     }
 
+    type DropReentryPayloadStore = SimplePayloadStore<String, DropReentryBody, Budgeted>;
+
+    #[derive(Clone)]
+    struct DropReentryBody {
+        id: u8,
+        armed: Arc<std::sync::atomic::AtomicBool>,
+        home: Arc<OnceLock<Weak<DropReentryPayloadStore>>>,
+        peer: Arc<OnceLock<Weak<DropReentryPayloadStore>>>,
+        hits: Arc<AtomicUsize>,
+    }
+
+    impl ByteSized for DropReentryBody {
+        fn byte_size(&self) -> u64 {
+            1
+        }
+    }
+
+    impl CanonicalKey for DropReentryBody {
+        fn canonical_key(&self) -> Vec<u8> {
+            vec![self.id]
+        }
+    }
+
+    impl Drop for DropReentryBody {
+        fn drop(&mut self) {
+            if !self.armed.swap(false, Ordering::SeqCst) {
+                return;
+            }
+            let home = self.home.get().expect("home installed").upgrade().expect("home live");
+            assert!(matches!(
+                home.stats(),
+                Err(MemoryError::OperationInProgress(resource)) if resource == "payload store"
+            ));
+            let peer = self.peer.get().expect("peer installed").upgrade().expect("peer live");
+            peer.put_canonical(RetainedEnvelope::new(Self {
+                id: 2,
+                armed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                home: Arc::clone(&self.home),
+                peer: Arc::clone(&self.peer),
+                hits: Arc::clone(&self.hits),
+            }))
+            .expect("other store can publish during retired body drop");
+            self.hits.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn delete_drop_reentry_is_bounded_and_peer_publication_retains_exact_charge() {
+        const CHILD: &str = "QMP_PAYLOAD_DELETE_DROP_REENTRY_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let mut child =
+                std::process::Command::new(std::env::current_exe().expect("test binary"))
+                    .arg("delete_drop_reentry_is_bounded_and_peer_publication_retains_exact_charge")
+                    .env(CHILD, "1")
+                    .spawn()
+                    .expect("spawn bounded reentry test");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                if let Some(status) = child.try_wait().expect("poll child") {
+                    assert!(status.success(), "reentry child failed: {status}");
+                    return;
+                }
+                if std::time::Instant::now() >= deadline {
+                    child.kill().expect("terminate deadlocked child");
+                    child.wait().expect("reap child");
+                    panic!("reentry child exceeded bounded deadline");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+
+        let broker = live_broker(1_000_000, 600_000);
+        let home = Arc::new(DropReentryPayloadStore::new_budgeted(binding(), None, broker.clone()));
+        let peer = Arc::new(DropReentryPayloadStore::new_budgeted(
+            StoreBindingHandle::new(MemoryClass::ArtifactCache, "drop-peer".into(), None),
+            None,
+            broker.clone(),
+        ));
+        let home_slot = Arc::new(OnceLock::new());
+        let peer_slot = Arc::new(OnceLock::new());
+        home_slot.set(Arc::downgrade(&home)).expect("install home");
+        peer_slot.set(Arc::downgrade(&peer)).expect("install peer");
+        let hits = Arc::new(AtomicUsize::new(0));
+        let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let published = home
+            .put_canonical(RetainedEnvelope::new(DropReentryBody {
+                id: 1,
+                armed: Arc::clone(&armed),
+                home: Arc::clone(&home_slot),
+                peer: Arc::clone(&peer_slot),
+                hits: Arc::clone(&hits),
+            }))
+            .expect("seed");
+        assert_eq!(
+            broker.ledger_snapshot().expect("seed ledger").total_owner_bytes(),
+            retained_cost(1, 0)
+        );
+        armed.store(true, Ordering::SeqCst);
+        home.delete_if_unpinned(&published.payload_ref).expect("delete and retire body");
+
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        assert_eq!(home.stats().expect("home postimage").item_count, 0);
+        assert_eq!(peer.stats().expect("peer postimage").item_count, 1);
+        assert_eq!(
+            broker.ledger_snapshot().expect("peer ledger").total_owner_bytes(),
+            retained_cost(1, 0)
+        );
+        home.close().expect("close home");
+        peer.close().expect("close peer");
+        assert_eq!(broker.ledger_snapshot().expect("drained ledger").total_owner_bytes(), 0);
+    }
+
     #[test]
     fn delete_contains_two_panicking_client_destructors_after_exact_refund() {
         use std::sync::atomic::AtomicBool;

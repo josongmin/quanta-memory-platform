@@ -47,7 +47,12 @@ Correctness is managed as **tests**; benchmarks answer a different question
   tracking allocator. `scripts/verify-scaling-results.py` owns the executable
   absolute and optional same-host baseline thresholds; its negative fixtures
   prove drift and regressed results are rejected. Correctness remains in the
-  owning unit/conformance suites.
+  owning unit/conformance suites. The scheduler-admission row retains its
+  **combined** timed-call count, throughput and `p50/p95/p99_ns`,
+  and also reports `admitted_*_ns` and `denied_*_ns` percentiles from the same
+  timed calls. New rows require both distributions. Historical v3 baselines
+  without the split compare aggregate latency only; outcome-specific regressions
+  require a baseline carrying both outcome distributions.
 
 ---
 
@@ -171,6 +176,15 @@ check helpers that the control plane enforces (see group C/D).
   queued or replayed. Two independently initiated hard requests also share at
   most one in-flight host reclaimer; the second reaches a bounded denial while
   the first callback is deliberately held by a channel, not a sleep.
+- ✅ **Panicking host callbacks are quarantined, not leaked per request** —
+  `sink_panic_payloads_are_retired_once_and_callback_is_quarantined` and
+  `reclaimer_panic_payloads_are_retired_once_and_admission_remeasures`
+  (`core/src/api/control.rs`) exercise ordinary and panicking payload destructors.
+  Later operations retain exact accounting without reinvoking the failed sink
+  or reclaimer. `soft_and_hard_reclaim_plans_share_one_callback_in_both_arrival_orders`,
+  `held_reclaim_remeasures_concurrent_policy_and_slot_changes`, and
+  `concurrent_recharge_and_observe_never_expose_torn_axes` pin the mixed-pressure,
+  changed-policy, and coherent-snapshot interleavings with exact postimages.
 
 ## D. Scheduler — ✅ (`core/src/application/scheduler.rs`)
 
@@ -198,6 +212,13 @@ check helpers that the control plane enforces (see group C/D).
   (`facade/src/payload_store/service.rs`) traps the stored-reference clone in
   `put_canonical`; the public store stays readable, no charge is acquired,
   and a retry plus cleanup drains exactly.
+- ✅ **Retired client destructor reentry** —
+  `delete_drop_reentry_is_bounded_and_peer_publication_retains_exact_charge`
+  (`facade/src/payload_store/service.rs`) and
+  `overwrite_drop_reentry_is_bounded_and_other_store_sees_exact_ledger`
+  (`facade/src/retained_map/service.rs`) run in bounded child processes. Same-store
+  reads return typed busy during the mutation lane; a peer store can publish on
+  the shared broker, and final inventory and charge drain exactly.
 - ✅ **F#3 for payload_store** — `charged_store_bytes_flow_through_the_ledger_and_drain_to_zero`, `charged_payload_over_cap_put_is_fail_closed`, `uncharged_store_is_explicit_non_budgeted_mode` (a "charged store" mode routes bytes through the broker ledger).
 - ✅ retained_map hash-indexed point operations + accounting/order preservation — `put_get_remove_get_none_round_trip_corrects_bytes`, `equal_hash_key_duplicate_overwrites_and_does_not_double_count`, `first_and_last_key_point_operations_share_one_n_independent_probe_bound_v1`, `overwrite_preserves_original_insertion_position_for_newest_first_sweep`, `arbitrary_remove_preserves_remaining_newest_first_sweep_order`, `charged_sweep_during_rebuild_is_fail_closed`, and `keys_lists_inserted_keys_in_deterministic_sorted_order`. The public key identity law is `Eq + Hash`; exact lookup/overwrite/remove use the canonical linked hash container while enumeration remains deterministically key-sorted.
 - ✅ **Read-side client panic does not poison retained-map state** — `checked_reads_propagate_client_clone_panics_without_poisoning_owner_mutex_v1` proves a panicking value clone still propagates to the caller, then subsequent get/stats/key/entry reads remain available. This is not a callback time bound; synchronous callback latency remains caller-controlled.
@@ -213,6 +234,11 @@ check helpers that the control plane enforces (see group C/D).
 - ✅ CanonicalKey/MeasuredValue — `cloning_measured_arc_shares_the_allocation_not_a_deep_copy`, `measured_value_charges_caller_supplied_size_not_inner_len`, `cloning_measured_value_preserves_size_and_value_context`.
 - ✅ spill routing fail-closed — `routed_spill_to_available_target_succeeds_and_counts`, `spill_to_unavailable_target_fails_closed_and_does_not_count`, `routed_spill_after_target_goes_offline_fails_closed_leaving_inventory_unchanged`.
 - ✅ **spill write → restore (inverse) round-trips** — the restore inverse landed: `in_memory_target_write_then_restore_round_trips_the_payload`, `in_memory_target_restore_of_missing_handle_is_none_not_an_error`, `in_memory_target_restore_after_offline_fails_closed_leaving_retained_state_unchanged` (`facade/src/spill/service.rs`).
+- ✅ **Closed source after in-process spill** —
+  `closed_source_rejects_restored_handle_without_losing_its_charge`
+  (`facade/src/revocable_store/service.rs`) proves rejected restore returns the
+  still-charged handle and its later retirement refunds once, even after the
+  target controller is dropped.
 - ✅ transcript per-session isolation + charged mode — `append_identity_is_partitioned_by_session`, `retention_stats_separate_active_evidence_and_session_costs`, and (charged) `exact_retry_charges_once_and_truncate_refunds_only_active_body`, `quota_denial_leaves_row_indexes_and_charge_unchanged` (`facade/src/transcript_store/service.rs`).
 - ✅ **Transcript read-planning panic availability** —
   `session_order_panic_before_mutation_keeps_public_transcript_available`,

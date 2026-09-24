@@ -73,6 +73,8 @@ impl ProcessMemoryBrokerBuilder {
 
     /// Install the bounded reclaim callback used by soft-threshold and hard
     /// denial slow paths. The callback is invoked without the broker mutex.
+    /// A panicking callback is quarantined for this broker's remaining lifetime;
+    /// subsequent requests use the live ledger without invoking it again.
     #[cfg(feature = "live_control")]
     #[must_use]
     pub fn with_reclaimer(mut self, reclaimer: Arc<dyn MemoryReclaimer>) -> Self {
@@ -81,7 +83,9 @@ impl ProcessMemoryBrokerBuilder {
     }
 
     /// Install an advisory, bounded-cardinality operational event sink. The
-    /// broker invokes it outside its mutex and contains callback panics.
+    /// broker invokes it outside its mutex and contains callback panics. A
+    /// panicking sink is quarantined for this broker's remaining lifetime;
+    /// accounting remains authoritative, but later advisory events are dropped.
     #[cfg(feature = "live_control")]
     #[must_use]
     pub fn with_event_sink(mut self, event_sink: Arc<dyn MemoryEventSink>) -> Self {

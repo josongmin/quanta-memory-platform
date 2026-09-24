@@ -1754,6 +1754,44 @@ mod tests {
 
     #[cfg(feature = "spill")]
     #[test]
+    fn closed_source_rejects_restored_handle_without_losing_its_charge() {
+        let broker = live_broker(1_000_000);
+        let source = store_with_broker(&broker);
+        source.insert_checked("first".into(), vec![1; 4]).expect("insert");
+        let charged = expected_entry_cost("first", 4);
+        let controller = RoutedSpillController::new(InMemorySpillTarget::available());
+
+        assert!(source.spill_one_into(&controller).expect("spill"));
+        source.close().expect("close empty source");
+        let handle = controller.restore().expect("restore from tier").expect("live handle");
+        assert_eq!(handle.key(), "first");
+        assert_eq!(handle.value(), &vec![1; 4]);
+        assert_eq!(handle.charged_bytes(), charged);
+        assert_eq!(controller.spilled_count(), Ok(0));
+        assert_eq!(broker.ledger_snapshot().expect("handle ledger").total_owner_bytes(), charged);
+
+        let (error, handle) =
+            source.accept_restored(handle).expect_err("source is closed").into_parts();
+        assert!(matches!(error, MemoryError::Closed(_)));
+        assert_eq!(handle.key(), "first", "rejected restore retains the original payload");
+        assert_eq!(handle.charged_bytes(), charged);
+        assert_eq!(source.stats().expect("closed source stats").item_count, 0);
+        assert_eq!(
+            broker.ledger_snapshot().expect("rejected handle ledger").total_owner_bytes(),
+            charged
+        );
+
+        drop(controller);
+        assert_eq!(
+            broker.ledger_snapshot().expect("handle outlives tier").total_owner_bytes(),
+            charged
+        );
+        drop(handle);
+        assert_eq!(broker.ledger_snapshot().expect("retired handle ledger").total_owner_bytes(), 0);
+    }
+
+    #[cfg(feature = "spill")]
+    #[test]
     fn durable_spill_releases_source_only_after_commit() {
         struct ObservingDurableTarget {
             broker: LiveProcessMemoryBroker,

@@ -31,7 +31,7 @@ def sample(
         "revocable_fill_and_drain", "scheduler_admission_group_cardinality",
     } else 1)
     successful = entries if operation == "scheduler_admission_group_cardinality" else timed
-    return {
+    result = {
         "schema": MODULE.SAMPLE_SCHEMA,
         "operation": operation,
         "mode": mode,
@@ -55,6 +55,12 @@ def sample(
         "allocator_underflowed": False,
         "busy_retries": 0,
     }
+    if operation == "scheduler_admission_group_cardinality":
+        result.update({
+            "admitted_p50_ns": 8, "admitted_p95_ns": 16, "admitted_p99_ns": 24,
+            "denied_p50_ns": 12, "denied_p95_ns": 22, "denied_p99_ns": 32,
+        })
+    return result
 
 
 def valid_records(
@@ -213,6 +219,60 @@ class ScalingResultTests(unittest.TestCase):
         records[1]["p99_ns"] = 1_000_000_001
         with self.assertRaisesRegex(MODULE.ValidationError, "latency distribution"):
             MODULE.validate(records)
+
+    def test_scheduler_outcome_latency_is_required_and_bounded(self) -> None:
+        for field, value, message in (
+            ("denied_p99_ns", None, "incomplete scheduler outcome latency"),
+            ("admitted_p95_ns", 25, "admitted latency distribution"),
+            ("denied_p99_ns", 1_000_000_001, "denied latency distribution"),
+            ("admitted_p50_ns", True, "must be an integer"),
+        ):
+            with self.subTest(field=field, value=value):
+                records = valid_records(["--smoke"])
+                scheduler = next(
+                    record for record in records
+                    if record.get("operation") == "scheduler_admission_group_cardinality"
+                )
+                if value is None:
+                    del scheduler[field]
+                else:
+                    scheduler[field] = value
+                with self.assertRaisesRegex(MODULE.ValidationError, message):
+                    MODULE.validate(records)
+
+    def test_legacy_baseline_compares_aggregate_only(self) -> None:
+        baseline = valid_records(["--smoke"])
+        current = valid_records(["--smoke"])
+        for record in baseline:
+            if record.get("operation") == "scheduler_admission_group_cardinality":
+                for fields in MODULE.OUTCOME_LATENCY_FIELDS.values():
+                    for field in fields:
+                        del record[field]
+        self.assertEqual(MODULE.validate(current, baseline), 48)
+        with self.assertRaisesRegex(MODULE.ValidationError, "incomplete scheduler outcome latency"):
+            MODULE.validate(baseline)
+
+    def test_mixed_baseline_outcome_generations_are_rejected(self) -> None:
+        baseline = valid_records(["--smoke"])
+        scheduler = next(
+            record for record in baseline
+            if record.get("operation") == "scheduler_admission_group_cardinality"
+        )
+        for fields in MODULE.OUTCOME_LATENCY_FIELDS.values():
+            for field in fields:
+                del scheduler[field]
+        with self.assertRaisesRegex(MODULE.ValidationError, "mixed scheduler outcome latency generations"):
+            MODULE.validate(valid_records(["--smoke"]), baseline)
+
+    def test_outcome_specific_p99_regressions_are_rejected(self) -> None:
+        for field, label in (("admitted_p99_ns", "admitted"), ("denied_p99_ns", "denied")):
+            with self.subTest(field=field):
+                current = valid_records(["--smoke"])
+                for record in current:
+                    if record.get("operation") == "scheduler_admission_group_cardinality":
+                        record[field] = 2_000_000
+                with self.assertRaisesRegex(MODULE.ValidationError, f"{label} p99 regressed"):
+                    MODULE.validate(current, valid_records(["--smoke"]))
 
     def test_throughput_denominator_mismatch_is_rejected(self) -> None:
         records = valid_records(["--smoke"])

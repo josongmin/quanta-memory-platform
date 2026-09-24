@@ -174,11 +174,12 @@ struct WorkerSample {
 struct OperationCounts {
     successful: usize,
     denied: usize,
+    outcome_latencies: Option<(LatencySample, LatencySample)>,
 }
 
 impl OperationCounts {
     fn all_successful(successful: usize) -> Self {
-        Self { successful, denied: 0 }
+        Self { successful, denied: 0, outcome_latencies: None }
     }
 
     fn timed(self) -> usize {
@@ -300,6 +301,12 @@ fn emit(
     let elapsed_ns = elapsed.as_nanos();
     let timed_operations = operations.timed();
     let throughput = (timed_operations as f64 / elapsed.as_secs_f64()).round() as u64;
+    let outcome_latency_fields = operations.outcome_latencies.map_or_else(String::new, |(admitted, denied)| {
+        format!(
+            ",\"admitted_p50_ns\":{},\"admitted_p95_ns\":{},\"admitted_p99_ns\":{},\"denied_p50_ns\":{},\"denied_p95_ns\":{},\"denied_p99_ns\":{}",
+            admitted.p50, admitted.p95, admitted.p99, denied.p50, denied.p95, denied.p99,
+        )
+    });
     println!(
         concat!(
             "{{\"schema\":\"qmp-scaling-sample-v3\",",
@@ -317,7 +324,7 @@ fn emit(
             "\"allocator_live_bytes\":{live},",
             "\"allocator_high_water_bytes\":{high_water},",
             "\"allocator_underflowed\":{underflowed},",
-            "\"busy_retries\":{busy_retries}}}"
+            "\"busy_retries\":{busy_retries}{outcome_latency_fields}}}"
         ),
         operation = operation,
         mode = mode,
@@ -340,6 +347,7 @@ fn emit(
         high_water = allocation.high_water,
         underflowed = allocation.underflowed,
         busy_retries = busy_retries,
+        outcome_latency_fields = outcome_latency_fields,
     );
 }
 
@@ -814,10 +822,12 @@ fn scheduler_admission_group_cardinality(
     for _ in 0..entries {
         let operation = Instant::now();
         assert!(scheduler.admits(&target, 1), "cached one-byte fair share must admit");
-        latencies.push(operation.elapsed().as_nanos() as u64);
+        let latency = operation.elapsed().as_nanos() as u64;
+        latencies.push(latency);
         let operation = Instant::now();
         assert!(!scheduler.admits(&target, 2), "request beyond cached share must deny");
-        latencies.push(operation.elapsed().as_nanos() as u64);
+        let latency = operation.elapsed().as_nanos() as u64;
+        latencies.push(latency);
     }
     let elapsed = started.elapsed();
     assert_eq!(
@@ -839,7 +849,13 @@ fn scheduler_admission_group_cardinality(
     );
 
     // Phase 5: summarize and drop with tracking disabled.
+    // Split the existing alternating samples only after the timed loop and
+    // allocation epoch. This keeps throughput comparable to prior v3 runs.
+    let admitted_latencies: Vec<u64> = latencies.iter().step_by(2).copied().collect();
+    let denied_latencies: Vec<u64> = latencies.iter().skip(1).step_by(2).copied().collect();
     let latency = summarize_latencies(latencies);
+    let outcome_latencies =
+        (summarize_latencies(admitted_latencies), summarize_latencies(denied_latencies));
     drop(scheduler);
     drop(target);
     emit(
@@ -853,7 +869,11 @@ fn scheduler_admission_group_cardinality(
         0,
         0,
         allocation,
-        OperationCounts { successful: entries, denied: entries },
+        OperationCounts {
+            successful: entries,
+            denied: entries,
+            outcome_latencies: Some(outcome_latencies),
+        },
         0,
     );
 }

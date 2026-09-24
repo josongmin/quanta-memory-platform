@@ -1456,6 +1456,125 @@ mod tests {
         assert_eq!(store.stats().item_count, 1);
     }
 
+    type DropReentryStore = SimpleRetainedMapStore<String, DropReentryValue, Budgeted>;
+
+    #[derive(Clone)]
+    struct DropReentryValue {
+        id: u8,
+        bytes: u64,
+        armed: Arc<AtomicBool>,
+        home: Arc<OnceLock<Weak<DropReentryStore>>>,
+        peer: Arc<OnceLock<Weak<DropReentryStore>>>,
+        hits: Arc<AtomicUsize>,
+    }
+
+    impl ByteSized for DropReentryValue {
+        fn byte_size(&self) -> u64 {
+            self.bytes
+        }
+    }
+
+    impl Drop for DropReentryValue {
+        fn drop(&mut self) {
+            if !self.armed.swap(false, Ordering::SeqCst) {
+                return;
+            }
+            let home = self.home.get().expect("home installed").upgrade().expect("home live");
+            assert!(matches!(
+                home.stats_checked(),
+                Err(MemoryError::OperationInProgress(resource)) if resource == "retained map"
+            ));
+            let peer = self.peer.get().expect("peer installed").upgrade().expect("peer live");
+            peer.insert_checked(
+                "peer".to_string(),
+                Self {
+                    id: 3,
+                    bytes: 2,
+                    armed: Arc::new(AtomicBool::new(false)),
+                    home: Arc::clone(&self.home),
+                    peer: Arc::clone(&self.peer),
+                    hits: Arc::clone(&self.hits),
+                },
+            )
+            .expect("other store can admit during retired value drop");
+            self.hits.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn overwrite_drop_reentry_is_bounded_and_other_store_sees_exact_ledger() {
+        use quanta_memory_platform_core::{MemoryPreset, ProcessMemoryBrokerBuilder};
+
+        const CHILD: &str = "QMP_RETAINED_OVERWRITE_DROP_REENTRY_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let mut child =
+                std::process::Command::new(std::env::current_exe().expect("test binary"))
+                    .arg("overwrite_drop_reentry_is_bounded_and_other_store_sees_exact_ledger")
+                    .env(CHILD, "1")
+                    .spawn()
+                    .expect("spawn bounded reentry test");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                if let Some(status) = child.try_wait().expect("poll child") {
+                    assert!(status.success(), "reentry child failed: {status}");
+                    return;
+                }
+                if std::time::Instant::now() >= deadline {
+                    child.kill().expect("terminate deadlocked child");
+                    child.wait().expect("reap child");
+                    panic!("reentry child exceeded bounded deadline");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+
+        let broker = ProcessMemoryBrokerBuilder::new()
+            .with_preset(MemoryPreset::Development)
+            .build()
+            .expect("broker");
+        let home = Arc::new(DropReentryStore::new_budgeted(
+            StoreBindingHandle::new(MemoryClass::MemoResidency, "drop-home".into(), None),
+            broker.clone(),
+        ));
+        let peer = Arc::new(DropReentryStore::new_budgeted(
+            StoreBindingHandle::new(MemoryClass::MemoResidency, "drop-peer".into(), None),
+            broker.clone(),
+        ));
+        let home_slot = Arc::new(OnceLock::new());
+        let peer_slot = Arc::new(OnceLock::new());
+        home_slot.set(Arc::downgrade(&home)).expect("install home");
+        peer_slot.set(Arc::downgrade(&peer)).expect("install peer");
+        let hits = Arc::new(AtomicUsize::new(0));
+        let armed = Arc::new(AtomicBool::new(false));
+        let value = |id, bytes, armed| DropReentryValue {
+            id,
+            bytes,
+            armed,
+            home: Arc::clone(&home_slot),
+            peer: Arc::clone(&peer_slot),
+            hits: Arc::clone(&hits),
+        };
+        home.insert_checked("home".to_string(), value(1, 4, Arc::clone(&armed))).expect("seed");
+        armed.store(true, Ordering::SeqCst);
+        home.insert_checked("home".to_string(), value(2, 7, Arc::new(AtomicBool::new(false))))
+            .expect("overwrite and retire old value");
+
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "old value drop ran exactly once");
+        assert_eq!(home.get_checked(&"home".to_string()).expect("home read").expect("row").id, 2);
+        assert_eq!(peer.get_checked(&"peer".to_string()).expect("peer read").expect("row").id, 3);
+        let expected_home = retained_cost("home", 7);
+        let expected_peer = retained_cost("peer", 2);
+        assert_eq!(home.stats_checked().expect("home stats").estimated_bytes, expected_home);
+        assert_eq!(peer.stats_checked().expect("peer stats").estimated_bytes, expected_peer);
+        assert_eq!(
+            broker.ledger_snapshot().expect("ledger").total_owner_bytes(),
+            expected_home + expected_peer
+        );
+        home.close().expect("close home");
+        peer.close().expect("close peer");
+        assert_eq!(broker.ledger_snapshot().expect("drained ledger").total_owner_bytes(), 0);
+    }
+
     #[test]
     fn remove_releases_committed_bytes() {
         let store = store();

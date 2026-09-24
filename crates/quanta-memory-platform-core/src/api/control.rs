@@ -105,6 +105,19 @@ impl Drop for CallbackPermit<'_> {
     }
 }
 
+/// Retire an opaque host panic payload outside the broker lock. A malicious
+/// payload may panic again in `Drop`; leaking that *one* secondary payload is
+/// preferable to allowing a host destructor to unwind through accounting.
+/// Callers quarantine the callback before invoking this, so the leak cannot
+/// grow with repeated broker operations.
+fn retire_host_panic_payload(payload: Box<dyn std::any::Any + Send>) {
+    if let Err(drop_panic) =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(payload)))
+    {
+        std::mem::forget(drop_panic);
+    }
+}
+
 /// A live, accounting-backed process memory broker.
 ///
 /// All mutating operations route through the [`AccountingLedger`] so the global
@@ -117,9 +130,13 @@ pub struct LiveProcessMemoryBroker {
     /// Serialize advisory sink calls across broker clones and threads. Events
     /// arriving while a sink callback is active are dropped to bound reentry.
     event_sink_active: Arc<AtomicBool>,
+    /// A panicking host sink is not retried: its opaque panic payload cannot
+    /// be guaranteed safe to destroy, so repeated invocation is unbounded.
+    event_sink_quarantined: Arc<AtomicBool>,
     /// At most one external reclaim callback may execute for this broker at a
     /// time. This cross-thread gate complements the same-thread reentry guard.
     reclaimer_active: Arc<AtomicBool>,
+    reclaimer_quarantined: Arc<AtomicBool>,
 }
 
 struct BrokerCore {
@@ -494,7 +511,9 @@ impl LiveProcessMemoryBroker {
             })),
             events,
             event_sink_active: Arc::new(AtomicBool::new(false)),
+            event_sink_quarantined: Arc::new(AtomicBool::new(false)),
             reclaimer_active: Arc::new(AtomicBool::new(false)),
+            reclaimer_quarantined: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -507,18 +526,23 @@ impl LiveProcessMemoryBroker {
     }
 
     fn emit(&self, event: MemoryEvent) {
+        if self.event_sink_quarantined.load(AtomicOrdering::Acquire) {
+            return;
+        }
         // Thread-local detection is insufficient when a sink spawns a thread
         // that observes this broker. Serialize by broker identity across all
         // threads; recursive/concurrent advisory events may be dropped.
         let Some(_callback_permit) = CallbackPermit::try_enter(&self.event_sink_active) else {
             return;
         };
+        if self.event_sink_quarantined.load(AtomicOrdering::Acquire) {
+            return;
+        }
         if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.events.emit(event);
         })) {
-            // A telemetry sink has no accounting authority. Contain a hostile
-            // panic payload rather than letting observation abort a caller.
-            std::mem::forget(payload);
+            self.event_sink_quarantined.store(true, AtomicOrdering::Release);
+            retire_host_panic_payload(payload);
         }
     }
 
@@ -950,6 +974,14 @@ impl LiveProcessMemoryBroker {
     }
 
     fn run_reclaim(&self, reclaimer: Arc<dyn MemoryReclaimer>, request: &ReclaimRequest) {
+        if self.reclaimer_quarantined.load(AtomicOrdering::Acquire) {
+            self.emit(MemoryEvent::new(
+                MemoryOperation::Reclaim,
+                MemoryOutcome::CallbackFailed,
+                Some(request.requested_bytes),
+            ));
+            return;
+        }
         let Some(reclaimer_permit) = CallbackPermit::try_enter(&self.reclaimer_active) else {
             // Concurrent plans may still make progress without host work if the
             // live postimage admits them; otherwise their normal remeasurement
@@ -961,6 +993,9 @@ impl LiveProcessMemoryBroker {
             ));
             return;
         };
+        if self.reclaimer_quarantined.load(AtomicOrdering::Acquire) {
+            return;
+        }
         let broker_identity = Arc::as_ptr(&self.inner) as usize;
         // The entry guard in `reserve_with_reclaim` rejects same-broker reserve
         // reentry before it can prepare another callback. This local guard is a
@@ -972,8 +1007,14 @@ impl LiveProcessMemoryBroker {
         };
         let outcome =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| reclaimer.reclaim(request)));
+        if outcome.is_err() {
+            self.reclaimer_quarantined.store(true, AtomicOrdering::Release);
+        }
         drop(callback_scope);
         drop(reclaimer_permit);
+        // Payload destructors are host code too. Never run one under the
+        // broker mutex; it may reenter accounting before it panics.
+        let outcome = outcome.map_err(retire_host_panic_payload);
         let mut core = match self.lock() {
             Ok(core) => core,
             Err(error) => {
@@ -996,12 +1037,8 @@ impl LiveProcessMemoryBroker {
                 core.reclaim_stats.failures += 1;
                 MemoryOutcome::CallbackFailed
             }
-            Err(payload) => {
+            Err(()) => {
                 core.reclaim_stats.failures += 1;
-                // A hostile panic payload may itself panic on Drop. This is an
-                // exceptional, bounded leak that keeps a client callback from
-                // aborting the process during panic-payload retirement.
-                std::mem::forget(payload);
                 MemoryOutcome::CallbackFailed
             }
         };
@@ -4486,6 +4523,133 @@ mod tests {
         assert_eq!(broker.ledger_snapshot().expect("ledger").total_owner_bytes(), 0);
     }
 
+    struct CountedPanicPayload {
+        drops: Arc<std::sync::atomic::AtomicUsize>,
+        panic_on_drop: bool,
+    }
+
+    impl Drop for CountedPanicPayload {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, AtomicOrdering::SeqCst);
+            if self.panic_on_drop {
+                panic!("host panic payload destructor");
+            }
+        }
+    }
+
+    struct PayloadPanickingSink {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        drops: Arc<std::sync::atomic::AtomicUsize>,
+        panic_on_drop: bool,
+    }
+
+    impl MemoryEventSink for PayloadPanickingSink {
+        fn emit(&self, _event: MemoryEvent) {
+            self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+            std::panic::panic_any(CountedPanicPayload {
+                drops: self.drops.clone(),
+                panic_on_drop: self.panic_on_drop,
+            });
+        }
+    }
+
+    #[test]
+    fn sink_panic_payloads_are_retired_once_and_callback_is_quarantined() {
+        for panic_on_drop in [false, true] {
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let broker = crate::ProcessMemoryBrokerBuilder::new()
+                .with_preset(crate::MemoryPreset::Development)
+                .with_event_sink(Arc::new(PayloadPanickingSink {
+                    calls: calls.clone(),
+                    drops: drops.clone(),
+                    panic_on_drop,
+                }))
+                .build()
+                .expect("broker");
+            for _ in 0..8 {
+                let charge = broker
+                    .reserve_managed_charge(
+                        MemoryClass::ArtifactCache,
+                        "hostile-sink".into(),
+                        MemoryContextKind::Request,
+                        ChargeKind::RetainedPayload,
+                        1,
+                    )
+                    .expect("sink cannot alter admission");
+                drop(charge);
+            }
+            assert_eq!(calls.load(AtomicOrdering::SeqCst), 1);
+            assert_eq!(drops.load(AtomicOrdering::SeqCst), 1);
+            sep23_assert_fully_drained(&broker);
+        }
+    }
+
+    struct PayloadPanickingReclaimer {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        drops: Arc<std::sync::atomic::AtomicUsize>,
+        panic_on_drop: bool,
+    }
+
+    impl MemoryReclaimer for PayloadPanickingReclaimer {
+        fn reclaim(
+            &self,
+            _request: &ReclaimRequest,
+        ) -> MemoryResult<crate::ports::reclaim::ReclaimOutcome> {
+            self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+            std::panic::panic_any(CountedPanicPayload {
+                drops: self.drops.clone(),
+                panic_on_drop: self.panic_on_drop,
+            });
+        }
+    }
+
+    #[test]
+    fn reclaimer_panic_payloads_are_retired_once_and_admission_remeasures() {
+        for panic_on_drop in [false, true] {
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let policy = ResidencyPolicy::new(100)
+                .with_class_budget(MemoryClass::ArtifactCache, class_budget(0, 100, 100, false));
+            let broker = LiveProcessMemoryBroker::from_report_with_reclaimer(
+                report_with(policy),
+                Some(Arc::new(PayloadPanickingReclaimer {
+                    calls: calls.clone(),
+                    drops: drops.clone(),
+                    panic_on_drop,
+                })),
+            )
+            .expect("broker");
+            let baseline = broker
+                .reserve_managed_charge(
+                    MemoryClass::ArtifactCache,
+                    "baseline".into(),
+                    MemoryContextKind::Request,
+                    ChargeKind::RetainedPayload,
+                    100,
+                )
+                .expect("baseline");
+            for _ in 0..8 {
+                assert!(matches!(
+                    broker.reserve(
+                        MemoryClass::ArtifactCache,
+                        "request".into(),
+                        MemoryContextKind::Request,
+                        ChargeKind::RetainedPayload,
+                        1,
+                    ),
+                    Err(MemoryError::Capacity(_))
+                ));
+            }
+            assert_eq!(calls.load(AtomicOrdering::SeqCst), 1);
+            assert_eq!(drops.load(AtomicOrdering::SeqCst), 1);
+            assert_eq!(broker.reclaim_runtime_stats().expect("stats").attempts, 1);
+            assert_eq!(broker.ledger_snapshot().expect("snapshot").total_owner_bytes(), 100);
+            drop(baseline);
+            sep23_assert_fully_drained(&broker);
+        }
+    }
+
     struct RecursiveObserveEventSink {
         broker: Mutex<Option<LiveProcessMemoryBroker>>,
         calls: std::sync::atomic::AtomicUsize,
@@ -4759,6 +4923,310 @@ mod tests {
         assert_eq!(reclaimer.calls.load(AtomicOrdering::SeqCst), 1);
         assert_eq!(broker.ledger_snapshot().expect("unchanged").total_owner_bytes(), 100);
         drop(baseline);
+        sep23_assert_fully_drained(&broker);
+    }
+
+    #[test]
+    fn soft_and_hard_reclaim_plans_share_one_callback_in_both_arrival_orders() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        struct HeldReclaimer {
+            entered: mpsc::Sender<ReclaimTrigger>,
+            release: Mutex<mpsc::Receiver<()>>,
+            triggers: Mutex<Vec<ReclaimTrigger>>,
+            calls: std::sync::atomic::AtomicUsize,
+        }
+        impl MemoryReclaimer for HeldReclaimer {
+            fn reclaim(
+                &self,
+                request: &ReclaimRequest,
+            ) -> MemoryResult<crate::ports::reclaim::ReclaimOutcome> {
+                self.triggers.lock().expect("triggers").push(request.trigger);
+                if self.calls.fetch_add(1, AtomicOrdering::SeqCst) == 0 {
+                    self.entered.send(request.trigger).expect("first callback entered");
+                    self.release.lock().expect("release channel").recv().expect("first released");
+                }
+                Ok(crate::ports::reclaim::ReclaimOutcome::default())
+            }
+        }
+
+        for soft_first in [true, false] {
+            let (entered_tx, entered_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            let reclaimer = Arc::new(HeldReclaimer {
+                entered: entered_tx,
+                release: Mutex::new(release_rx),
+                triggers: Mutex::new(Vec::new()),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            });
+            let policy = if soft_first {
+                ResidencyPolicy::new(1_000)
+                    .with_class_budget(MemoryClass::ArtifactCache, class_budget(0, 50, 100, false))
+            } else {
+                ResidencyPolicy::new(1_000)
+                    .with_class_budget(MemoryClass::ArtifactCache, class_budget(0, 100, 100, false))
+                    .with_owner_quota(
+                        "soft",
+                        OwnerQuota { soft_cap_bytes: 10, hard_cap_bytes: 100 },
+                    )
+            };
+            let broker = LiveProcessMemoryBroker::from_report_with_reclaimer(
+                report_with(policy),
+                Some(reclaimer.clone()),
+            )
+            .expect("broker");
+            let baseline_bytes = if soft_first { 40 } else { 80 };
+            let baseline = broker
+                .reserve_managed_charge(
+                    MemoryClass::ArtifactCache,
+                    "baseline".into(),
+                    MemoryContextKind::Request,
+                    ChargeKind::RetainedPayload,
+                    baseline_bytes,
+                )
+                .expect("baseline below soft or hard boundary");
+            let first_broker = broker.clone();
+            let first = std::thread::spawn(move || {
+                first_broker.reserve_managed_charge(
+                    MemoryClass::ArtifactCache,
+                    if soft_first { "soft" } else { "hard" }.into(),
+                    MemoryContextKind::Request,
+                    ChargeKind::RetainedPayload,
+                    if soft_first { 20 } else { 30 },
+                )
+            });
+            assert_eq!(
+                entered_rx.recv_timeout(Duration::from_secs(5)).expect("first callback held"),
+                if soft_first {
+                    ReclaimTrigger::SoftThreshold
+                } else {
+                    ReclaimTrigger::CapacityDenial
+                }
+            );
+            let (second_tx, second_rx) = mpsc::channel();
+            let second_broker = broker.clone();
+            let second = std::thread::spawn(move || {
+                let result = second_broker.reserve_managed_charge(
+                    MemoryClass::ArtifactCache,
+                    if soft_first { "hard" } else { "soft" }.into(),
+                    MemoryContextKind::Request,
+                    ChargeKind::RetainedPayload,
+                    if soft_first { 70 } else { 20 },
+                );
+                second_tx.send(result).expect("parent receives competing outcome");
+            });
+            let second_during_first = second_rx.recv_timeout(Duration::from_secs(5));
+            release_tx.send(()).expect("release held callback even if peer timed out");
+            let first_result = first.join().expect("first request thread");
+            second.join().expect("second request thread");
+            let second_result = second_during_first.expect("peer must finish while callback held");
+            assert_eq!(first_result.is_ok(), soft_first);
+            assert_eq!(second_result.is_ok(), !soft_first);
+            let denied = if soft_first { &second_result } else { &first_result };
+            assert!(matches!(denied, Err(MemoryError::Capacity(_))));
+            let observation = broker.observe().expect("single live postimage");
+            assert_eq!(observation.semantic_bytes, if soft_first { 60 } else { 100 });
+            assert_eq!(observation.ledger.live_ticket_count, 2);
+            assert_eq!(observation.reclaim.attempts, 1);
+            assert_eq!(observation.reclaim.terminal_denials, 1);
+            assert_eq!(reclaimer.calls.load(AtomicOrdering::SeqCst), 1);
+            assert_eq!(
+                reclaimer.triggers.lock().expect("triggers").as_slice(),
+                &[if soft_first {
+                    ReclaimTrigger::SoftThreshold
+                } else {
+                    ReclaimTrigger::CapacityDenial
+                }]
+            );
+            drop(first_result);
+            drop(second_result);
+            drop(baseline);
+            sep23_assert_fully_drained(&broker);
+        }
+    }
+
+    #[test]
+    fn held_reclaim_remeasures_concurrent_policy_and_slot_changes() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        struct HeldReclaimer {
+            entered: mpsc::Sender<()>,
+            release: Mutex<mpsc::Receiver<()>>,
+            calls: std::sync::atomic::AtomicUsize,
+        }
+        impl MemoryReclaimer for HeldReclaimer {
+            fn reclaim(
+                &self,
+                _request: &ReclaimRequest,
+            ) -> MemoryResult<crate::ports::reclaim::ReclaimOutcome> {
+                self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+                self.entered.send(()).expect("callback entered");
+                self.release.lock().expect("release channel").recv().expect("callback released");
+                Ok(crate::ports::reclaim::ReclaimOutcome::default())
+            }
+        }
+
+        for (competing_bytes, should_admit) in [(120, true), (130, false)] {
+            let (entered_tx, entered_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            let reclaimer = Arc::new(HeldReclaimer {
+                entered: entered_tx,
+                release: Mutex::new(release_rx),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            });
+            let old_policy = ResidencyPolicy::new(100)
+                .with_class_budget(MemoryClass::ArtifactCache, class_budget(0, 100, 100, false));
+            let broker = LiveProcessMemoryBroker::from_report_with_reclaimer(
+                report_with(old_policy),
+                Some(reclaimer.clone()),
+            )
+            .expect("broker");
+            let baseline = broker
+                .reserve_managed_charge(
+                    MemoryClass::ArtifactCache,
+                    "baseline".into(),
+                    MemoryContextKind::Request,
+                    ChargeKind::RetainedPayload,
+                    80,
+                )
+                .expect("baseline");
+            let request_broker = broker.clone();
+            let request = std::thread::spawn(move || {
+                request_broker.reserve_managed_charge(
+                    MemoryClass::ArtifactCache,
+                    "request".into(),
+                    MemoryContextKind::Request,
+                    ChargeKind::RetainedPayload,
+                    30,
+                )
+            });
+            entered_rx.recv_timeout(Duration::from_secs(5)).expect("hard callback entered");
+            drop(baseline);
+            broker
+                .try_live_reconfigure(ResidencyPolicy::new(150).with_class_budget(
+                    MemoryClass::ArtifactCache,
+                    class_budget(0, 150, 150, false),
+                ))
+                .expect("raise policy while callback is held");
+            let competing = broker
+                .reserve_managed_charge(
+                    MemoryClass::ArtifactCache,
+                    "competing".into(),
+                    MemoryContextKind::Request,
+                    ChargeKind::RetainedPayload,
+                    competing_bytes,
+                )
+                .expect("other thread claims the newly available slot");
+            release_tx.send(()).expect("release callback");
+            let result = request.join().expect("request thread");
+            assert_eq!(result.is_ok(), should_admit, "live postimage decides admission");
+            let observation = broker.observe().expect("consistent observation");
+            assert_eq!(observation.report.policy_revision, 2);
+            assert_eq!(
+                observation.semantic_bytes,
+                competing_bytes + if should_admit { 30 } else { 0 }
+            );
+            assert_eq!(reclaimer.calls.load(AtomicOrdering::SeqCst), 1);
+            drop(result);
+            drop(competing);
+            sep23_assert_fully_drained(&broker);
+        }
+    }
+
+    #[test]
+    fn concurrent_recharge_and_observe_never_expose_torn_axes() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let policy = ResidencyPolicy::new(100)
+            .with_class_budget(MemoryClass::ArtifactCache, class_budget(0, 100, 100, false))
+            .with_class_budget(MemoryClass::EvidenceCache, class_budget(0, 100, 100, false));
+        let broker = LiveProcessMemoryBroker::from_report(report_with(policy)).expect("broker");
+        let charge = broker
+            .reserve_managed_charge(
+                MemoryClass::ArtifactCache,
+                "axis:a".into(),
+                MemoryContextKind::Request,
+                ChargeKind::RetainedPayload,
+                40,
+            )
+            .expect("initial charge");
+        let done = Arc::new(AtomicBool::new(false));
+        let writer_done = done.clone();
+        let (stage_tx, stage_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            let mut charge = charge;
+            for step in 0..1_024 {
+                let (class, owner, context, kind) = if step % 2 == 0 {
+                    (
+                        MemoryClass::EvidenceCache,
+                        "axis:b".to_string(),
+                        MemoryContextKind::Session,
+                        ChargeKind::RetainedMetadata,
+                    )
+                } else {
+                    (
+                        MemoryClass::ArtifactCache,
+                        "axis:a".to_string(),
+                        MemoryContextKind::Request,
+                        ChargeKind::RetainedPayload,
+                    )
+                };
+                charge.recharge(class, owner, context, kind, 40).expect("atomic swap");
+                if step < 2 {
+                    stage_tx.send(step).expect("reader observes both live vectors");
+                    resume_rx.recv().expect("reader releases writer");
+                }
+                std::thread::yield_now();
+            }
+            drop(charge);
+            writer_done.store(true, AtomicOrdering::Release);
+        });
+        let inspect = |observation: BrokerObservation| {
+            let ledger = &observation.ledger;
+            ledger.validate_exact().expect("all accounting axes balance");
+            let a = ledger.owner_usage.get("axis:a").map_or(0, |usage| usage.total());
+            let b = ledger.owner_usage.get("axis:b").map_or(0, |usage| usage.total());
+            assert!(
+                (a, b) == (40, 0) || (a, b) == (0, 40) || (a, b) == (0, 0),
+                "no mixed owner vector: {ledger:?}"
+            );
+            let class_a = ledger.class_usage.get(&MemoryClass::ArtifactCache);
+            let class_b = ledger.class_usage.get(&MemoryClass::EvidenceCache);
+            let context_a = ledger.context_usage.get(&MemoryContextKind::Request);
+            let context_b = ledger.context_usage.get(&MemoryContextKind::Session);
+            assert_eq!(class_a.map_or(0, |usage| usage.retained_payload_bytes), a);
+            assert_eq!(class_a.map_or(0, |usage| usage.retained_metadata_bytes), 0);
+            assert_eq!(class_b.map_or(0, |usage| usage.retained_metadata_bytes), b);
+            assert_eq!(class_b.map_or(0, |usage| usage.retained_payload_bytes), 0);
+            assert_eq!(context_a.map_or(0, |usage| usage.retained_payload_bytes), a);
+            assert_eq!(context_a.map_or(0, |usage| usage.retained_metadata_bytes), 0);
+            assert_eq!(context_b.map_or(0, |usage| usage.retained_metadata_bytes), b);
+            assert_eq!(context_b.map_or(0, |usage| usage.retained_payload_bytes), 0);
+            assert_eq!(ledger.live_ticket_count, usize::from(a + b != 0));
+            assert_eq!(observation.semantic_bytes, a + b);
+            (a, b)
+        };
+        // The first two handshakes guarantee that both nonzero postimages are
+        // actually observed while the writer thread is live; the remaining
+        // swaps race with the reader without timing-based assertions.
+        for expected in [(0, 40), (40, 0)] {
+            stage_rx.recv_timeout(Duration::from_secs(5)).expect("writer reached next vector");
+            assert!(!done.load(AtomicOrdering::Acquire));
+            assert_eq!(inspect(broker.observe().expect("staged observation")), expected);
+            resume_tx.send(()).expect("resume writer");
+        }
+        let mut samples = 0usize;
+        while !done.load(AtomicOrdering::Acquire) || samples < 64 {
+            inspect(broker.observe().expect("lock-consistent observation"));
+            samples += 1;
+        }
+        writer.join().expect("writer");
+        assert_eq!(inspect(broker.observe().expect("drained observation")), (0, 0));
         sep23_assert_fully_drained(&broker);
     }
 
@@ -6700,7 +7168,8 @@ mod tests {
         assert_eq!(broker.ledger_snapshot().expect("snapshot").total_owner_bytes(), 80);
         drop(baseline);
         sep23_assert_fully_drained(&broker);
-        // And a second panicking attempt behaves identically (no poisoning).
+        // A hostile callback is quarantined after the first panic: admission
+        // still remeasures the unchanged ledger, without retrying host code.
         let baseline = broker
             .reserve_managed_charge(
                 MemoryClass::ArtifactCache,
@@ -6718,7 +7187,8 @@ mod tests {
             30,
         );
         assert!(matches!(denied, Err(MemoryError::Capacity(_))), "got {denied:?}");
-        assert_eq!(*reclaimer.calls.lock().expect("calls"), 2);
+        assert_eq!(*reclaimer.calls.lock().expect("calls"), 1);
+        assert_eq!(broker.reclaim_runtime_stats().expect("stats").attempts, 1);
         drop(baseline);
         sep23_assert_fully_drained(&broker);
     }

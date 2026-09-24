@@ -1,4 +1,8 @@
 #![forbid(unsafe_code)]
+#![cfg_attr(
+    not(test),
+    deny(clippy::let_underscore_must_use, clippy::allow_attributes_without_reason)
+)]
 
 //! Builder-first portable memory platform.
 //!

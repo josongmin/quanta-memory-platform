@@ -128,9 +128,10 @@ if rg -q 'quanta-memory-platform-core feature "(default|live_control)"' <<<"${fa
 fi
 
 # Production/default aggregates must not expose the explicit unbudgeted escape
-# hatch. Resolve the graph instead of parsing Cargo.toml text: dependency feature
-# forwarding and renamed edges are visible only in Cargo's resolved graph.
-assert_facade_escape_hatch_absent() {
+# hatch or crash-rail instrumentation. Resolve each graph once instead of
+# parsing Cargo.toml text: dependency feature forwarding and renamed edges are
+# visible only in Cargo's resolved graph.
+assert_facade_consumer_graph() {
   local label="$1"
   shift
   local tree
@@ -140,23 +141,8 @@ assert_facade_escape_hatch_absent() {
     printf '%s\n' "${tree}" >&2
     exit 1
   fi
-}
-
-assert_facade_escape_hatch_absent "default features"
-assert_facade_escape_hatch_absent "feature 'full'" --no-default-features --features full
-assert_facade_escape_hatch_absent \
-  "feature 'full-backings'" --no-default-features --features full-backings
-
-# Crash-rail instrumentation must stay out of every consumer aggregate, same as
-# the escape hatch above. Both the L1 hooks and the L2 syscall rail are test-only
-# and must be impossible to enable through `default`, `full`, or
-# `full-backings`. Check both names explicitly so a future dependency-edge
-# change cannot make the L1 assertion stop covering L2 transitively.
-assert_facade_durability_rails_absent() {
-  local label="$1"
-  shift
-  local tree
-  tree="$(cargo tree --locked -p "${FACADE_CRATE}" "$@" -e features -i "${FACADE_CRATE}")"
+  # Both the L1 hooks and the L2 syscall rail are test-only. Check both names
+  # explicitly so a future dependency-edge change cannot hide L2.
   if rg -q 'quanta-memory-platform-facade feature "(durability-test-hooks|durability-l2)"' <<<"${tree}"; then
     echo "feature-matrix: facade ${label} must not enable durability-test-hooks or durability-l2" >&2
     printf '%s\n' "${tree}" >&2
@@ -164,9 +150,9 @@ assert_facade_durability_rails_absent() {
   fi
 }
 
-assert_facade_durability_rails_absent "default features"
-assert_facade_durability_rails_absent "feature 'full'" --no-default-features --features full
-assert_facade_durability_rails_absent \
+assert_facade_consumer_graph "default features"
+assert_facade_consumer_graph "feature 'full'" --no-default-features --features full
+assert_facade_consumer_graph \
   "feature 'full-backings'" --no-default-features --features full-backings
 
 # Every crate's bare all-target surface was checked above. Their union is the

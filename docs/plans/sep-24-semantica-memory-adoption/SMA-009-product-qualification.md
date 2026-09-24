@@ -54,6 +54,18 @@ test unchanged. The direct persona preflight still returned
 owner QBC or product E2E was launched under that failed preflight. This is an
 environment block, not a test failure or a current-source GREEN receipt.
 
+2026-09-25 later source update: Semantica `e5d3ef11a7e` committed a public
+`Code::query().builder::<FileTextQuery>()` miss/hit and installed memo-charge
+oracle. Semantica `4515ce74c98` extends the zero-cap test to require a
+typed public `Code` denial with unchanged installed ledger. Both passed
+`rustfmt --check` and `git diff --check`; neither was compiled or executed.
+A later working-tree extension checks public memo hit→invalidation/refund→miss;
+it is likewise uncompiled and is not coordinated GC or close/drain proof.
+An exact owner selector for the public test resolved, but `owner run` stopped
+before compilation: the QBC lane reported 7.4 GiB free against its 50 GiB and
+4.75% activation thresholds. The earlier 16 GiB persona floor is therefore
+not sufficient for this QBC lane. Do not infer GREEN from selector resolution.
+
 Read-only QBC owner resolution on that checkout identified the exact lib-test
 selectors below. Resolution is not compilation or test discovery; run them
 only after the quota preflight passes, and require one executed test each:
@@ -66,11 +78,16 @@ scripts/quanta-build-cli owner resolve --package quanta-sdk-runtime-composition-
 `quanta-runtime/src/orchestration/observation_feedback_runtime/product_bound_runtime.rs`
 의 SQL-family shadow leg는 별도 in-memory artifact/evidence/memo store를 만들고,
 SDK installed broker 밖이라고 명시한다. 해당 함수는
-`sql-family-product-runtime` 공개 surface로 re-export된다. 현재 내부 호출
-census에는 test/probe 호출만 있었으나 외부 consumer closure는 미확인이다.
-전체 product process budget을 주장하려면 같은 domain 설치 또는 독립
-domain의 한도·범위 제외 계약을 먼저 결정해야 한다. 이 경로를 조용히
-SDK G6 통과로 합산하지 않는다.
+`sql-family-product-runtime` 공개 surface로 re-export된다. 이는 test/probe
+전용이 아니다. `quanta-cli-ingress-runtime`의 `sql-family-runtime-activation`
+(`dist-full` 포함)과 별도 프로세스 `quanta-sql-rulepack-worker`가 baseline 및
+candidate leg를 실제로 생성한다. 현재 두 production caller 모두 packet에
+예산 authority를 전달하지 않는다. 따라서 각 프로세스의 설치된 예산과
+shadow leg의 실사용량 사이에 연결이 없다. worker와 CLI는 프로세스가
+달라 하나의 in-process broker를 공유할 수 없으며, 각 프로세스에서
+baseline/candidate가 공유하는 bounded domain을 설치하거나 별도 domain의
+명시적 한도 및 제품 범위 계약을 정의해야 한다. 이 경로를 SDK G6 통과로
+합산하지 않는다.
 
 ## 최소 proof matrix
 
@@ -82,7 +99,8 @@ SDK G6 통과로 합산하지 않는다.
 | G4 실제 admission 연결 | 기존 composer live-broker bridge/cap 테스트 | 실제 publication의 typed denial와 기존 값/원장 postimage 보존 |
 | G5 Canonical memo 수명 | adapter+host+composer | row/index semantic cost, receipt/prepared/GC 최종 lease, 동일 broker snapshot |
 | G6 SDK/query 제품 E2E | 실제 SDK ingress의 broker-backed memo table | query miss→publish→hit→invalidate/GC, capacity denial typed, 후속 정상 요청, close/drain |
-| G7 Source integration | 현재 main | 001/002/003 계약 보존, 뒤늦은 caller/feature drift 없음, 최종 소스에서 G1~G6 재검증 |
+| G7 Source integration | 현재 main | 001/002/003 계약 보존, 뒤늦은 caller/feature drift 없음, 최종 소스에서 G1~G6 및 G8 재검증 |
+| G8 SQL shadow 제품 경계 | CLI `dist-full` + 별도 rulepack worker의 baseline/candidate | 프로세스별 bounded domain 설치, 두 leg의 합산 한도·거절·해제·재시도 검증. SDK broker와 다른 프로세스의 broker를 하나라고 주장하지 않음 |
 
 main에는 `production_cutover_memory_deps_charge_runtime_contract_bridges_against_live_broker`
 등 실제 bridge 테스트가 이미 있다. G4를 위해 같은 목적의 새 root E2E를 만들지 않는다.
@@ -104,6 +122,6 @@ qualification은 이번 gate가 아니다.
   무조건 선행시키지 않는다. 실제 dependency/feature 변화가 있으면 해당 proof만 추가한다.
 - 큰 root Rust rail은 owner/public boundary로 커버되지 않는 이유가 확인된 경우만 실행한다.
 
-완료: main에 포함된 001/002/003 변경의 G1~G7 evidence. owner GREEN, 제품
+완료: main에 포함된 001/002/003 변경의 G1~G8 evidence. owner GREEN, 제품
 GREEN, main 통합, 최종 검증은 분리 기록한다. benchmark/디스크/프로세스 RSS
 보장은 포함하지 않는다.

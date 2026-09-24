@@ -23,6 +23,13 @@ CONTENTION_MODES = {"metadata-stats-heavy", "write-heavy", "mixed-stats-put"}
 PAIRWISE_MODES = {
     "shared-single-owner", "shared-per-thread-owner", "independent-per-thread-owner",
 }
+OUTCOME_LATENCY_FIELDS = {
+    outcome: tuple(f"{outcome}_{percentile}_ns" for percentile in ("p50", "p95", "p99"))
+    for outcome in ("admitted", "denied")
+}
+ALL_OUTCOME_LATENCY_FIELDS = tuple(
+    field for fields in OUTCOME_LATENCY_FIELDS.values() for field in fields
+)
 COMPAT_FIELDS = (
     "rustc", "cargo", "machine", "feature_set", "feature_graph_sha256",
     "dependency_lock_sha256", "package", "bench_target",
@@ -153,6 +160,7 @@ def run_metadata(records: list[dict[str, object]]) -> tuple[dict[str, object], B
 
 def validate_samples(
     records: list[dict[str, object]], spec: BenchmarkSpec, max_p99_ns: int,
+    require_outcome_latencies: bool = True,
 ) -> tuple[list[dict[str, object]], dict[tuple[object, ...], list[dict[str, object]]]]:
     samples = [record for record in records if record.get("schema") == SAMPLE_SCHEMA]
     expected = expected_keys(spec)
@@ -193,6 +201,19 @@ def validate_samples(
                 f"{key}: outcome counts {succeeded}/{denied} != expected "
                 f"{expected_succeeded}/{expected_denied}"
             )
+        present = tuple(field for field in ALL_OUTCOME_LATENCY_FIELDS if field in sample)
+        if sample.get("operation") == "scheduler_admission_group_cardinality":
+            # A legacy v3 baseline may contain only aggregate latency. New runs
+            # must report both results; a partial set is never meaningful.
+            if (require_outcome_latencies or present) and len(present) != len(ALL_OUTCOME_LATENCY_FIELDS):
+                raise ValidationError(f"{key}: incomplete scheduler outcome latency fields")
+            if present:
+                for outcome, fields in OUTCOME_LATENCY_FIELDS.items():
+                    values = tuple(integer(sample, field) for field in fields)
+                    if not (0 <= values[0] <= values[1] <= values[2] <= max_p99_ns):
+                        raise ValidationError(f"{key}: invalid/over-limit {outcome} latency distribution {values}")
+        elif present:
+            raise ValidationError(f"{key}: outcome latency fields are only valid for scheduler admission")
         derived_throughput = round(timed * 1_000_000_000 / integer(sample, "elapsed_ns"))
         if abs(throughput - derived_throughput) > max(1, derived_throughput // 1_000):
             raise ValidationError(f"{key}: throughput does not match timed operations / elapsed time")
@@ -218,6 +239,13 @@ def validate_samples(
             raise ValidationError(f"{key}: allocator high-water is below live bytes")
         if integer(sample, "busy_retries") < 0:
             raise ValidationError(f"{key}: busy retry count is negative")
+    scheduler_samples = [
+        sample for sample in samples
+        if sample.get("operation") == "scheduler_admission_group_cardinality"
+    ]
+    split_count = sum("admitted_p99_ns" in sample for sample in scheduler_samples)
+    if split_count not in (0, len(scheduler_samples)):
+        raise ValidationError("mixed scheduler outcome latency generations")
     observed_keys = set(observed)
     if missing := expected - observed_keys:
         raise ValidationError(f"benchmark matrix is incomplete: {len(missing)} missing; first {sorted(missing)[:3]}")
@@ -264,7 +292,9 @@ def validate(
         for field in COMPAT_FIELDS:
             if baseline_run[field] != run[field]:
                 raise ValidationError(f"baseline incompatible {field}: {baseline_run[field]!r} != {run[field]!r}")
-        baseline_samples, baseline_groups = validate_samples(baseline_records, spec, max_p99_ns)
+        baseline_samples, baseline_groups = validate_samples(
+            baseline_records, spec, max_p99_ns, require_outcome_latencies=False,
+        )
         validate_growth(baseline_samples)
         throughput_allowed = max_throughput_regression_percent / 100.0
         p99_allowed = max_p99_regression_percent / 100.0
@@ -278,11 +308,20 @@ def validate(
                 and current_throughput < baseline_throughput * (1.0 - throughput_allowed)
             ):
                 raise ValidationError(f"{key}: throughput regressed beyond {max_throughput_regression_percent}%")
-            current_p99 = statistics.median(integer(sample, "p99_ns") for sample in current)
-            baseline_p99 = statistics.median(integer(sample, "p99_ns") for sample in baseline)
-            p99_limit = max(baseline_p99 * (1.0 + p99_allowed), baseline_p99 + p99_noise_floor_ns)
-            if current_p99 > p99_limit:
-                raise ValidationError(f"{key}: p99 regressed beyond {max_p99_regression_percent}%")
+            for field, label in (
+                ("p99_ns", "p99"),
+                ("admitted_p99_ns", "admitted p99"),
+                ("denied_p99_ns", "denied p99"),
+            ):
+                # Historic v3 baselines have no outcome split. They remain
+                # comparable for aggregate latency, not for either outcome.
+                if field not in baseline[0]:
+                    continue
+                current_p99 = statistics.median(integer(sample, field) for sample in current)
+                baseline_p99 = statistics.median(integer(sample, field) for sample in baseline)
+                p99_limit = max(baseline_p99 * (1.0 + p99_allowed), baseline_p99 + p99_noise_floor_ns)
+                if current_p99 > p99_limit:
+                    raise ValidationError(f"{key}: {label} regressed beyond {max_p99_regression_percent}%")
     return len(samples)
 
 
