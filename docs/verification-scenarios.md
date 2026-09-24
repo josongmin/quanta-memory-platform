@@ -53,6 +53,10 @@ Correctness is managed as **tests**; benchmarks answer a different question
   timed calls. New rows require both distributions. Historical v3 baselines
   without the split compare aggregate latency only; outcome-specific regressions
   require a baseline carrying both outcome distributions.
+  The `revocable_fill_and_drain` 1k→10k complexity gate compares the median
+  per-operation p95 across repetitions (maximum 4×). Wall elapsed and throughput
+  remain reported and baseline-comparable, but are not used for that complexity
+  gate because host scheduling gaps between calls are not store-operation cost.
 
 ---
 

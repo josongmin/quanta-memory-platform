@@ -162,12 +162,21 @@ class ScalingResultTests(unittest.TestCase):
         records = valid_records()
         for record in records:
             if record.get("operation") == "revocable_fill_and_drain" and record.get("entries") == 10_000:
+                record["p50_ns"] = 100
+                record["p95_ns"] = 200
+                record["p99_ns"] = 300
+        with self.assertRaisesRegex(MODULE.ValidationError, "revocable_fill_and_drain growth"):
+            MODULE.validate(records)
+
+    def test_wall_clock_gap_does_not_masquerade_as_operation_growth(self) -> None:
+        records = valid_records()
+        for record in records:
+            if record.get("operation") == "revocable_fill_and_drain" and record.get("entries") == 10_000:
                 record["elapsed_ns"] = 100_000
                 record["throughput_ops_per_sec"] = round(
                     int(record["timed_operations"]) * 1_000_000_000 / 100_000
                 )
-        with self.assertRaisesRegex(MODULE.ValidationError, "revocable_fill_and_drain growth"):
-            MODULE.validate(records)
+        self.assertEqual(MODULE.validate(records), 220)
 
     def test_accounting_and_operation_counts_are_rejected(self) -> None:
         for field, value, message in (

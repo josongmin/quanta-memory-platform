@@ -263,12 +263,16 @@ def validate_growth(samples: list[dict[str, object]]) -> None:
     if len(sizes) < 2 or sizes[-1] < sizes[0] * 10:
         return
     smallest, largest = sizes[0], sizes[-1]
-    small = statistics.median(integer(sample, "elapsed_ns") / smallest for sample in by_entries[smallest])
-    large = statistics.median(integer(sample, "elapsed_ns") / largest for sample in by_entries[largest])
+    # Wall elapsed includes time between calls, including host scheduling gaps.
+    # The row already times each store operation independently; its p95 is the
+    # stable signal for a systemic fill/drain complexity regression. Keep wall
+    # elapsed and throughput in the receipt and in optional baseline checks.
+    small = statistics.median(integer(sample, "p95_ns") for sample in by_entries[smallest])
+    large = statistics.median(integer(sample, "p95_ns") for sample in by_entries[largest])
     ratio = large / small if small > 0 else float("inf")
     if ratio > 4.0:
         raise ValidationError(
-            f"revocable_fill_and_drain growth: per-entry cost grew {ratio:.2f}x "
+            f"revocable_fill_and_drain growth: operation p95 grew {ratio:.2f}x "
             f"from {smallest} to {largest} entries (allowed 4.0x)"
         )
 
