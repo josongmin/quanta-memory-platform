@@ -1,6 +1,6 @@
 # TO-02 — Replace Source/Text Greps with Executable Contract Authorities
 
-Status: `IMPLEMENTED; final exact-source receipt pending`
+Status: `IMPLEMENTED; owner proof recorded; included in historical qmp-final-qualified-sep23-followup-v5 source; current HEAD qualification separate`
 Priority: `P0`
 Depends on: `TO-03` for `scaling.rs`
 
@@ -209,7 +209,7 @@ rg -n 'include_str!|read_to_string' crates/quanta-memory-platform-facade/src cra
 - README wording만 바꿔도 rail이 실패하지 않는다.
 - public API 계약을 compiler 대신 source text로 다시 검사하면 reopen한다.
 
-## Closeout receipt (owner-verified, IMPLEMENTED — annotated receipt owed)
+## Historical owner proof (subsequently covered by the v5 source receipt)
 
 - Mutant (a): temporary `pub fn new` on `SimplePayloadStore` → doctest
   `SimplePayloadStore (line 81) - compile fail` FAILED (snippet compiled).
@@ -229,7 +229,7 @@ rg -n 'include_str!|read_to_string' crates/quanta-memory-platform-facade/src cra
 - Smoke artifact: receipts §10 (`00ab2a6`, exit 0, 33 samples).
 - All mutants reverted; production byte-identical to HEAD after each.
 
-### Review correction (post-`943cf0a`, exact-source receipt pending)
+### Historical review correction (post-`943cf0a`; later covered by v5)
 
 - The prior late-attach examples on retained map, revocable store, transcript,
   and prepared publication used `store.charged_against` as a field expression.

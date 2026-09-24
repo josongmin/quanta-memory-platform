@@ -1,8 +1,21 @@
 # TO-AUDIT-structural — Structural Audit Assembly
 
-Status: `ASSEMBLED; IMPLEMENTED, final exact-source receipt pending`
-Authority: `tickets/FINAL-CLOSEOUT.md` (newest annotated `qmp-final-qualified-*`
-tag is the only qualification receipt). No ticket below is `DONE`.
+Status: `HISTORICAL AUDIT at d370529; its gaps were subsequently resolved for the v5 source; current db0b03c qualification is separate`.
+Authority: [FINAL-CLOSEOUT.md](FINAL-CLOSEOUT.md) and the annotated
+`qmp-final-qualified-sep23-followup-v5` receipt. The verdicts and unchecked
+gap list below record this audit's earlier observation, not today's queue.
+Later owner mutant proofs appear in
+[TEST-OPTIMIZATION-RECEIPTS.md](TEST-OPTIMIZATION-RECEIPTS.md)
+§§11–15 and the TO-01..09 ticket handoffs. The clean v5 source included the
+implemented queue and passed its recorded repository, extraction, and host
+rails. The later `db0b03c` verifier delta still needs current-source
+qualification; see the [plan index](../docs/plans/README.md).
+
+Current resolution: TO-01..09 implementation and ticket-local evidence are
+recorded in their owner handoffs and [receipts §§11–15](TEST-OPTIMIZATION-RECEIPTS.md).
+The annotated v5 tag qualifies the past source containing them. No row in the
+historical verdict table below is an open TO implementation assignment; only
+the later source-wide qualification boundary remains open.
 
 ## Assembly provenance
 
@@ -36,7 +49,7 @@ this session:
 Grouping: the nine TO tickets are collated into six audit tracks
 (T1–T6) so the six prior findings map 1:1 to a track section.
 
-## Per-ticket verdict table
+## Historical per-ticket verdict table (at the audit snapshot)
 
 | Ticket | Track | Owner file(s) | Implementation marker (observed) | Verdict |
 |---|---|---|---|---|
@@ -54,7 +67,7 @@ No ticket meets the execution SSOT closeout rule (preimage/postimage HEAD,
 digests, exact commands+exit codes, mutant-RED excerpts, medians recorded
 in-repo). None may be flipped to `DONE` on this file's authority.
 
-## Consolidated violation list (ranked by severity)
+## Historical violation list (ranked at the audit snapshot)
 
 1. **Severe — per-ticket mutant-RED evidence outstanding (TO-01…TO-08).**
    Each ticket's acceptance clause requires a temporary-mutant RED log;
@@ -96,7 +109,7 @@ in-repo). None may be flipped to `DONE` on this file's authority.
    content while implementation is landed. Cosmetic; the fix is filling the
    closeout-receipt fields per ticket, not editing status prose first.
 
-## Gap list for owner execution (mutant proofs, bench smoke)
+## Historical gap list (subsequently reconciled in the receipts)
 
 Each item names the owner and the exact artifact owed. Substitute evidence
 (full-rail green, doctest pass) does not close these.
@@ -176,5 +189,5 @@ binds only its own older source. A new review found two post-tag issues:
 The command-level TO-02 matrix discrepancy is reconciled as a deduplication
 of identical resolved feature sets in the ticket and final inventory. The
 Semgrep CA startup failure is historical: `scripts/check-workspace.sh` passed
-at `943cf0a` in the review host. Current-source qualification remains open
-until a newer annotated tag binds a clean committed source and its host pair.
+at `943cf0a` in the review host. The later v5 tag binds its own clean source
+and host pair. It does not cover the `db0b03c` verifier delta.

@@ -1,6 +1,6 @@
 # TO-09 — Assert Exact Independent Transcript Cost Partitions
 
-Status: `IMPLEMENTED; final exact-source receipt pending`
+Status: `IMPLEMENTED; owner proof recorded; included in historical qmp-final-qualified-sep23-followup-v5 source; current HEAD qualification separate`
 Priority: `P1`
 Depends on: none
 
@@ -81,7 +81,7 @@ cargo test -p quanta-memory-platform-facade --all-features transcript_store::ser
 - append와 truncate postimage 모두 exact하다.
 - `> 0`/sum-only assertion으로 되돌리거나 partition swap mutant가 GREEN이면 reopen한다.
 
-## Closeout receipt (owner-verified, IMPLEMENTED — annotated receipt owed)
+## Historical owner proof (subsequently covered by the v5 source receipt)
 
 - Mutant: `append` swaps `evidence_bytes` ↔ `key_bytes` cost sources;
   total preserved at 235.

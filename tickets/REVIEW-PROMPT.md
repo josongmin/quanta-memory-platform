@@ -1,7 +1,14 @@
 # Review prompt — test-optimization wave (TO-01 … TO-09)
 
-Paste everything below the line into a fresh review session (repo root,
-branch `main`).
+Status: historical prompt pinned to `943cf0a`. Its expected counts and
+`receipt pending` question are superseded by the later owner proofs and
+`qmp-final-qualified-sep23-followup-v5` receipt. For current work, use
+[docs/plans/README.md](../docs/plans/README.md). Do not redispatch the
+instructions below without freezing a new source and updating their expected
+counts.
+
+Archived dispatch instruction from the original wave: paste everything below
+the line into a fresh review session (repo root, branch `main`).
 
 ---
 

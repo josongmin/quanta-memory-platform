@@ -132,4 +132,5 @@ Extraction and host adoption are separate operations; see
 | Standalone-repository extraction procedure | [EXTRACTION.md](EXTRACTION.md) |
 | Consumer breaking changes | [MIGRATION.md](MIGRATION.md) |
 | Release inventory | [CHANGELOG.md](CHANGELOG.md) |
+| Current plan status and remaining gates | [docs/plans/README.md](docs/plans/README.md) |
 | Exact audit/qualification records | [tickets/FINAL-CLOSEOUT.md](tickets/FINAL-CLOSEOUT.md) |

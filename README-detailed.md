@@ -3,7 +3,8 @@
 This document describes the current code structure and behavioral boundaries.
 It is a library architecture guide, not a host-adoption or production
 qualification receipt. For exact qualification state, use
-[tickets/FINAL-CLOSEOUT.md](tickets/FINAL-CLOSEOUT.md).
+[tickets/FINAL-CLOSEOUT.md](tickets/FINAL-CLOSEOUT.md); for current plan status
+and remaining gates, use [docs/plans/README.md](docs/plans/README.md).
 
 Product-scope note: Redb-backed durable spill and its codec are existing opt-in
 code, not part of the active QMP/SDK/Semantica plan. The Redb sections below

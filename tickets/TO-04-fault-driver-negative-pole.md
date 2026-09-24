@@ -1,6 +1,6 @@
 # TO-04 — Route the Broken Spill Fake through the Real Fault Classifier
 
-Status: `IMPLEMENTED; final exact-source receipt pending`
+Status: `IMPLEMENTED; owner proof recorded; included in historical qmp-final-qualified-sep23-followup-v5 source; current HEAD qualification separate`
 Priority: `P0`
 Depends on: none
 
@@ -69,7 +69,7 @@ cargo test --locked -p quanta-memory-platform-testkit --features faults faults::
 - public driver의 branch를 바꾼 mutant를 negative pole이 잡는다.
 - test module에 duplicated `match controller.spill` classifier가 다시 생기면 reopen한다.
 
-## Closeout receipt (owner-verified, IMPLEMENTED — annotated receipt owed)
+## Historical owner proof (subsequently covered by the v5 source receipt)
 
 - Mutant: success arm (`(_, Ok(_), _)`) → `Contained` in production
   `classify_spill_failure`.

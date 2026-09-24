@@ -1,5 +1,11 @@
 # FINAL-001 File Inventory
 
+Status: historical file inventory for the frozen bases below. The latest
+plan status and receipt boundary are in
+[docs/plans/README.md](../docs/plans/README.md) and
+[FINAL-CLOSEOUT.md](FINAL-CLOSEOUT.md). Later commits are not unreviewed
+changes to the frozen inventory; they require their own source identity.
+
 Frozen review base: `101781c2ea6122602b4acd9aa69ebfc13fda958f` (`main` and
 `origin/main` when reviewed). This inventory classifies every path in that
 commit. Later untracked inputs are listed in `FINAL-CLOSEOUT.md` and are not

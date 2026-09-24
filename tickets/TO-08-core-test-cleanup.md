@@ -1,6 +1,6 @@
 # TO-08 — Remove Exact Duplicate/Dead Assertions Only
 
-Status: `IMPLEMENTED; final exact-source receipt pending`
+Status: `IMPLEMENTED; owner proof recorded; included in historical qmp-final-qualified-sep23-followup-v5 source; current HEAD qualification separate`
 Priority: `P2`
 Depends on: none
 
@@ -70,7 +70,7 @@ keeper assertion과 동일 실행 경로를 지목하는 diff proof다.
 - unique outcome/variant/capacity invariant가 같이 삭제되거나 production diff가 생기면
   reopen한다.
 
-## Closeout receipt (owner-verified, IMPLEMENTED — annotated receipt owed)
+## Historical owner proof (subsequently covered by the v5 source receipt)
 
 Ticket requires no mutant; keeper-implication diff proof (verified live):
 - (a) Deleted telemetry case's exact row `(2_000, 1_000, 1_000, true)`

@@ -44,7 +44,7 @@ failing use case.
 
 ## 2. Source Audit
 
-This contract was derived from the current source at:
+This contract was derived from the source snapshot at the time of the RFC:
 
 ```text
 HEAD b6d162650edba4f2b32e5020c8f0ac707efb0c22

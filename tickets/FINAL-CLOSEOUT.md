@@ -1,12 +1,15 @@
 # Final Closeout SSOT
 
-Status: the historical bare `qmp-final-qualified` tag (`014eb65`) covers only
-its own source. The newest annotated `qmp-final-qualified-*` tag is the
-current receipt authority: it must name the exact source under review. At the
-time this document was last qualified, that authority was
-`qmp-final-qualified-0dce55d`; resolve the newest tag rather than copying this
-example. Deployment and production activation remain separate operational
-approvals; neither is claimed here.
+Status: `HISTORICAL QUALIFIED SOURCES; CURRENT HEAD QUALIFICATION OPEN`.
+The bare `qmp-final-qualified` tag (`014eb65`) covers only its own source.
+The newest annotated `qmp-final-qualified-*` tag observed at the clean
+`db0b03c` audit base is `qmp-final-qualified-sep23-followup-v5`, targeting
+`f637d42`. A later clean QMP `7f1c2f8` / Semantica `a71e3e9` pair has
+local canonical, extraction dry-run, benchmark, ENOSPC, and host QBC evidence
+in [FUP-006](../docs/plans/sep-23-followup-misc/RECEIPT.md), but no successor
+tag. Current QMP `db0b03c` changes the scaling verifier after that pair;
+neither earlier receipt qualifies its whole tree. Deployment and activation
+remain separate and unclaimed.
 
 ## Scope and non-goals
 
@@ -17,6 +20,9 @@ depend on Semantica. This record distinguishes library qualification, standalone
 extraction, host-pair qualification, and deployment activation.
 
 ## Completion gates
+
+The results in this table describe the historically tagged source, not the
+later `db0b03c` tree or a documentation-only successor.
 
 | Gate | Required evidence | Result |
 | --- | --- | --- |
@@ -57,11 +63,11 @@ not executable campaign tooling or a qualification receipt. The inventory in
 
 ## Receipt binding
 
-The executable and extraction receipt is the newest immutable annotated local
-tag matching `qmp-final-qualified-*`. Its annotation carries the exact QMP
+For tagged historical sources, the executable and extraction receipt is the
+newest immutable annotated local tag matching `qmp-final-qualified-*` that
+actually targets the source under review. Its annotation carries the exact QMP
 SHA/tree, canonical source manifest, extracted SHA/tree, host SHA, commands,
-and outcome. Do not infer current qualification from the historical bare
-`qmp-final-qualified` tag. Resolve the current receipt with:
+and outcome. A newer HEAD does not inherit that receipt. Resolve tags with:
 
 ```text
 git tag --list 'qmp-final-qualified-*' --sort=-creatordate | head -1

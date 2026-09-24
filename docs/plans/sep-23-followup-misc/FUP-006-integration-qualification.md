@@ -1,6 +1,6 @@
 # FUP-006 — 통합과 current-source qualification
 
-Status: `QMP 7f1c2f8 local canonical/extraction dry-run/ENOSPC/benchmark GREEN; Semantica a71e3e9 committed-host pair QBC GREEN on one host source digest; later shared-tree documentation edits are outside this receipt; hosted CI/deploy/activation NOT RUN`
+Status: `PRIOR PAIR VERIFIED at QMP 7f1c2f8 / Semantica a71e3e9; current QMP db0b03c verifier delta has no new same-source canonical/benchmark/host receipt; hosted CI/deploy/activation NOT RUN`
 Priority: `SCOPE-SPECIFIC LOCAL GATE` (현재 in-memory scope; durable branch는 historical)
 Owner: `Lane I — serial integrator`
 Depends on: 현재 core/no-redb 후보는 `FUP-007`; in-memory full-followup은 추가로 `FUP-003`, `FUP-004`, `FUP-005`. 아래 durable-enabled 분기는 과거/별도 제안에만 적용.
@@ -242,6 +242,16 @@ runs qualify the current in-memory consumer path, not host Redb activation.
 The optional Redb runner is recorded as supplemental QMP capability evidence,
 not as an active Semantica release gate or a request to wire Redb into the
 host.
-This is local qualification, not hosted CI, deploy or activation. Later
-README-only edits in the shared QMP checkout are not silently included in the
-frozen proof.
+This is local qualification, not hosted CI, deploy or activation. README-only
+edits present when this pair was frozen were not silently included in its
+proof.
+
+Current-source correction (2026-09-24): the later `db0b03c` commit also
+changes `scripts/verify-scaling-results.py` and its Python contracts. At that
+clean audit base the Python suite passed 20/20, the two cross-store E2E cases
+passed 2/2, and the previous 48/220-row artifacts passed the current verifier.
+These checks establish the changed verifier's local behavior; the prior raw
+benchmark runs and host-pair receipt remain bound to `7f1c2f8`. Re-run the
+canonical workspace rail and fresh benchmark on one clean candidate before
+recording a current-source FUP-006 completion receipt. A new host run is needed
+only for an exact current QMP/host pair claim.

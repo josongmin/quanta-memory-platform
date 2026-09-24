@@ -1,6 +1,6 @@
 # TO-06 — Make Zero Shared-Pool Borrowing an Executable Public Contract
 
-Status: `IMPLEMENTED; final exact-source receipt pending`
+Status: `IMPLEMENTED; owner proof recorded; included in historical qmp-final-qualified-sep23-followup-v5 source; current HEAD qualification separate`
 Priority: `P1`
 Depends on: none
 
@@ -77,7 +77,7 @@ cargo test -p quanta-memory-platform-core --all-features
 - hard cap 성공, hard cap + 1 typed denial, unchanged snapshot, final zero가 모두 존재한다.
 - public broker를 우회하거나 denial 뒤 state equality를 없애면 reopen한다.
 
-## Closeout receipt (owner-verified, IMPLEMENTED — annotated receipt owed)
+## Historical owner proof (subsequently covered by the v5 source receipt)
 
 - Mutant: `validate_reserve_postimage` pool allowance +1 (admits the
   over-cap byte).

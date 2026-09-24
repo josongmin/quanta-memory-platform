@@ -14,6 +14,9 @@ receipt. Hard pass/fail counts go stale fast and are deliberately **not** pinned
 here — re-run the rail (see *How evidence was gathered / re-verify*) for current
 results. Each scenario below cites the exact `#[test]` fn name and its file as
 its own evidence; trust those citations over aggregate counts.
+For the 2026-09-24 implementation and qualification boundary, see the
+[current plan index](plans/README.md) and the
+[source-bound receipt](plans/sep-23-followup-misc/RECEIPT.md).
 
 Repo-local success establishes the portable library's source, feature, and
 standalone-extraction contracts only. Semantica host adoption, deployment, and

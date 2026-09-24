@@ -1,6 +1,6 @@
 # TO-01 — Keep the redb Race Oracle, Remove the 200-Transaction Hotspot
 
-Status: `IMPLEMENTED; final exact-source receipt pending`
+Status: `IMPLEMENTED; owner proof recorded; included in historical qmp-final-qualified-sep23-followup-v5 source; current HEAD qualification separate`
 Priority: `P0`
 Depends on: none; use `TestDb` landed in `014eb65`
 
@@ -79,7 +79,7 @@ median 대비 80% 이상 감소다. 임계값은 코드 assertion이 아니라 c
   inventory 중 하나라도 빠지면 미완료다.
 - runtime만 줄고 temporary mutant가 GREEN이면 오라클이 약해진 것이므로 reopen한다.
 
-## Closeout receipt (owner-verified, IMPLEMENTED — annotated receipt owed)
+## Historical owner proof (subsequently covered by the v5 source receipt)
 
 - Mutant: `reserve_record_id` returns constant duplicate ID 0.
 - RED: `concurrent_accepts_lose_no_handle_and_assign_distinct_keys` FAILED,

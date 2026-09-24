@@ -1,6 +1,6 @@
 # TO-07 — Exercise Reclaimer Wiring through the Builder-First API
 
-Status: `IMPLEMENTED; final exact-source receipt pending`
+Status: `IMPLEMENTED; owner proof recorded; included in historical qmp-final-qualified-sep23-followup-v5 source; current HEAD qualification separate`
 Priority: `P1`
 Depends on: none
 
@@ -81,7 +81,7 @@ cargo test -p quanta-memory-platform-core --all-features api::builder
 - callback request 내용, admitted ledger state, cleanup state를 모두 검증한다.
 - reclaimer를 설치했다는 field-level assertion만 남으면 reopen한다.
 
-## Closeout receipt (owner-verified, IMPLEMENTED — annotated receipt owed)
+## Historical owner proof (subsequently covered by the v5 source receipt)
 
 - Mutant: `build` passes `reclaimer = None` instead of the configured
   callback.

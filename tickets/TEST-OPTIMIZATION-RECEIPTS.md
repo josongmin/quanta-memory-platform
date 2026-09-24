@@ -1,9 +1,11 @@
 # Test-Optimization Wave — Integrator Receipts
 
-Status: `HISTORICAL INTEGRATOR-COLLATED, NOT QUALIFIED` — this is a
-time-scoped observation of `41faf05`, not a current qualification receipt and
-not authority to mark any ticket `DONE`. The only final authority is the newer
-annotated `qmp-final-qualified-*` receipt defined in `FINAL-CLOSEOUT.md`.
+Status: `HISTORICAL INTEGRATOR OBSERVATION at 41faf05; later owner proofs and v5 qualification closed that source; current db0b03c qualification separate`.
+Sections 1–10 record the incomplete `41faf05` observation. Sections 11–15
+record subsequent owner proof and review corrections. The annotated
+`qmp-final-qualified-sep23-followup-v5` tag later qualified a clean source
+containing the TO-01..09 work. Resolve its target through
+[FINAL-CLOSEOUT.md](FINAL-CLOSEOUT.md); it does not qualify later HEADs.
 
 ## 1. Integrator observation window
 
@@ -411,3 +413,15 @@ source is still dirty. Do not mark this overlay or TO-01..TO-09 `DONE`, and do
 not mint a replacement annotated receipt, until the intended code is committed,
 the source digest is re-frozen, the standalone extraction succeeds, and the
 required host-pair/tag gates are rerun on that exact commit.
+
+## Current status after the historical observation
+
+The preceding `0284489` paragraph was correct for its dirty candidate.
+Subsequently, the TO-01..09 owner proofs, late-attach compiler correction,
+and BTreeMap restoration were committed, and the annotated
+`qmp-final-qualified-sep23-followup-v5` tag qualified source `f637d42`.
+Therefore §§1–10 `UNRESOLVED` rows and §16's `DONE` prohibition must not be
+read as the current ticket queue. The clean `db0b03c` audit base is newer
+than the tag and includes a benchmark verifier change. No same-source
+canonical, fresh benchmark, or host-pair qualification was run on that base
+in the documentation audit.

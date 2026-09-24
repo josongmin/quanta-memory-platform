@@ -1,14 +1,16 @@
 # Test Optimization — Structural Remediation Queue
 
-Status: `IMPLEMENTED; completion is determined only by the newest annotated qmp-final-qualified-* receipt`
+Status: `IMPLEMENTED AND HISTORICALLY QUALIFIED by qmp-final-qualified-sep23-followup-v5; current QMP db0b03c whole-tree qualification OPEN`
 
 이 문서는 `docs/bugbash/sep-22-test-optimization/`에서 실제 문제로 남긴
-9개 항목의 실행 SSOT다. 구현은 현재 `main` 열에 합쳐졌지만, closeout은
-`FINAL-CLOSEOUT.md`가 지정한 exact-source annotated receipt가 있을 때만
-성립한다. 기존
+9개 항목의 실행 SSOT다. 구현과 owner negative proofs는
+[TEST-OPTIMIZATION-RECEIPTS.md](TEST-OPTIMIZATION-RECEIPTS.md)에 기록됐고,
+`qmp-final-qualified-sep23-followup-v5`가 그 구현을 포함한 과거 소스를
+검증했다. 현재 `db0b03c` 전체 tree에는 후속 verifier 변경이 있으므로 새
+qualification이 필요하다. 기존
 `tickets/FINAL-CLOSEOUT.md`의
 `qmp-final-qualified` historical receipt를 수정하거나 소급 무효화하지 않는다.
-아래 구현이 들어가면 별도의 exact-head qualification 영수증을 새로 발급한다.
+아래 source freeze와 writer lease는 당시 실행 기록이며 현재 작업 지시가 아니다.
 
 ## Source freeze
 

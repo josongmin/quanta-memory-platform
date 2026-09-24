@@ -1,7 +1,16 @@
 # QMP adversarial coverage: in-memory scope
 
-Status: **active plan excludes Redb-backed durable spill, its codec, and disk
-fault/recovery qualification**. The 2026-09-24 candidate based on
+Status: **T1 and T4/T5 implemented; current-source final receipt pending**.
+At the clean `db0b03c` audit base, the two T1 cross-store tests passed 2/2,
+the verifier's Python contracts passed 20/20, and the existing 48-row smoke
+and 220-row full artifacts passed the current verifier. Those raw runs were
+produced at `7f1c2f8`; `db0b03c` changes verifier outcome-count validation.
+The current candidate still needs a canonical workspace run and fresh clean
+benchmark runs before a new source-bound qualification claim. See the
+[plan status index](../README.md) and [FUP-006 receipt](../sep-23-followup-misc/RECEIPT.md).
+
+The active plan excludes Redb-backed durable spill, its codec, and disk
+fault/recovery qualification. The 2026-09-24 candidate based on
 `b6d162650edba4f2b32e5020c8f0ac707efb0c22` produced historical QMP-only
 evidence for those optional paths; that evidence is not a current release or
 host gate. In-memory cross-store E2E, benchmark verifier, 48-row smoke,
@@ -26,7 +35,7 @@ or physical power loss.
 | One charged store with broker | `facade/tests/hellgate_e2e.rs`: 18 tests; charged retained-map/payload, denial, rebuild, reconfigure, one-store contention and drain. | New `cross_store_hellgate.rs` adds only the distinct two-store broker history and store/scratch/0-byte remap history. |
 | Scaling bench | `scaling.rs` labels real timed calls, adds retained-map point reads and a bounded three-topology pairwise comparison. `verify-scaling-results.py` enforces complete v3 rows. | Old full-mode 1k-only **51-row** fixture must be RED; clean smoke requires 48 rows and full requires 220, with raw artifact and compatible baseline metadata. |
 
-## Minimum new implementation: owner-local first
+## Implemented packets and remaining proof gates
 
 Only the following packets add coverage. Owner-local oracles test transitions;
 integration runs only where two product owners interact or a benchmark needs a
@@ -34,8 +43,8 @@ clean source-bound receipt.
 
 | Packet / gate | Cheapest owner-local work | Necessary integration/E2E work | Exact acceptance oracle |
 | --- | --- | --- | --- |
-| **T1 / P1** cross-store accounting | Reuse ledger/control owner tests and an independent numeric cost oracle. | Two feature-gated cases live in **new** `facade/tests/cross_store_hellgate.rs`, preserving the original retained-map-only test slice. One shared global slot is contended by map/revocable stores; the second covers store+scratch+0-byte ticket through denied remap and legal raise. | At each quiescent point, exactly one admitted store, typed capacity denial, owner/class/context/kind totals and ticket count; release→peer handoff and final zero. |
-| **T4 / P1 proof gate** scaling verifier and receipt | Python negative fixtures independently enumerate 48 smoke / 220 full v3 cells, including custom dimensions, duplicate/missing/extra/truncated output and incompatible machine/toolchain/feature graph/dependency lock/schema baselines. Different baseline source SHA is allowed. | Runner retains raw JSONL on success/failure, records HEAD/tree and clean end-state, checks invocation-derived matrix; run smoke and full once on a clean committed candidate. | Old 51-row fixture is RED. Only exact matrices pass; incompatible baseline and incomplete run are RED. Current permissive regression thresholds are not a performance SLO. |
+| **T1 / P1** cross-store accounting | Reuse ledger/control owner tests and an independent numeric cost oracle. | Two feature-gated cases live in `facade/tests/cross_store_hellgate.rs`, preserving the original retained-map-only test slice. One shared global slot is contended by map/revocable stores; the second covers store+scratch+0-byte ticket through denied remap and legal raise. | At each quiescent point, exactly one admitted store, typed capacity denial, owner/class/context/kind totals and ticket count; release→peer handoff and final zero. |
+| **T4 / P1 proof gate** scaling verifier and receipt | Python negative fixtures independently enumerate 48 smoke / 220 full v3 cells, including custom dimensions, duplicate/missing/extra/truncated output and incompatible machine/toolchain/feature graph/dependency lock/schema baselines. Different baseline source SHA is allowed. | Runner retains raw JSONL on success/failure, records HEAD/tree and clean end-state, checks invocation-derived matrix; prior clean smoke/full passed at `7f1c2f8`. Repeat on a clean current candidate after the verifier change. | Old 51-row fixture is RED. Only exact matrices pass; incompatible baseline and incomplete run are RED. Current permissive regression thresholds are not a performance SLO. |
 | **T5 / P2 measurement** honest workloads | Existing owner tests retain correctness authority for `get_checked`, dedup, cap denial and drain. | Benchmark v3 relabels dedup put and stats contention, adds actual retained-map hit/miss reads and a 3-topology × 2-size broker-release pairwise comparison; `retained_map` becomes a bench required feature. | Every sample's timed/success/denial counts, retry count, throughput denominator, semantic peak and final drain match the timed calls. Contention writes use collision-free IDs and assert the expected unique retained count; only compatible v3 baselines compare. |
 | **T6 / optional** phase-change endurance | Existing bounded fuzz/model/reconfigure/callback controls remain. | Do not add a long random sweep to daily rails without a newly identified invariant or failure. | If later needed, use a seeded opt-in phase driver with bounded time, operations and disk; RSS is separate from semantic authority. |
 
@@ -51,9 +60,10 @@ clean source-bound receipt.
 
 ## Writer boundaries, rails and stop conditions
 
-Order: **cross-store T1 and benchmark T4/T5 on disjoint files; then fixed-source
-integration**. The benchmark producer and verifier coordinate one v3 scenario
-schema, but the Python
+Implementation order was **cross-store T1 and benchmark T4/T5 on disjoint
+files, then fixed-source integration**. For requalification, freeze one clean
+source candidate before the canonical and benchmark rails. The benchmark
+producer and verifier coordinate one v3 scenario schema, but the Python
 fixture's expected cells are independent of production emission.
 
 Daily/focused: relevant owner-local selector with a **nonzero selected count**,

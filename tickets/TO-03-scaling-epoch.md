@@ -1,6 +1,6 @@
 # TO-03 — Make the Scaling Allocation Epoch Measure Admission Only
 
-Status: `IMPLEMENTED; final exact-source receipt pending`
+Status: `IMPLEMENTED; owner proof recorded; included in historical qmp-final-qualified-sep23-followup-v5 source; current HEAD qualification separate`
 Priority: `P0`
 Depends on: none
 
@@ -82,7 +82,7 @@ temporary mutant로 `Vec::with_capacity` 또는 scheduler construction을 epoch 
 때 non-zero allocation assertion이 RED여야 한다. 추적 전 allocate/추적 중 drop 패턴이
 남거나 JSON 소비자 schema가 바뀌면 reopen한다.
 
-## Closeout receipt (owner-verified, IMPLEMENTED — annotated receipt owed)
+## Historical owner proof (subsequently covered by the v5 source receipt)
 
 - `cargo bench -p quanta-memory-platform-facade --features
   payload_store,revocable_store --bench scaling --no-run` builds

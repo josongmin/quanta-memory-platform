@@ -1,6 +1,6 @@
 # TO-05 — Prove Bounded Release Preflight without 10,000 Owners
 
-Status: `IMPLEMENTED; final exact-source receipt pending`
+Status: `IMPLEMENTED; owner proof recorded; included in historical qmp-final-qualified-sep23-followup-v5 source; current HEAD qualification separate`
 Priority: `P1`
 Depends on: none
 
@@ -77,7 +77,7 @@ cargo test -p quanta-memory-platform-core --lib
 - full-scan mutant가 GREEN이거나 owner cardinality dependence를 assertion에서 제거하면
   reopen한다.
 
-## Closeout receipt (owner-verified, IMPLEMENTED — annotated receipt owed)
+## Historical owner proof (subsequently covered by the v5 source receipt)
 
 - Mutant: full `owner_usage` scan added to
   `last_release_preflight_axis_probes` in `preflight_release_batch`.
@@ -87,7 +87,7 @@ cargo test -p quanta-memory-platform-core --lib
 - Medians (same host/profile, warm, 3 runs): before 0.09s → after
   0.00s. No time assertion in code.
 
-### Review correction (post-`943cf0a`, exact-source receipt pending)
+### Historical review correction (post-`943cf0a`; later covered by v5)
 
 The later `e535f54` commit changed production `ticket_states` from `BTreeMap`
 to `HashMap` inside this ticket's owner file without a separate production
