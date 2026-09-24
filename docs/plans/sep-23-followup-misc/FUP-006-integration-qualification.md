@@ -1,10 +1,10 @@
 # FUP-006 — 통합과 current-source qualification
 
-Status: `prior frozen-candidate local/extraction/benchmark/host-pair VERIFIED; current shared worktree canonical + examples GREEN but not frozen; extraction/benchmark/host-pair stale for current digest; hosted CI/deploy/activation NOT RUN`
-Priority: `SCOPE-SPECIFIC RELEASE GATE` (구현 결함 티켓이 아님)
+Status: `QMP 7f1c2f8 local canonical/extraction dry-run/ENOSPC/benchmark GREEN; Semantica a71e3e9 committed-host pair QBC GREEN on one host source digest; later shared-tree documentation edits are outside this receipt; hosted CI/deploy/activation NOT RUN`
+Priority: `SCOPE-SPECIFIC LOCAL GATE` (현재 in-memory scope; durable branch는 historical)
 Owner: `Lane I — serial integrator`
-Depends on: core-enabled 후보는 `FUP-007`; durable-enabled 후보는 추가로 `FUP-001`, `FUP-002`; full-followup 후보는 추가로 `FUP-003`, `FUP-004`, `FUP-005`
-Checklist: source-bound `M09/M10`, durable restart 주장 시 `M05`의 강제 종료/재시작 범위. 이 티켓 자체가 100항목 전체를 자동으로 닫지 않는다.
+Depends on: 현재 core/no-redb 후보는 `FUP-007`; in-memory full-followup은 추가로 `FUP-003`, `FUP-004`, `FUP-005`. 아래 durable-enabled 분기는 과거/별도 제안에만 적용.
+Checklist: current in-memory scope의 source-bound `M09/M10`. 과거 durable 분기의 `M05` 지침은 아래에 기록만 보존한다. 이 티켓 자체가 100항목 전체를 자동으로 닫지 않는다.
 
 ## 목적
 
@@ -18,10 +18,11 @@ API/feature/extraction/host 영향과 회귀를 검증하고, 남은 경계를 �
 | --- | --- | --- | --- |
 | `core/no-redb` | 007 | core 권한 수명과 **Redb 비활성 graph가 증명된** profile의 source-bound 검증 | 001/002가 OPEN인데 durable 또는 `full-backings` PASS라고 말하기 |
 | `Semantica host/full` | core/no-redb 선행조건 | 재생성 가능한 revocable cache는 회수·프로세스 종료·재시작 시 손실 허용. 실제 host의 `full` feature graph와 재계산 경로를 검증 | Redb 미사용 host에 `spill-redb` 출하 gate를 걸거나, 유일한 원본 데이터까지 손실 허용이라고 확대하기 |
-| `durable-enabled` | 001→002, 007 | Redb state/claim/migration과 필요한 실제 restart·host gate까지 통과한 exact source | drop/reopen 단위 테스트만으로 forced kill/power loss/host activation GREEN 주장 |
-| `full-followup` | 001→002, 007, 004/005→003 | 위 P1 계약과 P2 admission/oracle/provenance까지 동일 source에서 검증 | 개별 focused GREEN을 합쳐 전체 repo/host GREEN으로 승격하기 |
+| `durable-enabled` (historical/optional) | 별도 채택 시 001→002, 007 | Redb state/claim/migration과 필요한 실제 restart·host gate까지 통과한 exact source | 현재 Semantica `full`의 선행조건으로 삼거나 drop/reopen 단위 테스트만으로 power loss/host activation GREEN 주장 |
+| `full-followup` (in-memory) | 007, 004/005→003 | core와 P2 admission/oracle/provenance를 동일 source에서 검증 | 개별 focused GREEN을 합쳐 전체 repo/host GREEN으로 승격하기 |
 
-시작 전에 실제 Cargo feature graph와 host adapter가 `spill-redb`, reclaimer,
+현재 출하 판정에서는 아래 durable-enabled/Redb 실행 조항을 dispatch하지 않는다.
+기존 실행 기록과 선택형 기능의 검증 절차로만 보존한다. 시작 전에 실제 Cargo feature graph와 host adapter가 `spill-redb`, reclaimer,
 custom event sink를 사용하는지 읽기 전용으로 확인한다. 사용하지 않음을 증명하지
 못한 capability는 `UNVERIFIED`다. F06/L04의 callback 재진입이 host에 설치돼 있으면
 P2로 기계적으로 제외하지 말고 도달성과 우선순위를 다시 판정한다. 미사용 feature를
@@ -49,7 +50,7 @@ P2로 기계적으로 제외하지 말고 도달성과 우선순위를 다시 �
 
 ## 2. 통합 검증
 
-- durable-enabled/full-followup 후보에서는 실제 Redb의 record state와 recovery lease를 함께 검증: ID hole, reopen, 두 store,
+- 과거 durable-enabled 후보에 한해 실제 Redb의 record state와 recovery lease를 함께 검증: ID hole, reopen, 두 store,
   foreign/stale claimant, unknown ACK/probe, exact one publication, 최종 charge 반환.
 - 같은 후보에서 FUP-001의 낮은 hole→높은 finalized ID가 `Absent`이고, FUP-002의 두 새 store
   barrier race가 정확히 한 `Restored`만 내는 owner-local negative oracle를
@@ -57,7 +58,7 @@ P2로 기계적으로 제외하지 말고 도달성과 우선순위를 다시 �
 - FUP-007의 committed explicit release/Drop 및 pending rollback/Drop을 group
   제거 재설정과 rebuild fence 아래 재검증한다. 재설정 reject 또는 retiring group
   계약이 일관되며 최종 live ticket/deferred backlog가 0이어야 한다.
-- durable-enabled/full-followup 후보에서는 정상 persistent fixture와 legacy fixture 각각에서 안전한 migration 또는 명시적
+- 과거 durable-enabled 후보에 한해 정상 persistent fixture와 legacy fixture 각각에서 안전한 migration 또는 명시적
   unresolved error를 확인. destructive DB 초기화 fallback은 금지.
 - full-followup 후보에서는 reclaim callback 중 reconfigure와 store release가 결합돼도
   initial/final revision, decision receipt, ledger/group usage가 일치하는지 검증.
@@ -65,7 +66,7 @@ P2로 기계적으로 제외하지 말고 도달성과 우선순위를 다시 �
   확인. 새 API가 broker/raw authority 우회 경로를 만들지 않아야 한다.
 - core/testkit dependency 방향과 pure domain/ports를 유지한다. stale snapshot/receipt를
   테스트 expected value에 복사하여 GREEN을 만들지 않는다.
-- durable restart recovery를 출하 계약에 포함하면 child process를 실제 종료하고
+- 향후 별도 제품 결정으로 durable restart recovery를 출하 계약에 포함하면 child process를 실제 종료하고
   새 process가 같은 Redb 파일을 reopen하는 rail을 둔다. write/commit/ACK/source
   release/restore/delete/finalize 중 **어떤 경계가 시험됐는지** 각 행에 기록한다.
   drop/reopen simulation, fault-injected ACK, forced process termination, power-loss
@@ -73,7 +74,7 @@ P2로 기계적으로 제외하지 말고 도달성과 우선순위를 다시 �
 
 ## 3. 검증 명령과 중복 제거
 
-먼저 선택한 scope의 owner-local 001/002/007 및 해당 P2 티켓의 신규 selector가 실제로
+먼저 현재 scope의 owner-local 007 및 포함된 P2 티켓의 신규 selector가 실제로
 선택되는지 확인한다. `0 passed / 0 selected`는 증거가 아니다. 이후 canonical
 rail을 한 번 실행하며, 이미 그 rail이 실행한 동일 suite를 근거 없이 반복하지 않는다.
 
@@ -86,8 +87,8 @@ cargo run --locked -p quanta-memory-platform-facade --example effective_budget_r
 - `tools/pm/sources/**`를 변경한 경우에만 sync 후 lint한다. generated AGENTS/CLAUDE는 직접 수정하지 않는다.
 - `core/no-redb`는 `--no-default-features --features full` 및 실제 host dependency
   graph에서 Redb 비활성임을 확인한다. `--all-features` GREEN을 durable 결함 해결의
-  대체 근거로 쓰지 않는다. `durable-enabled`는 `full-backings` graph와 owner-local
-  Redb 계약을 별도로 명시한다.
+  대체 근거로 쓰지 않는다. 과거 `durable-enabled` graph/owner 검증은 현재
+  출하 체크리스트에 포함하지 않는다.
 - Cargo manifest 또는 cross-crate use path 변경 시 clean committed candidate에서 extraction
   preflight를 실행한다. 기존 receipt가 약속한 full standalone qualification을 갱신하려면
   dry-run뿐 아니라 실제 추출물의 canonical rail까지 실행한다.
@@ -100,8 +101,8 @@ cargo run --locked -p quanta-memory-platform-facade --example effective_budget_r
 
 ## 4. Host / qualification 경계
 
-- 001/002의 durable API, 007의 live reconfiguration, 003의 reclaim API를 실제
-  host가 사용하는지 확인한다. 사용하면
+- 007의 live reconfiguration과 003의 reclaim API를 실제 host가 사용하는지
+  확인한다. 사용하면
   caller migration과 정확한 host SHA + QMP SHA 조합의 compile/contract 검증이 필요하다.
 - 사용하지 않는다면 그 근거를 남긴다. 사용 여부 미확인은 PASS가 아니라 `UNVERIFIED`다.
 - 공유 sibling dependency를 사용하는 host QBC 중에는 코드뿐 아니라 문서 변경도
@@ -125,20 +126,19 @@ remain outside this proof.
 
 ## 완료 기준
 
-- [x] 선택한 scope의 001/002/007 및 포함된 003/004/005의 regression과
+- [x] 선택한 in-memory scope의 007 및 포함된 003/004/005의 regression과
   negative proof가 같은 최종 소스에서 유효.
 - [x] canonical rail 성공, 예제/API/feature 계약 성공.
-- [x] `core/no-redb`이면 Redb 비활성 graph 증거. `durable-enabled`이면 legacy
-  migration, 배타적 recovery, 실제 process 종료/재시작의 적용 경계와 미시험
-  power-loss 범위가 명시됨.
+- [x] `core/no-redb` 및 host `full`에서 Redb 비활성 graph 증거.
 - [x] 필요한 extraction와 host-pair 검증 성공 또는 미검증 범위가 명시적으로 남음.
-- [x] 저장 포맷 호환성, opaque identity/lease, 오류/receipt API의 migration 안내 완성.
+- [x] 현재 scope의 public API와 오류/receipt migration 안내 완성.
 - [x] source-before/source-after 일치; 모든 실패·미실행·잔여 위험이 receipt에 포함.
 - [x] 코드만 VERIFIED인 상태를 deployment/activation 완료로 표기하지 않음.
 
-`B07`의 0-byte metadata 개수 상한, `J06` backlog 상한, `I03/I05/I06/I09`의
-durability/physical-resource/format 계약, custom callback 재진입과 host 의미 경계는
-해당 scope에서 따로 검증·명시하지 않으면 OPEN이다. **P1 세 root를 고쳤다 =
+`B07`의 0-byte metadata 개수 상한, `J06` backlog 상한, custom callback
+재진입과 host 의미 경계는 해당 scope에서 따로 검증·명시하지 않으면 OPEN이다.
+`I03/I05/I06/I09`의 durable/physical-resource/format 계약은 현재 제품 범위 밖이며,
+이 범위의 미완료를 in-memory 출하 blocker로 옮기지 않는다. **P1 세 root를 고쳤다 =
 100점 체크리스트 완료**라고 기록하지 않는다. M09 host E2E와 M10 receipt도 실제
 host와 raw 결과가 없으면 미검증이다.
 
@@ -230,3 +230,18 @@ only when shipping QMP's opt-in durable capability or a consumer that actually
 enables it. Do not add Redb host wiring for cache survival alone. Reopen this
 decision if a cache becomes the sole copy of data, rebuilding is unavailable,
 or the host enables the Redb feature.
+
+Qualification addendum (2026-09-24): QMP `7f1c2f8` and committed Semantica
+`a71e3e9` were checked as an exact code pair in a detached, clean host
+worktree. QMP's canonical rail, extraction dry-run, five-mode isolated ENOSPC
+runner, and 48/220-row scaling verifier passed. QBC owner runs for
+`quanta-memory-host` and `quanta-runtime-memory-compose` both passed against
+the same host source digest. Exact commands, counts and limits are in
+`RECEIPT.md`. The host uses facade `full` without `spill-redb`; these QBC
+runs qualify the current in-memory consumer path, not host Redb activation.
+The optional Redb runner is recorded as supplemental QMP capability evidence,
+not as an active Semantica release gate or a request to wire Redb into the
+host.
+This is local qualification, not hosted CI, deploy or activation. Later
+README-only edits in the shared QMP checkout are not silently included in the
+frozen proof.

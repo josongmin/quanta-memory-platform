@@ -1,10 +1,10 @@
 # FUP-002 — Backend 범위의 single-owner recovery
 
-Status: `VERIFIED — owner-local GREEN + temporary-mutant RED; FUP-006 exact-source gate 별도`
-Priority: `P1`
+Status: `HISTORICAL VERIFIED — excluded from the current Redb-free product plan; owner-local GREEN + temporary-mutant RED, not an active FUP-006 gate`
+Priority: `historical P1; no current product priority`
 Owner: `Lane A`
 Depends on: `FUP-001`의 persisted state와 migration 계약
-Blocks: `FUP-006`의 durable-enabled 후보
+Blocks: historically `FUP-006`'s durable-enabled candidate; not the current in-memory gate
 Checklist: `I04`의 이중 공개/환급, `I08`의 restart claimant/fencing, `I02`의 attempt authority. Disk/staging byte budget과 실제 강제 종료 복구까지 이 티켓만으로 닫지 않는다.
 
 ## 문제와 근거

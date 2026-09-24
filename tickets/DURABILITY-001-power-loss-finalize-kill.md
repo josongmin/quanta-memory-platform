@@ -1,8 +1,8 @@
 # DURABILITY-001 — finalize instruction-point kill and physical power-loss qualification
 
-Status: `L1 committed at edfef66; L2 Linux+root+strace candidate implemented but exact-current-source Linux receipt pending; block-device L2 and physical L3 OPEN; frozen-candidate Slice D receipt pending`
+Status: `HISTORICAL / OUT OF CURRENT PRODUCT SCOPE. L1 committed at edfef66; L2 Linux+root+strace candidate implemented but exact-current-source Linux receipt pending; block-device L2 and physical L3 were not qualified. Do not schedule these as current release gates.`
 Contract: `option 1 (existing contract accepted)` per §2 planning default; no host contract presented requiring a durable publication ACK. The L1 after-oracle asserts no resurrection and no replay expectation, and asserts nothing about the killed process's volatile resident copy.
-Priority: `P1 only if durable spill is promoted as power-loss-safe; otherwise release-boundary hardening`
+Priority: `historical conditional P1; no current product/release priority`
 Source freeze: `f637d424724aade94564ca76bb5ca6d9b73b28ae` (`main == origin/main`, clean when planned)
 Owner: `quanta-memory-platform facade / durability qualification`
 Depends on: closed `FUP-001`, `FUP-002`, and the existing `FUP-006` SIGKILL/reopen rail

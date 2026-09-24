@@ -1,10 +1,10 @@
 # FUP-001 — Durable record의 정확한 terminal state
 
-Status: `VERIFIED — owner-local GREEN + temporary-mutant RED; FUP-006 exact-source gate 별도`
-Priority: `P1`
+Status: `HISTORICAL VERIFIED — excluded from the current Redb-free product plan; owner-local GREEN + temporary-mutant RED, not an active FUP-006 gate`
+Priority: `historical P1; no current product priority`
 Owner: `Lane A`
 Depends on: 실행 인덱스의 source freeze
-Blocks: `FUP-002`, `FUP-006`의 durable-enabled 후보
+Blocks: historically `FUP-002` and `FUP-006`'s durable-enabled candidate; not the current in-memory gate
 Checklist: `I07`의 정확한 record disposition, `I02`의 identity 일부. `I03/I05/I09`의 전체 계약을 이 티켓만으로 닫지 않는다.
 
 ## 문제와 근거

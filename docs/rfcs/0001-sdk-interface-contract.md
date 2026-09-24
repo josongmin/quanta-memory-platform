@@ -19,9 +19,14 @@ Its public SDK is organized around six concepts:
 5. `MemoryReservation` — non-forgeable RAII accounting authority.
 6. `MemorySnapshot` — one revision-consistent operational observation.
 
-Built-in stores and spill/recovery remain feature-specific APIs constructed from
+Built-in stores and in-process transfer remain feature-specific APIs constructed from
 the same `MemoryPlatform`. They are not forced through a generic plugin or
 service-container abstraction.
+
+Scope amendment (2026-09-24): the 0.3 SDK plan covers in-memory accounting,
+reclaim, and in-process transfer only. Redb-backed durable spill, its codec,
+disk recovery, and backing configuration are excluded. Existing 0.2 opt-in
+code is not removed by this RFC and is not an SDK or host release gate.
 
 This revision deliberately does **not** introduce:
 
@@ -64,7 +69,7 @@ The current implementation already provides valuable primitives:
 - one lock-consistent `BrokerObservation`;
 - reclaim callbacks outside the broker lock followed by remeasurement;
 - typed, accounting-backed built-in store builders;
-- explicit durable uncertainty and reconciliation;
+- in-process transfer of revocable entries;
 - bounded management metadata and deferred cleanup.
 
 The 0.3 SDK should wrap, rename, and narrow these authorities. It should not
@@ -149,7 +154,7 @@ QMP answers and enforces four questions:
 
 1. May a component retain another `N` semantic bytes?
 2. Which class, owner, context, and resource group owns those bytes?
-3. How is that authority released, moved, spilled, or recovered without drift?
+3. How is that authority released, reclaimed, or moved in-process without drift?
 4. Which exact resolved policy and revision produced the decision?
 
 The ledger tracks semantic retained authority. It does not claim exact RSS,
@@ -165,7 +170,7 @@ allocator, mmap, page-cache, or backing-database memory.
 - accounting-backed payload, retained-map, revocable, transcript, and
   publication stores;
 - pressure classification and bounded reclaim requests;
-- in-process and durable spill/restore with uncertain-outcome fencing;
+- in-process revocable-entry transfer;
 - deterministic config layering, validation, provenance, and fingerprinting;
 - typed live-policy updates with optimistic revision checks;
 - one revision-consistent operational snapshot;
@@ -220,7 +225,7 @@ are not parallel policy systems.
 ### 5.3 Fail closed
 
 Invalid config, unknown class IDs, unavailable capabilities, stale revisions,
-capacity denial, and uncertain durable commits return typed errors. They never
+and capacity denial return typed errors. They never
 fall back to an unbudgeted or assumed-success path.
 
 ### 5.4 Sync core, host-owned orchestration
@@ -367,8 +372,8 @@ MemoryConfig
 
 Non-memory execution limits are absent.
 
-Store, codec, and backing configuration remains with the owning feature API
-(`TranscriptConfig`, `RedbSpillConfig`, and similar types). The platform config
+Store-specific configuration remains with the owning feature API
+(`TranscriptConfig` and similar types). The platform config
 does not become a monolithic service configuration document.
 
 ### 8.2 Construction
@@ -571,8 +576,6 @@ skip-validation
 allow-counter-drift
 ignore-release-failure
 disable-hard-limit
-assume-durable-commit
-drop-recovery-records
 unbounded-management-metadata
 ```
 
@@ -800,28 +803,20 @@ The host coordinates shutdown:
 
 1. stop new work at the host boundary;
 2. close owned stores/services;
-3. complete required durable reconciliation;
-4. release custom reservations;
-5. inspect a final QMP snapshot;
-6. fail qualification if authority is unexpectedly non-zero.
+3. release custom reservations;
+4. inspect a final QMP snapshot;
+5. fail qualification if authority is unexpectedly non-zero.
 
-QMP may add a read-only `quiescence_report()` for step 5; it must not pretend to
-own steps 1–4.
+QMP may add a read-only `quiescence_report()` for step 4; it must not pretend to
+own steps 1–3.
 
-## 16. Durable Spill and Recovery
+## 16. Disk-Backed Spill Is Out of Scope
 
-Durability remains an explicit feature-specific API rather than a generic
-platform tier. QMP currently has concrete Redb constraints; backing paths, file
-ownership, and capacity are deployment concerns; and durable ambiguity requires
-operation-specific receipts.
-
-The stable contract includes bounded codec APIs, explicit record/resident-byte
-limits, spill/restore receipts, uncertain outcomes retaining recovery authority,
-inspectable pending recovery, idempotent reconciliation, and no direct
-backing-to-ledger mutation.
-
-Raw backing transactions, durable claim constructors, schema tables, and kill
-hooks remain private or test-only.
+The 0.3 SDK does not add Redb configuration, codecs, durable spill/restore,
+recovery receipts, or a generic persistent tier. The existing opt-in 0.2
+implementation remains a separate maintenance surface until a named consumer
+and its storage failure/invalidation contract justify retaining or removing it.
+No host adoption or release gate in this RFC depends on that surface.
 
 ## 17. Error Contract
 
@@ -850,8 +845,8 @@ pub struct CapacityDenied {
 Its getters expose capacity axis, requested/current/limit bytes, optional class,
 owner and resource group, policy revision, and retryability.
 
-Errors may expose backing-independent recovery identifiers, but never concrete
-Redb errors or text that callers must parse.
+The planned SDK error contract does not expose backing-specific errors or
+recovery identifiers.
 
 ## 18. Serialization Boundary
 
@@ -898,16 +893,15 @@ Normative rules:
 - features are additive;
 - default enables enforced live accounting only;
 - store slices remain independently selectable;
-- Redb remains opt-in;
+- the existing Redb feature remains opt-in but is outside this 0.3 plan;
 - `full` means production in-memory capabilities, not every feature;
-- `full-backings` adds production backings;
+- `full-backings` remains an existing aggregate feature, not a 0.3 release target;
 - unbudgeted stores and fault hooks are absent from default, `full`, and
   `full-backings`;
 - test-only features cannot change production success semantics;
 - feature-off configuration fails rather than becoming a successful no-op.
 
-Moving hooks into testkit is useful only if real backing-path instrumentation is
-preserved.
+The 0.3 SDK does not add backing-path fault-injection hooks.
 
 ## 20. Extension Contract
 
@@ -916,7 +910,6 @@ Supported external seams:
 - `MemoryReclaimer`;
 - `MemoryEventSink`;
 - `AllocatorTelemetry`;
-- documented bounded codecs;
 - host-owned config loading and capacity discovery;
 - custom retained components built from `MemoryConsumer`.
 
@@ -925,8 +918,7 @@ Sealed/private authority:
 - ledger construction and mutation;
 - raw reservation tickets and accounting sinks;
 - policy revision mutation;
-- durable claim minting and backing transactions;
-- ambiguous-commit resolution authority.
+- backing-specific persistent authority, if retained outside this RFC.
 
 No `Any` extension bag, generic plugin registry, or arbitrary callback under the
 broker lock is introduced.
@@ -1037,8 +1029,8 @@ would preserve the wrong abstraction.
 - stale revision and cap shrink fail without mutation;
 - observation is revision-consistent;
 - feature-off telemetry cannot report successful wiring;
-- conformance rejects broken accounting and backing fakes;
-- ambiguous durable outcomes retain recovery authority.
+- conformance rejects broken accounting fakes;
+- in-process transfer retains exactly one accounting authority.
 
 ### 24.3 Repository and host gates
 
@@ -1055,7 +1047,7 @@ scripts/extract-to-standalone-repo.sh --dry-run /tmp/qmp-check
 Repository GREEN proves only the portable library candidate. Host adoption
 requires separate exact-source evidence for dependency identity, host class
 taxonomy, resolved config/fingerprint, custom reservations, built-in stores,
-snapshot, reconfiguration, and enabled durable recovery. Merge, deployment,
+snapshot, and reconfiguration. Merge, deployment,
 and activation remain separate states.
 
 ## 25. Explicitly Deferred
@@ -1065,7 +1057,7 @@ and activation remain separate states.
 - Kubernetes-like conditions;
 - platform-wide drain ownership;
 - generic mitigation engine;
-- generic durable tier;
+- disk-backed spill, Redb SDK configuration, codecs, and a generic durable tier;
 - dynamic `Knob<T>` registry;
 - arbitrary plugin registry;
 - JSON/YAML;
@@ -1086,8 +1078,8 @@ The 0.3 interface is accepted only if:
 7. Built-in stores use the same ledger and hide accounting plumbing.
 8. Reconfiguration is atomic, revision-checked, and receipt-returning.
 9. Observation is bounded and revision-consistent.
-10. Durable uncertainty remains explicit and recoverable.
-11. Raw accounting and durable authority remain sealed.
+10. In-process transfer preserves exactly one accounting authority.
+11. Raw accounting authority remains sealed.
 12. New abstractions require demonstrated consumers, not analogy alone.
 
 This is the accepted 0.3 interface contract. Changes to its twelve acceptance

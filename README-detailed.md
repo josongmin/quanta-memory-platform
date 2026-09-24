@@ -5,6 +5,11 @@ It is a library architecture guide, not a host-adoption or production
 qualification receipt. For exact qualification state, use
 [tickets/FINAL-CLOSEOUT.md](tickets/FINAL-CLOSEOUT.md).
 
+Product-scope note: Redb-backed durable spill and its codec are existing opt-in
+code, not part of the active QMP/SDK/Semantica plan. The Redb sections below
+describe current implementation and historical tests only; they do not create
+a release gate or a host integration requirement.
+
 ## 1. Purpose and non-goals
 
 The platform gives a host one portable authority for memory-relevant retained
@@ -160,7 +165,7 @@ It is not a switch that changes a budgeted store after construction.
 | `retained_map` | Typed key/value retention, overwrite, read, remove, targeted sweep. | Charges retained key/index/value cost; replacement is net-postimage accounting. |
 | `revocable_store` | FIFO cache or scratch-like entries that may be evicted. | `reclaim_one`/`reclaim_until` refund exact front-entry charges; failure restores FIFO state and authority. |
 | `spill` | Move revocable entries to another tier. | In-process handles move the live charge; durable operations fence uncertain writes/deletes until reconciliation. |
-| `spill-redb` | Durable spill backing. | Optional Redb implementation of the durable receipt/reconciliation contract. `RedbSpillLimits` bounds encoded record size, retained record count, logical retained payload bytes, Redb database file length, cache setting, and backing-owned restore staging bytes/buffers. The file cap does not reserve filesystem space or bound caller-codec scratch; an I/O error may require cold reopen and additional file capacity before restore can progress. |
+| `spill-redb` | Existing opt-in backing; out of active product scope. | Redb implementation remains in the 0.2 source; prior validation is historical evidence. `RedbSpillLimits` bounds encoded record size, retained record count, logical retained payload bytes, Redb database file length, cache setting, and backing-owned restore staging bytes/buffers. The file cap does not reserve filesystem space or bound caller-codec scratch; an I/O error may require cold reopen and additional file capacity before restore can progress. |
 | `transcript` | Idempotent session/event transcript. | Exact replay is deterministic; evidence/session-key bytes are separately tracked; retention saturation fails closed. |
 | `publish_pipeline` | Stage/commit publication transitions. | Legacy non-retaining pipeline remains supported; retaining prepared publication uses token-owned accounting and root-aware orphan GC. |
 
@@ -206,7 +211,7 @@ invent or own host activation state.
 | default `core-live-accounting` | Live broker bridge only. |
 | store/pipeline slices | Each module/export exists only when its named feature is enabled. |
 | `full` | Every in-memory slice and spill contracts, without a durable backing dependency. |
-| `full-backings` | `full` plus the currently supported production backing, `spill-redb`. |
+| `full-backings` | Existing feature adding `spill-redb`; excluded from the current release plan. |
 | `unbudgeted-stores` | Explicit non-production escape hatch; absent from default/full/full-backings. |
 
 ## 5. Algorithms, data structures, and state machines

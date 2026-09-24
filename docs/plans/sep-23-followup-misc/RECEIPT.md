@@ -1,8 +1,8 @@
 # Sep-23 follow-up qualification receipt
 
-Status: `HISTORICAL exact-source candidate qualified before later Redb changes. Current revision: dirty-worktree local rail and isolated ENOSPC oracle GREEN; clean-source extraction, benchmark, host-pair, hosted CI, deploy and activation NOT QUALIFIED; no v5 tag.`
-Scope: `full-followup` (`FUP-001` through `FUP-007`)
-Date: `2026-09-23 Asia/Seoul`
+Status: `Historical v5 receipt below; new QMP 7f1c2f8 + committed Semantica a71e3e9 local candidate qualification in the 2026-09-24 addendum. Hosted CI, deploy, activation, physical power loss and v5 tag NOT QUALIFIED.`
+Scope: historical `full-followup` (`FUP-001` through `FUP-007`); 2026-09-24 addendum qualifies the in-memory consumer pair, with optional Redb evidence recorded separately
+Date: `2026-09-24 Asia/Seoul` (historical entries retain their original dates)
 
 This file is part of the candidate tree, so it cannot contain its own final
 commit ID. Resolve the annotated tag and verify that it targets the current
@@ -602,3 +602,43 @@ changed production `spill/backings/redb.rs` again (a capped file backend and
 qualify the subsequently moving shared checkout. Re-freeze its final content
 and rerun the affected local, extraction, scaling, and host rails before any
 release/activation claim.
+
+## 2026-09-24 committed QMP / committed Semantica local pair
+
+This section supersedes the historical **local** stale-rail statements above
+for the named pair only; it does not create a v5 tag or a deployment receipt.
+QMP was clean at the start of these runs: HEAD
+`7f1c2f8352e62dd8e186ba3ede1f60185a0af4b9`, tree
+`567fb4d72ec5cf343bce49db9a5b24fc439f7287`, equal to `origin/main`.
+Semantica was verified from a separate clean, detached worktree at
+`a71e3e975dcab23aa654ea0c4ea5a66183000412`; its workspace metadata
+resolved both QMP crates by path to this QMP checkout. The shared Semantica
+main worktree's unrelated dirty changes are **not** part of this pair.
+
+| Local rail | Observed result on the named pair |
+| --- | --- |
+| `CARGO_TARGET_DIR=<external target> scripts/check-workspace.sh` | Exit 0, `check-workspace: clean`; all-feature workspace, feature capability, seven Redb SIGKILL/reopen tests, 284 documented selectors, PM lint and cargo-deny passed. |
+| `scripts/extract-to-standalone-repo.sh --dry-run <external destination>` | Exit 0; committed QMP HEAD/tree frozen; extracted-file manifest SHA-256 `87faa47955f1cf87938791e419a01ae6479a856d010642b29c88b0eae8446956`. This is pre-flight, **not** an extracted workspace build. |
+| `scripts/durability/run-enospc-docker.sh` | Exit 0; five isolated Linux tmpfs modes passed, including charged spill and charged restore commit; source-before/after SHA-256 `17684892cbef438bb6cb6282ce1ccaa388d1e24710373a19eff83ea9aa93c400`, `source_stable=true`. No physical power-loss claim. |
+| `scripts/run-scaling-bench.sh --smoke` | Exit 0; verifier accepted 48 rows; run-end `source_clean=true` and QMP HEAD/tree unchanged. Raw JSONL `target/scaling-results/qmp-scaling.qfGfwl/results.jsonl`, SHA-256 `3469f9543231f71673ee4bc8b0c3cc761a73bfd68d3d6e43d56b70e887d052d3`. |
+| `scripts/run-scaling-bench.sh` | Exit 0; verifier accepted 220 rows; run-end `source_clean=true` and QMP HEAD/tree unchanged. Raw JSONL `target/scaling-results/qmp-scaling.71wspY/results.jsonl`, SHA-256 `cf07f5a6bffd825525e29b803b1b0fe534be581e02cd809649066f44a3514d02`. The verifier's permissive threshold is **not** a production latency SLO. |
+| QBC `owner run`, `quanta-memory-host`, `all-tests`, `package-all-features` | `GREEN`, 129 passed / 0 failed; run `20260924T034719.894082Z-1fbccc48507e`. |
+| QBC `owner run`, `quanta-runtime-memory-compose`, `all-tests`, `package-all-features` | `GREEN`, 48 passed / 0 failed; run `20260924T034802.136358Z-247666960b60`. |
+
+Both QBC runs used the same host source snapshot digest
+`fcacc666479fabebe606b19183b328786c69f0863c7a29e1d1027327afa7b7e0`
+and the external QBC target root under `/Volumes/Extreme SSD 1/build-cache`.
+The host manifest enables facade `full` and **not** `spill-redb`; optional
+Redb's five-mode Linux oracle is supplemental QMP-capability evidence, **not
+an active Semantica release gate**, a host Redb consumer, or host
+filesystem-policy qualification. Semantica's reconstructible
+revocable caches may be lost on reclaim/restart and rebuilt from their
+authoritative source.
+
+After these runs, another writer changed only `README.md` and
+`README-detailed.md` in the shared QMP checkout. This receipt edit itself is
+also post-run documentation. Therefore the rows prove the frozen QMP
+`7f1c2f8` code candidate and committed Semantica pair, **not** a later dirty
+working-tree snapshot or any subsequently published commit. Hosted CI,
+deployment/activation, physical power loss and current-source Linux L2 syscall
+fault injection were not run. No v5 tag was created.

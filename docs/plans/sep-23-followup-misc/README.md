@@ -1,9 +1,17 @@
-# Sep-23 follow-up misc — 실행 계획
+# Sep-23 follow-up misc — historical execution record
 
-Status: `FUP-001..007 implementation complete on historical candidate; current Redb revision has dirty-worktree local GREEN only. Clean-source extraction, benchmark and host-pair qualification remain OPEN; no v5 tag or activation.`
+Status: **HISTORICAL**. Redb/durable FUP-001/002 and related release gates are
+excluded from the current product plan. See the
+[active in-memory scope](../sep-24-adversarial-e2e-bench/README.md). Prior
+implementation and receipts remain historical evidence, not current release work.
 작성일: `2026-09-23`
 계획 기준 HEAD: `028448946caa95676df034481a830c1d3e3b1f33`
 계획 기준 tree: `f983669731805a330200213bad7bf1bd5573f308`
+
+The sequence and writer lanes below record the 2026-09-23 campaign. Do not
+dispatch its Redb lane or carry its durable qualification into the current
+release checklist. The active scope is core accounting, in-memory stores,
+reclaim, and in-process transfer; existing optional Redb code is unchanged.
 
 ## 목적과 증거 범위
 
@@ -46,17 +54,17 @@ source/result tuple과 잔여 경계는
 - 기존 `qmp-final-qualified-d370529`는 현재 후보의 qualification이 아니다.
   기존 late-attach compile-fail 교정과 ticket index의 `BTreeMap` 복원은 이번 작업에서 보존한다.
 
-## 티켓과 실행 순서
+## 당시 티켓과 실행 순서 (현재 dispatch 금지)
 
 | 티켓 | 우선순위 / 성격 | 담당 lane | 선행 조건 |
 | --- | --- | --- | --- |
-| [FUP-001 — 정확한 durable record 상태](FUP-001-durable-record-state.md) | P1 / correctness | A | source freeze |
-| [FUP-002 — recovery 단일 소유권](FUP-002-recovery-ownership.md) | P1 / correctness | A | FUP-001 |
+| [FUP-001 — 정확한 durable record 상태](FUP-001-durable-record-state.md) | historical / current plan excluded | A | source freeze |
+| [FUP-002 — recovery 단일 소유권](FUP-002-recovery-ownership.md) | historical / current plan excluded | A | FUP-001 |
 | [FUP-007 — 0-byte ticket scope 수명](FUP-007-zero-byte-ticket-scope.md) | P1 / correctness | B0 | source freeze; `control.rs` 단독 lease |
 | [FUP-003 — admission preflight와 reclaim](FUP-003-admission-reclaim.md) | P2 / 정책 품질 | B | FUP-007, FUP-004, FUP-005 |
 | [FUP-004 — kind 교차검증](FUP-004-kind-axis-validation.md) | P2 / 방어 강화 | C | FUP-007의 ledger lease 반환 |
 | [FUP-005 — bounded provenance](FUP-005-bounded-provenance.md) | P2 / 운영 비용 | B | FUP-007의 control lease 반환 |
-| [FUP-006 — 통합·exact-source qualification](FUP-006-integration-qualification.md) | scope별 release gate | I | P1: FUP-001/002/007; P2는 후보 포함 시 추가 |
+| [FUP-006 — 통합·exact-source qualification](FUP-006-integration-qualification.md) | in-memory release gate; durable branch historical | I | FUP-007; P2는 후보 포함 시 추가 |
 
 1. **P1 Wave 1:** A=001과 B0=007을 병렬 진행한다. A는 facade의 Redb/spill/revocable,
    B0는 core의 `api/control.rs`와 필요한 ledger/scheduler 검증 파일을 독점한다.
@@ -67,7 +75,7 @@ source/result tuple과 잔여 경계는
 4. **통합:** full-followup 범위로 구현됐다. 최종 고정 source의 canonical/extraction
    결과와 host-pair GREEN을 `RECEIPT.md`와 annotated tag에 분리 기록한다.
 
-P1이 우선이다. `spill-redb`는 opt-in이므로 **사용하지 않는다는 host/dependency graph
+당시 P1이 우선이었다. `spill-redb`는 opt-in이므로 **사용하지 않는다는 host/dependency graph
 증거가 있을 때만** durable 미해결 상태를 기능 비활성 범위로 분리할 수 있다. 이 경우에도
 007은 core 경로이므로 남는다. 사용 여부가 미확인이면 durable 기능을 PASS로 추정하지 않는다.
 
