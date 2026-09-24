@@ -4,6 +4,7 @@ import copy
 import contextlib
 import io
 import importlib.util
+import sys
 import unittest.mock
 import tempfile
 import unittest
@@ -288,6 +289,52 @@ class ScalingResultTests(unittest.TestCase):
         with self.assertRaisesRegex(MODULE.ValidationError, "Busy retries per operation exceeded"):
             MODULE.validate_release(candidates, baselines, RELEASE_POLICY)
 
+    def test_release_rejects_recurrent_single_repetition_tail_regression(self) -> None:
+        candidates, baselines = release_receipts()
+        for repetition, records in enumerate(candidates):
+            row = next(
+                row for row in records if row.get("operation") == "payload_unique_fill"
+                and row.get("entries") == 1_000 and row.get("repetition") == repetition
+            )
+            row["p99_ns"] = 100
+        with self.assertRaisesRegex(MODULE.ValidationError, "release p99 regressed"):
+            MODULE.validate_release(candidates, baselines, RELEASE_POLICY)
+
+    def test_release_rejects_recurrent_single_repetition_throughput_regression(self) -> None:
+        candidates, baselines = release_receipts()
+        for repetition, records in enumerate(candidates):
+            row = next(
+                row for row in records if row.get("operation") == "payload_unique_fill"
+                and row.get("entries") == 1_000 and row.get("repetition") == repetition
+            )
+            row["elapsed_ns"] *= 2
+            row["throughput_ops_per_sec"] = round(
+                int(row["timed_operations"]) * 1_000_000_000 / int(row["elapsed_ns"])
+            )
+        with self.assertRaisesRegex(MODULE.ValidationError, "release throughput regressed"):
+            MODULE.validate_release(candidates, baselines, RELEASE_POLICY)
+
+    def test_release_single_process_tail_spike_is_inconclusive(self) -> None:
+        candidates, baselines = release_receipts()
+        row = next(
+            row for row in candidates[0] if row.get("operation") == "payload_unique_fill"
+            and row.get("entries") == 1_000 and row.get("repetition") == 0
+        )
+        row["p99_ns"] = 100
+        with self.assertRaisesRegex(MODULE.InconclusiveError, "varies beyond run-noise"):
+            MODULE.validate_release(candidates, baselines, RELEASE_POLICY)
+
+    def test_release_rejects_recurrent_single_repetition_denied_tail_regression(self) -> None:
+        candidates, baselines = release_receipts(["--profile=in-memory-pressure"])
+        for repetition, records in enumerate(candidates):
+            row = next(
+                row for row in records if row.get("operation") == "broker_pressure_cycle"
+                and row.get("entries") == 1_000 and row.get("repetition") == repetition
+            )
+            row["denied_p99_ns"] = 100
+        with self.assertRaisesRegex(MODULE.ValidationError, "release denied_p99_ns regressed"):
+            MODULE.validate_release(candidates, baselines, RELEASE_POLICY)
+
     def test_release_classifies_noisy_or_loaded_host_as_inconclusive(self) -> None:
         candidates, baselines = release_receipts()
         for row in candidates[0]:
@@ -355,6 +402,16 @@ class ScalingResultTests(unittest.TestCase):
         args = ["--sizes=25,250", "--threads=1,4", "--repetitions=3"]
         records = valid_records(args, (25, 250), (1, 4), 3)
         self.assertEqual(MODULE.validate(records), 96)
+
+    def test_runner_rejects_number_spellings_rust_usize_will_not_parse(self) -> None:
+        for args in (
+            ["--sizes=1, 2"],
+            ["--threads=1_000"],
+            ["--repetitions=3 "],
+            [f"--sizes={2 * sys.maxsize + 2}"],
+        ):
+            with self.subTest(args=args), self.assertRaises(MODULE.ValidationError):
+                MODULE.parse_benchmark_args(args)
 
     def test_pressure_profile_is_independent_and_fail_closed(self) -> None:
         args = ["--smoke", "--profile=in-memory-pressure"]

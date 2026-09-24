@@ -60,13 +60,22 @@ def parse_listed_tests(output: str) -> set[str]:
 
 def parse_executed_tests(output: str) -> set[str]:
     tests: set[str] = set()
+    has_ignored = re.search(r"\.\.\. ignored\b|;\s*[1-9][0-9]* ignored\b", output) is not None
+    marker = re.compile(r"(?:^|(?<=\.\.\. ))test (?P<name>[A-Za-z0-9_:]+) \.\.\.")
     for line in output.splitlines():
         # libtest output can interleave when tests spawn subprocesses: one
         # line may contain "test A ... test B ... ok" and A's "ok" later.
         # The caller only reuses output after cargo test exits successfully.
-        for match in re.finditer(
-            r"(?:^|(?<=\.\.\. ))test (?P<name>[A-Za-z0-9_:]+) \.\.\.", line
-        ):
+        matches = list(marker.finditer(line))
+        for index, match in enumerate(matches):
+            result_end = matches[index + 1].start() if index + 1 < len(matches) else len(line)
+            result = line[match.end():result_end]
+            if re.search(r"\bignored\b", result):
+                continue
+            if has_ignored and not re.search(r"\b(?:ok|FAILED)\b", result):
+                # An interleaved marker with no attached result may itself be
+                # ignored, so do not certify it from a later standalone "ok".
+                continue
             tests.add(match.group("name").split("::")[-1])
     return tests
 
@@ -100,16 +109,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--test-output",
         type=Path,
-        help="reuse output from a completed cargo test run instead of invoking cargo --list",
+        help="require completed cargo test output as well as Cargo's registered test list",
     )
     args = parser.parse_args(argv)
 
     candidates = documented_candidates()
-    tests = (
-        parse_executed_tests(args.test_output.read_text(encoding="utf-8"))
-        if args.test_output
-        else listed_tests()
-    )
+    registered = listed_tests()
+    tests = registered
+    if args.test_output:
+        # Cargo's successful output proves execution, while --list proves the
+        # name was registered by the harness rather than printed by a test.
+        tests = registered & parse_executed_tests(args.test_output.read_text(encoding="utf-8"))
     missing = sorted(set(candidates) - tests - NON_TEST_IDENTIFIERS)
     if missing:
         for selector in missing:

@@ -71,8 +71,13 @@ Correctness is managed as **tests**; benchmarks answer a different question
   `scripts/run-scaling-bench.sh --profile=in-memory-pressure` (or the unchanged
   standard profile), then invoke `scripts/verify-scaling-results.py --release`
   with three `--baseline` and three `--input` paths. Supply every
-  `--release-*` limit explicitly from the consumer's approved policy. The
-  verifier rejects mixed source/toolchain/feature/machine runs, missing or
+  `--release-*` limit explicitly from the consumer's approved policy. The release
+  comparator takes each process's slowest repetition for throughput,
+  highest repetition p99 (including admitted/denied tails), and highest Busy
+  retry rate, then compares the median of three independent processes. A
+  one-process spike below the absolute cap but beyond the run-noise bound is
+  `INCONCLUSIVE`; recurrence across processes can fail the regression limit.
+  The verifier rejects mixed source/toolchain/feature/machine runs, missing or
   reused run IDs, a baseline with the candidate's source tree, incomplete rows,
   an absent/nonzero benchmark exit status, accounting drift, and threshold
   violations.

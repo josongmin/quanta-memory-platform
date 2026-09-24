@@ -1,7 +1,10 @@
 import importlib.util
+import contextlib
+import io
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "verify-doc-test-selectors.py"
@@ -31,7 +34,7 @@ class DocTestSelectorTests(unittest.TestCase):
         )
         self.assertEqual(MODULE.parse_listed_tests(output), {"exact_test_selector"})
 
-    def test_cargo_execution_parser_reuses_passed_and_ignored_test_names(self) -> None:
+    def test_cargo_execution_parser_does_not_count_ignored_test_names(self) -> None:
         output = (
             "running 3 tests\n"
             "test module::exact_test_selector ... ok\n"
@@ -44,9 +47,16 @@ class DocTestSelectorTests(unittest.TestCase):
             {
                 "exact_test_selector",
                 "failed_test_selector",
-                "ignored_test_selector",
             },
         )
+
+    def test_ignored_interleaving_does_not_certify_ambiguous_names(self) -> None:
+        output = (
+            "test module::ambiguous_selector ... test module::ignored_selector ... ignored\n"
+            "ok\n"
+            "test result: ok. 1 passed; 0 failed; 1 ignored\n"
+        )
+        self.assertEqual(MODULE.parse_executed_tests(output), set())
 
     def test_cargo_execution_parser_handles_interleaved_test_lines(self) -> None:
         output = (
@@ -65,6 +75,36 @@ class DocTestSelectorTests(unittest.TestCase):
             "test module::real_selector ... ok\n"
         )
         self.assertEqual(MODULE.parse_executed_tests(output), {"real_selector"})
+
+    def test_logged_marker_without_cargo_registration_is_not_a_selector(self) -> None:
+        with tempfile.TemporaryDirectory(dir=MODULE.ROOT) as directory:
+            output = Path(directory) / "cargo.log"
+            output.write_text("test module::fake_test_selector ... ok\n", encoding="utf-8")
+            with (
+                patch.object(
+                    MODULE, "documented_candidates",
+                    return_value={"fake_test_selector": {"doc.md"}},
+                ),
+                patch.object(MODULE, "listed_tests", return_value={"real_test_selector"}),
+                patch("sys.argv", ["verify-doc-test-selectors.py", "--test-output", str(output)]),
+                contextlib.redirect_stderr(io.StringIO()),
+            ):
+                self.assertEqual(MODULE.main(), 1)
+
+    def test_logged_and_registered_selector_resolves(self) -> None:
+        with tempfile.TemporaryDirectory(dir=MODULE.ROOT) as directory:
+            output = Path(directory) / "cargo.log"
+            output.write_text("test module::real_test_selector ... ok\n", encoding="utf-8")
+            with (
+                patch.object(
+                    MODULE, "documented_candidates",
+                    return_value={"real_test_selector": {"doc.md"}},
+                ),
+                patch.object(MODULE, "listed_tests", return_value={"real_test_selector"}),
+                patch("sys.argv", ["verify-doc-test-selectors.py", "--test-output", str(output)]),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                self.assertEqual(MODULE.main(), 0)
 
 
 if __name__ == "__main__":

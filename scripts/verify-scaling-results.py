@@ -66,13 +66,22 @@ class ReleasePolicy(NamedTuple):
 
 
 def positive_list(raw: str, option: str) -> tuple[int, ...]:
-    try:
-        values = tuple(int(part) for part in raw.split(","))
-    except ValueError as error:
-        raise ValidationError(f"{option} must contain positive integers") from error
-    if not values or any(value <= 0 for value in values) or len(values) != len(set(values)):
+    values = tuple(positive_usize(part, option) for part in raw.split(","))
+    if len(values) != len(set(values)):
         raise ValidationError(f"{option} must contain distinct positive integers")
     return values
+
+
+def positive_usize(raw: str, option: str) -> int:
+    if not raw or not raw.isascii() or not raw.isdecimal():
+        raise ValidationError(f"{option} must be a positive usize decimal")
+    try:
+        value = int(raw)
+    except ValueError as error:
+        raise ValidationError(f"{option} must be a positive usize decimal") from error
+    if value <= 0 or value > 2 * sys.maxsize + 1:
+        raise ValidationError(f"{option} is outside the positive usize range")
+    return value
 
 
 def parse_benchmark_args(arguments: object) -> BenchmarkSpec:
@@ -96,10 +105,7 @@ def parse_benchmark_args(arguments: object) -> BenchmarkSpec:
             threads_override = positive_list(argument.split("=", 1)[1], option)
         elif argument.startswith("--repetitions="):
             option = "--repetitions"
-            try:
-                repetitions_override = int(argument.split("=", 1)[1])
-            except ValueError as error:
-                raise ValidationError("--repetitions must be an integer") from error
+            repetitions_override = positive_usize(argument.split("=", 1)[1], option)
             if repetitions_override < 3:
                 raise ValidationError("--repetitions must be at least three")
         elif argument == "--profile=in-memory-pressure":
@@ -460,16 +466,18 @@ def run_cell_metrics(
 ) -> dict[tuple[object, ...], dict[str, float]]:
     metrics: dict[tuple[object, ...], dict[str, float]] = {}
     for key, samples in grouped.items():
+        # A recurring one-of-five collapse is not erased by a within-process
+        # median. Cross-process noise remains a separate INCONCLUSIVE gate.
         cell = {
-            "throughput": statistics.median(integer(row, "throughput_ops_per_sec") for row in samples),
-            "p99": statistics.median(integer(row, "p99_ns") for row in samples),
+            "throughput": min(integer(row, "throughput_ops_per_sec") for row in samples),
+            "p99": max(integer(row, "p99_ns") for row in samples),
             "busy_per_operation": max(
                 integer(row, "busy_retries") / integer(row, "timed_operations") for row in samples
             ),
         }
         for field in ("admitted_p99_ns", "denied_p99_ns"):
             if field in samples[0]:
-                cell[field] = statistics.median(integer(row, field) for row in samples)
+                cell[field] = max(integer(row, field) for row in samples)
         metrics[key] = cell
     return metrics
 
