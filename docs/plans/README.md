@@ -9,6 +9,7 @@ hosted CI, deployment, and activation are separate claims.
 
 | Plan | Implementation | Evidence and remaining gate |
 | --- | --- | --- |
+| [Sep-24 Semantica memory adoption — remaining work](sep-24-semantica-memory-adoption/README.md) | SMA-001/002/003 integrated into Semantica main at `31a07f43e1f`; QMP code unchanged. | Adapter/host/composer owner lib all-features passed only on earlier snapshots (122/119/51 tests). Current-main Rust/QBC and SDK/query product proof are blocked by disk capacity; no product GREEN asserted. |
 | [Sep-23 FUP-001/002](sep-23-followup-misc/README.md) | Implemented and historically verified for opt-in Redb; outside the current in-memory product scope. | Prior Redb receipts remain historical. A future durable consumer needs its own feature and failure-model qualification. |
 | [Sep-23 FUP-003/004/005/007](sep-23-followup-misc/README.md) | Implemented with owner-local GREEN and temporary-mutant RED. | The Sep-23 candidate has an annotated v5 receipt. The newer in-memory pair was qualified at QMP `7f1c2f8` with Semantica `a71e3e9`; neither receipt names this audit base. |
 | [Sep-23 FUP-006](sep-23-followup-misc/FUP-006-integration-qualification.md) | Prior local QMP and committed-host pair gates passed. | Verifier change and focused proof are at `db0b03c`; current local qualification requires an exact-target `qmp-local-qualified-*` receipt. Extraction dry-run is included; host proof is separate and conditional on a host-adoption claim. |
