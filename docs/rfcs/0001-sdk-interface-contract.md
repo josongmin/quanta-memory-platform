@@ -33,6 +33,54 @@ Current-source anchors: [policy and class taxonomy](../../crates/quanta-memory-p
 [pending/committed authority](../../crates/quanta-memory-platform-core/src/api/control.rs),
 and [facade builders](../../crates/quanta-memory-platform-facade/src/shared/builder.rs).
 
+### As-Is: 0.2 public integration path
+
+```mermaid
+flowchart TD
+    H["Host adapter (outside this repo)"] --> I["Manifest or preset + override layers"]
+    I --> B["MemoryPlatformBuilder / ProcessMemoryBrokerBuilder"]
+    B --> R["EffectiveBudgetResolver"]
+    R -->|report only| E["EffectiveMemoryBudgetReport (no authority)"]
+    R -->|build| P["LiveMemoryPlatform"]
+    P -->|broker() escape| BR["LiveProcessMemoryBroker"]
+    P -->|attach_runtime with RuntimeKind enum| V["RuntimeMemoryView"]
+    P -->|feature-gated builders| S["Budgeted stores"]
+    V --> BR
+    S --> BR
+    BR --> L["AccountingLedger (semantic source of truth)"]
+```
+
+The facade already supplies budgeted stores, but the host can reach the broker
+and core binding types. The runtime kind and memory-class taxonomy are closed
+enums, while preset and source-override concerns are mixed into construction.
+This diagram describes the current API shape, not a claim that every host uses
+each branch.
+
+### To-Be: 0.3 consumer contract (not implemented)
+
+```mermaid
+flowchart TD
+    H["Host inputs and capacity (outside QMP)"] --> C["MemoryConfig (typed policy; profiles optional)"]
+    C -->|builder(config).build| R["One resolver + complete validation"]
+    C -->|resolve for inspection| O["ResolvedMemoryConfig (no authority)"]
+    O -->|builder_resolved| P["MemoryPlatform (one budget domain / ledger)"]
+    R --> P
+    P -->|scope with runtime ID| S["MemoryScope (attribution only)"]
+    P -->|snapshot / reconfigure / retry cleanup| M["Management API"]
+    S -->|feature-specific builder| ST["Budgeted store"]
+    S -->|consumer name + owner + class| MC["MemoryConsumer"]
+    MC -->|reserve_up_to| PR["PendingReservation"]
+    PR -->|commit_measured| CR["MemoryReservation"]
+    ST -->|retaining mutations| L["One core accounting ledger"]
+    PR -->|pending charge| L
+    CR -->|committed charge| L
+```
+
+Both construction paths use the same resolver. The scope creates no second
+ledger; store and custom-component charges meet at the platform's single
+authority. Raw broker and ticket constructors are not consumer entry points.
+Separately built platforms do not share a combined cap.
+
 The SDK must make the common path obvious while preserving explicit
 ownership, deterministic policy, and safe extension:
 
@@ -178,6 +226,12 @@ and prepared publication.
 ### 2.3 Account a custom component
 
 ```rust
+// Application-owned pair: Rust drops struct fields in declaration order.
+struct AppRetained<T> {
+    value: T,
+    reservation: MemoryReservation,
+}
+
 let consumer = scope.consumer("vector-index")?
     .owner(owner)
     .class(class.clone())
@@ -189,7 +243,8 @@ let pending = consumer.reserve_up_to(max_size, ChargeKind::RetainedPayload)?;
 let value = construct_value()?;
 let actual_size = MemorySize::try_from_usize(measure_retained_cost(&value)?)?;
 let reservation = pending.commit_measured(actual_size)?;
-// The component owns value and reservation together until both are released.
+let retained = AppRetained { value, reservation };
+// `retained.value` drops before `retained.reservation`, including on `?`.
 ```
 
 `MemoryConsumer` is a cheap, immutable attribution descriptor, not a
@@ -236,9 +291,11 @@ If a future reachable failure cannot preserve a live ticket, design and prove
 its ownership recovery separately before exposing it.
 `Drop` attempts bounded deferred cleanup but cannot return an error.
 Components must destroy retained data before or with its charge. Built-in
-stores enforce that lifecycle internally.
+stores enforce that lifecycle internally. `AppRetained<T>` above is an
+application-local ownership pattern, not an SDK wrapper or permission to
+mutate or escape `value` without updating its reservation.
 
-Do not add a generic `Retained<T>` wrapper to 0.3: without prohibiting
+Do not add an SDK-level generic `Retained<T>` wrapper to 0.3: without prohibiting
 mutation and value escape it cannot prove that `T` still matches its charge.
 A restricted wrapper may be added for a demonstrated caller.
 
@@ -455,10 +512,9 @@ scope with/without diagnostic kind, custom retention and growth/shrink, each
 enabled store, observation, and reconfiguration. Negative compile tests reject
 raw authority construction, caller-selected unbudgeted accounting through
 scope builders, disabled features, and forged headroom. Builder tests reject
-missing owner or class with
-typed `Build` errors for every enabled store and custom consumer; omitted
-context and store name use their documented defaults. Behavioral tests prove
-pending rollback, measured-commit
+missing owner or class with typed `Build` errors for every enabled store and
+custom consumer; omitted context and store name use their documented defaults.
+Behavioral tests prove pending rollback, measured-commit
 surplus/over-bound/zero-byte behavior, authority conservation across
 release/resize/transfer failures, default rejection of undeclared owners
 (including zero-byte tickets), explicit global-only opt-in, unique owner→group
@@ -466,8 +522,8 @@ attribution, profile collision rejection independent of insertion order,
 baseline resolution of profile collisions, any published profile's normative
 leaf table and golden vectors, context default/override and
 unknown-kind rejection, overlay `Clear`, live-remap rejection, stale/no-op
-reconfiguration, coherent
-semantic snapshots, advisory telemetry separation, and a conformance fake
+reconfiguration, coherent semantic snapshots, advisory telemetry separation,
+and a conformance fake
 that is deliberately rejected.
 The two construction paths must produce identical effective fingerprints
 and failures; checked `MemorySize` constructors reject overflow; omitting
@@ -485,6 +541,9 @@ Exercise grow-before-mutate, partial mutation failure with conservative charge,
 shrink-before-refund, and failed refund retaining an overcharge. No public
 `RecoveryRequired` branch is accepted for live resize without a reachable
 fault-injection oracle and an exact authority-preserving recovery design.
+An application-owned pair example must demonstrate value-before-charge drop
+order on normal exit and early `?` return; it is not a substitute for semantic
+measurement tests.
 
 On a committed clean candidate, run `python3 tools/pm/pm.py sync`,
 `scripts/check-workspace.sh`, strict rustdoc, public API baseline, and the
@@ -515,6 +574,9 @@ of those gates.
 - [Rust API Guidelines](https://rust-lang.github.io/api-guidelines/type-safety.html)
   supports unit-safe newtypes and builders for genuinely compound values;
   QMP does not introduce a builder for a reservation with only kind and size.
+- [Rust Reference destructor order](https://doc.rust-lang.org/reference/destructors.html)
+  guarantees declaration-order drop for struct fields; the custom-component
+  example puts the retained value before its reservation for that reason.
 
 Deferred until a named consumer justifies them: generic `Knob<T>` registry,
 plugin/service container, runtime/control handle split, generic durability
