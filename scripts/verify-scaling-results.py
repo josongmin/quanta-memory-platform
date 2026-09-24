@@ -198,6 +198,12 @@ def run_metadata(records: list[dict[str, object]]) -> tuple[dict[str, object], B
             raise ValidationError(f"source changed during benchmark: {field}")
     if end.get("source_clean") is not True:
         raise ValidationError("source changed during benchmark: working tree is dirty")
+    if "bench_exit_code" in end and (
+        not isinstance(end["bench_exit_code"], int)
+        or isinstance(end["bench_exit_code"], bool)
+        or end["bench_exit_code"] != 0
+    ):
+        raise ValidationError("bench exited nonzero or has invalid exit status")
     if run.get("run_id") != end.get("run_id"):
         raise ValidationError("run identity changed during benchmark")
     spec = parse_benchmark_args(run.get("benchmark_args"))
@@ -401,8 +407,14 @@ def release_run(
     run, spec = run_metadata(records)
     if "--smoke" in run["benchmark_args"]:
         raise ValidationError("release comparison requires full, not smoke, benchmark runs")
+    canonical_args = ["--profile=in-memory-pressure"] if spec.profile == "in-memory-pressure" else []
+    canonical_full = parse_benchmark_args(canonical_args)
+    if spec != canonical_full:
+        raise ValidationError("release comparison requires the canonical full matrix")
     if not isinstance(run.get("run_id"), str) or not run["run_id"]:
         raise ValidationError("release run identity is missing")
+    if "bench_exit_code" not in records[-1]:
+        raise ValidationError("release bench exit status is missing")
     if (
         not isinstance(run.get("logical_cpus"), int)
         or isinstance(run["logical_cpus"], bool)
@@ -473,6 +485,11 @@ def validate_release(
     for field in (*COMPAT_FIELDS, "logical_cpus"):
         if baseline_ref[field] != candidate_ref[field]:
             raise ValidationError(f"release baseline incompatible {field}")
+    if (
+        baseline_ref["source_sha"] == candidate_ref["source_sha"]
+        or baseline_ref["source_tree"] == candidate_ref["source_tree"]
+    ):
+        raise ValidationError("release baseline and candidate use the same source tree or commit")
 
     baseline_metrics = [run_cell_metrics(grouped) for _, _, grouped in baseline_runs]
     candidate_metrics = [run_cell_metrics(grouped) for _, _, grouped in candidate_runs]

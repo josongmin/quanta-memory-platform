@@ -127,6 +127,7 @@ def valid_records(
         "source_sha": "a" * 40,
         "source_tree": "b" * 40,
         "source_clean": True,
+        "bench_exit_code": 0,
     })
     return records
 
@@ -134,11 +135,12 @@ def valid_records(
 def release_receipts(
     benchmark_args: list[str] | None = None,
 ) -> tuple[list[list[dict[str, object]]], list[list[dict[str, object]]]]:
-    def group(prefix: str, sha: str) -> list[list[dict[str, object]]]:
+    def group(prefix: str, sha: str, tree: str) -> list[list[dict[str, object]]]:
         runs = []
         for index in range(3):
             records = valid_records(benchmark_args)
             records[0]["source_sha"] = records[-1]["source_sha"] = sha
+            records[0]["source_tree"] = records[-1]["source_tree"] = tree
             records[0]["run_id"] = records[-1]["run_id"] = f"{prefix}-{index}"
             records[0]["logical_cpus"] = 8
             records[0]["load_per_cpu_start"] = 0.1
@@ -146,7 +148,7 @@ def release_receipts(
             runs.append(records)
         return runs
 
-    return group("candidate", "c" * 40), group("baseline", "a" * 40)
+    return group("candidate", "c" * 40, "d" * 40), group("baseline", "a" * 40, "b" * 40)
 
 
 RELEASE_POLICY = MODULE.ReleasePolicy(
@@ -181,6 +183,50 @@ class ScalingResultTests(unittest.TestCase):
             MODULE.validate_release(candidates, baselines, RELEASE_POLICY)
         with self.assertRaisesRegex(MODULE.ValidationError, "three candidate"):
             MODULE.validate_release(candidates[:2], baselines, RELEASE_POLICY)
+
+    def test_release_rejects_same_source_tree_on_both_sides(self) -> None:
+        candidates, baselines = release_receipts()
+        for records in candidates:
+            records[0]["source_tree"] = records[-1]["source_tree"] = baselines[0][0]["source_tree"]
+        with self.assertRaisesRegex(MODULE.ValidationError, "same source tree"):
+            MODULE.validate_release(candidates, baselines, RELEASE_POLICY)
+
+    def test_release_requires_successful_recorded_bench_exit(self) -> None:
+        candidates, baselines = release_receipts()
+        candidates[0][-1]["bench_exit_code"] = 1
+        with self.assertRaisesRegex(MODULE.ValidationError, "bench exited nonzero"):
+            MODULE.validate_release(candidates, baselines, RELEASE_POLICY)
+        candidates, baselines = release_receipts()
+        del candidates[0][-1]["bench_exit_code"]
+        with self.assertRaisesRegex(MODULE.ValidationError, "bench exit status is missing"):
+            MODULE.validate_release(candidates, baselines, RELEASE_POLICY)
+
+    def test_release_rejects_custom_small_matrix_without_smoke_flag(self) -> None:
+        for pressure in (False, True):
+            with self.subTest(pressure=pressure):
+                args = (["--profile=in-memory-pressure"] if pressure else []) + [
+                    "--sizes=1000", "--threads=1", "--repetitions=3",
+                ]
+                candidates, baselines = release_receipts()
+                for records in (*candidates, *baselines):
+                    records[0]["benchmark_args"] = args
+                    records[1:-1] = [
+                        row for row in records[1:-1]
+                        if row["entries"] == 1_000 and row["repetition"] < 3 and (
+                            row["operation"] != "payload_contention" or row["threads"] == 1
+                        )
+                    ]
+                    if pressure:
+                        records[1:-1] = [
+                            sample("broker_pressure_cycle", "single-thread", 1_000, 1, repetition)
+                            for repetition in range(3)
+                        ] + [
+                            sample("dual_store_write_contention", "shared-broker", 1_000, 1, repetition)
+                            for repetition in range(3)
+                        ]
+                        records[0]["feature_set"] = "full"
+                with self.assertRaisesRegex(MODULE.ValidationError, "canonical full matrix"):
+                    MODULE.validate_release(candidates, baselines, RELEASE_POLICY)
 
     def test_release_rejects_real_regression_and_busy_storm(self) -> None:
         candidates, baselines = release_receipts()

@@ -48,6 +48,17 @@ class DocTestSelectorTests(unittest.TestCase):
             },
         )
 
+    def test_cargo_execution_parser_handles_interleaved_test_lines(self) -> None:
+        output = (
+            "test module::first_selector ... test module::second_selector ... ok\n"
+            "\nok\n"
+            "test result: ok. 2 passed; 0 failed; 0 ignored\n"
+        )
+        self.assertEqual(
+            MODULE.parse_executed_tests(output),
+            {"first_selector", "second_selector"},
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -61,8 +61,10 @@ def parse_listed_tests(output: str) -> set[str]:
 def parse_executed_tests(output: str) -> set[str]:
     tests: set[str] = set()
     for line in output.splitlines():
-        match = re.match(r"^test (?P<name>.+?) \.\.\. (?:ok|FAILED|ignored)$", line)
-        if match:
+        # libtest output can interleave when tests spawn subprocesses: one
+        # line may contain "test A ... test B ... ok" and A's "ok" later.
+        # The caller only reuses output after cargo test exits successfully.
+        for match in re.finditer(r"test (?P<name>[A-Za-z0-9_:]+) \.\.\.", line):
             tests.add(match.group("name").split("::")[-1])
     return tests
 

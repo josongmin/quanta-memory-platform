@@ -98,11 +98,11 @@ source_clean=true
 if [[ -n "$(git status --porcelain --untracked-files=all)" ]]; then
   source_clean=false
 fi
-python3 - "$end_source_sha" "$end_source_tree" "$source_clean" "$run_id" <<'PY' | tee -a "$result_file"
+python3 - "$end_source_sha" "$end_source_tree" "$source_clean" "$run_id" "$bench_status" <<'PY' | tee -a "$result_file"
 import json
 import os
 import sys
-sha, tree, clean, run_id = sys.argv[1:]
+sha, tree, clean, run_id, bench_status = sys.argv[1:]
 logical_cpus = os.cpu_count()
 if not logical_cpus:
     raise SystemExit("run-scaling-bench: logical CPU count is unavailable")
@@ -112,6 +112,7 @@ print(json.dumps({
     "source_tree": tree,
     "source_clean": clean == "true",
     "run_id": run_id,
+    "bench_exit_code": int(bench_status),
     "load_per_cpu_end": os.getloadavg()[0] / logical_cpus,
 }, separators=(",", ":")))
 PY

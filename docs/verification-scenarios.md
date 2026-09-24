@@ -67,13 +67,15 @@ Correctness is managed as **tests**; benchmarks answer a different question
 
   Ordinary JSONL validation proves measurement shape and absolute guards, not
   an approved performance SLO. For a release performance comparison, collect
-  **three independent full-process receipts per baseline and candidate** using
+  **three independent canonical full-process receipts per baseline and candidate** using
   `scripts/run-scaling-bench.sh --profile=in-memory-pressure` (or the unchanged
   standard profile), then invoke `scripts/verify-scaling-results.py --release`
   with three `--baseline` and three `--input` paths. Supply every
   `--release-*` limit explicitly from the consumer's approved policy. The
   verifier rejects mixed source/toolchain/feature/machine runs, missing or
-  reused run IDs, incomplete rows, accounting drift, and threshold violations.
+  reused run IDs, a baseline with the candidate's source tree, incomplete rows,
+  an absent/nonzero benchmark exit status, accounting drift, and threshold
+  violations.
   Recorded per-CPU host load or cross-process timing spread above policy yields
   exit 2 (`INCONCLUSIVE`), never GREEN. Exit 1 is invalid evidence or a
   measured regression; exit 0 covers only the selected local performance
