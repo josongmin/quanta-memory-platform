@@ -150,6 +150,12 @@ owner-local 신규 테스트는 아직 실행되지 않았다. RED 브랜치를 
 edge가 각각 0개였다. 이는 PTA의 이름 비교만 느슨하게 해서 해결할 문제가
 아니라 call-graph packet/edge 생성·전달의 불일치다. 임시 진단 코드는
 출하 브랜치에 남기지 않았다.
+추가 계수 진단에서 해당 call graph는 edge 2개·function 6개였고
+`direct_call_target_not_found_in_canonical_interproc_authority` 및
+`call_graph_trace_diff_unavailable` partial reason을 보유했다. budget
+exhaustion 증거는 없었다. `sqlite3.connect`의 canonical direct-call target
+해결 또는 제품 fixture의 source/import authority를 먼저 교정하고,
+partial graph를 promotable baseline으로 취급하지 않는지 재검증해야 한다.
 
 ## 최소 proof matrix
 
