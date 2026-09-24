@@ -1,3 +1,6 @@
+mod cost;
+#[cfg(feature = "spill")]
+mod durable_codec;
 pub mod service;
 
 use quanta_memory_platform_core::{MemoryResult, StoreBindingHandle, StoreStats, StoreWriteError};

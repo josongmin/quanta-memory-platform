@@ -34,7 +34,7 @@ non-disposable data.
 
 ## 2. Contract decision before implementation
 
-`RevocableStore::restore_one_durable` publishes a resident entry and then asks
+`RevocableStore::restore_one_durable_bounded` publishes a resident entry and then asks
 the durable controller to finalize. A successful Redb finalize removes the
 recovery payload and persists the exact generation's terminal proof in one
 transaction.

@@ -117,7 +117,7 @@ fn main() {
             let controller = RoutedSpillController::new(backing);
             store.insert_checked("k0".to_string(), payload(0)).expect("child insert");
             let receipt = store
-                .spill_one_durable(&controller, |_key, value| Ok(value.clone()))
+                .spill_one_durable_bounded(&controller)
                 .expect("child durable spill")
                 .expect("one committed record");
             assert!(matches!(receipt, SpillReceipt::Durable { sequence: 0, .. }));

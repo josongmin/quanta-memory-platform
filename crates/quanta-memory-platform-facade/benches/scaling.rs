@@ -11,11 +11,12 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use quanta_memory_platform_core::{
-    ChargeKind, MemoryClass, MemoryContextKind, MemoryError, ReclaimPriority, ResourceGroup,
-    ResourceGroupScheduler, RetainedEnvelope, StoreBindingHandle, WeightedResourceGroupScheduler,
+    ChargeKind, ManagedCharge, MemoryClass, MemoryContextKind, MemoryError, ReclaimPriority,
+    ResourceGroup, ResourceGroupScheduler, RetainedEnvelope, StoreBindingHandle,
+    WeightedResourceGroupScheduler,
 };
 use quanta_memory_platform_facade::{
-    MemoryPlatformBuilder, PayloadStore, PortableMemoryPresets, RevocableStore,
+    MemoryPlatformBuilder, PayloadStore, PortableMemoryPresets, RetainedMapStore, RevocableStore,
 };
 #[global_allocator]
 static GLOBAL: BenchAllocator = BenchAllocator;
@@ -115,17 +116,34 @@ struct Options {
 
 #[derive(Clone, Copy, Debug)]
 enum ContentionMode {
-    ReadHeavy,
+    MetadataStatsHeavy,
     WriteHeavy,
-    Mixed,
+    MixedStatsPut,
 }
 
 impl ContentionMode {
     fn label(self) -> &'static str {
         match self {
-            Self::ReadHeavy => "read-heavy",
+            Self::MetadataStatsHeavy => "metadata-stats-heavy",
             Self::WriteHeavy => "write-heavy",
-            Self::Mixed => "mixed",
+            Self::MixedStatsPut => "mixed-stats-put",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum BrokerPairwiseMode {
+    SingleOwner,
+    PerThreadOwner,
+    IndependentOwners,
+}
+
+impl BrokerPairwiseMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::SingleOwner => "shared-single-owner",
+            Self::PerThreadOwner => "shared-per-thread-owner",
+            Self::IndependentOwners => "independent-per-thread-owner",
         }
     }
 }
@@ -150,6 +168,22 @@ struct LatencySample {
 struct WorkerSample {
     latencies: Vec<u64>,
     busy_retries: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct OperationCounts {
+    successful: usize,
+    denied: usize,
+}
+
+impl OperationCounts {
+    fn all_successful(successful: usize) -> Self {
+        Self { successful, denied: 0 }
+    }
+
+    fn timed(self) -> usize {
+        self.successful.checked_add(self.denied).expect("timed operation count")
+    }
 }
 
 fn options() -> Options {
@@ -260,15 +294,20 @@ fn emit(
     semantic_peak_bytes: u64,
     semantic_after_close_bytes: u64,
     allocation: AllocationSample,
+    operations: OperationCounts,
     busy_retries: u64,
 ) {
     let elapsed_ns = elapsed.as_nanos();
-    let throughput = (entries as f64 / elapsed.as_secs_f64()).round() as u64;
+    let timed_operations = operations.timed();
+    let throughput = (timed_operations as f64 / elapsed.as_secs_f64()).round() as u64;
     println!(
         concat!(
-            "{{\"schema\":\"qmp-scaling-sample-v2\",",
+            "{{\"schema\":\"qmp-scaling-sample-v3\",",
             "\"operation\":\"{operation}\",\"mode\":\"{mode}\",",
             "\"entries\":{entries},\"threads\":{threads},\"repetition\":{repetition},",
+            "\"timed_operations\":{timed_operations},",
+            "\"successful_operations\":{successful_operations},",
+            "\"denied_operations\":{denied_operations},",
             "\"elapsed_ns\":{elapsed_ns},\"throughput_ops_per_sec\":{throughput},",
             "\"p50_ns\":{p50},\"p95_ns\":{p95},\"p99_ns\":{p99},",
             "\"semantic_peak_bytes\":{semantic_peak_bytes},",
@@ -285,6 +324,9 @@ fn emit(
         entries = entries,
         threads = threads,
         repetition = repetition,
+        timed_operations = timed_operations,
+        successful_operations = operations.successful,
+        denied_operations = operations.denied,
         elapsed_ns = elapsed_ns,
         throughput = throughput,
         p50 = latency.p50,
@@ -307,15 +349,26 @@ fn main() {
     let allocations = &ALLOCATION_COUNTERS;
     for entries in options.sizes {
         for repetition in 0..options.repetitions {
-            payload_unique_fill_and_lookup(entries, repetition, allocations);
+            payload_unique_fill_and_dedup_put(entries, repetition, allocations);
             revocable_fill_and_drain(entries, repetition, allocations);
             broker_release_owner_cardinality(entries, repetition, allocations);
             scheduler_admission_group_cardinality(entries, repetition, allocations);
+            retained_map_point_read(entries, repetition, true, allocations);
+            retained_map_point_read(entries, repetition, false, allocations);
+            for mode in [
+                BrokerPairwiseMode::SingleOwner,
+                BrokerPairwiseMode::PerThreadOwner,
+                BrokerPairwiseMode::IndependentOwners,
+            ] {
+                broker_release_pairwise(entries, repetition, mode, allocations);
+            }
         }
         for threads in &options.threads {
-            for mode in
-                [ContentionMode::ReadHeavy, ContentionMode::WriteHeavy, ContentionMode::Mixed]
-            {
+            for mode in [
+                ContentionMode::MetadataStatsHeavy,
+                ContentionMode::WriteHeavy,
+                ContentionMode::MixedStatsPut,
+            ] {
                 for repetition in 0..options.repetitions {
                     payload_contention(entries, *threads, repetition, mode, allocations);
                 }
@@ -354,7 +407,7 @@ fn new_platform() -> quanta_memory_platform_facade::LiveMemoryPlatform {
         .expect("production platform")
 }
 
-fn payload_unique_fill_and_lookup(
+fn payload_unique_fill_and_dedup_put(
     entries: usize,
     repetition: usize,
     allocations: &AllocationCounters,
@@ -397,6 +450,7 @@ fn payload_unique_fill_and_lookup(
         semantic_peak,
         semantic_after,
         allocation,
+        OperationCounts::all_successful(entries),
         0,
     );
 
@@ -429,7 +483,7 @@ fn payload_unique_fill_and_lookup(
     let latency = summarize_latencies(latencies);
     let allocation = end_allocation_epoch(allocations);
     emit(
-        "payload_dedup_lookup",
+        "payload_dedup_put",
         "single-thread",
         entries,
         1,
@@ -439,6 +493,7 @@ fn payload_unique_fill_and_lookup(
         semantic_peak,
         semantic_after,
         allocation,
+        OperationCounts::all_successful(entries),
         0,
     );
 }
@@ -451,18 +506,22 @@ fn revocable_fill_and_drain(entries: usize, repetition: usize, allocations: &All
         .bind(StoreBindingHandle::new(MemoryClass::ArtifactCache, "bench:revocable".into(), None))
         .build()
         .expect("revocable store");
-    let mut latencies = Vec::with_capacity(entries);
-    let started = Instant::now();
+    let mut latencies = Vec::with_capacity(entries.checked_mul(2).expect("operation count"));
+    let fill_started = Instant::now();
     for value in 0..entries {
         let operation = Instant::now();
         store.insert_checked(format!("key-{value}"), vec![0; 8]).expect("revocable insert");
         latencies.push(operation.elapsed().as_nanos() as u64);
     }
+    let fill_elapsed = fill_started.elapsed();
     let semantic_peak = store.stats().expect("stats").estimated_bytes;
+    let drain_started = Instant::now();
     for _ in 0..entries {
+        let operation = Instant::now();
         black_box(store.reclaim_one().expect("reclaim").expect("entry"));
+        latencies.push(operation.elapsed().as_nanos() as u64);
     }
-    let elapsed = started.elapsed();
+    let elapsed = fill_elapsed + drain_started.elapsed();
     store.close().expect("close revocable store");
     drop(store);
     let semantic_after =
@@ -481,6 +540,7 @@ fn revocable_fill_and_drain(entries: usize, repetition: usize, allocations: &All
         semantic_peak,
         semantic_after,
         allocation,
+        OperationCounts::all_successful(entries.checked_mul(2).expect("operation count")),
         0,
     );
 }
@@ -533,6 +593,172 @@ fn broker_release_owner_cardinality(
         semantic_peak,
         semantic_after,
         allocation,
+        OperationCounts::all_successful(entries),
+        0,
+    );
+}
+
+/// Only release is timed. One-byte charges are staged before the barrier so
+/// broker sharing and owner cardinality are the variables under comparison,
+/// not fixture construction or reserve/commit behavior.
+fn broker_release_pairwise(
+    entries: usize,
+    repetition: usize,
+    mode: BrokerPairwiseMode,
+    allocations: &AllocationCounters,
+) {
+    const THREADS: usize = 2;
+    begin_allocation_epoch(allocations);
+    let platforms = if matches!(mode, BrokerPairwiseMode::IndependentOwners) {
+        vec![new_platform(), new_platform()]
+    } else {
+        vec![new_platform()]
+    };
+    let mut charges_by_thread: Vec<Vec<ManagedCharge>> = Vec::with_capacity(THREADS);
+    for thread_id in 0..THREADS {
+        let count = entries / THREADS + usize::from(thread_id < entries % THREADS);
+        let platform_index =
+            if matches!(mode, BrokerPairwiseMode::IndependentOwners) { thread_id } else { 0 };
+        let owner = if matches!(mode, BrokerPairwiseMode::SingleOwner) {
+            "bench:pairwise:shared".to_string()
+        } else {
+            format!("bench:pairwise:owner:{thread_id}")
+        };
+        let mut charges = Vec::with_capacity(count);
+        for _ in 0..count {
+            charges.push(
+                platforms[platform_index]
+                    .broker()
+                    .reserve_managed_charge(
+                        MemoryClass::ArtifactCache,
+                        owner.clone(),
+                        MemoryContextKind::Request,
+                        ChargeKind::RetainedPayload,
+                        1,
+                    )
+                    .expect("pairwise reserve"),
+            );
+        }
+        charges_by_thread.push(charges);
+    }
+    let semantic_peak: u64 = platforms
+        .iter()
+        .map(|platform| {
+            platform.broker().ledger_snapshot().expect("peak ledger").total_owner_bytes()
+        })
+        .sum();
+    assert_eq!(semantic_peak, entries as u64, "staged one-byte charges");
+
+    let ready = Arc::new(Barrier::new(THREADS + 1));
+    let start = Arc::new(Barrier::new(THREADS + 1));
+    let mut handles = Vec::with_capacity(THREADS);
+    for mut charges in charges_by_thread {
+        let ready = Arc::clone(&ready);
+        let start = Arc::clone(&start);
+        handles.push(thread::spawn(move || {
+            let mut latencies = Vec::with_capacity(charges.len());
+            ready.wait();
+            start.wait();
+            for charge in &mut charges {
+                let operation = Instant::now();
+                charge.release().expect("pairwise release");
+                latencies.push(operation.elapsed().as_nanos() as u64);
+            }
+            WorkerSample { latencies, busy_retries: 0 }
+        }));
+    }
+    ready.wait();
+    let started = Instant::now();
+    start.wait();
+    let mut latencies = Vec::with_capacity(entries);
+    for handle in handles {
+        let worker = handle.join().expect("pairwise worker");
+        latencies.extend(worker.latencies);
+    }
+    let elapsed = started.elapsed();
+    assert_eq!(latencies.len(), entries);
+    let semantic_after: u64 = platforms
+        .iter()
+        .map(|platform| {
+            platform.broker().ledger_snapshot().expect("post-release ledger").total_owner_bytes()
+        })
+        .sum();
+    drop(platforms);
+    drop(ready);
+    drop(start);
+    let latency = summarize_latencies(latencies);
+    let allocation = end_allocation_epoch(allocations);
+    emit(
+        "broker_release_pairwise",
+        mode.label(),
+        entries,
+        THREADS,
+        repetition,
+        elapsed,
+        latency,
+        semantic_peak,
+        semantic_after,
+        allocation,
+        OperationCounts::all_successful(entries),
+        0,
+    );
+}
+
+/// Real point reads against a charged retained map. Queries are prebuilt so
+/// formatting does not dominate the timed `get_checked` hit/miss measurement.
+fn retained_map_point_read(
+    entries: usize,
+    repetition: usize,
+    hit: bool,
+    allocations: &AllocationCounters,
+) {
+    begin_allocation_epoch(allocations);
+    let platform = new_platform();
+    let store = platform
+        .retained_map_store_builder::<String, Vec<u8>>()
+        .bind(StoreBindingHandle::new(
+            MemoryClass::ArtifactCache,
+            "bench:retained-read".into(),
+            None,
+        ))
+        .build();
+    for value in 0..entries {
+        store.insert_checked(format!("key-{value}"), vec![0; 8]).expect("retained-map seed");
+    }
+    let semantic_peak = store.stats_checked().expect("retained-map stats").estimated_bytes;
+    let queries: Vec<String> = (0..entries)
+        .map(|value| if hit { format!("key-{value}") } else { format!("missing-{value}") })
+        .collect();
+    let mut latencies = Vec::with_capacity(entries);
+    let started = Instant::now();
+    for query in &queries {
+        let operation = Instant::now();
+        let found = store.get_checked(black_box(query)).expect("retained-map point read");
+        latencies.push(operation.elapsed().as_nanos() as u64);
+        assert_eq!(found.is_some(), hit, "point-read fixture");
+        black_box(found);
+    }
+    let elapsed = started.elapsed();
+    drop(queries);
+    store.close().expect("close retained map");
+    drop(store);
+    let semantic_after =
+        platform.broker().ledger_snapshot().expect("ledger after close").total_owner_bytes();
+    drop(platform);
+    let latency = summarize_latencies(latencies);
+    let allocation = end_allocation_epoch(allocations);
+    emit(
+        "retained_map_point_read",
+        if hit { "hit" } else { "miss" },
+        entries,
+        1,
+        repetition,
+        elapsed,
+        latency,
+        semantic_peak,
+        semantic_after,
+        allocation,
+        OperationCounts::all_successful(entries),
         0,
     );
 }
@@ -562,7 +788,7 @@ fn scheduler_admission_group_cardinality(
     let target = format!("group-{:08}", entries / 2);
     let mut scheduler = WeightedResourceGroupScheduler::new(groups, entries as u64);
     scheduler.record_usage(&target, 1_000).expect("record target hard-cap usage");
-    let mut latencies = Vec::with_capacity(entries);
+    let mut latencies = Vec::with_capacity(entries.checked_mul(2).expect("operation count"));
 
     // Phase 2: open the epoch immediately before the admission loop and
     // require a clean precondition.
@@ -588,6 +814,8 @@ fn scheduler_admission_group_cardinality(
     for _ in 0..entries {
         let operation = Instant::now();
         assert!(scheduler.admits(&target, 1), "cached one-byte fair share must admit");
+        latencies.push(operation.elapsed().as_nanos() as u64);
+        let operation = Instant::now();
         assert!(!scheduler.admits(&target, 2), "request beyond cached share must deny");
         latencies.push(operation.elapsed().as_nanos() as u64);
     }
@@ -625,6 +853,7 @@ fn scheduler_admission_group_cardinality(
         0,
         0,
         allocation,
+        OperationCounts { successful: entries, denied: entries },
         0,
     );
 }
@@ -649,7 +878,7 @@ fn payload_contention(
             .build()
             .expect("payload store"),
     );
-    if matches!(mode, ContentionMode::ReadHeavy | ContentionMode::Mixed) {
+    if matches!(mode, ContentionMode::MetadataStatsHeavy | ContentionMode::MixedStatsPut) {
         store
             .put_canonical(RetainedEnvelope::new(0u64.to_be_bytes().to_vec()))
             .expect("dedup seed");
@@ -666,10 +895,15 @@ fn payload_contention(
             barrier.wait();
             for operation_id in 0..count {
                 let operation = Instant::now();
-                let unique = ((thread_id as u64) << 32) | operation_id as u64 | 1;
-                let is_read = matches!(mode, ContentionMode::ReadHeavy)
-                    || matches!(mode, ContentionMode::Mixed) && operation_id % 2 == 0;
-                if is_read {
+                let thread_slot = u32::try_from(thread_id).expect("thread ID fits payload key");
+                let operation_slot = u32::try_from(operation_id)
+                    .expect("operation ID fits payload key")
+                    .checked_add(1)
+                    .expect("nonzero operation slot fits payload key");
+                let unique = (u64::from(thread_slot) << 32) | u64::from(operation_slot);
+                let is_metadata_stats = matches!(mode, ContentionMode::MetadataStatsHeavy)
+                    || matches!(mode, ContentionMode::MixedStatsPut) && operation_id % 2 == 0;
+                if is_metadata_stats {
                     loop {
                         match store.stats() {
                             Ok(stats) => {
@@ -680,7 +914,7 @@ fn payload_contention(
                                 busy_retries = busy_retries.checked_add(1).expect("retry count");
                                 thread::yield_now();
                             }
-                            Err(error) => panic!("contention read: {error}"),
+                            Err(error) => panic!("contention metadata stats: {error}"),
                         }
                     }
                 } else {
@@ -716,7 +950,25 @@ fn payload_contention(
     }
     let elapsed = started.elapsed();
     assert_eq!(latencies.len(), entries);
+    let expected_items = match mode {
+        ContentionMode::MetadataStatsHeavy => 1,
+        ContentionMode::WriteHeavy => entries,
+        ContentionMode::MixedStatsPut => {
+            1 + (0..threads)
+                .map(|thread_id| {
+                    let count = entries / threads + usize::from(thread_id < entries % threads);
+                    count / 2
+                })
+                .sum::<usize>()
+        }
+    };
+    assert_eq!(
+        store.stats().expect("contention stats").item_count,
+        expected_items,
+        "contention workload must retain every unique write exactly once"
+    );
     let semantic_peak = store.charged_bytes().expect("charged bytes");
+    assert!(semantic_peak > 0, "contention workload must retain semantic bytes");
     store.close().expect("close payload store");
     drop(store);
     drop(barrier);
@@ -736,6 +988,7 @@ fn payload_contention(
         semantic_peak,
         semantic_after,
         allocation,
+        OperationCounts::all_successful(entries),
         busy_retries,
     );
 }

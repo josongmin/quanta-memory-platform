@@ -115,7 +115,7 @@ fn store_finalize(backing: RedbSpillBacking, point: FinalizeKillPoint) -> ! {
     for index in 0..2u64 {
         store.insert_checked(format!("k{index}"), payload(index)).expect("child insert");
         let receipt = store
-            .spill_one_durable(&controller, |_key, value| Ok(value.clone()))
+            .spill_one_durable_bounded(&controller)
             .expect("child durable spill")
             .expect("one spilled entry");
         assert!(matches!(receipt, SpillReceipt::Durable { sequence, .. } if sequence == index));
@@ -136,11 +136,7 @@ fn store_finalize(backing: RedbSpillBacking, point: FinalizeKillPoint) -> ! {
     drop(stdout);
 
     install(point, armed_hook);
-    let _ = store.restore_one_durable(&controller, |bytes| {
-        let mut index = [0u8; 8];
-        index.copy_from_slice(&bytes[..8]);
-        Ok((format!("k{}", u64::from_le_bytes(index)), bytes.to_vec()))
-    });
+    let _ = store.restore_one_durable_bounded(&controller);
     eprintln!("store finalize returned without firing the armed hook");
     std::process::exit(3);
 }

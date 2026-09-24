@@ -31,8 +31,12 @@ echo "ENOSPC source_head=${source_head} source_digest=${source_before}"
 echo "ENOSPC mechanism=Linux tmpfs size=8MiB; no host-volume or power-loss claim"
 
 run_status=0
-for mode in spill restore finalize; do
+for mode in spill restore finalize charged charged-restore-commit; do
   echo "ENOSPC scenario=${mode}"
+  features="spill-redb,revocable_store"
+  if [[ "${mode}" == "charged-restore-commit" ]]; then
+    features+=",durability-test-hooks"
+  fi
   if docker run --rm --network none \
     --mount "type=bind,src=${repo_root},dst=/workspace,readonly" \
     --mount "type=bind,src=${cargo_registry},dst=/usr/local/cargo/registry,readonly" \
@@ -43,7 +47,7 @@ for mode in spill restore finalize; do
     -e CARGO_TARGET_DIR=/tmp/qmp-linux-target \
     rust:1.92-bookworm \
     cargo run --offline --locked -p quanta-memory-platform-facade \
-      --features spill-redb --example spill_redb_enospc_volume -- \
+      --features "${features}" --example spill_redb_enospc_volume -- \
       "/qmp-volume/${mode}.redb" "${mode}"; then
     :
   else

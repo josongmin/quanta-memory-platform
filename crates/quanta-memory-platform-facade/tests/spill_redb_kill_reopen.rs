@@ -364,12 +364,8 @@ fn durable_spill_store_charge_and_record_survive_process_boundary() {
         .expect("survivor store");
     let controller =
         RoutedSpillController::new(RedbSpillBacking::create(&db.path).expect("cold reopen"));
-    let decode = |bytes: &[u8]| {
-        assert_eq!(bytes, expected_payload(0), "committed payload survives whole");
-        Ok(("k0".to_string(), bytes.to_vec()))
-    };
     assert!(matches!(
-        store.restore_one_durable(&controller, decode).expect("restore committed record"),
+        store.restore_one_durable_bounded(&controller).expect("restore committed record"),
         DurableRestoreOutcome::Restored { sequence: 0 }
     ));
     assert!(platform.broker().ledger_snapshot().expect("resident ledger").total_owner_bytes() > 0);
@@ -378,7 +374,7 @@ fn durable_spill_store_charge_and_record_survive_process_boundary() {
         Some(("k0".to_string(), expected_payload(0)))
     );
     assert!(matches!(
-        store.restore_one_durable(&controller, decode).expect("second restore"),
+        store.restore_one_durable_bounded(&controller).expect("second restore"),
         DurableRestoreOutcome::Empty
     ));
     assert_eq!(controller.spilled_count(), Ok(0));

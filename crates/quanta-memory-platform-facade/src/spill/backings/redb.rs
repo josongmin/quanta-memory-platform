@@ -376,6 +376,32 @@ pub mod finalize_kill_hooks {
     }
 }
 
+/// One-shot, opt-in fault boundary for the Linux charged restore ENOSPC rail.
+/// The callback fills an isolated test volume only after the active claim has
+/// been checked and before its queue-to-recovery transaction writes. It is
+/// absent from production feature graphs.
+#[cfg(feature = "durability-test-hooks")]
+#[doc(hidden)]
+pub mod restore_commit_volume_hook {
+    use std::sync::Mutex;
+
+    type Hook = fn(u64, u64);
+    static INSTALLED: Mutex<Option<Hook>> = Mutex::new(None);
+
+    pub fn install(hook: Hook) {
+        let mut installed = INSTALLED.lock().expect("restore volume hook mutex");
+        assert!(installed.is_none(), "a restore volume hook is already installed");
+        *installed = Some(hook);
+    }
+
+    pub(crate) fn fire(sequence: u64, generation: u64) {
+        let hook = INSTALLED.lock().expect("restore volume hook mutex").take();
+        if let Some(hook) = hook {
+            hook(sequence, generation);
+        }
+    }
+}
+
 /// Best-effort 128-bit backend identity minted once per logical database
 /// lineage.
 ///
@@ -1012,6 +1038,10 @@ impl DurableSpillTarget<Vec<u8>> for RedbSpillBacking {}
 impl crate::spill::service::sealed::DurableSpillTarget<Vec<u8>> for RedbSpillBacking {}
 
 impl ReconciledDurableSpillTarget for RedbSpillBacking {
+    fn max_record_bytes(&self) -> Option<u64> {
+        Some(self.limits.max_record_bytes)
+    }
+
     fn reserve_record_id(&self) -> MemoryResult<DurableRecordId> {
         let txn = self
             .database
@@ -1528,6 +1558,8 @@ impl DurableRestoreTarget for RedbSpillBacking {
                      active claim (sequence {active:?}, generation {active_generation:?})"
                 ))));
             }
+            #[cfg(feature = "durability-test-hooks")]
+            restore_commit_volume_hook::fire(sequence, generation);
             if recovery
                 .get(sequence)
                 .map_err(|e| {

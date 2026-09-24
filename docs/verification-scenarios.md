@@ -199,6 +199,12 @@ check helpers that the control plane enforces (see group C/D).
 - ✅ retained_map hash-indexed point operations + accounting/order preservation — `put_get_remove_get_none_round_trip_corrects_bytes`, `equal_hash_key_duplicate_overwrites_and_does_not_double_count`, `first_and_last_key_point_operations_share_one_n_independent_probe_bound_v1`, `overwrite_preserves_original_insertion_position_for_newest_first_sweep`, `arbitrary_remove_preserves_remaining_newest_first_sweep_order`, `charged_sweep_during_rebuild_is_fail_closed`, and `keys_lists_inserted_keys_in_deterministic_sorted_order`. The public key identity law is `Eq + Hash`; exact lookup/overwrite/remove use the canonical linked hash container while enumeration remains deterministically key-sorted.
 - ✅ **Read-side client panic does not poison retained-map state** — `checked_reads_propagate_client_clone_panics_without_poisoning_owner_mutex_v1` proves a panicking value clone still propagates to the caller, then subsequent get/stats/key/entry reads remain available. This is not a callback time bound; synchronous callback latency remains caller-controlled.
 - ✅ **F#3 for retained_map** — retained_map is ledger-wired only through the typestate builder: binding produces `BoundRetainedMapStoreBuilder`, only the bound state exposes infallible `build()`, and `SimpleRetainedMapStore` has no public late-attach transition. Evidence: the two compile-fail docs plus `retained_map_platform_builder_routes_bytes_through_the_ledger`, `charged_insert_routes_bytes_through_the_ledger`, `charged_insert_over_cap_is_denied_and_fails_closed`, `charged_overwrite_denial_leaves_existing_entry_unchanged`, and `charged_sweep_refunds_reclaimed_bytes_to_the_ledger`. Internal ticket corruption is also fail-closed before refund or container mutation (`charged_remove_rejects_a_ticketless_entry_without_mutating_state`, `charged_sweep_rejects_a_ticketless_candidate_without_partial_refund_or_eviction`). The uncharged `new` path remains distinct via `uncharged_retained_map_bytes_are_not_reflected_in_a_broker_ledger_snapshot`.
+- ✅ **Cross-store shared broker** —
+  `distinct_grouped_stores_compete_for_one_global_slot_and_handoff_after_release`
+  and `store_scratch_and_zero_byte_authorities_survive_denied_remap_and_legal_raise`
+  (`facade/tests/cross_store_hellgate.rs`, features `retained_map,revocable_store`)
+  use independent cost constants and check exact class/owner/context/kind
+  postimages and live-ticket counts, including a zero-byte authority.
 - ✅ revocable FIFO/revoke/eviction — `reclaim_one_is_fifo_and_releases_its_bytes`, `revoke_makes_entry_unretrievable_and_decrements_accounting`, `reclaim_eviction_order_is_deterministic_fifo_at_capacity_boundary`.
 - ✅ publish_pipeline commit transition — `default_pipeline_runs_stage_then_commit_each_exactly_once_no_rollback`, `failed_commit_never_publishes_and_never_increments_count`.
 - ✅ CanonicalKey/MeasuredValue — `cloning_measured_arc_shares_the_allocation_not_a_deep_copy`, `measured_value_charges_caller_supplied_size_not_inner_len`, `cloning_measured_value_preserves_size_and_value_context`.
@@ -298,7 +304,7 @@ check helpers that the control plane enforces (see group C/D).
   `durability_l1_store_and_ledger_recover_across_finalize_kill`
   (`facade/tests/spill_redb_finalize_kill.rs`, features
   `spill-redb,durability-test-hooks,revocable_store`) drives actual
-  `RevocableStore::restore_one_durable` in the killed child and proves a live
+  `RevocableStore::restore_one_durable_bounded` in the killed child and proves a live
   resident charge at each hook. A fresh platform/store restores the pre-commit
   victim exactly once; a post-commit victim is terminal and not replayed under
   the documented revocable contract. The unrelated record restores and every
@@ -361,12 +367,36 @@ check helpers that the control plane enforces (see group C/D).
   and cold-reopens to zero durable payloads. The caller has already allocated
   the encoded `Vec`; this does not bound codec output before allocation or
   private encoder scratch.
+- ✅ **Bounded typed durable codec** —
+  `literal_v1_record_decodes_without_using_the_current_encoder`,
+  `revocable_entry_cost_has_one_checked_formula`,
+  `bounded_codec_spill_preflights_backend_and_broker_before_allocating`,
+  `bounded_codec_cold_reopen_restore_denial_and_retry_keep_one_authority`,
+  `bounded_codec_rejects_malformed_durable_record_without_publication`,
+  `bounded_codec_keeps_output_charged_until_durable_commit_returns`, and
+  `bounded_codec_committed_recovery_retries_after_capacity_denial`
+  (`revocable_store/{cost,durable_codec,service}.rs`)
+  prove literal V1 decode, shared resident/preflight cost, cap/admission
+  denial, charged output overlap, cold reopen, and committed recovery retry.
+  An unsupported QMR2 record is neither published nor deleted; an absent
+  backend record cap is rejected before ID reservation. The closure-based
+  custom codec remains explicitly unbounded.
 - 🧪 **Real Linux volume ENOSPC, isolated from host data** —
   `scripts/durability/run-enospc-docker.sh` runs the
   Redb ENOSPC example on a disposable 8 MiB Docker tmpfs.
-  Three fresh-volume modes cover spill write, restore commit, and finalize.
+  Five fresh-volume modes cover backing spill write, restore commit, finalize,
+  bounded charged spill and bounded charged restore commit. The charged spill
+  mode checks that real ENOSPC retains the source ledger charge,
+  proves the record-id reservation survived so the fault reached the payload
+  commit, cold-reopens and reconciles any ambiguous spill, then restores or reads the
+  exact payload and drains both durable records and ledger charge to zero.
   The spill and restore modes require a real `ENOSPC` to be classified as
   `Capacity`, free only the filler, then cold-reopen and drain whole records.
+  The charged restore-commit mode fills the volume after a valid persisted
+  claim and resident charge, before Redb's queue-to-recovery write. It checks
+  the exact fenced postimage, unrelated record, cold reopen and final ledger
+  drain. Its one-shot hook exists only under `durability-test-hooks`, outside
+  production feature graphs.
   Finalize may succeed by reusing Redb space even when the volume is full; its
   mode checks the exact finalized or recoverable postimage after cold reopen.
   The runner fingerprints all present source files before and after. This is a

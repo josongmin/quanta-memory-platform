@@ -230,6 +230,10 @@ impl<T> ReconciledDurableSpillController for RoutedSpillController<T>
 where
     T: ReconciledDurableSpillTarget + DurableSpillTarget<Vec<u8>>,
 {
+    fn max_record_bytes(&self) -> Option<u64> {
+        self.target.max_record_bytes()
+    }
+
     fn reserve_record_id(&self) -> MemoryResult<DurableRecordId> {
         self.target.reserve_record_id()
     }
@@ -252,6 +256,11 @@ where
 pub trait ReconciledDurableSpillTarget:
     SpillInventory + sealed::DurableSpillTarget<Vec<u8>>
 {
+    /// Return the cap actually enforced by `commit_spill`, if one exists.
+    fn max_record_bytes(&self) -> Option<u64> {
+        None
+    }
+
     fn reserve_record_id(&self) -> MemoryResult<DurableRecordId>;
     fn commit_spill(
         &self,

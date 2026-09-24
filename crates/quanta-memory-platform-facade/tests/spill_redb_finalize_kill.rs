@@ -241,22 +241,13 @@ fn durability_l1_store_and_ledger_recover_across_finalize_kill() {
             .expect("survivor store");
         let controller =
             RoutedSpillController::new(RedbSpillBacking::create(&db.path).expect("cold reopen"));
-        let decode = |bytes: &[u8]| {
-            assert_eq!(bytes.len(), 32, "whole payload on restart");
-            let mut index = [0u8; 8];
-            index.copy_from_slice(&bytes[..8]);
-            let index = u64::from_le_bytes(index);
-            assert_eq!(bytes, expected_payload(index));
-            Ok((format!("k{index}"), bytes.to_vec()))
-        };
-
         if mode == "store-before" {
             assert!(matches!(
                 controller.resolve_record(DurableRecordId::new(0)).expect("record state"),
                 DurableRecordResolution::Present { .. }
             ));
             assert!(matches!(
-                store.recover_active_durable_restore(&controller, decode).expect("recover victim"),
+                store.recover_active_durable_restore_bounded(&controller).expect("recover victim"),
                 DurableRestoreOutcome::Restored { sequence: 0 }
             ));
             assert_eq!(
@@ -271,13 +262,13 @@ fn durability_l1_store_and_ledger_recover_across_finalize_kill() {
             );
             assert!(matches!(
                 store
-                    .recover_active_durable_restore(&controller, decode)
+                    .recover_active_durable_restore_bounded(&controller)
                     .expect("no victim replay"),
                 DurableRestoreOutcome::Empty
             ));
         }
         assert!(matches!(
-            store.restore_one_durable(&controller, decode).expect("restore unrelated"),
+            store.restore_one_durable_bounded(&controller).expect("restore unrelated"),
             DurableRestoreOutcome::Restored { sequence: 1 }
         ));
         assert_eq!(
@@ -285,7 +276,7 @@ fn durability_l1_store_and_ledger_recover_across_finalize_kill() {
             Some(("k1".to_string(), expected_payload(1)))
         );
         assert!(matches!(
-            store.restore_one_durable(&controller, decode).expect("second drain"),
+            store.restore_one_durable_bounded(&controller).expect("second drain"),
             DurableRestoreOutcome::Empty
         ));
         assert_eq!(controller.spilled_count(), Ok(0));

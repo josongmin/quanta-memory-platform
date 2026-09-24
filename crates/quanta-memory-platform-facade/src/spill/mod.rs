@@ -121,6 +121,13 @@ pub enum DurableWriteFailure {
 pub trait ReconciledDurableSpillController:
     service::sealed::DurableSpillController<Vec<u8>>
 {
+    /// A backend-enforced encoded-record cap. Bounded codecs require this
+    /// declaration before allocating their output; `None` means that the
+    /// controller cannot support the bounded codec path.
+    fn max_record_bytes(&self) -> Option<u64> {
+        None
+    }
+
     fn reserve_record_id(&self) -> MemoryResult<DurableRecordId>;
     fn commit_spill(
         &self,

@@ -91,6 +91,17 @@ store slices a consumer needs:
 | `full` | All in-memory facade slices; no durable backing dependency. |
 | `full-backings` | `full` plus all production backings. |
 
+For a budgeted String/Vec<u8> revocable store backed by Redb, use the bounded
+spill, restore, and recovery methods shown in the linked example. This
+versioned codec checks the backend's record cap and broker-reserves its
+encoded output or decoded resident bytes before allocating them. The source
+and encoded output coexist until commit; insufficient scratch rejects the
+spill without discarding the source. Custom-format closure methods are
+explicitly named with an unbounded suffix; arbitrary callback allocations are not
+bounded by QMP. Neither path claims an exact physical RSS bound for allocator
+overhead or Redb's separately limited transactional buffers. See the runnable
+[bounded-codec example](crates/quanta-memory-platform-facade/examples/spill_redb_bounded_codec.rs).
+
 `unbudgeted-stores` is an explicit, distinct product type for fixtures or
 deliberate non-accounted use. It is absent from `default`, `full`, and
 `full-backings`; `--all-features` enables it only to test that isolated surface.
