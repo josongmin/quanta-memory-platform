@@ -1,1087 +1,371 @@
-# RFC 0001: Public SDK Contract for Quanta Memory Platform
-
-- Status: **ACCEPTED — final 0.3 interface contract; implementation and qualification pending**
-- Target: `0.3.0`
-- Date: 2026-09-24
-- Scope: public Rust SDK, configuration, profiles, accounting DSL, observation,
-  and live policy updates
-- Decision owner: repository maintainers and consuming-host owner
-
-## 1. Decision
-
-QMP remains a small, synchronous, host-independent semantic-memory authority.
-Its public SDK is organized around six concepts:
-
-1. `MemoryPlatform` — the configured aggregate and factory.
-2. `MemoryConfig` — complete typed desired policy.
-3. `ConfigPatch` — typed build-time or runtime overrides.
-4. `MemoryConsumer` — reusable accounting identity for custom components.
-5. `MemoryReservation` — non-forgeable RAII accounting authority.
-6. `MemorySnapshot` — one revision-consistent operational observation.
-
-Built-in stores and in-process transfer remain feature-specific APIs constructed from
-the same `MemoryPlatform`. They are not forced through a generic plugin or
-service-container abstraction.
-
-Scope amendment (2026-09-24): the 0.3 SDK plan covers in-memory accounting,
-reclaim, and in-process transfer only. Redb-backed durable spill, its codec,
-disk recovery, and backing configuration are excluded. Existing 0.2 opt-in
-code is not removed by this RFC and is not an SDK or host release gate.
-
-This revision deliberately does **not** introduce:
-
-- a Kubernetes-style `spec/status/conditions` control plane;
-- a separate `MemoryRuntime` / `MemoryControl` handle hierarchy;
-- an AWS-style global `BehaviorVersion`;
-- a generic `Knob<T>` registry parallel to typed configuration;
-- a platform-wide store registry or drain state machine;
-- a package rename as a prerequisite for the API work;
-- an embedded config loader, daemon, exporter, or async runtime.
-
-Those mechanisms add state and migration cost without solving a demonstrated
-QMP requirement. They may be reconsidered only with a concrete consumer and a
-failing use case.
-
-## 2. Source Audit
-
-This contract was derived from the source snapshot at the time of the RFC:
-
-```text
-HEAD b6d162650edba4f2b32e5020c8f0ac707efb0c22
-branch main
-```
-
-The worktree contained unrelated active durability and documentation changes.
-This RFC does not claim those changes are qualified and does not depend on
-their completion.
-
-### 2.1 Existing behavior to preserve
-
-The current implementation already provides valuable primitives:
-
-- one fail-closed semantic ledger;
-- two-phase reserve/commit through `PendingReservation`;
-- RAII committed authority through `ManagedCharge`;
-- deterministic preset/manifest/override resolution;
-- ordered override provenance;
-- monotonic live-policy revision;
-- live reconfiguration that rejects caps below current usage;
-- one lock-consistent `BrokerObservation`;
-- reclaim callbacks outside the broker lock followed by remeasurement;
-- typed, accounting-backed built-in store builders;
-- in-process transfer of revocable entries;
-- bounded management metadata and deferred cleanup.
-
-The 0.3 SDK should wrap, rename, and narrow these authorities. It should not
-replace them with a second accounting model.
-
-### 2.2 Confirmed public-contract defects
-
-#### A. Host-specific memory classes leak into the portable core
-
-The public `MemoryClass` enum contains names such as:
-
-```text
-MemoResidency
-TraceIndex
-ManifestResidency
-ReasoningGraphResidency
-PtaResumeState
-PtaAuthorityState
-PtaPortableBundle
-ReopenStore
-GenerationMetadata
-```
-
-These are consuming-host policy names, not portable memory-library concepts.
-They contradict the repository rule that public APIs remain host-independent.
-
-**Decision:** replace the closed enum with a validated, bounded
-`MemoryClassId`. QMP may publish a minimal set of genuinely portable constants;
-the host defines its own namespaced class IDs in its adapter/configuration.
-
-#### B. Non-memory execution policy is carried by a memory library
-
-`ExecutionBudget` includes wall time, subquery count, trace-edge count, and
-output-byte limits. QMP neither owns the execution engine nor observes the
-required events. Carrying those fields creates nominal enforcement and expands
-the public contract beyond memory authority.
-
-**Decision:** remove non-memory execution limits from the 0.3 QMP contract.
-Scratch and retained byte limits remain memory classes or consumer limits.
-Wall time, query count, graph edges, and output policy belong to the host.
-
-#### C. Presets conflate deployment and workload
-
-`Development`, `Ci`, and `Production` describe deployment contexts;
-`Interactive` describes workload behavior. They currently occupy one enum.
-
-**Decision:** split these axes into `DeploymentProfile` and
-`WorkloadProfile`. Profiles expand into ordinary typed configuration and never
-bypass validation.
-
-#### D. Production has a machine-independent capacity
-
-The current production preset materializes a fixed `4 GiB` global limit. The
-safe limit depends on the process/container boundary, co-resident components,
-and headroom.
-
-**Decision:** production construction requires explicit host-supplied capacity.
-QMP does not discover cgroups, environment variables, or host RAM.
-
-#### E. Errors require message parsing
-
-`MemoryError` variants currently carry strings. Callers cannot reliably inspect
-capacity axis, requested bytes, active revision, closed resource, or recovery
-requirement.
-
-**Decision:** retain one non-exhaustive top-level error enum, but give actionable
-variants structured payloads. Human-readable text remains `Display` output.
-
-#### F. The root exposes implementation topology and raw broker control
-
-`api`, `application`, `domain`, `adapters`, `ports`, `shared`, concrete
-`Simple*` implementations, and direct `broker()` access are visible parts of
-the current surface.
-
-**Decision:** converge on canonical root exports and documented extension
-traits. Deep implementation paths are not 0.3 contracts. Direct broker access
-is deprecated after equivalent platform methods exist.
-
-## 3. Purpose
-
-QMP answers and enforces four questions:
-
-1. May a component retain another `N` semantic bytes?
-2. Which class, owner, context, and resource group owns those bytes?
-3. How is that authority released, reclaimed, or moved in-process without drift?
-4. Which exact resolved policy and revision produced the decision?
-
-The ledger tracks semantic retained authority. It does not claim exact RSS,
-allocator, mmap, page-cache, or backing-database memory.
-
-### 3.1 Provided capabilities
-
-- global, class, owner, context, and resource-group memory budgets;
-- reserved, soft, hard, headroom, and bounded burst policy;
-- two-phase fail-closed reservation and commit;
-- RAII release and explicit release reporting;
-- typed custom-consumer integration;
-- accounting-backed payload, retained-map, revocable, transcript, and
-  publication stores;
-- pressure classification and bounded reclaim requests;
-- in-process revocable-entry transfer;
-- deterministic config layering, validation, provenance, and fingerprinting;
-- typed live-policy updates with optimistic revision checks;
-- one revision-consistent operational snapshot;
-- deterministic conformance and fault-injection support in testkit.
-
-### 3.2 Non-goals
-
-QMP is not:
-
-- a general-purpose allocator;
-- an RSS or cgroup enforcer;
-- an execution engine or query governor;
-- a storage database;
-- a service container or plugin runtime;
-- an HTTP/gRPC administration service;
-- a Prometheus/OpenTelemetry exporter;
-- a host configuration loader;
-- the Semantica adapter;
-- an async scheduling or wait-for-capacity system.
-
-## 4. External Reference Disposition
-
-External designs are used selectively, not copied wholesale.
-
-| Reference | Adopt | Do not adopt |
-| --- | --- | --- |
-| [DataFusion memory pool](https://docs.rs/datafusion/latest/datafusion/execution/memory_pool/trait.MemoryPool.html) | named consumers, multiple RAII reservations, reserve before retention, spill-or-fail on denial | public pluggable raw pool mutation; unbounded pool as production default |
-| [DataFusion reservation](https://docs.rs/datafusion/latest/datafusion/execution/memory_pool/struct.MemoryReservation.html) | grow/shrink/split semantics and drop release | QMP keeps two-phase reserve/commit because retained authority may fail between admission and ownership transfer |
-| [Envoy overload manager](https://www.envoyproxy.io/docs/envoy/latest/intro/arch_overview/operations/overload_manager.html) | separate measurement, threshold, and mitigation; external callbacks outside critical locks | allocator/cgroup pressure silently changing the semantic ledger |
-| [Cargo features](https://doc.rust-lang.org/cargo/reference/features.html) | additive capabilities and deliberate default features | mutually exclusive policy modes or test hooks in production defaults |
-| [AWS behavior versions](https://docs.aws.amazon.com/sdk-for-rust/latest/dg/behavior-versions.html) | explicit versioning is useful when defaults evolve independently of package versions | global `BehaviorVersion` now; QMP has one local config domain and is pre-1.0 |
-| [Kubernetes API conventions](https://github.com/kubernetes/community/blob/master/contributors/devel/sig-architecture/api-conventions.md) | desired configuration must be distinguishable from observed runtime state | resource generations, conditions, controllers, timestamps, and API-server semantics in an in-process library |
-| [Tower](https://docs.rs/tower/latest/tower/) | small stable traits and composition outside the trait | an async `Service`/`Layer` abstraction for synchronous accounting |
-
-Revisit `BehaviorVersion` only if one released SDK must intentionally support
-multiple incompatible default-behavior families. Revisit conditions only if an
-actual external control plane needs them.
-
-## 5. Design Principles
-
-### 5.1 One authority
-
-Every retained semantic byte has exactly one accounting authority. The SDK
-never exposes a second counter, raw ledger writer, or independently mutable
-accounting sink.
-
-### 5.2 Structured config is the source of truth
-
-Profiles and operator knobs expand into `MemoryConfig` or `ConfigPatch`. They
-are not parallel policy systems.
-
-### 5.3 Fail closed
-
-Invalid config, unknown class IDs, unavailable capabilities, stale revisions,
-and capacity denial return typed errors. They never
-fall back to an unbudgeted or assumed-success path.
-
-### 5.4 Sync core, host-owned orchestration
-
-QMP operations are synchronous and non-waiting. The host owns retries,
-timeouts, cancellation, async scheduling, authentication, and coordinated
-shutdown.
-
-### 5.5 Portable names, host-defined taxonomy
-
-Core understands bounded identifiers and accounting semantics, not host domain
-nouns. A host adapter defines domain-specific class constants and profiles.
-
-### 5.6 Observable effective state
-
-Every accepted configuration resolves to an inspectable policy, source
-provenance, fingerprint, and revision. Defaults are never invisible.
-
-## 6. Package and Module Boundary
-
-### 6.1 Packages
-
-Keep the existing three-package graph for 0.3:
-
-```text
-quanta-memory-platform-core
-        ^
-        |
-quanta-memory-platform-facade
-        ^
-        |
-quanta-memory-platform-testkit
-```
-
-The facade remains the primary consumer entry point. Renaming it to
-`quanta-memory-platform` is a release/distribution decision, not a prerequisite
-for correcting the interface. No fourth runtime crate is introduced.
-
-### 6.2 Canonical public paths
-
-The facade root re-exports the normal integration surface:
+# RFC 0001: Portable Memory SDK Contract (0.3)
+
+- Status: **accepted design target; not implemented or qualified**
+- Target: `0.3` (2026-09-24 design decision)
+- Scope: public Rust DSL for in-memory budgeting, accounting, reclaim, stores, and in-process transfer
+
+API freeze remains open on runtime-kind portability, public deferred-cleanup
+observation/retry, and the store-callback lock migration and its tests. The
+acceptance conditions below name these gaps; the accepted design direction
+does not claim they are implemented.
+
+The snippets specify the intended 0.3 interface, not the current 0.2 API.
+Before release they must become complete, compiling public examples.
+
+## 1. Background, purpose, and boundary
+
+QMP is a **portable library** used by independent hosts. It decides whether
+declared memory use may be admitted, attributes it, and maintains one
+fail-closed accounting authority until release or transfer. The same budget
+must cover QMP's built-in stores and host-defined retained components. The
+host adapter lives outside this repository; neither public types nor core
+policy may encode a particular host's artifacts or execution model.
+
+The current implementation already has a semantic ledger, two-phase tickets,
+RAII charges, pressure/reclaim, budgeted store builders, and live policy
+replacement. Its public integration surface is less portable than that
+engine: `MemoryClass` contains host-specific variants, presets mix deployment
+and workload concerns, `ExecutionBudget` carries non-memory limits, and
+callers can reach deep broker/building paths. This RFC defines the consumer
+contract before reshaping the engine. It does not claim those changes are
+already present.
+
+Current-source anchors: [policy and class taxonomy](../../crates/quanta-memory-platform-core/src/domain/policy.rs),
+[pending/committed authority](../../crates/quanta-memory-platform-core/src/api/control.rs),
+and [facade builders](../../crates/quanta-memory-platform-facade/src/shared/builder.rs).
+
+The SDK must make the common path obvious while preserving explicit
+ownership, deterministic policy, and safe extension:
+
+- One typed policy model; profiles provide defaults, runtime knobs edit that
+  model, and no parallel string-key registry can disagree with it.
+- Host-defined, validated IDs extend taxonomy without a QMP release; they
+  never grant special ledger privileges by their spelling.
+- One platform owns one ledger. Stores and custom components obtain scoped,
+  non-forgeable reservation authority from it.
+- Errors, observations, and reconfiguration report machine-readable facts.
+  A failed accounting operation does not leave a partial ledger mutation.
+- New backings or operational controls remain feature/owner-specific; the
+  base SDK does not become a plugin container or host framework.
+
+QMP limits **declared semantic bytes**, including retained payload, retained
+metadata, and live scratch charges. It does not allocate application memory
+or impose an RSS, mmap, page-cache, or process-wide hard limit. Allocator
+telemetry is advisory and never changes semantic counters. Wall time, query
+count, graph edges, and output limits belong to the host. Disk-backed Redb
+spill and recovery remain an existing opt-in maintenance surface, outside
+this 0.3 SDK and host-adoption gate.
+
+## 2. Consumer DSL
+
+The normal path is `MemoryConfig → ResolvedMemoryConfig → MemoryPlatform →
+MemoryScope → store or MemoryConsumer → reservation`. Observation and
+reconfiguration return to the platform. The facade crate provides these
+canonical public paths; raw ledger, ticket, and sink constructors are not
+part of the consumer DSL.
+
+### 2.1 Configure once
 
 ```rust
-use quanta_memory_platform_facade::{
-    MemoryPlatform,
-    MemoryPlatformBuilder,
-    MemoryConfig,
-    MemoryConfigBuilder,
-    MemoryError,
-    MemoryResult,
-};
-```
+let class = MemoryClassId::parse("app.artifact-cache")?;
+let owner = OwnerId::parse("retrieval")?;
+let group = ResourceGroupId::parse("interactive")?;
 
-Optional feature modules expose only their own store/spill contracts. The core
-crate remains available for advanced integrations, but raw ledger types and
-construction paths stay private.
-
-The following implementation directories are not stable public namespaces:
-
-```text
-application
-domain
-adapters
-shared
-service
-backings
-accounting
-lifecycle
-```
-
-### 6.3 Prelude
-
-A prelude is optional. If added, it contains only high-frequency traits and
-types. It must not wildcard-export every feature or hide required authority
-types.
-
-## 7. Identifier and Taxonomy Contract
-
-### 7.1 Validated identifiers
-
-```rust
-pub struct MemoryClassId(/* private */);
-pub struct OwnerId(/* private */);
-pub struct ResourceGroupId(/* private */);
-pub struct ConsumerName(/* private */);
-```
-
-Each identifier:
-
-- validates UTF-8 byte length before entering policy or accounting state;
-- uses a stable lowercase dotted or kebab-case grammar;
-- is orderable and hashable;
-- has private fields;
-- provides `parse`, `as_str`, `Display`, and fallible conversion;
-- cannot contain empty segments, control characters, or surrounding space.
-
-Recommended namespaces:
-
-```text
-qmp.scratch
-qmp.transcript
-qmp.spill-cache
-host.artifact-cache
-host.pta.resume-state
-```
-
-QMP-owned constants are limited to semantics implemented by QMP itself. Host
-constants live in the host adapter.
-
-### 7.2 Why not an extensible enum
-
-A non-exhaustive enum still requires QMP releases for host classes and keeps
-host taxonomy in the portable crate. An opaque validated ID permits extension
-without granting authority: the ID must still be declared in validated config
-before any reservation succeeds.
-
-## 8. Configuration Contract
-
-### 8.1 Complete desired policy
-
-```rust
-pub struct MemoryConfig {
-    // private; immutable after validation
-}
-
-pub struct MemoryConfigBuilder {
-    // private
-}
-```
-
-Logical shape:
-
-```text
-MemoryConfig
-├── capacity
-├── headroom
-├── shared_burst_pool
-├── pressure
-├── classes
-├── owners
-├── resource_groups
-└── owner_group_bindings
-```
-
-Non-memory execution limits are absent.
-
-Store-specific configuration remains with the owning feature API
-(`TranscriptConfig` and similar types). The platform config
-does not become a monolithic service configuration document.
-
-### 8.2 Construction
-
-```rust
 let config = MemoryConfig::builder()
-    .capacity(MemoryCapacity::bytes(8 * GiB))
-    .headroom(1 * GiB)
-    .shared_burst_pool(512 * MiB)
+    .deployment_profile(profiles::PRODUCTION_V1)
+    .workload_profile(profiles::INTERACTIVE_V1)
+    .capacity_bytes(8 * GiB)
+    .headroom_bytes(1 * GiB)
     .class(
-        MemoryClassConfig::new(MemoryClassId::parse("host.artifact-cache")?)
-            .reserved(128 * MiB)
-            .soft_limit(1 * GiB)
-            .hard_limit(2 * GiB)
-            .reclaim_priority(ReclaimPriority::First)
-            .borrow_from_shared_pool(true),
+        class.clone(),
+        ClassBudget::new()
+            .reserved_bytes(128 * MiB)
+            .soft_bytes(1 * GiB)
+            .hard_bytes(2 * GiB),
     )
+    .resource_group(
+        group.clone(),
+        GroupBudget::new().soft_bytes(2 * GiB).hard_bytes(4 * GiB),
+    )
+    .owner_group(owner.clone(), group)
+    .build()?;
+
+let resolved = config.resolve()?; // validates; creates no accounting authority
+let platform = MemoryPlatform::builder(resolved)
+    .reclaimer(reclaimer)
     .build()?;
 ```
 
-All byte arithmetic is checked. `build()` performs complete validation and
-returns an immutable `MemoryConfig`.
+`MiB`, `GiB`, and the supplied reclaimer are illustrative inputs. The final
+public example must define them and use checked byte arithmetic. Every
+platform, including development, requires explicit host-supplied capacity.
+QMP does not discover RAM, cgroups, files, or environment variables.
 
-### 8.3 Capacity
+`MemoryConfigBuilder::build` checks local shape; `resolve` expands profile
+defaults and validates the complete effective policy. Platform construction
+accepts only resolved policy. No invalid, unbudgeted, or feature-disabled
+fallback is permitted.
 
-```rust
-pub struct MemoryCapacity(/* private */);
-
-impl MemoryCapacity {
-    pub fn bytes(bytes: u64) -> Self;
-}
-```
-
-The host may record how it discovered the value in provenance, but discovery is
-outside QMP. Production profiles cannot manufacture a machine-independent
-capacity.
-
-### 8.4 Profiles
-
-Profiles are versioned, typed functions that produce ordinary patches:
+### 2.2 Bind a runtime and use a store
 
 ```rust
-pub struct DeploymentProfile(/* private */);
-pub struct WorkloadProfile(/* private */);
+let scope = platform.scope(
+    RuntimeId::parse("worker-1")?,
+    RuntimeKind::Retrieval,
+)?;
 
-pub mod profiles {
-    pub const DEVELOPMENT_V1: DeploymentProfile;
-    pub const CI_V1: DeploymentProfile;
-    pub const PRODUCTION_V1: DeploymentProfile;
-    pub const INTERACTIVE_V1: WorkloadProfile;
-    pub const BATCH_V1: WorkloadProfile;
-    pub const SERVICE_V1: WorkloadProfile;
-}
-```
-
-Rules:
-
-- profile IDs are explicitly versioned;
-- deployment and workload are separate axes;
-- profiles provide defaults, never hidden exceptions;
-- `PRODUCTION_V1` does not provide capacity;
-- resolved output contains the expanded values and profile IDs;
-- custom host profiles live in the host adapter and return `ConfigPatch`;
-- applying conflicting profiles to the same axis is an error.
-
-This provides default stability without a global behavior-version mechanism.
-
-### 8.5 Layers and precedence
-
-```rust
-#[non_exhaustive]
-pub enum ConfigSource {
-    Profile,
-    Manifest,
-    Environment,
-    Cli,
-    Runtime,
-    TestFixture,
-}
-```
-
-Canonical precedence:
-
-```text
-profile < manifest < environment < CLI < runtime < test fixture
-```
-
-QMP does not read those sources. The host parses external state and submits
-typed layers with source identity.
-
-Within one source tier, order must be explicit and unique. Call order cannot
-silently invert source precedence.
-
-### 8.6 Patch semantics
-
-```rust
-pub enum PatchValue<T> {
-    Unchanged,
-    Set(T),
-    Clear,
-}
-```
-
-Map changes use explicit upsert/remove operations. Removing a class, owner, or
-resource group with live authority is rejected.
-
-### 8.7 Resolution result
-
-```rust
-pub struct ResolvedMemoryConfig {
-    // private
-}
-
-impl ResolvedMemoryConfig {
-    pub fn config(&self) -> &MemoryConfig;
-    pub fn fingerprint(&self) -> ConfigFingerprint;
-    pub fn provenance(&self) -> &ConfigProvenance;
-    pub fn profiles(&self) -> &ResolvedProfiles;
-}
-```
-
-Resolution creates no broker, store, ticket, or reservation.
-
-### 8.8 Validation
-
-Validation checks at least:
-
-- `reserved <= soft <= hard` for every class and resource group;
-- every hard limit is within global capacity;
-- aggregate reserved floors plus headroom fit capacity;
-- owner and group mappings reference declared IDs;
-- all identifiers meet length and grammar bounds;
-- class, owner-quota, group, and mapping counts stay within published
-  management-metadata bounds;
-- checked arithmetic does not overflow;
-- production has explicit capacity;
-- unknown serialized fields are rejected.
-
-Builder construction may fail fast at the first structurally impossible call.
-Document parsing should aggregate independent validation issues so operators can
-fix one file in one pass.
-
-## 9. Knob Contract
-
-### 9.1 Knob is an operational role, not a second type system
-
-A knob is a reloadable leaf of `MemoryConfig`. The SDK does not introduce a
-parallel generic `Knob<T>` registry.
-
-Typed code uses typed patch methods:
-
-```rust
-let patch = ConfigPatch::builder()
-    .capacity(10 * GiB)
-    .class("host.artifact-cache", |class| {
-        class.soft_limit(2 * GiB).hard_limit(3 * GiB)
-    })?
-    .pressure(|pressure| pressure.soft_percent(75).hard_percent(90))?
-    .build()?;
-```
-
-This avoids two sources of truth such as both
-`config.pressure.soft_limit` and `knobs::PRESSURE_SOFT_LIMIT`.
-
-### 9.2 Field metadata
-
-For documentation and external admin tooling, the optional serialization
-feature exposes a read-only schema:
-
-```rust
-pub struct ConfigFieldDescriptor {
-    // private fields; stable getters
-}
-```
-
-This schema describes the typed config; it does not mutate policy by itself.
-
-```rust
-pub enum ConfigMutability {
-    BuildOnly,
-    Runtime,
-}
-
-pub enum ConfigSafety {
-    Standard,
-    Expert,
-    TestOnly,
-}
-```
-
-String paths exist only at parsing/admin boundaries. Unknown path, wrong type,
-wrong unit, unavailable feature, or test-only field in production is an error.
-
-### 9.3 Forbidden knobs
-
-No configuration may mean:
-
-```text
-skip-validation
-allow-counter-drift
-ignore-release-failure
-disable-hard-limit
-unbounded-management-metadata
-```
-
-## 10. Platform Construction DSL
-
-```rust
-use quanta_memory_platform_facade::{
-    MemoryPlatform,
-    MemoryResult,
-    profiles,
-};
-
-fn build_platform(
-    reclaimer: Arc<dyn MemoryReclaimer>,
-    events: Arc<dyn MemoryEventSink>,
-) -> MemoryResult<MemoryPlatform> {
-    MemoryPlatform::builder()
-        .deployment_profile(profiles::PRODUCTION_V1)
-        .workload_profile(profiles::INTERACTIVE_V1)
-        .capacity(8 * GiB)
-        .manifest(manifest_patch)
-        .reclaimer(reclaimer)
-        .event_sink(events)
-        .build()
-}
-```
-
-Rules:
-
-- `build()` is the normal accounting-backed path;
-- `resolve()` returns `ResolvedMemoryConfig` without runtime authority;
-- there is no unbudgeted fallback;
-- required feature configuration fails if the feature is absent;
-- builder fields remain private;
-- missing required state returns typed `BuildError`, never a panic;
-- config resolution and platform construction are separately testable.
-
-`build_live()` becomes a deprecated alias once `build()` is the only enforced
-production path.
-
-## 11. Consumer and Reservation DSL
-
-### 11.1 Consumer
-
-```rust
-let consumer = platform
-    .consumer("vector-index")?
-    .owner("retrieval")?
-    .class("host.artifact-cache")?
-    .context(MemoryContextKind::Request)
-    .resource_group("interactive-queries")?
-    .build()?;
-```
-
-`MemoryConsumer` is a cheap immutable accounting descriptor tied to one
-platform. Creating it does not reserve bytes and does not require a permanent
-registry entry.
-
-### 11.2 Two-phase authority
-
-```rust
-let pending = consumer.reserve(8 * MiB, ChargeKind::RetainedPayload)?;
-let buffer = allocate_and_initialize()?;
-let reservation = pending.commit()?;
-```
-
-If allocation or initialization fails, dropping `pending` rolls back admission.
-After commit, the retained object owns a `MemoryReservation` or transfers it to
-a built-in store.
-
-```rust
-pub struct PendingReservation(/* private, non-forgeable */);
-pub struct MemoryReservation(/* private, non-forgeable */);
-
-impl MemoryReservation {
-    pub fn bytes(&self) -> u64;
-    pub fn class(&self) -> &MemoryClassId;
-    pub fn owner(&self) -> &OwnerId;
-    pub fn kind(&self) -> ChargeKind;
-    pub fn try_resize(&mut self, new_bytes: u64) -> MemoryResult<()>;
-    pub fn try_release(&mut self) -> MemoryResult<ReleaseReceipt>;
-    pub fn is_active(&self) -> bool;
-}
-```
-
-Normative behavior:
-
-- denial leaves all counters unchanged;
-- commit is single-use;
-- resize is atomic or preserves the prior reservation;
-- cross-platform or cross-consumer transfer requires a validated recharge;
-- drop attempts release and uses only bounded deferred cleanup;
-- failed explicit release leaves the reservation active in the caller-owned
-  object;
-- no public `forget`, raw ticket, counter setter, or ledger writer exists.
-
-Reservation splitting is deferred. A consumer may hold multiple reservations;
-`split` is added only when a real caller needs ownership subdivision and its
-failure/recovery semantics are specified.
-
-Built-in stores encapsulate this protocol; ordinary store users should not need
-to hold reservations manually.
-
-## 12. Built-in Store DSL
-
-```rust
-let payloads = platform
-    .payload_store::<ArtifactId, Vec<u8>>()
+let payloads = scope.payload_store::<ArtifactId, Vec<u8>>()
     .name("artifacts")?
-    .owner("retrieval")?
-    .class("host.artifact-cache")?
-    .context(request_context)
+    .owner(owner.clone())
+    .class(class.clone())
     .build()?;
 ```
 
-The platform supplies accounting automatically. Public standalone builders may
-exist for compile-time typestate, but their unset state has no `build()` method.
+`RuntimeKind::Retrieval` is a provisional example, not a decision to require a
+host-specific variant in portable QMP. Before the 0.3 API is frozen, specify
+whether runtime kind is a validated host-defined ID or a smaller portable
+taxonomy, and prove that an independent host can create a scope without
+adopting another host's named kinds.
 
-Stable public handles use domain names such as:
+`MemoryScope` carries runtime attribution; it is not a second ledger or a
+control handle. Creating it reserves no bytes. The platform supplies
+budgeted accounting to each feature-gated store builder. Store-specific
+policy stays on that store's builder. A caller never attaches a broker, raw
+ticket, or accounting sink. Store handles have stable feature-specific names,
+not a generic store trait without a generic caller.
+The in-memory slices are payload, retained map, revocable store, transcript,
+and prepared publication.
 
-```text
-PayloadStoreHandle
-RetainedMapHandle
-RevocableStoreHandle
-TranscriptStoreHandle
-PreparedPublicationHandle
-```
-
-The existing `Simple*` implementation types are migrated behind these handles
-or deprecated aliases. Do not introduce a trait hierarchy merely to hide a
-name; add a trait only when an external implementation or generic caller exists.
-
-Every built-in store must reserve before retaining, keep exactly one authority
-per value, fail closed, expose bounded stats, close idempotently, reject mutation
-after close, preserve release/recovery during close, and avoid external
-callbacks under its lock.
-
-Custom stores compose `MemoryConsumer`; they never implement a raw accounting
-sink.
-
-## 13. Pressure and Reclaim
-
-QMP retains its existing semantic pressure model:
+### 2.3 Account a custom component
 
 ```rust
-pub enum PressureState {
-    Normal,
-    Soft,
-    Hard,
-    Fatal,
-}
+let consumer = scope.consumer("vector-index")?
+    .owner(owner)
+    .class(class.clone())
+    .context(MemoryContextKind::Request)
+    .build()?;
+
+let pending = consumer.reserve_up_to(max_bytes, ChargeKind::RetainedPayload)?;
+let value = construct_value()?;
+let actual_bytes = measure_retained_cost(&value)?;
+let reservation = pending.commit_measured(actual_bytes)?;
+// The component owns value and reservation together until both are released.
 ```
 
-Reclaim callbacks execute outside the broker lock, receive a bounded typed
-request, cannot mutate ledger counters directly, are followed by remeasurement,
-and cannot convert a hard denial into silent overcommit.
+`MemoryConsumer` is a cheap, immutable attribution descriptor, not a
+permanent registry entry. One consumer may own many independent reservations.
+Its name is diagnostic. Class, owner, context, charge kind, and the owner's
+configured resource group determine accounting. The consumer cannot choose
+a different group; `owner → group` in validated policy is the only group
+mapping.
 
-Allocator, RSS, and cgroup observations are advisory. The host may use them for
-load shedding or to propose a config change; they never directly mutate QMP
-semantic accounting.
+`reserve_up_to` admits a conservative upper bound **before** constructing
+retained data. `commit_measured(actual_bytes)` is a single fail-closed
+shrink-and-commit transition. It rejects a cost above the bound and rolls
+back the pending authority; if cleanup itself fails, the exact ticket
+remains owned for bounded deferred retry. The caller discards the
+unpublishable value.
+Dropping an uncommitted reservation also rolls it back. A zero-byte commit
+still owns one live ticket until release. If a useful upper bound cannot be
+known, the component must budget construction as scratch/temporary work and
+reserve measured retained cost before publication. QMP cannot infer the
+physical allocation size of arbitrary `T`.
 
-Do not add a generic ordered mitigation engine until QMP owns at least two
-independently configurable mitigation mechanisms. Reclaim and spill remain
-explicit.
+The committed `MemoryReservation` is non-cloneable and broker-bound.
+`try_release` and `try_resize` preserve caller-owned authority on failure;
+resize retains the current recharge API's explicit recovery-required outcome.
+`Drop` attempts bounded deferred cleanup but cannot return an error.
+Components must destroy retained data before or with its charge. Built-in
+stores enforce that lifecycle internally.
 
-## 14. Observation and Operations
+Before API freeze, specify how a host observes and retries a failed deferred
+rollback/release, and how shutdown reports remaining ticket authority. The
+current engine's deferred queue is not by itself a public 0.3 status API.
 
-### 14.1 One consistent snapshot
-
-```rust
-pub struct MemorySnapshot(/* private */);
-
-impl MemoryPlatform {
-    pub fn snapshot(&self) -> MemoryResult<MemorySnapshot>;
-}
-```
-
-The snapshot contains one lock-consistent view of policy revision, config
-fingerprint, semantic totals, charge-kind breakdown, class/owner/group usage,
-pressure, reclaim counters, bounded deferred cleanup, and optional allocator
-advisory data.
-
-High-cardinality owner detail is returned through bounded queries, not metric
-labels.
-
-### 14.2 Live reconfiguration
-
-Retain the current atomic reconfigure operation and add expected revision plus
-a receipt. A separate plan object is unnecessary.
+### 2.4 Observe and change policy
 
 ```rust
 let before = platform.snapshot()?;
+let patch = ConfigPatch::builder()
+    .set_class_hard_limit(class, 3 * GiB)
+    .build()?;
 let receipt = platform.reconfigure(
-    ReconfigureRequest::new(patch)
-        .expected_revision(before.policy_revision()),
+    ReconfigureRequest::new(before.policy_revision(), patch),
 )?;
 ```
 
-```rust
-pub struct ReconfigureReceipt {
-    // private fields; stable getters
-}
-```
-
-Reject stale revisions, build-only changes, caps below live usage, removal of
-live IDs, unavailable features, and invalid invariants. Failure leaves config,
-revision, and ledger unchanged.
-
-### 14.3 No global control handle yet
-
-`MemoryPlatform` is already the authority-bearing aggregate. Splitting it into
-runtime and control handles would not create a security boundary inside one
-process and would double forwarding APIs. Introduce separate handles only after
-a concrete component must receive data-plane access while being statically
-unable to reconfigure.
-
-## 15. Lifecycle Ownership
-
-Stores keep explicit, idempotent `close()` operations. QMP does not yet add a
-platform-wide registry or drain state machine: stores are independently owned,
-custom consumers cannot be forcibly closed safely, and the host owns shutdown,
-deadlines, and cancellation.
-
-The host coordinates shutdown:
-
-1. stop new work at the host boundary;
-2. close owned stores/services;
-3. release custom reservations;
-4. inspect a final QMP snapshot;
-5. fail qualification if authority is unexpectedly non-zero.
-
-QMP may add a read-only `quiescence_report()` for step 4; it must not pretend to
-own steps 1–3.
-
-## 16. Disk-Backed Spill Is Out of Scope
-
-The 0.3 SDK does not add Redb configuration, codecs, durable spill/restore,
-recovery receipts, or a generic persistent tier. The existing opt-in 0.2
-implementation remains a separate maintenance surface until a named consumer
-and its storage failure/invalidation contract justify retaining or removing it.
-No host adoption or release gate in this RFC depends on that surface.
-
-## 17. Error Contract
-
-```rust
-#[non_exhaustive]
-pub enum MemoryError {
-    Build(BuildError),
-    Config(ConfigError),
-    Capacity(CapacityDenied),
-    Closed(ResourceClosed),
-    Busy(OperationBusy),
-    Poisoned(AuthorityPoisoned),
-    InvalidState(StateViolation),
-    Unsupported(UnsupportedCapability),
-    StaleRevision(StaleRevision),
-    RecoveryRequired(RecoveryRequired),
-}
-```
-
-```rust
-pub struct CapacityDenied {
-    // private fields; stable getters for every item below
-}
-```
-
-Its getters expose capacity axis, requested/current/limit bytes, optional class,
-owner and resource group, policy revision, and retryability.
-
-The planned SDK error contract does not expose backing-specific errors or
-recovery identifiers.
-
-## 18. Serialization Boundary
-
-Serialization is optional and feature-gated. QMP parses bytes supplied by the
-host; it does not open files or inspect environment variables.
-
-```toml
-schema-version = 1
-deployment-profile = "production-v1"
-workload-profile = "interactive-v1"
-
-[capacity]
-limit = "8GiB"
-headroom = "1GiB"
-shared-burst-pool = "512MiB"
-
-[pressure]
-soft = "75%"
-hard = "90%"
-fatal = "97%"
-
-[classes."host.artifact-cache"]
-reserved = "128MiB"
-soft-limit = "1GiB"
-hard-limit = "2GiB"
-borrow-from-shared-pool = true
-reclaim-priority = "first"
-```
-
-Unknown and duplicate fields fail; units are mandatory where ambiguous;
-overflow and invalid identifiers fail; serialized config cannot enable an
-absent feature. Schema version covers document compatibility, profile IDs cover
-versioned defaults, and fingerprinting occurs after expansion and validation.
-
-TOML support is optional. JSON/YAML are not part of this RFC.
-
-## 19. Features
-
-Keep current feature names during migration unless renaming has a concrete
-payoff. Renaming every underscore feature to a hyphen is churn, not architecture.
-
-Normative rules:
-
-- features are additive;
-- default enables enforced live accounting only;
-- store slices remain independently selectable;
-- the existing Redb feature remains opt-in but is outside this 0.3 plan;
-- `full` means production in-memory capabilities, not every feature;
-- `full-backings` remains an existing aggregate feature, not a 0.3 release target;
-- unbudgeted stores and fault hooks are absent from default, `full`, and
-  `full-backings`;
-- test-only features cannot change production success semantics;
-- feature-off configuration fails rather than becoming a successful no-op.
-
-The 0.3 SDK does not add backing-path fault-injection hooks.
-
-## 20. Extension Contract
-
-Supported external seams:
-
-- `MemoryReclaimer`;
-- `MemoryEventSink`;
-- `AllocatorTelemetry`;
-- host-owned config loading and capacity discovery;
-- custom retained components built from `MemoryConsumer`.
-
-Sealed/private authority:
-
-- ledger construction and mutation;
-- raw reservation tickets and accounting sinks;
-- policy revision mutation;
-- backing-specific persistent authority, if retained outside this RFC.
-
-No `Any` extension bag, generic plugin registry, or arbitrary callback under the
-broker lock is introduced.
-
-## 21. Observability Contract
-
-QMP emits bounded semantic events and typed snapshots, not an exporter.
-
-- semantic and process/RSS bytes use distinct names;
-- owner, session, key, path, and arbitrary text are not metric labels;
-- high-cardinality detail uses bounded diagnostic queries;
-- sink failure cannot corrupt accounting;
-- explicit `NoopMemoryEventSink` is allowed because the choice is visible;
-- feature-off metrics cannot report successful installation;
-- snapshots include policy revision.
-
-## 22. Compatibility Rules
-
-- QMP is pre-1.0; 0.3 may intentionally break the current internal surface.
-- Every public type has one canonical documented path.
-- Public evolvable enums use `#[non_exhaustive]` where appropriate.
-- Identifier grammar and maximum lengths are stable contracts.
-- Incompatible documents require a schema-version change.
-- Profile default changes require a new profile ID.
-- Config removal requires deprecation or schema migration.
-- Feature removal/default changes require an explicit migration note.
-- Public APIs do not expose backing-library errors or concrete lock types.
-- Accepted live changes increment revision exactly once.
-- Failed mutations change neither policy, revision, fingerprint, nor ledger.
-
-## 23. Migration Plan
-
-### Phase 0 — Freeze and characterize
-
-- record a public API baseline;
-- add compile tests for happy paths and forbidden raw paths;
-- record exact host call sites and feature selections;
-- freeze current semantics with conformance tests.
-
-### Phase 1 — Correct portability boundaries
-
-- introduce `MemoryClassId` and bounded identifier types;
-- move host-specific class constants/default weights to the host adapter;
-- remove non-memory `ExecutionBudget` fields;
-- replace fixed production capacity with required input;
-- split deployment and workload profiles.
-
-This phase is first because later DSL work on the closed host-specific enum
-would preserve the wrong abstraction.
-
-### Phase 2 — Configuration and errors
-
-- introduce `MemoryConfig`, `ConfigPatch`, fingerprint, and provenance;
-- add versioned profile IDs;
-- add structured errors;
-- wrap the existing resolver rather than creating a second one.
-
-### Phase 3 — Consumer DSL
-
-- introduce `MemoryConsumer`;
-- rename/wrap `ManagedCharge` as `MemoryReservation`;
-- preserve pending/commit and deferred cleanup;
-- add resize/split only with invariant and negative conformance tests.
-
-### Phase 4 — Facade DX
-
-- add canonical platform store, snapshot, and reconfigure methods;
-- introduce stable store handle names;
-- deprecate `Simple*`, direct `broker()`, deep modules, and `build_live` only
-  after replacements cover real host use cases.
-
-### Phase 5 — Optional serialization
-
-- add strict TOML parsing behind a feature;
-- generate field docs from parser descriptors;
-- do not add JSON/YAML or a dynamic knob registry without a consumer.
-
-### Phase 6 — Host migration and removal
-
-- migrate one exact consuming-host revision;
-- verify config fingerprint and reservation lifecycle;
-- remove deprecated surfaces only after the host no longer uses them;
-- qualify repository and host separately.
-
-## 24. Acceptance Tests
-
-### 24.1 Compile contracts
-
-- minimal platform build and config-only resolution;
-- custom consumer reserve/commit/release;
-- every enabled built-in store happy path;
-- snapshot and revision-checked reconfigure;
-- feature-disabled APIs are unreachable;
-- raw ledger/ticket/sink construction is unreachable;
-- unset store builder cannot build;
-- host class constants compile outside QMP core.
-
-### 24.2 Behavioral contracts
-
-- reservation drop restores exact capacity;
-- pending drop rolls back every accounting axis;
-- resize/recharge conserve authority;
-- denial leaves ledger and revision unchanged;
-- precedence is independent of builder call order;
-- profile expansion is deterministic by ID;
-- config fingerprint is canonical;
-- unknown config/class/capability fails;
-- stale revision and cap shrink fail without mutation;
-- observation is revision-consistent;
-- feature-off telemetry cannot report successful wiring;
-- conformance rejects broken accounting fakes;
-- in-process transfer retains exactly one accounting authority.
-
-### 24.3 Repository and host gates
-
-On one clean committed candidate:
-
-```bash
-python3 tools/pm/pm.py sync
-RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps
-cargo public-api --simplified
-scripts/check-workspace.sh
-scripts/extract-to-standalone-repo.sh --dry-run /tmp/qmp-check
-```
-
-Repository GREEN proves only the portable library candidate. Host adoption
-requires separate exact-source evidence for dependency identity, host class
-taxonomy, resolved config/fingerprint, custom reservations, built-in stores,
-snapshot, and reconfiguration. Merge, deployment,
-and activation remain separate states.
-
-## 25. Explicitly Deferred
-
-- global `BehaviorVersion`;
-- `MemoryRuntime` / `MemoryControl` split;
-- Kubernetes-like conditions;
-- platform-wide drain ownership;
-- generic mitigation engine;
-- disk-backed spill, Redb SDK configuration, codecs, and a generic durable tier;
-- dynamic `Knob<T>` registry;
-- arbitrary plugin registry;
-- JSON/YAML;
-- async runtime integration;
-- cross-language FFI;
-- package rename or fourth runtime crate.
-
-## 26. Final Contract Summary
-
-The 0.3 interface is accepted only if:
-
-1. The portable crate contains no consuming-host class taxonomy.
-2. QMP owns memory authority only, not generic execution governance.
-3. Production capacity is explicit and host-supplied.
-4. Profiles are separate, typed, versioned default bundles.
-5. Typed config is the source of truth; knobs are typed patches over it.
-6. Custom components use consumers and non-forgeable reservations.
-7. Built-in stores use the same ledger and hide accounting plumbing.
-8. Reconfiguration is atomic, revision-checked, and receipt-returning.
-9. Observation is bounded and revision-consistent.
-10. In-process transfer preserves exactly one accounting authority.
-11. Raw accounting authority remains sealed.
-12. New abstractions require demonstrated consumers, not analogy alone.
-
-This is the accepted 0.3 interface contract. Changes to its twelve acceptance
-statements require an RFC amendment with source-backed rationale. Acceptance is
-not an implementation or qualification receipt.
+`ConfigPatch` is the typed runtime-knob DSL. `Set` replaces a leaf in the
+runtime overlay; `Clear` removes that override and reveals the validated
+baseline. Map `Remove` hides/removes an effective item only if no live
+authority depends on it, including zero-byte tickets. Runtime writes always
+carry an expected revision. Stale revision, below-usage cap, live owner/group
+remap, missing feature, or invalid postimage rejects without changing policy,
+revision, fingerprint, or ledger.
+
+`ReconfigureReceipt` reports before/after revision, effective-policy
+identity, outcome, and changed fields. An identical effective postimage is
+`Unchanged` and does not advance revision. A change advances it exactly once.
+`MemorySnapshot` gives one coherent semantic ledger/policy/revision view,
+including pressure and reclaim state from that authority.
+High-cardinality owner detail is a separate bounded, sorted query.
+Allocator/RSS samples are separate advisory observations, never represented
+as simultaneous with the semantic snapshot.
+
+## 3. Exact abstraction rules
+
+### Policy, profiles, and knobs
+
+`MemoryConfig` is the single desired-policy type: capacity, headroom,
+shared burst pool, pressure thresholds, class budgets, owner quotas,
+resource-group budgets, and owner/group bindings. Store options remain with
+their store. Validation checks `reserved <= soft <= hard`, global headroom
+and floor sums, checked arithmetic, referential integrity, feature
+availability, and bounded class/owner/group/mapping counts.
+
+Deployment and workload profiles are separate, explicitly versioned IDs.
+They provide portable defaults, never hidden admission exceptions or a
+machine-independent capacity. They cannot assign budgets to host classes
+unknown to QMP. A changed default gets a new profile ID. Host-specific
+profiles are host code that builds ordinary `MemoryConfig` values.
+
+QMP defines two construction layers—versioned profile defaults and the
+explicit typed baseline—and one runtime override overlay.
+The host decides whether and how files, environment, CLI, or remote control
+produce that baseline. QMP does **not** prescribe source precedence or load
+those sources. This avoids making one host's deployment convention a library
+contract. `Clear` acts only on the runtime overlay; it cannot erase a
+required baseline field. Resolution and every runtime update validate the
+complete effective postimage. `ResolvedMemoryConfig` exposes effective
+policy, selected profile IDs, and fingerprint; the host owns input-source
+provenance.
+
+An optional read-only `ConfigSchema` may describe field type, units,
+mutability (`BuildOnly`/`Runtime`), and safety level for host tooling. It
+does not create a second `Knob<T>` registry. If a document parser is later
+provided, it accepts host-supplied bytes, rejects unknown/duplicate fields
+and unavailable features, and maps to these same typed fields. JSON/YAML,
+file watching, and source-precedence logic are not part of 0.3.
+
+### IDs and privileged roles
+
+`MemoryClassId`, `OwnerId`, `ResourceGroupId`, `RuntimeId`, and
+`ConsumerName` have private fields, bounded UTF-8 grammar, and fallible
+`parse`. Class IDs are extensible host taxonomy, but a class must be
+declared in validated policy before admission. QMP-owned IDs are limited
+to semantics QMP actually implements.
+
+The existing `MemoryClass::Headroom` is a privileged admission role, not
+an ordinary class string. Migration must keep that role non-forgeable and
+preserve current headroom/floor/burst mathematics. A host class named
+`qmp.headroom` or similar gains no privilege. Current mandatory
+host-specific enum variants become host-declared budgets, not mandatory
+portable-core classes. Host use of the old privileged role must be inventoried
+before its API is removed.
+
+### Authority, errors, and lifecycle
+
+The ledger remains the sole accounting source of truth. Every accounting
+mutation validates the complete postimage before committing. Reclaim
+callbacks run outside the accounting lock and admission remeasures afterward;
+hard denial never becomes silent overcommit. In-process transfer conserves
+one live authority and preserves the source on denial. Stores reserve before
+retaining, close idempotently, reject mutation after close, and keep cleanup
+possible during shutdown. For 0.3, no client-provided callback may execute
+under a store or broker lock.
+
+This last rule is a migration requirement, not a property of every 0.2 store
+path: current caller `Clone`/`Ord`/`Hash` work can run under a store mutex.
+The 0.3 change needs public reentrancy, panic, and slow-callback oracles that
+show the lock is released without losing the accounting postimage.
+
+`MemoryError` remains non-exhaustive, with typed capacity axis,
+requested/current/limit bytes, relevant IDs, revision, and explicit
+recovery-required state where applicable. Callers do not parse `Display`.
+Failed observation does not fabricate zero usage. Events/metrics are bounded;
+owner, session, key, path, and arbitrary error text are not metric labels.
+Zero-byte tickets and deferred cleanup consume bounded management metadata.
+The host owns shutdown ordering: stop work, close stores, release custom
+reservations, then inspect final semantic usage.
+
+### Extensibility and compatibility
+
+New host classes and owners need no QMP release; new store/backing semantics
+do need a feature-specific typed contract and tests. External ports are
+`MemoryReclaimer`, `MemoryEventSink`, and `AllocatorTelemetry`; hosts own
+config loading/capacity detection and use `MemoryConsumer` for custom
+components. None can write ledger counters directly. Public structs keep
+private fields, evolvable enums are non-exhaustive, and each type has one
+canonical public path. Existing `0.2` feature names remain unless a rename
+has a consumer benefit. Features are additive: default enables enforced
+accounting, store slices are independent, `full` covers production in-memory
+slices, and Redb remains opt-in/out of this release target.
+
+No promise of zero breaking changes is made for pre-1.0. Instead, changes to
+identifier grammar, profile defaults, serialized document shape, or feature
+defaults require explicit versioning/migration. `ConfigFingerprint` identifies
+the effective policy, excluding source/provenance and telemetry. It requires a
+versioned canonical encoding and golden vectors before release;
+cross-version comparability is not implied.
+
+## 4. Engine obligations and acceptance
+
+The package direction stays `core <- facade <- testkit`. `domain/` and
+`ports/` remain free of host I/O/clocks. The facade adapts existing
+`EffectiveBudgetResolver`, `PendingReservation`, `ManagedCharge`,
+`ProcessMemoryBroker::attach_runtime`, budgeted store builders,
+`BrokerObservation`, and `try_live_reconfigure`; it must not add a second
+ledger, a global mutable policy, or public raw accounting constructors.
+
+Implement in this order: (1) freeze real 0.2 and host call sites; (2) separate
+host taxonomy from privileged headroom and remove non-memory execution
+policy; (3) add typed config/profile resolution and structured errors;
+(4) add scope/consumer/measurement authority; (5) move stores and
+observation/reconfiguration behind the facade; (6) migrate an exact host
+revision, then remove deep-path aliases. The public `broker()` escape cannot
+be removed before every current host use has a safe replacement.
+
+Acceptance requires compiling examples for config, custom retention, each
+enabled store, observation, and reconfiguration. Negative compile tests
+reject raw authority construction, unset builders, disabled features, and
+forged headroom. Behavioral tests prove pending rollback, measured-commit
+surplus/over-bound/zero-byte behavior, authority conservation across
+release/resize/transfer failures, unique owner→group attribution, overlay
+`Clear`, live-remap rejection, stale/no-op reconfiguration, coherent
+semantic snapshots, advisory telemetry separation, and a conformance fake
+that is deliberately rejected.
+
+Add fault-injection coverage for deferred cleanup failure: exact ticket
+authority remains retained, the backlog/error is publicly observable, bounded
+retry can finish, and shutdown cannot report a false zero. Prove that an
+independent host can use runtime scope without a mandatory host-specific kind.
+
+On a committed clean candidate, run `python3 tools/pm/pm.py sync`,
+`scripts/check-workspace.sh`, strict rustdoc, public API baseline, and the
+standalone extraction dry-run. The dry-run is preflight, not a real standalone
+export qualification. If standalone qualification is claimed, perform real
+extraction and its locked
+rail on the same frozen source. Repo-local checks qualify only the library;
+host adoption requires a separate exact dependency/source receipt. Merge,
+deployment, and activation are separate states. This RFC alone closes none
+of those gates.
+
+## 5. External design evidence
+
+- [DataFusion's MemoryPool/MemoryReservation](https://docs.rs/datafusion/latest/datafusion/execution/memory_pool/trait.MemoryPool.html)
+  supports named consumers and RAII charges; QMP keeps its stricter
+  reserve/commit and fail-closed ledger semantics.
+- [Velox's memory management](https://facebookincubator.github.io/velox/develop/memory.html)
+  separates hierarchy/attribution from aggregate reservations; QMP adopts
+  scoped attribution without pretending to own a physical allocator.
+- [RocksDB's memory accounting](https://github.com/facebook/rocksdb/wiki/Memory-usage-in-RocksDB)
+  shows why a limit must name its covered components and exclusions; QMP
+  therefore calls its numbers semantic, not process-wide.
+- [AWS SDK for Rust behavior versions](https://docs.aws.amazon.com/sdk-for-rust/latest/dg/behavior-versions.html)
+  motivates stable default sets; QMP uses versioned profiles rather than a
+  global behavior-version axis.
+- [Cargo feature guidance](https://doc.rust-lang.org/cargo/reference/features.html)
+  supports additive feature slices; QMP avoids a mandatory backing bundle.
+
+Deferred until a named consumer justifies them: generic `Knob<T>` registry,
+plugin/service container, runtime/control handle split, generic durability
+tier, async runtime, process-wide shutdown registry, FFI, and package rename.

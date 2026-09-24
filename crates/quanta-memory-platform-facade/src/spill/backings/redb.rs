@@ -1,5 +1,10 @@
 //! Durable spill backing over `redb` (opt-in `spill-redb` feature).
 //!
+//! This existing opt-in implementation is outside the current product plan:
+//! it is not production-qualified or supported as a current product capability.
+//! A consuming host must separately qualify its filesystem and volume/quota
+//! policy, required durability level, and any caller-owned codec scratch.
+//!
 //! `RedbSpillBacking` is a durable [`SpillTarget`] for the spill slice: it stores
 //! spilled handles (opaque `Vec<u8>`) in a `redb` table and restores them FIFO.
 //! It is reached ONLY through the `SpillTarget` abstraction — the raw `redb`
@@ -292,8 +297,10 @@ impl StorageBackend for CappedFileBackend {
     }
 }
 
-/// A durable spill backing over `redb`. Implements [`SpillTarget<Vec<u8>>`]; the
-/// `redb` database is fully encapsulated.
+/// An opt-in durable spill backing over `redb`. Implements
+/// [`SpillTarget<Vec<u8>>`]; the `redb` database is fully encapsulated.
+/// This backing is not production-qualified or supported as a current product
+/// capability; see the module-level qualification boundaries.
 #[derive(Debug)]
 pub struct RedbSpillBacking {
     database: Database,

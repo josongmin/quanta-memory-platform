@@ -18,8 +18,10 @@ deployment, and activation require separate exact-source evidence.
 Current product scope is in-memory accounting and reclaim. Redb-backed durable
 spill, its codec, and disk-recovery qualification are **excluded from the active
 QMP/SDK/Semantica plan**: no current consumer requirement has been identified.
-The opt-in code still exists in this 0.2 workspace; this scope decision does
-not remove its API or turn historical test results into a release claim.
+The opt-in code still exists in this 0.2 workspace, but is **not
+production-qualified or supported as a current product capability**. This
+scope decision does not remove its API or turn historical test results into a
+release claim.
 Reconsider it only with a named consumer, measured reuse benefit, and an owned
 disk-failure and invalidation contract.
 
@@ -95,9 +97,9 @@ store slices a consumer needs:
 | `transcript` | Idempotent session transcript with bounded replay evidence. |
 | `publish_pipeline` | Publication staging/commit and prepared-publication lifecycle. |
 | `spill` | Portable in-process/durable spill contracts. |
-| `spill-redb` | Existing opt-in Redb backing; excluded from the active product plan. |
+| `spill-redb` | Existing opt-in Redb backing; not production-qualified or supported as a current product capability. |
 | `full` | All in-memory facade slices; no durable backing dependency. |
-| `full-backings` | Existing aggregate feature that adds `spill-redb`; not a current release target. |
+| `full-backings` | Existing aggregate feature that adds `spill-redb`; not a current release target or production qualification claim. |
 
 The Redb/codec implementation remains documented in the detailed current-code
 guide for maintainers, but is not an SDK integration or release prerequisite.

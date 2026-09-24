@@ -29,7 +29,8 @@ transcript = ["core-live-accounting", "dep:blake3"]
 publish_pipeline = ["core-live-accounting", "dep:blake3"]
 spill = []
 
-# Opt-in heavy backings (each pulls one third-party crate).
+# Existing opt-in backing. `spill-redb` is outside the current product plan
+# and is not production-qualified; enabling it is not a release claim.
 spill-redb = ["spill", "dep:redb"]
 # Test-only finalize kill hooks (DURABILITY-001 L1). This is crash-rail
 # instrumentation, not a production capability: it stays absent from `default`,
@@ -53,9 +54,10 @@ full = [
     "publish_pipeline",
     "spill",
 ]
-# `full-backings` = `full` plus every production backing. Compile-only
-# moka/scc indexes were removed because they never implemented the canonical
-# revocable-store contract.
+# `full-backings` = `full` plus the existing opt-in Redb backing. It is a
+# feature aggregate, not a production-support or release-qualification claim.
+# Compile-only moka/scc indexes were removed because they never implemented
+# the canonical revocable-store contract.
 full-backings = ["full", "spill-redb"]
 
 [[example]]
