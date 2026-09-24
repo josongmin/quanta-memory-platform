@@ -93,7 +93,40 @@ production preset의 4 GiB global hard limit을 각 프로세스에 별도로 �
 두 leg의 memo charge 합산·개별 환급과 shared-pool peer denial→release→retry
 oracle이 작성됐다. 이 단락은 구현·테스트 소스 상태이지 G8 GREEN이 아니다.
 QBC compiler/owner, CLI `dist-full`, worker process 제품 실행과 실제
-거절·해제 관측을 고정된 최종 소스에서 별도로 판정한다.
+거절·해제 관측을 고정된 최종 소스에서 별도로 판정한다. CLI의
+`bootstrap_scope_direct_with_paired_rulepack_sources_v1`는 현재 정의만 있고
+호출자가 확인되지 않았다. 따라서 CLI `dist-full` 컴파일·E2E GREEN은 feature
+closure 증거이지 SQL paired 실행 증거가 아니다. 현재 도달 가능한 SQL paired
+제품 경로는 별도 rulepack worker이고, 그 프로세스 테스트와 composer의
+admission/refund oracle을 각각 확인해야 한다.
+
+2026-09-25 실행 판정: Semantica 고정 스냅샷
+`ffc285adef9316b7a62598b02d202a3b10f8ae02+ext-3932ca34c00dcfc40ba8`에서
+`quanta-runtime-memory-compose --lib --all-features` owner rail은 55/55 GREEN이다.
+두 SQL shadow-leg 합산·격리 및 peer denial→release→retry 테스트가 실제로 실행됐다.
+같은 스냅샷의 `quanta-cli-ingress-runtime --lib --all-features`는 runtime
+retrieval/targeted-recompute 경로의 37개 compile error로 RED였다. 같은
+스냅샷의 worker `--tests --all-features`는 실행 도중 Semantica main에
+candidate-failure baseline drain 변경(`9c0b9181fe6`)과 다른 통합 변경이
+들어와 최종 소스와 달라졌고, 중단되어 GREEN receipt가 없다. 이후 main
+`73b24ff9cb5`에 다른 경로의 변경도 들어왔으므로 G7/G8은 여전히 OPEN이다.
+새 최종 소스에서 composer·CLI feature closure·worker process 증거를
+다시 묶어 판정한다.
+
+후속 고정 스냅샷
+`73b24ff9cb56129211c8299b1cf81400cc0de5c5+ext-fcff8df2cdf05ac707a9`의
+CLI `--lib --all-features`도 compile RED였다. 이번 실패는
+`quanta-sdk-session-backend-owner`의 `ReadIndexRepositoryWorkItemV1` 초기화에서
+`binary_content_digest_v1` 누락(E0063)이다. 이후 Semantica main의 해당
+초기화에는 필드가 추가됐으므로 이 RED를 현 HEAD 실패로 일반화하지 않는다.
+최종 메인에 대한 CLI GREEN과 worker 제품 GREEN은 아직 확보되지 않았다.
+
+별도 `semantica-shadow-budget-final` 체크아웃의 worker owner rail은
+`worker_process_canary_owns_timer_runtime_v1`를 실제 실행했으나 RED였다.
+baseline product runtime 구성 중 `RUNTIME.QUERY_ARGS_SOURCE_CLOSURE_MISMATCH`
+(`sql_canary.py`, `QueryId(82)`)가 발생했다. 해당 체크아웃은 이 경로를
+수정 중인 dirty 상태이므로, 이 결과는 최종 main verdict가 아니다. 수정 후
+고정 소스 worker process 재실행과 성공 receipt가 필요하다.
 
 ## 최소 proof matrix
 
@@ -106,7 +139,7 @@ QBC compiler/owner, CLI `dist-full`, worker process 제품 실행과 실제
 | G5 Canonical memo 수명 | adapter+host+composer | row/index semantic cost, receipt/prepared/GC 최종 lease, 동일 broker snapshot |
 | G6 SDK/query 제품 E2E | 실제 SDK ingress의 broker-backed memo table | query miss→publish→hit→invalidate/GC, capacity denial typed, 후속 정상 요청, close/drain |
 | G7 Source integration | 현재 main | 001/002/003 계약 보존, 뒤늦은 caller/feature drift 없음, 최종 소스에서 G1~G6 및 G8 재검증 |
-| G8 SQL shadow 제품 경계 | CLI `dist-full` + 별도 rulepack worker의 baseline/candidate | 프로세스별 bounded domain 설치, 두 leg의 합산 한도·거절·해제·재시도 검증. SDK broker와 다른 프로세스의 broker를 하나라고 주장하지 않음 |
+| G8 SQL shadow 제품 경계 | CLI `dist-full` feature closure + 실제 rulepack worker baseline/candidate + composer admission oracle | worker의 프로세스별 bounded domain 설치, 두 leg의 합산 한도·거절·해제·재시도 검증. CLI helper는 호출자가 생기기 전까지 제품 실행으로 합산하지 않음. SDK broker와 다른 프로세스의 broker를 하나라고 주장하지 않음 |
 
 main에는 `production_cutover_memory_deps_charge_runtime_contract_bridges_against_live_broker`
 등 실제 bridge 테스트가 이미 있다. G4를 위해 같은 목적의 새 root E2E를 만들지 않는다.
