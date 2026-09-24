@@ -1042,11 +1042,12 @@ impl<Key, Value> SimpleRevocableStore<Key, Value, Budgeted> {
         C: DurableRestoreController,
     {
         if phase == DurableRestorePhase::Prepared {
-            // The caller's panic remains primary. On abort failure the durable
-            // claim stays persisted for recover_active_restore.
+            // The caller's panic remains primary. Abort failure cannot be
+            // returned while unwinding; the backing's recovery path owns any
+            // claim that remains active.
             #[expect(
                 clippy::let_underscore_must_use,
-                reason = "panic unwind must preserve the original payload; failed abort retains the persisted claim"
+                reason = "panic unwind must preserve the original payload; abort failure cannot replace it"
             )]
             let _ = controller.abort_restore(&candidate.claim);
         }

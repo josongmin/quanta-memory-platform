@@ -11,9 +11,9 @@ fail-closed. A Semgrep exception requires a trailing
 | `x.unwrap()` in non-test code | `x.ok_or_else(|| MemoryError::config("…"))?` | review |
 | `panic!` / `unreachable!` / `todo!` / `unimplemented!` in shipping paths | return a `MemoryError` variant | review |
 | `.expect("")` / `.expect("TODO")` | only in `#[cfg(test)]`, with `.expect("<why this cannot fail>")` | review |
-| `Err(_) => {}` / `let _ = fallible();` / `.ok();` | propagate with `?` or map to a typed `MemoryError` | review |
+| `Err(_) => {}` / `let _ = fallible();` / `.ok();` | propagate with `?` or map to a typed `MemoryError`; production `let _ =` on a `#[must_use]` result needs an explicit reasoned exception | review; production `let _ =` also Clippy `let_underscore_must_use` |
 | `map_err(|_| …)` when the source carries actionable context | preserve it: `map_err(|e| MemoryError::config(format!("…: {e}")))`; discarding poison or range-conversion details is allowed when the replacement error is complete | review |
-| bare `#[allow(<lint>)]` (no reason) | append `-- reason: <…>` on the same line | review |
+| bare `#[allow(<lint>)]` (no reason) | use `#[allow(<lint>, reason = "…")]` in production; explain test-only exceptions inline | production Clippy `allow_attributes_without_reason`; test-only review |
 | `arr[i]` / `&s[a..b]` on untrusted indices | `arr.get(i)` / checked slicing | review |
 | `n as u64` (lossy / truncating) | `u64::try_from(n)?` or a checked/saturating op | review |
 | `x as i64` / `as i32` / `as i16` / `as i8` (sign-flips a magnitude — the `bytes as i64` ledger-corruption bug) | keep `u64` magnitudes with saturating/checked ops; `i64::try_from(..)?`; widen a signed *diff* to `i128` | regression-guards (`qmp-magnitude-as-signed`) |

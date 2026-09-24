@@ -45,6 +45,12 @@ scripts/tests/extraction-contracts.sh
 echo "[check-workspace] regression-guards"
 scripts/regression-guards.sh
 
+echo "[check-workspace] production error-discard and lint-exception policy"
+cargo clippy --locked -p quanta-memory-platform-core \
+  -p quanta-memory-platform-facade --lib --all-features -- \
+  -D warnings -D clippy::let_underscore_must_use \
+  -D clippy::allow_attributes_without_reason
+
 echo "[check-workspace] feature-matrix"
 scripts/verify-feature-matrix.sh
 
