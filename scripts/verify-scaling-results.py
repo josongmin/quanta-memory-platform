@@ -124,7 +124,10 @@ def parse_benchmark_args(arguments: object) -> BenchmarkSpec:
 
 
 def load_jsonl(path: Path) -> list[dict[str, object]]:
-    content = path.read_text(encoding="utf-8")
+    try:
+        content = path.read_text(encoding="utf-8")
+    except UnicodeDecodeError as error:
+        raise ValidationError(f"{path}: invalid UTF-8") from error
     if content and not content.endswith("\n"):
         raise ValidationError(f"{path}: truncated final line")
     records: list[dict[str, object]] = []
@@ -150,7 +153,10 @@ def integer(sample: dict[str, object], field: str) -> int:
 
 
 def scenario_key(sample: dict[str, object]) -> tuple[object, ...]:
-    return sample.get("operation"), sample.get("mode"), integer(sample, "entries"), integer(sample, "threads")
+    identity = (sample.get("operation"), sample.get("mode"))
+    if any(not isinstance(value, str) or not value for value in identity):
+        raise ValidationError("sample operation/mode must be nonempty strings")
+    return *identity, integer(sample, "entries"), integer(sample, "threads")
 
 
 def expected_keys(spec: BenchmarkSpec) -> set[tuple[object, ...]]:
@@ -181,8 +187,9 @@ def run_metadata(records: list[dict[str, object]]) -> tuple[dict[str, object], B
     if not records or records[0].get("schema") != RUN_SCHEMA or records[-1].get("schema") != END_SCHEMA:
         raise ValidationError("benchmark run header must be first and completion footer last")
     for record in records:
-        if record.get("schema") not in {RUN_SCHEMA, END_SCHEMA, SAMPLE_SCHEMA}:
-            raise ValidationError(f"unexpected JSON record schema {record.get('schema')!r}")
+        schema = record.get("schema")
+        if not isinstance(schema, str) or schema not in {RUN_SCHEMA, END_SCHEMA, SAMPLE_SCHEMA}:
+            raise ValidationError(f"unexpected JSON record schema {schema!r}")
     runs = [record for record in records if record.get("schema") == RUN_SCHEMA]
     ends = [record for record in records if record.get("schema") == END_SCHEMA]
     if len(runs) != 1 or len(ends) != 1:
@@ -198,14 +205,23 @@ def run_metadata(records: list[dict[str, object]]) -> tuple[dict[str, object], B
             raise ValidationError(f"source changed during benchmark: {field}")
     if end.get("source_clean") is not True:
         raise ValidationError("source changed during benchmark: working tree is dirty")
+    has_run_identity = "run_id" in run or "run_id" in end
+    if has_run_identity and "bench_exit_code" not in end:
+        raise ValidationError("bench exit status is missing")
     if "bench_exit_code" in end and (
         not isinstance(end["bench_exit_code"], int)
         or isinstance(end["bench_exit_code"], bool)
         or end["bench_exit_code"] != 0
     ):
         raise ValidationError("bench exited nonzero or has invalid exit status")
-    if run.get("run_id") != end.get("run_id"):
-        raise ValidationError("run identity changed during benchmark")
+    if has_run_identity:
+        if (
+            not isinstance(run.get("run_id"), str) or not run["run_id"]
+            or not isinstance(end.get("run_id"), str) or not end["run_id"]
+        ):
+            raise ValidationError("run identity is invalid")
+        if run["run_id"] != end["run_id"]:
+            raise ValidationError("run identity changed during benchmark")
     spec = parse_benchmark_args(run.get("benchmark_args"))
     expected_features = "full" if spec.profile == "in-memory-pressure" else "all-features"
     if run.get("feature_set") != expected_features:
@@ -278,7 +294,10 @@ def validate_samples(
         if abs(throughput - derived_throughput) > max(1, derived_throughput // 1_000):
             raise ValidationError(f"{key}: throughput does not match timed operations / elapsed time")
         semantic_peak = integer(sample, "semantic_peak_bytes")
-        if sample.get("operation") == "scheduler_admission_group_cardinality":
+        if sample.get("operation") == PRESSURE_OUTCOME_OPERATION:
+            if semantic_peak != 1:
+                raise ValidationError(f"{key}: pressure cycle must retain exactly one semantic byte")
+        elif sample.get("operation") == "scheduler_admission_group_cardinality":
             if semantic_peak != 0:
                 raise ValidationError(f"{key}: scheduler admission must not retain semantic bytes")
         elif semantic_peak <= 0:

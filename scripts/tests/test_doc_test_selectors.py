@@ -59,6 +59,13 @@ class DocTestSelectorTests(unittest.TestCase):
             {"first_selector", "second_selector"},
         )
 
+    def test_cargo_execution_parser_ignores_unstructured_prose(self) -> None:
+        output = (
+            "warning: someone wrote test fake_selector ... ok in a log\n"
+            "test module::real_selector ... ok\n"
+        )
+        self.assertEqual(MODULE.parse_executed_tests(output), {"real_selector"})
+
 
 if __name__ == "__main__":
     unittest.main()

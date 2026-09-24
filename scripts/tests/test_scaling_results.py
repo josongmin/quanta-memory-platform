@@ -52,7 +52,11 @@ def sample(
         "p50_ns": 10,
         "p95_ns": 20,
         "p99_ns": 30,
-        "semantic_peak_bytes": 0 if operation == "scheduler_admission_group_cardinality" else 100,
+        "semantic_peak_bytes": (
+            0 if operation == "scheduler_admission_group_cardinality"
+            else 1 if operation == "broker_pressure_cycle"
+            else 100
+        ),
         "semantic_after_close_bytes": 0,
         "allocator_allocated_bytes": 200,
         "allocator_deallocated_bytes": 200,
@@ -200,6 +204,36 @@ class ScalingResultTests(unittest.TestCase):
         del candidates[0][-1]["bench_exit_code"]
         with self.assertRaisesRegex(MODULE.ValidationError, "bench exit status is missing"):
             MODULE.validate_release(candidates, baselines, RELEASE_POLICY)
+
+    def test_current_receipt_missing_exit_status_is_not_ordinary_green(self) -> None:
+        records = valid_records(["--smoke"])
+        records[0]["run_id"] = records[-1]["run_id"] = "new-run"
+        del records[-1]["bench_exit_code"]
+        with self.assertRaisesRegex(MODULE.ValidationError, "bench exit status is missing"):
+            MODULE.validate(records)
+
+    def test_current_receipt_requires_nonempty_string_run_identity(self) -> None:
+        for invalid in ([], ""):
+            with self.subTest(invalid=invalid):
+                records = valid_records(["--smoke"])
+                records[0]["run_id"] = records[-1]["run_id"] = invalid
+                with self.assertRaisesRegex(MODULE.ValidationError, "run identity is invalid"):
+                    MODULE.validate(records)
+
+    def test_pressure_one_byte_peak_cannot_be_forged_as_two(self) -> None:
+        records = valid_records(["--profile=in-memory-pressure", "--smoke"])
+        pressure = next(row for row in records if row.get("operation") == "broker_pressure_cycle")
+        pressure["semantic_peak_bytes"] = 2
+        with self.assertRaisesRegex(MODULE.ValidationError, "exactly one semantic byte"):
+            MODULE.validate(records)
+
+    def test_malformed_record_identity_is_a_validation_error(self) -> None:
+        for field in ("schema", "operation", "mode"):
+            with self.subTest(field=field):
+                records = valid_records(["--smoke"])
+                records[1][field] = ["invalid"]
+                with self.assertRaises(MODULE.ValidationError):
+                    MODULE.validate(records)
 
     def test_release_rejects_custom_small_matrix_without_smoke_flag(self) -> None:
         for pressure in (False, True):
@@ -598,6 +632,9 @@ class ScalingResultTests(unittest.TestCase):
                 MODULE.load_jsonl(path)
             path.write_text('{"schema":"qmp-scaling-run-v3"\n', encoding="utf-8")
             with self.assertRaisesRegex(MODULE.ValidationError, "invalid JSON"):
+                MODULE.load_jsonl(path)
+            path.write_bytes(b"\xff\n")
+            with self.assertRaisesRegex(MODULE.ValidationError, "invalid UTF-8"):
                 MODULE.load_jsonl(path)
 
 

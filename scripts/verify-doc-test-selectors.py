@@ -64,7 +64,9 @@ def parse_executed_tests(output: str) -> set[str]:
         # libtest output can interleave when tests spawn subprocesses: one
         # line may contain "test A ... test B ... ok" and A's "ok" later.
         # The caller only reuses output after cargo test exits successfully.
-        for match in re.finditer(r"test (?P<name>[A-Za-z0-9_:]+) \.\.\.", line):
+        for match in re.finditer(
+            r"(?:^|(?<=\.\.\. ))test (?P<name>[A-Za-z0-9_:]+) \.\.\.", line
+        ):
             tests.add(match.group("name").split("::")[-1])
     return tests
 
