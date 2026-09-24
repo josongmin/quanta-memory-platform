@@ -221,7 +221,9 @@ then resize the charge down; a failed refund safely leaves an overcharge.
 If no safe retained-growth bound is available, do not mutate in place: build
 under a separately bounded scratch reservation and admit the measured retained
 charge before swapping or publishing the value. `try_resize` is not a
-scratch-to-retained transfer.
+scratch-to-retained transfer. A mutation error must not return through `?`
+while a partially changed value remains live after its charge is dropped;
+the component handles that failure with its value and reservation still paired.
 
 For a live reservation, every `try_release` or `try_resize` failure leaves its
 exact ticket owned by that same reservation and available for retry. A call on
@@ -451,8 +453,9 @@ be removed before every current host use has a safe replacement.
 Acceptance requires compiling examples for both platform construction paths,
 scope with/without diagnostic kind, custom retention and growth/shrink, each
 enabled store, observation, and reconfiguration. Negative compile tests reject
-raw authority construction, caller-selected unbudgeted accounting, disabled
-features, and forged headroom. Builder tests reject missing owner or class with
+raw authority construction, caller-selected unbudgeted accounting through
+scope builders, disabled features, and forged headroom. Builder tests reject
+missing owner or class with
 typed `Build` errors for every enabled store and custom consumer; omitted
 context and store name use their documented defaults. Behavioral tests prove
 pending rollback, measured-commit
