@@ -184,6 +184,15 @@ def validate_samples(
         )
         if timed != expected_timed:
             raise ValidationError(f"{key}: timed operations {timed} != expected {expected_timed}")
+        if sample.get("operation") == "scheduler_admission_group_cardinality":
+            expected_succeeded = expected_denied = integer(sample, "entries")
+        else:
+            expected_succeeded, expected_denied = expected_timed, 0
+        if (succeeded, denied) != (expected_succeeded, expected_denied):
+            raise ValidationError(
+                f"{key}: outcome counts {succeeded}/{denied} != expected "
+                f"{expected_succeeded}/{expected_denied}"
+            )
         derived_throughput = round(timed * 1_000_000_000 / integer(sample, "elapsed_ns"))
         if abs(throughput - derived_throughput) > max(1, derived_throughput // 1_000):
             raise ValidationError(f"{key}: throughput does not match timed operations / elapsed time")

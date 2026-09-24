@@ -30,6 +30,7 @@ def sample(
     timed = entries * (2 if operation in {
         "revocable_fill_and_drain", "scheduler_admission_group_cardinality",
     } else 1)
+    successful = entries if operation == "scheduler_admission_group_cardinality" else timed
     return {
         "schema": MODULE.SAMPLE_SCHEMA,
         "operation": operation,
@@ -40,8 +41,8 @@ def sample(
         "elapsed_ns": entries,
         "throughput_ops_per_sec": round(timed * 1_000_000_000 / entries),
         "timed_operations": timed,
-        "successful_operations": timed,
-        "denied_operations": 0,
+        "successful_operations": successful,
+        "denied_operations": timed - successful,
         "p50_ns": 10,
         "p95_ns": 20,
         "p99_ns": 30,
@@ -174,6 +175,24 @@ class ScalingResultTests(unittest.TestCase):
                 records[1][field] = value
                 with self.assertRaisesRegex(MODULE.ValidationError, message):
                     MODULE.validate(records)
+
+    def test_falsified_outcome_counts_are_rejected(self) -> None:
+        records = valid_records(["--smoke"])
+        scheduler = next(
+            record for record in records
+            if record.get("operation") == "scheduler_admission_group_cardinality"
+        )
+        scheduler["successful_operations"] = scheduler["timed_operations"]
+        scheduler["denied_operations"] = 0
+        with self.assertRaisesRegex(MODULE.ValidationError, "outcome counts"):
+            MODULE.validate(records)
+
+        records = valid_records(["--smoke"])
+        payload = next(record for record in records if record.get("operation") == "payload_unique_fill")
+        payload["successful_operations"] = 0
+        payload["denied_operations"] = payload["timed_operations"]
+        with self.assertRaisesRegex(MODULE.ValidationError, "outcome counts"):
+            MODULE.validate(records)
 
     def test_semantic_peak_matches_workload_role(self) -> None:
         records = valid_records(["--smoke"])
