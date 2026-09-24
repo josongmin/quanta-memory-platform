@@ -716,3 +716,13 @@ extraction manifest SHA-256 was
 This tag proves local repository qualification for its target only. Any
 subsequent commit requires resolving a newer exact-target tag before claiming
 current qualification.
+
+The following clean documentation candidate `2dc071a48445e21e51bfa42f8e1dd7b049d98322`
+(tree `8a911b2eefffee1d81f27239aacda4e7dfa29ec5`) also emitted 220 benchmark
+rows, but its verifier rejected `revocable_fill_and_drain` at 4.61x against
+the 4.0x limit. The raw artifact
+`target/scaling-results/qmp-scaling.8HdqxG/results.jsonl` has SHA-256
+`335bedd9c787407ae96b0f09e8cb354618677007d945dad79abcbf0964c6a920`; run-end
+metadata says `source_clean=true`. Other repository Cargo/rustc jobs were
+active, but their effect is unproven. The prior 267 tag does not qualify this
+newer candidate; an exact-head receipt is still required.

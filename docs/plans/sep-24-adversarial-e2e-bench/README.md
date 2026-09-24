@@ -1,6 +1,6 @@
 # QMP adversarial coverage: in-memory scope
 
-Status: **T1 and T4/T5 implemented; current-source final receipt pending**.
+Status: **T1 and T4/T5 implemented; current-source qualification is determined by the exact-target local receipt tag**.
 At the clean `db0b03c` audit base, the two T1 cross-store tests passed 2/2,
 the verifier's Python contracts passed 20/20, and the prior 48-row smoke
 and 220-row full artifacts passed the current verifier. Those raw runs were
@@ -9,7 +9,9 @@ A later local clean `db0b03c` smoke artifact at
 `target/scaling-results/qmp-scaling.KorxZf/results.jsonl` passed the revised
 verifier 48/48 (SHA-256 `502f6e70a2009f6e1c725a72a9167db8895a25117bb4facfc738fd7532b4f8a4`).
 It is ignored local evidence, not a durable full-run receipt. Later committed
-changes after `db0b03c` do not alter executable behavior. Current source-wide
+product behavior changes after `db0b03c` are outside this plan; the later
+`98dce1f`/`267cdc9` commits fixed the nested Cargo invocation in crash-test
+harnesses. Current source-wide
 status is defined by the exact-target annotated `qmp-local-qualified-*` tag;
 it must bind the fresh canonical rail, full benchmark, and extraction dry-run
 to one clean candidate. See the
@@ -34,6 +36,19 @@ or proof of a product regression. Preserve both artifacts; do not loosen the
 verifier threshold on this evidence. Rerun the full bench on the final clean
 candidate after competing builds stop. Until a fresh run passes alongside the
 canonical and extraction rails, no `qmp-local-qualified-*` tag is issued.
+
+The later tagged candidate `267cdc9` passed 220/220 samples (artifact SHA-256
+`ce5be25d5766961f522aa4ca4fa1b50f3a991bd32baaa84e6f6dff2dbe69b558`). After
+the closeout-status documentation commit, source `2dc071a48445e21e51bfa42f8e1dd7b049d98322`
+(tree `8a911b2eefffee1d81f27239aacda4e7dfa29ec5`) emitted all 220 rows but
+failed the same growth verifier at 4.61x. Its run-end record reports
+`source_clean=true`; raw artifact
+`target/scaling-results/qmp-scaling.8HdqxG/results.jsonl` has SHA-256
+`335bedd9c787407ae96b0f09e8cb354618677007d945dad79abcbf0964c6a920`.
+Other Cargo/rustc work remained active. As with the earlier misses, contention
+is a plausible confounder, not an established cause. The 267 receipt is valid
+for that commit only; this newer source needs its own successful exact-head
+benchmark and receipt tag.
 
 The active plan excludes Redb-backed durable spill, its codec, and disk
 fault/recovery qualification. The 2026-09-24 candidate based on
