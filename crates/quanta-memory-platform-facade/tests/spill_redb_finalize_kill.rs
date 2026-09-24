@@ -110,7 +110,11 @@ fn finalize_kill_child_binary() -> PathBuf {
                 .parent()
                 .expect("workspace root")
                 .to_path_buf();
-            let build = Command::new("cargo")
+            // Use the Cargo binary that launched this test process. Resolving
+            // the rustup shim by PATH can fail intermittently in large
+            // all-features test runs even though the invoking Cargo is live.
+            let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+            let build = Command::new(cargo)
                 .arg("build")
                 .arg("--locked")
                 .arg("--offline")
