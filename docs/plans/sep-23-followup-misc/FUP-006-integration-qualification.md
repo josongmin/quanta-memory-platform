@@ -17,6 +17,7 @@ API/feature/extraction/host 영향과 회귀를 검증하고, 남은 경계를 �
 | 후보 | 필수 선행 티켓 | 허용되는 완료 표현 | 금지되는 확대 주장 |
 | --- | --- | --- | --- |
 | `core/no-redb` | 007 | core 권한 수명과 **Redb 비활성 graph가 증명된** profile의 source-bound 검증 | 001/002가 OPEN인데 durable 또는 `full-backings` PASS라고 말하기 |
+| `Semantica host/full` | core/no-redb 선행조건 | 재생성 가능한 revocable cache는 회수·프로세스 종료·재시작 시 손실 허용. 실제 host의 `full` feature graph와 재계산 경로를 검증 | Redb 미사용 host에 `spill-redb` 출하 gate를 걸거나, 유일한 원본 데이터까지 손실 허용이라고 확대하기 |
 | `durable-enabled` | 001→002, 007 | Redb state/claim/migration과 필요한 실제 restart·host gate까지 통과한 exact source | drop/reopen 단위 테스트만으로 forced kill/power loss/host activation GREEN 주장 |
 | `full-followup` | 001→002, 007, 004/005→003 | 위 P1 계약과 P2 admission/oracle/provenance까지 동일 source에서 검증 | 개별 focused GREEN을 합쳐 전체 repo/host GREEN으로 승격하기 |
 
@@ -219,3 +220,13 @@ actual ENOSPC, filesystem quota, caller codec scratch, and exact-source host
 activation remain unqualified. At the file cap, Redb may require a cold reopen
 and additional cap headroom before a retained record can restore. The older
 exact-source host-pair receipt does not close this durable release gate.
+
+Scope decision (2026-09-24): the Semantica host's reconstructible revocable
+memory caches are **not durable authority**. Losing them on reclaim or process
+restart is allowed; they must be rebuilt from an independently authoritative
+source. Therefore the optional `spill-redb` capability is **not a prerequisite
+for the Semantica `full` host release**. The preceding Redb release gate applies
+only when shipping QMP's opt-in durable capability or a consumer that actually
+enables it. Do not add Redb host wiring for cache survival alone. Reopen this
+decision if a cache becomes the sole copy of data, rebuilding is unavailable,
+or the host enables the Redb feature.
