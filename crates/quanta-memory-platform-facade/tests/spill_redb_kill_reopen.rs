@@ -107,7 +107,10 @@ fn crash_child_binary() -> PathBuf {
                 .parent()
                 .expect("workspace root")
                 .to_path_buf();
-            let build = Command::new("cargo")
+            // Reuse the Cargo binary that launched this test process instead
+            // of resolving the rustup shim through PATH in nested test runs.
+            let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+            let build = Command::new(cargo)
                 .arg("build")
                 .arg("--locked")
                 .arg("--offline")
