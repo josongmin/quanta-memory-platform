@@ -63,6 +63,11 @@ inspection/build path, not an extra step every caller must write.
 Observation and reconfiguration return to the platform. The facade crate
 provides these canonical public paths; raw ledger, ticket, and sink
 constructors are not part of the consumer DSL.
+Create one platform per independently budgeted domain and share its cheap
+scopes across runtimes. Each platform has a separate ledger: creating two
+platforms with the same capacity does not impose a combined cap. QMP does not
+enforce a process-wide singleton or coordinate budgets across platforms; the
+host owns that composition.
 
 ### 2.1 Configure once
 
@@ -72,8 +77,6 @@ let owner = OwnerId::parse("retrieval")?;
 let group = ResourceGroupId::parse("interactive")?;
 
 let config = MemoryConfig::builder()
-    .deployment_profile(profiles::PRODUCTION_V1)
-    .workload_profile(profiles::INTERACTIVE_V1)
     .capacity(MemorySize::gib(8)?)
     .headroom(MemorySize::gib(1)?)
     .class(
@@ -151,6 +154,16 @@ policy stays on that store's builder. A caller never attaches a broker, raw
 ticket, or accounting sink. Store handles have stable feature-specific names,
 not a generic store trait without a generic caller.
 
+All budgeted store builders and the custom-consumer builder require an owner
+and a declared class. `build()` returns a typed `Build` error if either is
+missing, rather than silently choosing an owner or class; context is optional
+and defaults as below. A store name is diagnostic and optional, with a stable
+feature-specific default; a custom consumer supplies its name to `consumer()`.
+The scope itself supplies accounting authority, so callers cannot select an
+unset or unbudgeted accounting mode through these builders. This avoids a
+typestate parameter for every attribution field while keeping missing policy
+inputs fail-closed.
+
 Context kind is an attribution axis, not a quota or privilege. A scope defaults
 to the QMP-owned `ContextKindId::runtime()`; every store builder and custom
 consumer inherits it unless `.context(kind)` selects a declared host kind.
@@ -198,18 +211,27 @@ scratch/temporary work and reserve measured retained cost before publication.
 QMP cannot infer the physical allocation size of arbitrary `T`.
 
 The committed `MemoryReservation` is non-cloneable and broker-bound.
-On an ordinary `try_release` or `try_resize` error, the same reservation still
-owns the exact unchanged ticket and is usable for retry. An exceptional
-`RecoveryRequired` result is permitted only if the exact ticket remains in a
-non-usable, inspectable recovery state owned by the reservation; it must never
-mean an untracked or silently released charge. `try_recover()` restores the
-unchanged active ticket or leaves that recovery state unchanged on failure.
-Alternatively, the caller destroys the retained value and calls `try_release()`;
-a failed release still owns the exact ticket. `try_resize()` is unavailable in
-the recovery state. The broker must not automatically queue this live-value
-ticket for release. A call on an already released reservation is
-`InvalidState`, not `RecoveryRequired`; a missing old ticket is
-an invariant failure, not a normal capacity denial.
+`try_resize(&mut self, new_size: MemorySize)` changes only the charged byte
+count; class, owner, context, charge kind, and broker identity remain fixed.
+To grow a retained value, first resize its charge to a conservative upper
+bound, then mutate or allocate, then resize down to measured cost. If mutation
+fails or partially changes the value, keep the upper-bound charge until the
+value is measured or destroyed. To shrink, reduce or destroy the value first,
+then resize the charge down; a failed refund safely leaves an overcharge.
+If no safe retained-growth bound is available, do not mutate in place: build
+under a separately bounded scratch reservation and admit the measured retained
+charge before swapping or publishing the value. `try_resize` is not a
+scratch-to-retained transfer.
+
+For a live reservation, every `try_release` or `try_resize` failure leaves its
+exact ticket owned by that same reservation and available for retry. A call on
+an already released reservation returns `InvalidState`; it does not claim to
+preserve an absent ticket. The 0.2 `ManagedChargeRechargeRecovery::RecoveryRequired`
+branch is reached when `recharge` is called after release, while the live
+broker's recharge denial preserves the old charge. It does not justify a new
+public `RecoveryRequired` state or `try_recover()` method in this 0.3 DSL.
+If a future reachable failure cannot preserve a live ticket, design and prove
+its ownership recovery separately before exposing it.
 `Drop` attempts bounded deferred cleanup but cannot return an error.
 Components must destroy retained data before or with its charge. Built-in
 stores enforce that lifecycle internally.
@@ -295,6 +317,17 @@ They provide portable defaults, never hidden admission exceptions or a
 machine-independent capacity. They cannot assign budgets to host classes
 unknown to QMP. A changed default gets a new profile ID. Host-specific
 profiles are host code that builds ordinary `MemoryConfig` values.
+Profiles are optional; the canonical path above uses explicit policy and
+does not depend on a built-in preset. The profile *mechanism* is a 0.3 target,
+but no specific built-in ID (including `PRODUCTION_V1` or `INTERACTIVE_V1`)
+is frozen by this RFC without a normative per-leaf default table, supported
+feature set, and golden resolved-policy/fingerprint vectors for that ID and
+its supported pairings. Do not publish a named profile or make it a default
+merely because the corresponding 0.2 preset exists.
+The no-profile path must resolve without hidden class, owner, or capacity
+budgets: every omitted field is either optional with a documented neutral
+default or a typed configuration error. The explicit example in §2.1 must be
+one of the compiling release examples, not merely illustrative syntax.
 The two profile axes have no implicit ordering: if both supply the same
 canonical policy leaf, `resolve` rejects the collision even when values are
 equal, unless the explicit baseline sets that leaf and therefore resolves it.
@@ -367,8 +400,10 @@ The 0.3 change needs public reentrancy, panic, and slow-callback oracles that
 show the lock is released without losing the accounting postimage.
 
 `MemoryError` remains non-exhaustive, with typed capacity axis,
-requested/current/limit bytes, relevant IDs, revision, and explicit
-recovery-required state where applicable. Callers do not parse `Display`.
+requested/current/limit bytes, relevant IDs, and revision. A live reservation's
+ordinary resize/release error never signals lost authority; any recovery state
+for a different feature needs its own reachable failure and ownership contract.
+Callers do not parse `Display`.
 Failed observation does not fabricate zero usage. Events/metrics are bounded;
 owner, session, key, path, and arbitrary error text are not metric labels.
 Zero-byte tickets and deferred cleanup consume bounded management metadata.
@@ -414,31 +449,39 @@ revision, then remove deep-path aliases. The public `broker()` escape cannot
 be removed before every current host use has a safe replacement.
 
 Acceptance requires compiling examples for both platform construction paths,
-scope with/without diagnostic kind, custom retention, each enabled store,
-observation, and reconfiguration. Negative compile tests
-reject raw authority construction, unset builders, disabled features, and
-forged headroom. Behavioral tests prove pending rollback, measured-commit
+scope with/without diagnostic kind, custom retention and growth/shrink, each
+enabled store, observation, and reconfiguration. Negative compile tests reject
+raw authority construction, caller-selected unbudgeted accounting, disabled
+features, and forged headroom. Builder tests reject missing owner or class with
+typed `Build` errors for every enabled store and custom consumer; omitted
+context and store name use their documented defaults. Behavioral tests prove
+pending rollback, measured-commit
 surplus/over-bound/zero-byte behavior, authority conservation across
 release/resize/transfer failures, default rejection of undeclared owners
 (including zero-byte tickets), explicit global-only opt-in, unique owner→group
 attribution, profile collision rejection independent of insertion order,
-baseline resolution of profile collisions, context default/override and
+baseline resolution of profile collisions, any published profile's normative
+leaf table and golden vectors, context default/override and
 unknown-kind rejection, overlay `Clear`, live-remap rejection, stale/no-op
 reconfiguration, coherent
 semantic snapshots, advisory telemetry separation, and a conformance fake
 that is deliberately rejected.
 The two construction paths must produce identical effective fingerprints
 and failures; checked `MemorySize` constructors reject overflow; omitting
-diagnostic runtime kind must not change admission.
+diagnostic runtime kind must not change admission. Scopes derived from one
+platform share its ledger, while two separately built platforms do not share
+usage or pretend to enforce a combined capacity.
 
 Add fault-injection coverage for deferred cleanup failure: exact ticket
 authority remains retained, the backlog/error is publicly observable, bounded
 retry can finish, and shutdown cannot report a false zero. Prove that an
 independent host can use its own runtime-kind ID without mandatory
-host-specific enum variants. For resize/release faults, distinguish ordinary
-unchanged-and-retryable failure from `RecoveryRequired`: assert exact ticket
-ownership, prohibit mutation of a non-usable recovery state, and prohibit
-automatic release while its retained value remains live.
+host-specific enum variants. For resize/release faults, assert the same live
+ticket is unchanged and retryable; post-release calls return `InvalidState`.
+Exercise grow-before-mutate, partial mutation failure with conservative charge,
+shrink-before-refund, and failed refund retaining an overcharge. No public
+`RecoveryRequired` branch is accepted for live resize without a reachable
+fault-injection oracle and an exact authority-preserving recovery design.
 
 On a committed clean candidate, run `python3 tools/pm/pm.py sync`,
 `scripts/check-workspace.sh`, strict rustdoc, public API baseline, and the
