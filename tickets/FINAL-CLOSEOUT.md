@@ -4,12 +4,18 @@ Status: `HISTORICAL QUALIFIED SOURCES; CURRENT HEAD QUALIFICATION OPEN`.
 The bare `qmp-final-qualified` tag (`014eb65`) covers only its own source.
 The newest annotated `qmp-final-qualified-*` tag observed at the clean
 `db0b03c` audit base is `qmp-final-qualified-sep23-followup-v5`, targeting
-`f637d42`. A later clean QMP `7f1c2f8` / Semantica `a71e3e9` pair has
+`f637d42`. Latest committed base is `65f57d5f844973e43b6dd40b4f9879c043294000`
+(tree `16781f7c6a771f3e062fcfb9469c879359871cbd`), equal to `origin/main`.
+A later clean QMP `7f1c2f8` / Semantica `a71e3e9` pair has
 local canonical, extraction dry-run, benchmark, ENOSPC, and host QBC evidence
 in [FUP-006](../docs/plans/sep-23-followup-misc/RECEIPT.md), but no successor
 tag. The `db0b03c` audit base changes the scaling verifier after that pair;
-neither earlier receipt qualifies it or a later documentation-only successor. Deployment and activation
-remain separate and unclaimed.
+later commits through `65f57d5` add documentation and comments only, but none
+of the receipts qualifies that exact commit. No current-HEAD canonical rail,
+fresh full benchmark, extraction, or host-pair receipt is recorded. The shared
+worktree now has a separate uncommitted RFC edit, so it is not a clean
+qualification candidate. Deployment and activation remain separate and
+unclaimed.
 
 ## Scope and non-goals
 
@@ -22,7 +28,7 @@ extraction, host-pair qualification, and deployment activation.
 ## Completion gates
 
 The results in this table describe the historically tagged source, not the
-later `db0b03c` tree or a documentation-only successor.
+later `db0b03c` audit base or current `65f57d5` commit.
 
 | Gate | Required evidence | Result |
 | --- | --- | --- |

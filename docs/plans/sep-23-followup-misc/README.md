@@ -6,9 +6,12 @@ excluded from the current product plan. See the
 implementation and receipts remain historical evidence, not current release work.
 Current status is summarized in the [plan index](../README.md): FUP-003/004/005/007
 are implemented and owner-verified; FUP-006's last local/host pair receipt
-names QMP `7f1c2f8`. The clean `db0b03c` audit base has a later benchmark
-verifier change, so it needs a new qualification receipt. Historical text
-below describes earlier candidate states and does not override that boundary.
+names QMP `7f1c2f8`. The clean `db0b03c` audit base has the later benchmark
+verifier change and focused checks. Latest committed base is `65f57d5`; later
+changes are non-behavioral comments/guidance, but no exact-HEAD canonical or
+fresh full benchmark receipt exists. The current shared worktree has a separate
+uncommitted RFC edit. Historical text below describes earlier candidate states
+and does not override that boundary.
 작성일: `2026-09-23`
 계획 기준 HEAD: `028448946caa95676df034481a830c1d3e3b1f33`
 계획 기준 tree: `f983669731805a330200213bad7bf1bd5573f308`

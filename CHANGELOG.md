@@ -7,7 +7,9 @@
   Existing 48-row smoke and 220-row full artifacts passed the revised verifier;
   a clean `db0b03c` smoke subsequently passed 48/48. Fresh full benchmark
   generation and repository-wide qualification on the newer source remain
-  separate.
+  open. Latest committed base is `65f57d5`; its later Cargo/Rust edits are
+  comments only, and no exact-HEAD canonical or fresh full benchmark receipt
+  exists. The current shared worktree also has a separate uncommitted RFC edit.
 
 ## Unreleased - 2026-09-23
 

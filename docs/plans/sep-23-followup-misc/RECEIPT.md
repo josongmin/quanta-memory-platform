@@ -1,6 +1,6 @@
 # Sep-23 follow-up qualification receipt
 
-Status: `Historical v5 receipt and QMP 7f1c2f8 / Semantica a71e3e9 local pair below. Current QMP db0b03c has later verifier code; no current-source canonical/benchmark/host receipt. Hosted CI, deploy, activation and physical power loss NOT QUALIFIED.`
+Status: `Historical v5 receipt and QMP 7f1c2f8 / Semantica a71e3e9 local pair below. Verifier delta/focused checks are bound to db0b03c; latest committed base is 65f57d5 with no current-HEAD canonical or fresh full benchmark receipt. Current worktree is dirty from a separate RFC edit. Extraction/host-pair are separate; hosted CI, deploy, activation and physical power loss NOT QUALIFIED.`
 Scope: historical `full-followup` (`FUP-001` through `FUP-007`); 2026-09-24 addendum qualifies the in-memory consumer pair, with optional Redb evidence recorded separately
 Date: `2026-09-24 Asia/Seoul` (historical entries retain their original dates)
 
@@ -645,20 +645,23 @@ deployment/activation, physical power loss and current-source Linux L2 syscall
 fault injection were not run. No successor tag for this pair was created;
 the older v5 tag targets its own Sep-23 source.
 
-## Current HEAD delta after the committed pair
+## Current committed base after the historical pair
 
-At the clean `db0b03cd3e58a53dd5439a6578bb3b3d86eac593` audit base
-(tree `388598df45c1f93a9ce4c8acc7b047fe43a30091`, equal to
-`origin/main`), `130d1ef` changed documentation and `db0b03c` added exact
-successful/denied outcome-count validation to
-`scripts/verify-scaling-results.py` with corresponding negative fixtures.
-Relative to `7f1c2f8`, no crate source or Cargo manifest changed.
+The verifier change is at clean audit base
+`db0b03cd3e58a53dd5439a6578bb3b3d86eac593` (tree
+`388598df45c1f93a9ce4c8acc7b047fe43a30091`). There the verifier Python
+contracts passed 20/20; `cross_store_hellgate` passed 2/2 with
+`core-live-accounting,retained_map,revocable_store`; and replay through the
+revised verifier accepted the prior 48 smoke and 220 full samples. A clean
+`db0b03c` smoke artifact separately passed 48/48 with SHA-256
+`502f6e70a2009f6e1c725a72a9167db8895a25117bb4facfc738fd7532b4f8a4`.
 
-Read-only/focused audit results on that base: verifier Python contracts
-20/20; `cross_store_hellgate` 2/2 with
-`core-live-accounting,retained_map,revocable_store`; replay of the previous
-raw artifacts through the current verifier accepted 48 smoke and 220 full
-samples, with their recorded SHA-256 values unchanged. No current-base
-`scripts/check-workspace.sh`, new benchmark generation, extraction, or host
-QBC run was performed in this audit. The earlier pair remains evidence for
-its own source only; this section is not a new qualification receipt.
+Latest committed base is `65f57d5f844973e43b6dd40b4f9879c043294000`
+(tree `16781f7c6a771f3e062fcfb9469c879359871cbd`), equal to `origin/main`.
+Changes after `db0b03c` include plan/receipt/RFC and product-scope wording;
+the Cargo and Rust changes are comments only and do not alter executable
+behavior. The focused results above remain evidence for the named `db0b03c`
+snapshot, not a source-bound receipt for `65f57d5`. No `scripts/check-workspace.sh`,
+new full benchmark generation, extraction, or host QBC run is recorded on
+`65f57d5`. The shared worktree currently contains a separate uncommitted RFC
+edit. This addendum is status reconciliation, not a qualification receipt.

@@ -4,10 +4,9 @@
 - Target: `0.3` (2026-09-24 design decision)
 - Scope: public Rust DSL for in-memory budgeting, accounting, reclaim, stores, and in-process transfer
 
-API freeze remains open on runtime-kind portability, public deferred-cleanup
-observation/retry, and the store-callback lock migration and its tests. The
-acceptance conditions below name these gaps; the accepted design direction
-does not claim they are implemented.
+API freeze still depends on independent-host compile proof, public
+deferred-cleanup implementation, and the store-callback lock migration/tests.
+The interface decisions below do not claim those changes are implemented.
 
 The snippets specify the intended 0.3 interface, not the current 0.2 API.
 Before release they must become complete, compiling public examples.
@@ -58,11 +57,12 @@ this 0.3 SDK and host-adoption gate.
 
 ## 2. Consumer DSL
 
-The normal path is `MemoryConfig → ResolvedMemoryConfig → MemoryPlatform →
-MemoryScope → store or MemoryConsumer → reservation`. Observation and
-reconfiguration return to the platform. The facade crate provides these
-canonical public paths; raw ledger, ticket, and sink constructors are not
-part of the consumer DSL.
+The common path is `MemoryConfig → MemoryPlatform → MemoryScope → store or
+MemoryConsumer → reservation`. `ResolvedMemoryConfig` is the explicit
+inspection/build path, not an extra step every caller must write.
+Observation and reconfiguration return to the platform. The facade crate
+provides these canonical public paths; raw ledger, ticket, and sink
+constructors are not part of the consumer DSL.
 
 ### 2.1 Configure once
 
@@ -74,45 +74,58 @@ let group = ResourceGroupId::parse("interactive")?;
 let config = MemoryConfig::builder()
     .deployment_profile(profiles::PRODUCTION_V1)
     .workload_profile(profiles::INTERACTIVE_V1)
-    .capacity_bytes(8 * GiB)
-    .headroom_bytes(1 * GiB)
+    .capacity(MemorySize::gib(8)?)
+    .headroom(MemorySize::gib(1)?)
     .class(
         class.clone(),
         ClassBudget::new()
-            .reserved_bytes(128 * MiB)
-            .soft_bytes(1 * GiB)
-            .hard_bytes(2 * GiB),
+            .reserved(MemorySize::mib(128)?)
+            .soft(MemorySize::gib(1)?)
+            .hard(MemorySize::gib(2)?),
     )
     .resource_group(
         group.clone(),
-        GroupBudget::new().soft_bytes(2 * GiB).hard_bytes(4 * GiB),
+        GroupBudget::new()
+            .soft(MemorySize::gib(2)?)
+            .hard(MemorySize::gib(4)?),
     )
-    .owner_group(owner.clone(), group)
+    .owner(owner.clone(), OwnerPolicy::new().group(group))
     .build()?;
 
-let resolved = config.resolve()?; // validates; creates no accounting authority
-let platform = MemoryPlatform::builder(resolved)
-    .reclaimer(reclaimer)
+let platform = MemoryPlatform::builder(config).build()?;
+```
+
+`MemorySize` is a public byte newtype with a private `u64` field:
+`bytes(u64)` is explicit, `mib`/`gib` and `try_from_usize` check conversion
+and multiplication, and `as_bytes` exposes the canonical value. It does not
+implement unchecked arithmetic operators. Public
+budgets, reservations, and byte-valued error getters use it; the ledger may
+continue to use `u64` internally. No implicit unit conversion or blanket
+integer extension trait is required. Every platform, including development,
+requires explicit host-supplied capacity.
+QMP does not discover RAM, cgroups, files, or environment variables.
+
+`MemoryConfigBuilder::build` checks local shape. The common
+`MemoryPlatform::builder(config).build()` path calls the same `resolve`
+operation once, expands profile defaults, validates the complete effective
+policy, and installs only the validated artifact. For offline inspection or
+recorded policy review, the explicit alternative to that construction is:
+
+```rust
+let resolved = config.resolve()?; // no broker or accounting authority
+let platform = MemoryPlatform::builder_resolved(resolved)
+    .reclaimer(reclaimer) // optional host callback
     .build()?;
 ```
 
-`MiB`, `GiB`, and the supplied reclaimer are illustrative inputs. The final
-public example must define them and use checked byte arithmetic. Every
-platform, including development, requires explicit host-supplied capacity.
-QMP does not discover RAM, cgroups, files, or environment variables.
-
-`MemoryConfigBuilder::build` checks local shape; `resolve` expands profile
-defaults and validates the complete effective policy. Platform construction
-accepts only resolved policy. No invalid, unbudgeted, or feature-disabled
-fallback is permitted.
+These are two entry points into one resolver and one platform builder
+contract, not two policy engines. No invalid, unbudgeted, or
+feature-disabled fallback is permitted.
 
 ### 2.2 Bind a runtime and use a store
 
 ```rust
-let scope = platform.scope(
-    RuntimeId::parse("worker-1")?,
-    RuntimeKind::Retrieval,
-)?;
+let scope = platform.scope(RuntimeId::parse("worker-1")?)?;
 
 let payloads = scope.payload_store::<ArtifactId, Vec<u8>>()
     .name("artifacts")?
@@ -121,11 +134,13 @@ let payloads = scope.payload_store::<ArtifactId, Vec<u8>>()
     .build()?;
 ```
 
-`RuntimeKind::Retrieval` is a provisional example, not a decision to require a
-host-specific variant in portable QMP. Before the 0.3 API is frozen, specify
-whether runtime kind is a validated host-defined ID or a smaller portable
-taxonomy, and prove that an independent host can create a scope without
-adopting another host's named kinds.
+`scope(runtime_id)` carries no caller-specified diagnostic kind. If the host
+needs that classification, it can call
+`scope_with_kind(runtime_id, RuntimeKindId::parse("app.retrieval")?)`.
+`RuntimeKindId` is bounded and has no admission privilege. The current
+`RuntimeKind` enum is stored/reported, not used to choose admission
+behavior; an optional validated ID avoids imposing one host's taxonomy
+on every integration.
 
 `MemoryScope` carries runtime attribution; it is not a second ledger or a
 control handle. Creating it reserves no bytes. The platform supplies
@@ -133,6 +148,7 @@ budgeted accounting to each feature-gated store builder. Store-specific
 policy stays on that store's builder. A caller never attaches a broker, raw
 ticket, or accounting sink. Store handles have stable feature-specific names,
 not a generic store trait without a generic caller.
+
 The in-memory slices are payload, retained map, revocable store, transcript,
 and prepared publication.
 
@@ -145,10 +161,11 @@ let consumer = scope.consumer("vector-index")?
     .context(MemoryContextKind::Request)
     .build()?;
 
-let pending = consumer.reserve_up_to(max_bytes, ChargeKind::RetainedPayload)?;
+let max_size = MemorySize::mib(16)?;
+let pending = consumer.reserve_up_to(max_size, ChargeKind::RetainedPayload)?;
 let value = construct_value()?;
-let actual_bytes = measure_retained_cost(&value)?;
-let reservation = pending.commit_measured(actual_bytes)?;
+let actual_size = MemorySize::try_from_usize(measure_retained_cost(&value)?)?;
+let reservation = pending.commit_measured(actual_size)?;
 // The component owns value and reservation together until both are released.
 ```
 
@@ -160,14 +177,14 @@ a different group; `owner → group` in validated policy is the only group
 mapping.
 
 `reserve_up_to` admits a conservative upper bound **before** constructing
-retained data. `commit_measured(actual_bytes)` is a single fail-closed
+retained data. `commit_measured(actual_size)` is a single fail-closed
 shrink-and-commit transition. It rejects a cost above the bound and rolls
 back the pending authority; if cleanup itself fails, the exact ticket
 remains owned for bounded deferred retry. The caller discards the
-unpublishable value.
-Dropping an uncommitted reservation also rolls it back. A zero-byte commit
-still owns one live ticket until release. If a useful upper bound cannot be
-known, the component must budget construction as scratch/temporary work and
+unpublishable value. Dropping an uncommitted reservation also rolls it back.
+A zero-byte commit still owns one live ticket until release. If a useful
+upper bound cannot be known, the component must budget construction as
+scratch/temporary work and
 reserve measured retained cost before publication. QMP cannot infer the
 physical allocation size of arbitrary `T`.
 
@@ -177,27 +194,44 @@ resize retains the current recharge API's explicit recovery-required outcome.
 `Drop` attempts bounded deferred cleanup but cannot return an error.
 Components must destroy retained data before or with its charge. Built-in
 stores enforce that lifecycle internally.
+Do not add a generic `Retained<T>` wrapper to 0.3: without prohibiting
+mutation and value escape it cannot prove that `T` still matches its charge.
+A restricted wrapper may be added for a demonstrated caller.
 
-Before API freeze, specify how a host observes and retries a failed deferred
-rollback/release, and how shutdown reports remaining ticket authority. The
-current engine's deferred queue is not by itself a public 0.3 status API.
+The platform exposes deferred-cleanup state through `MemorySnapshot`:
+active-ticket count, pending rollback/release counts, and bounded failure
+status. `platform.retry_deferred_cleanup()` attempts at most one published
+batch and returns a receipt with attempted/resolved/remaining counts; any
+failure retains exact ticket authority and is observable on the next
+snapshot. Zero semantic bytes do **not** mean quiescence: shutdown requires
+zero live tickets and zero deferred authorities. The current engine queues
+and retries internally but does not yet expose this public 0.3 contract.
 
 ### 2.4 Observe and change policy
 
 ```rust
 let before = platform.snapshot()?;
 let patch = ConfigPatch::builder()
-    .set_class_hard_limit(class, 3 * GiB)
+    .class(
+        class,
+        ClassBudgetPatch::new()
+            .hard(Override::Set(MemorySize::gib(3)?)),
+    )
     .build()?;
 let receipt = platform.reconfigure(
     ReconfigureRequest::new(before.policy_revision(), patch),
 )?;
 ```
 
-`ConfigPatch` is the typed runtime-knob DSL. `Set` replaces a leaf in the
-runtime overlay; `Clear` removes that override and reveals the validated
-baseline. Map `Remove` hides/removes an effective item only if no live
-authority depends on it, including zero-byte tickets. Runtime writes always
+`ConfigPatch` is the typed runtime-knob DSL. Patches are grouped by entity
+(`ClassBudgetPatch`, `OwnerPolicyPatch`, `GroupBudgetPatch`) so adding a
+field does not add another top-level setter. A missing field means unchanged;
+`Override<T>::Set(T)` replaces a leaf in the runtime overlay and `Clear`
+removes that override, revealing the validated baseline. Map `Remove` is a
+separate runtime tombstone that hides an effective item only if no live
+authority depends on it, including zero-byte tickets. Clearing the tombstone
+reveals the baseline item; field patches against a tombstoned item are
+rejected. Runtime writes always
 carry an expected revision. Stale revision, below-usage cap, live owner/group
 remap, missing feature, or invalid postimage rejects without changing policy,
 revision, fingerprint, or ledger.
@@ -221,6 +255,11 @@ resource-group budgets, and owner/group bindings. Store options remain with
 their store. Validation checks `reserved <= soft <= hard`, global headroom
 and floor sums, checked arithmetic, referential integrity, feature
 availability, and bounded class/owner/group/mapping counts.
+Top-level registration methods add classes, owners, and resource groups;
+scalar budget fields live in their typed policies. `OwnerPolicy` owns an
+optional group binding and quota, avoiding separate `owner_group`,
+`owner_quota`, and future owner-setting methods. An owner with no policy
+entry remains valid under global/class limits but has no owner/group cap.
 
 Deployment and workload profiles are separate, explicitly versioned IDs.
 They provide portable defaults, never hidden admission exceptions or a
@@ -237,7 +276,11 @@ contract. `Clear` acts only on the runtime overlay; it cannot erase a
 required baseline field. Resolution and every runtime update validate the
 complete effective postimage. `ResolvedMemoryConfig` exposes effective
 policy, selected profile IDs, and fingerprint; the host owns input-source
-provenance.
+provenance. It is an immutable, validated **baseline artifact**, not a live
+platform or a mutable runtime policy. Its read-only getters expose the
+effective baseline policy, fingerprint, and optional deployment/workload
+profile IDs. The platform's active policy is that baseline plus its current
+runtime overlay; a snapshot, not the old resolved value, reports active state.
 
 An optional read-only `ConfigSchema` may describe field type, units,
 mutability (`BuildOnly`/`Runtime`), and safety level for host tooling. It
@@ -248,11 +291,11 @@ file watching, and source-precedence logic are not part of 0.3.
 
 ### IDs and privileged roles
 
-`MemoryClassId`, `OwnerId`, `ResourceGroupId`, `RuntimeId`, and
-`ConsumerName` have private fields, bounded UTF-8 grammar, and fallible
-`parse`. Class IDs are extensible host taxonomy, but a class must be
-declared in validated policy before admission. QMP-owned IDs are limited
-to semantics QMP actually implements.
+`MemoryClassId`, `OwnerId`, `ResourceGroupId`, `RuntimeId`,
+`RuntimeKindId`, and `ConsumerName` have private fields, bounded UTF-8
+grammar, and fallible `parse`. Class IDs are extensible host taxonomy, but
+a class must be declared in validated policy before admission. QMP-owned IDs are limited
+to semantics QMP actually implements; the `qmp.` namespace is reserved.
 
 The existing `MemoryClass::Headroom` is a privileged admission role, not
 an ordinary class string. Migration must keep that role non-forgeable and
@@ -324,8 +367,9 @@ observation/reconfiguration behind the facade; (6) migrate an exact host
 revision, then remove deep-path aliases. The public `broker()` escape cannot
 be removed before every current host use has a safe replacement.
 
-Acceptance requires compiling examples for config, custom retention, each
-enabled store, observation, and reconfiguration. Negative compile tests
+Acceptance requires compiling examples for both platform construction paths,
+scope with/without diagnostic kind, custom retention, each enabled store,
+observation, and reconfiguration. Negative compile tests
 reject raw authority construction, unset builders, disabled features, and
 forged headroom. Behavioral tests prove pending rollback, measured-commit
 surplus/over-bound/zero-byte behavior, authority conservation across
@@ -333,11 +377,15 @@ release/resize/transfer failures, unique owner→group attribution, overlay
 `Clear`, live-remap rejection, stale/no-op reconfiguration, coherent
 semantic snapshots, advisory telemetry separation, and a conformance fake
 that is deliberately rejected.
+The two construction paths must produce identical effective fingerprints
+and failures; checked `MemorySize` constructors reject overflow; omitting
+diagnostic runtime kind must not change admission.
 
 Add fault-injection coverage for deferred cleanup failure: exact ticket
 authority remains retained, the backlog/error is publicly observable, bounded
 retry can finish, and shutdown cannot report a false zero. Prove that an
-independent host can use runtime scope without a mandatory host-specific kind.
+independent host can use its own runtime-kind ID without mandatory
+host-specific enum variants.
 
 On a committed clean candidate, run `python3 tools/pm/pm.py sync`,
 `scripts/check-workspace.sh`, strict rustdoc, public API baseline, and the
@@ -365,7 +413,21 @@ of those gates.
   global behavior-version axis.
 - [Cargo feature guidance](https://doc.rust-lang.org/cargo/reference/features.html)
   supports additive feature slices; QMP avoids a mandatory backing bundle.
+- [Rust API Guidelines](https://rust-lang.github.io/api-guidelines/type-safety.html)
+  supports unit-safe newtypes and builders for genuinely compound values;
+  QMP does not introduce a builder for a reservation with only kind and size.
 
 Deferred until a named consumer justifies them: generic `Knob<T>` registry,
 plugin/service container, runtime/control handle split, generic durability
 tier, async runtime, process-wide shutdown registry, FFI, and package rename.
+
+Do not add a reservation builder merely to move `ChargeKind` out of
+`reserve_up_to`; add one only when an independent reservation option has a
+real caller. Do not add `scratch.transition(retained)` in 0.3: the current
+`ManagedCharge::recharge` can atomically replace a **committed** charge, but
+the scratch port owns a separate **pending** authority. A public transition
+needs a concrete caller, an ownership bridge, and postimage/failure tests.
+If introduced later, releasing scratch before reserving retained bytes is
+forbidden while the value remains live. Reclaimability is likewise an
+orthogonal store/reclaimer capability, not a privilege inferred from a class
+name or an arbitrary per-reservation flag.

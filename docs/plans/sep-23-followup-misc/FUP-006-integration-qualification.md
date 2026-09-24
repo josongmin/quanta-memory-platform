@@ -1,6 +1,6 @@
 # FUP-006 — 통합과 current-source qualification
 
-Status: `PRIOR PAIR VERIFIED at QMP 7f1c2f8 / Semantica a71e3e9; current QMP db0b03c verifier delta has no new same-source canonical/benchmark/host receipt; hosted CI/deploy/activation NOT RUN`
+Status: `PRIOR PAIR VERIFIED at QMP 7f1c2f8 / Semantica a71e3e9; current committed base 65f57d5 has no same-source canonical/fresh full benchmark receipt; extraction and host-pair are separate gates; hosted CI/deploy/activation NOT RUN`
 Priority: `SCOPE-SPECIFIC LOCAL GATE` (현재 in-memory scope; durable branch는 historical)
 Owner: `Lane I — serial integrator`
 Depends on: 현재 core/no-redb 후보는 `FUP-007`; in-memory full-followup은 추가로 `FUP-003`, `FUP-004`, `FUP-005`. 아래 durable-enabled 분기는 과거/별도 제안에만 적용.
@@ -253,12 +253,15 @@ This is local qualification, not hosted CI, deploy or activation. README-only
 edits present when this pair was frozen were not silently included in its
 proof.
 
-Current-source correction (2026-09-24): the later `db0b03c` commit also
-changes `scripts/verify-scaling-results.py` and its Python contracts. At that
-clean audit base the Python suite passed 20/20, the two cross-store E2E cases
-passed 2/2, and the previous 48/220-row artifacts passed the current verifier.
-These checks establish the changed verifier's local behavior; the prior raw
-benchmark runs and host-pair receipt remain bound to `7f1c2f8`. Re-run the
-canonical workspace rail and fresh benchmark on one clean candidate before
-recording a current-source FUP-006 completion receipt. A new host run is needed
-only for an exact current QMP/host pair claim.
+Current-source correction (2026-09-24): the verifier change is at `db0b03c`.
+On that clean audit base the Python suite passed 20/20, the two cross-store
+E2E cases passed 2/2, and previous 48/220-row artifacts passed the revised
+verifier. The later committed `65f57d5` changes README/RFC/qualification
+guidance and adds only comments to Cargo/Rust files; it does not change
+executable behavior. Those `db0b03c` focused checks are not a current-HEAD
+canonical run or a newly generated full benchmark. The worktree also has an
+uncommitted RFC edit, so qualification must wait for that edit's disposition
+and a clean frozen candidate. Run the canonical workspace rail and fresh full
+benchmark on that candidate before recording FUP-006 local completion.
+Extraction belongs to the chosen source when claimed; host QBC is needed only
+for an exact current QMP/host pair claim.

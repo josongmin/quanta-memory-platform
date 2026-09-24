@@ -8,8 +8,11 @@ Later owner mutant proofs appear in
 [TEST-OPTIMIZATION-RECEIPTS.md](TEST-OPTIMIZATION-RECEIPTS.md)
 §§11–15 and the TO-01..09 ticket handoffs. The clean v5 source included the
 implemented queue and passed its recorded repository, extraction, and host
-rails. The later `db0b03c` verifier delta still needs current-source
-qualification; see the [plan index](../docs/plans/README.md).
+rails. The verifier delta and focused evidence are at `db0b03c`; latest
+committed base is `65f57d5`, with non-behavioral docs/comments after that audit.
+No exact-HEAD canonical or fresh full benchmark receipt exists, and the shared
+worktree has a separate uncommitted RFC edit. See the
+[plan index](../docs/plans/README.md).
 
 Current resolution: TO-01..09 implementation and ticket-local evidence are
 recorded in their owner handoffs and [receipts §§11–15](TEST-OPTIMIZATION-RECEIPTS.md).

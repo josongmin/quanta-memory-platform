@@ -6,8 +6,10 @@ Status: `IMPLEMENTED AND HISTORICALLY QUALIFIED by qmp-final-qualified-sep23-fol
 9개 항목의 실행 SSOT다. 구현과 owner negative proofs는
 [TEST-OPTIMIZATION-RECEIPTS.md](TEST-OPTIMIZATION-RECEIPTS.md)에 기록됐고,
 `qmp-final-qualified-sep23-followup-v5`가 그 구현을 포함한 과거 소스를
-검증했다. `db0b03c` 감사 기준 tree에는 후속 verifier 변경이 있으므로 새
-qualification이 필요하다. 기존
+검증했다. 후속 verifier 변경과 focused checks는 `db0b03c`에 묶여 있다.
+최신 committed base `65f57d5`까지의 이후 변경은 실행 동작을 바꾸지 않지만,
+그 SHA의 canonical/full-benchmark qualification receipt는 없다. 현재 shared
+worktree도 RFC 미커밋 편집으로 dirty 상태다. 기존
 `tickets/FINAL-CLOSEOUT.md`의
 `qmp-final-qualified` historical receipt를 수정하거나 소급 무효화하지 않는다.
 아래 source freeze와 writer lease는 당시 실행 기록이며 현재 작업 지시가 아니다.

@@ -422,6 +422,8 @@ and BTreeMap restoration were committed, and the annotated
 `qmp-final-qualified-sep23-followup-v5` tag qualified source `f637d42`.
 Therefore §§1–10 `UNRESOLVED` rows and §16's `DONE` prohibition must not be
 read as the current ticket queue. The clean `db0b03c` audit base is newer
-than the tag and includes a benchmark verifier change. No same-source
-canonical, fresh benchmark, or host-pair qualification was run on that base
-in the documentation audit.
+than the tag and includes a benchmark verifier change. Later committed base
+`65f57d5` adds docs and comments but no executable behavior change. No
+same-source canonical or fresh full benchmark was run on `65f57d5`; the current
+shared worktree also has an uncommitted RFC edit. Historical owner proofs and
+the v5 tag remain historical evidence, not a receipt for the latest commit.
