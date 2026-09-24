@@ -2,11 +2,15 @@
 
 Status: **T1 and T4/T5 implemented; current-source final receipt pending**.
 At the clean `db0b03c` audit base, the two T1 cross-store tests passed 2/2,
-the verifier's Python contracts passed 20/20, and the existing 48-row smoke
+the verifier's Python contracts passed 20/20, and the prior 48-row smoke
 and 220-row full artifacts passed the current verifier. Those raw runs were
 produced at `7f1c2f8`; `db0b03c` changes verifier outcome-count validation.
-The current candidate still needs a canonical workspace run and fresh clean
-benchmark runs before a new source-bound qualification claim. See the
+A later local clean `db0b03c` smoke artifact at
+`target/scaling-results/qmp-scaling.KorxZf/results.jsonl` passed the revised
+verifier 48/48 (SHA-256 `502f6e70a2009f6e1c725a72a9167db8895a25117bb4facfc738fd7532b4f8a4`).
+It is ignored local evidence, not a durable full-run receipt. A same-source
+canonical record and fresh clean full benchmark remain necessary before a
+new source-bound qualification claim. See the
 [plan status index](../README.md) and [FUP-006 receipt](../sep-23-followup-misc/RECEIPT.md).
 
 The active plan excludes Redb-backed durable spill, its codec, and disk
