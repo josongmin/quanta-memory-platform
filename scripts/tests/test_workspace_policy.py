@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import subprocess
 import tempfile
 import unittest
@@ -13,6 +14,17 @@ SPEC = importlib.util.spec_from_file_location("verify_workspace_policy", CHECKER
 assert SPEC and SPEC.loader
 checker = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(checker)
+
+
+def policy_errors_for(root: Path) -> list[str]:
+    result = subprocess.run(
+        ["cargo", "metadata", "--offline", "--no-deps", "--format-version", "1"],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return checker.lint_policy_errors(root, json.loads(result.stdout))
 
 
 class WorkspaceLintPolicyTest(unittest.TestCase):
@@ -33,7 +45,7 @@ class WorkspaceLintPolicyTest(unittest.TestCase):
                 "#![forbid(unsafe_code)]\n", encoding="utf-8"
             )
             self.assertEqual(
-                checker.lint_policy_errors(root),
+                policy_errors_for(root),
                 ["workspace member does not inherit lints: member"],
             )
 
@@ -53,7 +65,7 @@ class WorkspaceLintPolicyTest(unittest.TestCase):
             )
             (root / "member/src/lib.rs").write_text("pub fn safe() {}\n", encoding="utf-8")
             self.assertEqual(
-                checker.lint_policy_errors(root),
+                policy_errors_for(root),
                 ["library root does not forbid unsafe code: member"],
             )
 
@@ -106,9 +118,38 @@ class WorkspaceLintPolicyTest(unittest.TestCase):
             (root / "member/tests/rogue.rs").write_text(
                 "#![allow(unsafe_code)]\n", encoding="utf-8"
             )
-            self.assertEqual(
-                checker.lint_policy_errors(root),
-                ["unauthorized unsafe-code exception: member/tests/rogue.rs"],
+            (root / "member/tests/conditional.rs").write_text(
+                "#![cfg_attr(all(), allow(unused, unsafe_code))]\n",
+                encoding="utf-8",
+            )
+            self.assertCountEqual(
+                policy_errors_for(root),
+                [
+                    "unauthorized unsafe-code exception: member/tests/rogue.rs",
+                    "unauthorized unsafe-code exception: member/tests/conditional.rs",
+                ],
+            )
+
+    def test_single_quoted_cargo_members_are_checked(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="qmp-single-quote-members-") as directory:
+            root = Path(directory)
+            (root / "member/src").mkdir(parents=True)
+            (root / "Cargo.toml").write_text(
+                "[workspace]\nmembers = ['member']\n\n"
+                '[workspace.lints.rust]\nunsafe_code = "deny"\n',
+                encoding="utf-8",
+            )
+            (root / "member/Cargo.toml").write_text(
+                '[package]\nname = "member"\nversion = "0.1.0"\n',
+                encoding="utf-8",
+            )
+            (root / "member/src/lib.rs").write_text("pub fn safe() {}\n", encoding="utf-8")
+            self.assertCountEqual(
+                policy_errors_for(root),
+                [
+                    "workspace member does not inherit lints: member",
+                    "library root does not forbid unsafe code: member",
+                ],
             )
 
 

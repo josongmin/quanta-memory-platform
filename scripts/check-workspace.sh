@@ -21,6 +21,7 @@ in_memory_graph_features="${in_memory_features},quanta-memory-platform-facade/un
 workspace_test_output=""
 regression_output=""
 regression_pid=""
+shell_script_list=""
 cleanup() {
   if [[ -n "${regression_pid}" ]]; then
     wait "${regression_pid}" >/dev/null 2>&1 || true
@@ -31,6 +32,9 @@ cleanup() {
   if [[ -n "${regression_output}" && -f "${regression_output}" ]]; then
     rm -f -- "${regression_output}"
   fi
+  if [[ -n "${shell_script_list}" && -f "${shell_script_list}" ]]; then
+    rm -f -- "${shell_script_list}"
+  fi
 }
 trap cleanup EXIT
 
@@ -39,9 +43,11 @@ cargo fmt --all --check
 
 echo "[check-workspace] shellcheck"
 shell_scripts=()
+shell_script_list="$(mktemp /tmp/qmp-shell-scripts.XXXXXX)"
+find scripts -type f -name '*.sh' -print0 >"${shell_script_list}"
 while IFS= read -r -d '' script; do
   shell_scripts+=("${script}")
-done < <(find scripts -type f -name '*.sh' -print0)
+done <"${shell_script_list}"
 if ! command -v shellcheck >/dev/null 2>&1; then
   echo "check-workspace: shellcheck unavailable" >&2
   exit 1
@@ -68,7 +74,7 @@ else
 fi
 
 echo "[check-workspace] workspace policy"
-python3 scripts/verify-workspace-policy.py
+python3 scripts/verify-workspace-policy.py --metadata-stdin <<<"${workspace_metadata}"
 
 if [[ "${mode}" == "full" ]]; then
   # Crash tests build child examples with --offline to prove binary freshness.

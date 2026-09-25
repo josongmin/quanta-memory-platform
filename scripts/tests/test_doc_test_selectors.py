@@ -19,20 +19,26 @@ class DocTestSelectorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(dir=MODULE.ROOT) as directory:
             document = Path(directory) / "doc.md"
             document.write_text(
-                "`exact_test_selector` `two_parts` `TypeName` `feature-name`\n",
+                "`exact_test_selector` `fixtures::tests::qualified_test_selector` "
+                "`Widget::non_test_method` `two_parts` `TypeName` `feature-name`\n",
                 encoding="utf-8",
             )
             self.assertEqual(
                 MODULE.documented_candidates((document,)),
-                {"exact_test_selector": {document.relative_to(MODULE.ROOT).as_posix()}},
+                {
+                    "exact_test_selector": {document.relative_to(MODULE.ROOT).as_posix()},
+                    "fixtures::tests::qualified_test_selector": {
+                        document.relative_to(MODULE.ROOT).as_posix()
+                    },
+                },
             )
 
-    def test_cargo_list_parser_returns_leaf_selector(self) -> None:
+    def test_cargo_list_parser_preserves_full_selector(self) -> None:
         output = (
             "module::exact_test_selector: test\n"
             "module::ignored_benchmark: benchmark\n"
         )
-        self.assertEqual(MODULE.parse_listed_tests(output), {"exact_test_selector"})
+        self.assertEqual(MODULE.parse_listed_tests(output), {"module::exact_test_selector"})
 
     def test_cargo_execution_parser_does_not_count_ignored_test_names(self) -> None:
         output = (
@@ -45,8 +51,8 @@ class DocTestSelectorTests(unittest.TestCase):
         self.assertEqual(
             MODULE.parse_executed_tests(output),
             {
-                "exact_test_selector",
-                "failed_test_selector",
+                "module::exact_test_selector",
+                "module::failed_test_selector",
             },
         )
 
@@ -66,7 +72,7 @@ class DocTestSelectorTests(unittest.TestCase):
         )
         self.assertEqual(
             MODULE.parse_executed_tests(output),
-            {"first_selector", "second_selector"},
+            {"module::first_selector", "module::second_selector"},
         )
 
     def test_cargo_execution_parser_ignores_unstructured_prose(self) -> None:
@@ -74,7 +80,7 @@ class DocTestSelectorTests(unittest.TestCase):
             "warning: someone wrote test fake_selector ... ok in a log\n"
             "test module::real_selector ... ok\n"
         )
-        self.assertEqual(MODULE.parse_executed_tests(output), {"real_selector"})
+        self.assertEqual(MODULE.parse_executed_tests(output), {"module::real_selector"})
 
     def test_logged_marker_without_cargo_registration_is_not_a_selector(self) -> None:
         with tempfile.TemporaryDirectory(dir=MODULE.ROOT) as directory:
@@ -85,7 +91,7 @@ class DocTestSelectorTests(unittest.TestCase):
                     MODULE, "documented_candidates",
                     return_value={"fake_test_selector": {"doc.md"}},
                 ),
-                patch.object(MODULE, "listed_tests", return_value={"real_test_selector"}),
+                patch.object(MODULE, "listed_tests", return_value={"module::real_test_selector"}),
                 patch("sys.argv", ["verify-doc-test-selectors.py", "--test-output", str(output)]),
                 contextlib.redirect_stderr(io.StringIO()),
             ):
@@ -100,7 +106,34 @@ class DocTestSelectorTests(unittest.TestCase):
                     MODULE, "documented_candidates",
                     return_value={"real_test_selector": {"doc.md"}},
                 ),
-                patch.object(MODULE, "listed_tests", return_value={"real_test_selector"}),
+                patch.object(MODULE, "listed_tests", return_value={"module::real_test_selector"}),
+                patch("sys.argv", ["verify-doc-test-selectors.py", "--test-output", str(output)]),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                self.assertEqual(MODULE.main(), 0)
+
+    def test_qualified_selector_requires_the_exact_registered_and_executed_path(self) -> None:
+        qualified = "fixtures::tests::qualified_test_selector"
+        with tempfile.TemporaryDirectory(dir=MODULE.ROOT) as directory:
+            output = Path(directory) / "cargo.log"
+            output.write_text(
+                "test other::tests::qualified_test_selector ... ok\n",
+                encoding="utf-8",
+            )
+            with (
+                patch.object(MODULE, "documented_candidates", return_value={qualified: {"doc.md"}}),
+                patch.object(MODULE, "listed_tests", return_value={
+                    qualified, "other::tests::qualified_test_selector",
+                }),
+                patch("sys.argv", ["verify-doc-test-selectors.py", "--test-output", str(output)]),
+                contextlib.redirect_stderr(io.StringIO()),
+            ):
+                self.assertEqual(MODULE.main(), 1)
+
+            output.write_text(f"test {qualified} ... ok\n", encoding="utf-8")
+            with (
+                patch.object(MODULE, "documented_candidates", return_value={qualified: {"doc.md"}}),
+                patch.object(MODULE, "listed_tests", return_value={qualified}),
                 patch("sys.argv", ["verify-doc-test-selectors.py", "--test-output", str(output)]),
                 contextlib.redirect_stdout(io.StringIO()),
             ):

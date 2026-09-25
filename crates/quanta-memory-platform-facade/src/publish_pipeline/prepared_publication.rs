@@ -11,7 +11,10 @@ use quanta_memory_platform_core::{
 #[cfg(feature = "unbudgeted-stores")]
 use crate::shared::accounting::Unbudgeted;
 use crate::shared::accounting::{Budgeted, StoreAccounting};
-use crate::shared::lifecycle::{retire_client_value, BeginClose, DropTransition, StoreLifecycle};
+use crate::shared::lifecycle::{
+    invoke_client_read_while_locked, retire_client_value, BeginClose, DropTransition,
+    StoreLifecycle,
+};
 use crate::shared::measure::{semantic_cost_v1, ByteSized, CanonicalKey, RetainedCostV1};
 
 const TOKEN_DOMAIN: &[u8] = b"qmp.prepared-publication.v1\0";
@@ -536,6 +539,9 @@ where
         let _permit =
             self.lifecycle.begin_mutation().map_err(PreparedPublicationErrorV1::Storage)?;
         let payload_key = request.payload.canonical_key();
+        // Client measurement may panic; run it before acquiring the state lock
+        // so a read-only failure cannot poison intact publication state.
+        let payload_bytes = request.payload.byte_size();
         let token = derive_token(&request.identity, &payload_key)?;
         let state = self.lock_state()?;
 
@@ -572,11 +578,8 @@ where
         }
 
         let persistent_bytes = persistent_cost(request.identity.as_bytes().len())?;
-        let active_bytes = active_cost(
-            request.payload.byte_size(),
-            request.identity.as_bytes().len(),
-            payload_key.len(),
-        )?;
+        let active_bytes =
+            active_cost(payload_bytes, request.identity.as_bytes().len(), payload_key.len())?;
         let requested_bytes = persistent_bytes.checked_add(active_bytes).ok_or_else(|| {
             PreparedPublicationErrorV1::Accounting(MemoryError::capacity(
                 "prepared publication combined retained cost overflow",
@@ -656,13 +659,15 @@ where
         token: &PreparedPublicationTokenV1,
     ) -> Result<Payload, PreparedPublicationErrorV1> {
         let state = self.lock_read()?;
-        if let Some(entry) = state.entries.get(token) {
-            return Ok(entry.payload.clone());
-        }
-        if state.aborted_tokens.contains(token) {
-            return Err(PreparedPublicationErrorV1::AbortedToken { token: token.clone() });
-        }
-        Err(PreparedPublicationErrorV1::UnknownToken { token: token.clone() })
+        invoke_client_read_while_locked(state, |state| {
+            if let Some(entry) = state.entries.get(token) {
+                return Ok(entry.payload.clone());
+            }
+            if state.aborted_tokens.contains(token) {
+                return Err(PreparedPublicationErrorV1::AbortedToken { token: token.clone() });
+            }
+            Err(PreparedPublicationErrorV1::UnknownToken { token: token.clone() })
+        })
     }
 
     pub fn abort(
@@ -1269,7 +1274,7 @@ mod tests {
             ExecutionBudget, LiveProcessMemoryBroker, MemoryBudgetManifest, MemoryClassBudget,
             MemoryPreset, ReclaimPriority, ResidencyPolicy,
         };
-        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         use std::sync::{OnceLock, Weak};
 
         #[derive(Clone, Debug)]
@@ -1331,6 +1336,56 @@ mod tests {
             fn canonical_key(&self) -> Vec<u8> {
                 self.bytes.clone()
             }
+        }
+
+        #[derive(Debug)]
+        struct OneShotPanicPayload {
+            bytes: Vec<u8>,
+            panic_measure: Arc<AtomicBool>,
+            panic_clone: Arc<AtomicBool>,
+        }
+
+        impl Clone for OneShotPanicPayload {
+            fn clone(&self) -> Self {
+                if self.panic_clone.swap(false, Ordering::SeqCst) {
+                    panic!("client clone panic");
+                }
+                Self {
+                    bytes: self.bytes.clone(),
+                    panic_measure: Arc::clone(&self.panic_measure),
+                    panic_clone: Arc::clone(&self.panic_clone),
+                }
+            }
+        }
+
+        impl ByteSized for OneShotPanicPayload {
+            fn byte_size(&self) -> u64 {
+                if self.panic_measure.swap(false, Ordering::SeqCst) {
+                    panic!("client measurement panic");
+                }
+                self.bytes.len() as u64
+            }
+        }
+
+        impl CanonicalKey for OneShotPanicPayload {
+            fn canonical_key(&self) -> Vec<u8> {
+                self.bytes.clone()
+            }
+        }
+
+        fn one_shot_request(
+            identity: &str,
+            panic_measure: &Arc<AtomicBool>,
+            panic_clone: &Arc<AtomicBool>,
+        ) -> PreparedPublicationRequestV1<OneShotPanicPayload> {
+            PreparedPublicationRequestV1::new(
+                PreparedPublicationIdentityV1::new(identity.as_bytes().to_vec()).expect("identity"),
+                OneShotPanicPayload {
+                    bytes: b"owned".to_vec(),
+                    panic_measure: Arc::clone(panic_measure),
+                    panic_clone: Arc::clone(panic_clone),
+                },
+            )
         }
 
         fn panic_payload_request(
@@ -1501,6 +1556,75 @@ mod tests {
                 broker.ledger_snapshot().expect("unchanged charge").total_owner_bytes(),
                 live_cost("clone-reentry", b"owned")
             );
+            service.close().expect("close");
+            assert_eq!(broker.ledger_snapshot().expect("refunded").total_owner_bytes(), 0);
+        }
+
+        #[test]
+        fn prepare_measurement_panic_preserves_readability_and_allows_retry() {
+            let broker = broker(1_000_000);
+            let service = PreparedPublicationService::<OneShotPanicPayload, Budgeted>::new_budgeted(
+                binding(),
+                None,
+                None,
+                broker.clone(),
+            );
+            let panic_measure = Arc::new(AtomicBool::new(true));
+            let panic_clone = Arc::new(AtomicBool::new(false));
+            assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = service.prepare(one_shot_request(
+                    "measure-panic",
+                    &panic_measure,
+                    &panic_clone,
+                ));
+            }))
+            .is_err());
+            assert_eq!(
+                service.stats().expect("state remains readable"),
+                PreparedPublicationStatsV1::default()
+            );
+            assert_eq!(broker.ledger_snapshot().expect("no charge").total_owner_bytes(), 0);
+
+            let receipt = service
+                .prepare(one_shot_request("measure-panic", &panic_measure, &panic_clone))
+                .expect("retry after client panic");
+            assert_eq!(service.resolve(receipt.token()).expect("retry payload").bytes, b"owned");
+            assert_eq!(
+                broker.ledger_snapshot().expect("exact charge").total_owner_bytes(),
+                live_cost("measure-panic", b"owned")
+            );
+            service.close().expect("close");
+            assert_eq!(broker.ledger_snapshot().expect("refunded").total_owner_bytes(), 0);
+        }
+
+        #[test]
+        fn resolve_clone_panic_preserves_readability_and_charge() {
+            let broker = broker(1_000_000);
+            let service = PreparedPublicationService::<OneShotPanicPayload, Budgeted>::new_budgeted(
+                binding(),
+                None,
+                None,
+                broker.clone(),
+            );
+            let panic_measure = Arc::new(AtomicBool::new(false));
+            let panic_clone = Arc::new(AtomicBool::new(false));
+            let receipt = service
+                .prepare(one_shot_request("clone-panic", &panic_measure, &panic_clone))
+                .expect("prepare");
+            let before = service.stats().expect("before stats");
+            let charged = broker.ledger_snapshot().expect("before ledger").total_owner_bytes();
+            panic_clone.store(true, Ordering::SeqCst);
+
+            assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = service.resolve(receipt.token());
+            }))
+            .is_err());
+            assert_eq!(service.stats().expect("state remains readable"), before);
+            assert_eq!(
+                broker.ledger_snapshot().expect("charge intact").total_owner_bytes(),
+                charged
+            );
+            assert_eq!(service.resolve(receipt.token()).expect("retry resolve").bytes, b"owned");
             service.close().expect("close");
             assert_eq!(broker.ledger_snapshot().expect("refunded").total_owner_bytes(), 0);
         }

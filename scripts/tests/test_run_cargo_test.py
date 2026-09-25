@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import importlib.util
+import os
+import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -55,6 +58,56 @@ class CargoTestOutputTest(unittest.TestCase):
         )
         with self.assertRaisesRegex(module.CargoTestEvidenceError, "zero executable"):
             module.parse_cargo_test_counts(output)
+
+    def test_capability_rail_uses_exact_qualified_selectors(self) -> None:
+        root = SCRIPT.parents[2]
+        with tempfile.TemporaryDirectory() as directory:
+            temporary = Path(directory)
+            fake_python = temporary / "python3"
+            fake_python.write_text(
+                '#!/bin/sh\nprintf "%s\\n" "$*" >> "$QMP_TEST_CAPTURE"\n',
+                encoding="utf-8",
+            )
+            fake_python.chmod(0o755)
+            capture = temporary / "calls.txt"
+            environment = dict(os.environ)
+            environment["PATH"] = f"{temporary}:{environment['PATH']}"
+            environment["QMP_TEST_CAPTURE"] = str(capture)
+            for arguments, expected_count in ((["--in-memory"], 8), ([], 10)):
+                capture.write_text("", encoding="utf-8")
+                completed = subprocess.run(
+                    [str(root / "scripts/verify-feature-capabilities.sh"), *arguments],
+                    cwd=root,
+                    env=environment,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                calls = capture.read_text(encoding="utf-8").splitlines()
+                self.assertEqual(len(calls), expected_count)
+                for call in calls:
+                    self.assertIn("-- --nocapture --exact", call)
+                    if " --lib " in call:
+                        self.assertIn("::service::tests::", call)
+                lib_selectors = {
+                    call.split(" --lib ", 1)[1].split(" -- ", 1)[0]
+                    for call in calls if " --lib " in call
+                }
+                expected_lib_selectors = {
+                    "payload_store::service::tests::canonical_put_deduplicates_and_charges_once",
+                    "retained_map::service::tests::put_get_remove_get_none_round_trip_corrects_bytes",
+                    "revocable_store::service::tests::insert_tracks_reclaimable_bytes",
+                    "transcript_store::service::tests::exact_request_retried_n_times_applies_once",
+                    "publish_pipeline::service::tests::default_pipeline_runs_stage_then_commit_each_exactly_once_no_rollback",
+                    "spill::service::tests::in_memory_target_write_then_restore_round_trips_the_payload",
+                }
+                if not arguments:
+                    expected_lib_selectors.update({
+                        "revocable_store::service::tests::durable_redb_round_trip_transfers_charge_exactly_once",
+                        "revocable_store::service::tests::many_spills_share_large_binding_identity_without_unbilled_clones",
+                    })
+                self.assertEqual(lib_selectors, expected_lib_selectors)
 
 
 if __name__ == "__main__":

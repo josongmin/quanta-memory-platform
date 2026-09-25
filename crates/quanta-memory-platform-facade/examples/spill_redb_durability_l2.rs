@@ -105,6 +105,41 @@ fn syscall_ordinal_before_marker(trace: &str, syscall: &str) -> Result<usize, Bo
 }
 
 #[cfg(target_os = "linux")]
+fn verify_injection_after_marker(
+    trace: &str,
+    syscall: &str,
+    expected_ordinal: usize,
+) -> Result<(), Box<dyn Error>> {
+    let lines: Vec<_> = trace.lines().collect();
+    let marker = lines
+        .iter()
+        .position(|line| line.contains("L2_FINALIZE_BEGIN"))
+        .ok_or("fault trace did not observe the finalize marker")?;
+    let injected = lines
+        .iter()
+        .position(|line| {
+            line.contains(&format!("{syscall}("))
+                && line.contains("INJECTED")
+                && line.contains("EIO")
+        })
+        .ok_or_else(|| format!("strace did not inject EIO into {syscall} #{expected_ordinal}"))?;
+    if injected <= marker {
+        return Err(
+            format!("injected {syscall} syscall occurred before the finalize marker").into()
+        );
+    }
+    let observed_ordinal =
+        lines[..=injected].iter().filter(|line| line.contains(&format!("{syscall}("))).count();
+    if observed_ordinal != expected_ordinal {
+        return Err(format!(
+            "injected {syscall} ordinal drifted: expected {expected_ordinal}, observed {observed_ordinal}"
+        )
+        .into());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
 fn traced_worker(
     executable: &Path,
     db: &Path,
@@ -191,6 +226,14 @@ fn run_scenario(root: &Path, executable: &Path, syscall: &str) -> Result<String,
         )
         .into());
     }
+    if !String::from_utf8_lossy(&baseline.stdout).contains("L2_FINALIZE_OK") {
+        return Err(format!(
+            "baseline child reached finalize hook but did not complete it for {syscall}: stdout={} stderr={}",
+            String::from_utf8_lossy(&baseline.stdout),
+            String::from_utf8_lossy(&baseline.stderr)
+        )
+        .into());
+    }
     if fs::metadata(&baseline_trace)?.len() == 0 {
         return Err(
             "strace produced an empty baseline trace; verify ptrace permissions for this Linux environment"
@@ -213,14 +256,18 @@ fn run_scenario(root: &Path, executable: &Path, syscall: &str) -> Result<String,
     fs::write(root.join(format!("fault-{syscall}.stdout")), &fault.stdout)?;
     fs::write(root.join(format!("fault-{syscall}.stderr")), &fault.stderr)?;
     let fault_text = fs::read_to_string(&fault_trace)?;
-    if !fault_text.lines().any(|line| {
-        line.contains(&format!("{syscall}(")) && line.contains("INJECTED") && line.contains("EIO")
-    }) {
-        return Err(format!("strace did not inject EIO into {syscall} #{ordinal}").into());
-    }
+    verify_injection_after_marker(&fault_text, syscall, ordinal)?;
     if !String::from_utf8_lossy(&fault.stdout).contains("L2_FINALIZE_BEGIN") {
         return Err(format!(
             "faulted child failed before the finalize boundary: {}",
+            String::from_utf8_lossy(&fault.stderr)
+        )
+        .into());
+    }
+    if fault.status.success() {
+        return Err(format!(
+            "injected {syscall} EIO did not propagate as a finalize error (stdout={} stderr={})",
+            String::from_utf8_lossy(&fault.stdout),
             String::from_utf8_lossy(&fault.stderr)
         )
         .into());

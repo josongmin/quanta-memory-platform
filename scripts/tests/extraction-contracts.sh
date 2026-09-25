@@ -89,6 +89,17 @@ fn read_state(port: &dyn StatePort) -> Result<Vec<u8>, String> {
 }
 EOF
 
+cat > "${pure_fixture}/bypass.rs" <<'EOF'
+pub use crate::{adapters::metrics::MetricsAdapter};
+use crate::adapters as adapter_layer;
+use std::{
+    fs::File,
+};
+fn bad() {
+    let _ = std::fs::File::open("state");
+}
+EOF
+
 semgrep_json="${fixture}/semgrep-results.json"
 semgrep_stderr="${fixture}/semgrep.stderr"
 semgrep_status=0
@@ -122,6 +133,11 @@ clean_hits = sorted(
     for result in results
     if pathlib.Path(result["path"]).name in {"allowed.rs", "good.rs"}
 )
+bypass_hits = {
+    (result["check_id"].rsplit(".", 1)[-1], result["start"]["line"])
+    for result in results
+    if pathlib.Path(result["path"]).name == "bypass.rs"
+}
 failures = []
 if seen != expected:
     failures.append(f"rule IDs differ: missing={sorted(expected - seen)} extra={sorted(seen - expected)}")
@@ -129,10 +145,47 @@ if errors:
     failures.append(f"Semgrep reported {len(errors)} parse/runtime errors")
 if clean_hits:
     failures.append(f"clean/suppressed fixtures produced findings: {clean_hits}")
+expected_bypass = {
+    ("qmp-pure-layer-no-adapter-import", 1),
+    ("qmp-pure-layer-no-adapter-import", 2),
+    ("qmp-pure-layer-no-fs-env", 3),
+    ("qmp-pure-layer-no-fs-env", 7),
+}
+if not expected_bypass <= bypass_hits:
+    failures.append(f"scoped bypass fixtures missed: {sorted(expected_bypass - bypass_hits)}")
 if failures:
     raise SystemExit("; ".join(failures))
 ' "${semgrep_json}"
 echo "PASS: consolidated Semgrep fixtures exercised all 6 rules and clean cases"
+
+# A failed feature-list parser must stop the matrix before any Clippy slice.
+# Process substitution used to discard this failure and report a green matrix.
+mkdir -p "${fixture}/matrix-bin"
+cat > "${fixture}/matrix-bin/cargo" <<'EOF'
+#!/usr/bin/env bash
+case "$1" in
+  metadata) exec "${QMP_REAL_CARGO}" "$@" ;;
+  clippy|tree) exit 0 ;;
+esac
+exit 2
+EOF
+cat > "${fixture}/matrix-bin/python3" <<'EOF'
+#!/usr/bin/env bash
+if [[ "$1" == "-c" && "$2" == *'get("default"'* ]]; then
+  exit 37
+fi
+exec "${QMP_REAL_PYTHON}" "$@"
+EOF
+chmod +x "${fixture}/matrix-bin/cargo" "${fixture}/matrix-bin/python3"
+matrix_status=0
+env QMP_REAL_CARGO="$(command -v cargo)" QMP_REAL_PYTHON="$(command -v python3)" \
+  PATH="${fixture}/matrix-bin:${PATH}" scripts/verify-feature-matrix.sh \
+  >/dev/null 2>&1 || matrix_status=$?
+if [[ "${matrix_status}" -ne 37 ]]; then
+  echo "FAIL: feature-list failure returned ${matrix_status}, expected 37" >&2
+  exit 1
+fi
+echo "PASS: feature-list parser failure stops feature matrix"
 
 # A changed manifest must never rewrite the extracted lockfile implicitly.
 mkdir -p "${fixture}/locked/src"

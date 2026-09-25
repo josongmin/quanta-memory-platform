@@ -44,7 +44,9 @@ def documented_candidates(
     for path in documents:
         text = path.read_text(encoding="utf-8")
         for token in re.findall(r"`([A-Za-z][A-Za-z0-9_:-]{5,})`", text):
-            if token.count("_") < 2 or "::" in token or "-" in token:
+            if token.count("_") < 2 or "-" in token:
+                continue
+            if "::" in token and "::tests::" not in token:
                 continue
             candidates.setdefault(token, set()).add(path.relative_to(ROOT).as_posix())
     return candidates
@@ -52,7 +54,7 @@ def documented_candidates(
 
 def parse_listed_tests(output: str) -> set[str]:
     return {
-        line.removesuffix(": test").split("::")[-1]
+        line.removesuffix(": test")
         for line in output.splitlines()
         if line.endswith(": test")
     }
@@ -76,7 +78,7 @@ def parse_executed_tests(output: str) -> set[str]:
                 # An interleaved marker with no attached result may itself be
                 # ignored, so do not certify it from a later standalone "ok".
                 continue
-            tests.add(match.group("name").split("::")[-1])
+            tests.add(match.group("name"))
     return tests
 
 
@@ -120,7 +122,12 @@ def main(argv: list[str] | None = None) -> int:
         # Cargo's successful output proves execution, while --list proves the
         # name was registered by the harness rather than printed by a test.
         tests = registered & parse_executed_tests(args.test_output.read_text(encoding="utf-8"))
-    missing = sorted(set(candidates) - tests - NON_TEST_IDENTIFIERS)
+    test_leaves = {name.rsplit("::", 1)[-1] for name in tests}
+    missing = sorted(
+        candidate for candidate in candidates
+        if candidate not in NON_TEST_IDENTIFIERS
+        and candidate not in (tests if "::" in candidate else test_leaves)
+    )
     if missing:
         for selector in missing:
             locations = ", ".join(sorted(candidates[selector]))

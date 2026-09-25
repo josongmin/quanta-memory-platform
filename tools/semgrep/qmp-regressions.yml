@@ -63,8 +63,9 @@ rules:
         - /crates/quanta-memory-platform-core/src/ports/**/*.rs
     pattern-either:
       - pattern: std::fs::$FUNC(...)
+      - pattern: std::fs::$TYPE::$FUNC(...)
       - pattern: std::env::$FUNC(...)
-      - pattern-regex: '(?m)^\s*use\s+std::(?:(?:fs|env)\b|\{[^\n]*(?:fs|env)\b)'
+      - pattern-regex: '(?ms)^\s*(?:pub(?:\([^)]*\))?\s+)?use\s+std::(?:(?:fs|env)\b|\{[^;]*(?:fs|env)\b)'
 
   - id: qmp-pure-layer-no-wall-clock
     languages: [rust]
@@ -92,5 +93,6 @@ rules:
         - /crates/quanta-memory-platform-core/src/domain/**/*.rs
         - /crates/quanta-memory-platform-core/src/ports/**/*.rs
     pattern-either:
-      - pattern-regex: '(?m)^\s*use\s+crate::adapters(?:::|\s*;)'
+      - pattern-regex: '(?m)^\s*(?:pub(?:\([^)]*\))?\s+)?use\s+crate::adapters\b'
+      - pattern-regex: '(?ms)^\s*(?:pub(?:\([^)]*\))?\s+)?use\s+crate::\{[^;]*\badapters\b'
       - pattern: crate::adapters::$FUNC(...)

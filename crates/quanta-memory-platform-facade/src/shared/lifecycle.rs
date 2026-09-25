@@ -36,7 +36,12 @@ pub(crate) fn retire_client_value<T>(value: T) {
 /// side effects. These call sites use it only for read-side `Clone`, `Ord`, or
 /// identity work; it prevents such a panic from permanently poisoning an
 /// otherwise intact container.
-#[cfg(any(feature = "payload_store", feature = "retained_map", feature = "transcript"))]
+#[cfg(any(
+    feature = "payload_store",
+    feature = "retained_map",
+    feature = "transcript",
+    feature = "publish_pipeline"
+))]
 pub(crate) fn invoke_client_read_while_locked<G, R>(guard: G, callback: impl FnOnce(&G) -> R) -> R {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| callback(&guard)));
     drop(guard);
