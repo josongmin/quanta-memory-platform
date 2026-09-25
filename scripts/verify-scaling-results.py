@@ -13,9 +13,9 @@ from collections import defaultdict
 from pathlib import Path
 from typing import NamedTuple
 
-SAMPLE_SCHEMA = "qmp-scaling-sample-v3"
-RUN_SCHEMA = "qmp-scaling-run-v3"
-END_SCHEMA = "qmp-scaling-run-end-v3"
+SAMPLE_SCHEMA = "qmp-scaling-sample-v4"
+RUN_SCHEMA = "qmp-scaling-run-v4"
+END_SCHEMA = "qmp-scaling-run-end-v4"
 SINGLE = {
     "payload_unique_fill", "payload_dedup_put", "revocable_fill_and_drain",
     "broker_release_owner_cardinality", "scheduler_admission_group_cardinality",
@@ -27,7 +27,9 @@ PAIRWISE_MODES = {
 }
 PRESSURE_OUTCOME_OPERATION = "broker_pressure_cycle"
 PRESSURE_CONTENTION_OPERATION = "dual_store_write_contention"
-OUTCOME_OPERATIONS = {"scheduler_admission_group_cardinality", PRESSURE_OUTCOME_OPERATION}
+PRESSURE_RECLAIM_OPERATION = "contended_pressure_reclaim"
+FIXED_OUTCOME_OPERATIONS = {"scheduler_admission_group_cardinality", PRESSURE_OUTCOME_OPERATION}
+OUTCOME_OPERATIONS = FIXED_OUTCOME_OPERATIONS | {PRESSURE_RECLAIM_OPERATION}
 OUTCOME_LATENCY_FIELDS = {
     outcome: tuple(f"{outcome}_{percentile}_ns" for percentile in ("p50", "p95", "p99"))
     for outcome in ("admitted", "denied")
@@ -35,6 +37,16 @@ OUTCOME_LATENCY_FIELDS = {
 ALL_OUTCOME_LATENCY_FIELDS = tuple(
     field for fields in OUTCOME_LATENCY_FIELDS.values() for field in fields
 )
+DETAIL_LATENCY_FIELDS = {
+    operation: tuple(
+        f"{phase}_{percentile}_ns" for phase in phases for percentile in ("p50", "p95", "p99")
+    )
+    for operation, phases in {
+        "revocable_fill_and_drain": ("fill", "reclaim"),
+        PRESSURE_RECLAIM_OPERATION: ("reclaim",),
+    }.items()
+}
+ALL_DETAIL_LATENCY_FIELDS = set().union(*map(set, DETAIL_LATENCY_FIELDS.values()))
 COMPAT_FIELDS = (
     "rustc", "cargo", "machine", "feature_set", "feature_graph_sha256",
     "dependency_lock_sha256", "package", "bench_target",
@@ -186,6 +198,10 @@ def expected_keys(spec: BenchmarkSpec) -> set[tuple[object, ...]]:
                     (PRESSURE_CONTENTION_OPERATION, "shared-broker", entries, threads, repetition)
                     for threads in spec.threads
                 )
+                keys.update(
+                    (PRESSURE_RECLAIM_OPERATION, "two-revocable-stores", entries, threads, repetition)
+                    for threads in spec.threads if threads > 1
+                )
                 continue
             keys.update((op, "single-thread", entries, 1, repetition) for op in SINGLE)
             keys.update(("retained_map_point_read", mode, entries, 1, repetition) for mode in READ_MODES)
@@ -259,7 +275,6 @@ def run_metadata(records: list[dict[str, object]]) -> tuple[dict[str, object], B
 
 def validate_samples(
     records: list[dict[str, object]], spec: BenchmarkSpec, max_p99_ns: int,
-    require_outcome_latencies: bool = True,
 ) -> tuple[list[dict[str, object]], dict[tuple[object, ...], list[dict[str, object]]]]:
     samples = [record for record in records if record.get("schema") == SAMPLE_SCHEMA]
     expected = expected_keys(spec)
@@ -287,35 +302,53 @@ def validate_samples(
         if timed <= 0 or succeeded < 0 or denied < 0 or timed != succeeded + denied:
             raise ValidationError(f"{key}: timed/successful/denied operation counts disagree")
         expected_timed = integer(sample, "entries") * (
-            2 if sample.get("operation") in {"revocable_fill_and_drain", *OUTCOME_OPERATIONS} else 1
+            2 if sample.get("operation") in {"revocable_fill_and_drain", *FIXED_OUTCOME_OPERATIONS} else 1
         )
         if timed != expected_timed:
             raise ValidationError(f"{key}: timed operations {timed} != expected {expected_timed}")
-        if sample.get("operation") in OUTCOME_OPERATIONS:
+        if sample.get("operation") == PRESSURE_RECLAIM_OPERATION:
+            if not (0 < succeeded < timed and 0 < denied < timed):
+                raise ValidationError(f"{key}: contended pressure requires admitted and denied operations")
+        elif sample.get("operation") in FIXED_OUTCOME_OPERATIONS:
             expected_succeeded = expected_denied = integer(sample, "entries")
+            if (succeeded, denied) != (expected_succeeded, expected_denied):
+                raise ValidationError(
+                    f"{key}: outcome counts {succeeded}/{denied} != expected "
+                    f"{expected_succeeded}/{expected_denied}"
+                )
         else:
             expected_succeeded, expected_denied = expected_timed, 0
-        if (succeeded, denied) != (expected_succeeded, expected_denied):
-            raise ValidationError(
-                f"{key}: outcome counts {succeeded}/{denied} != expected "
-                f"{expected_succeeded}/{expected_denied}"
-            )
+            if (succeeded, denied) != (expected_succeeded, expected_denied):
+                raise ValidationError(
+                    f"{key}: outcome counts {succeeded}/{denied} != expected "
+                    f"{expected_succeeded}/{expected_denied}"
+                )
         present = tuple(field for field in ALL_OUTCOME_LATENCY_FIELDS if field in sample)
         if sample.get("operation") in OUTCOME_OPERATIONS:
-            # A legacy v3 baseline may contain only aggregate latency. New runs
-            # must report both results; a partial set is never meaningful.
-            must_have_outcomes = (
-                require_outcome_latencies or sample.get("operation") == PRESSURE_OUTCOME_OPERATION
-            )
-            if (must_have_outcomes or present) and len(present) != len(ALL_OUTCOME_LATENCY_FIELDS):
+            if len(present) != len(ALL_OUTCOME_LATENCY_FIELDS):
                 raise ValidationError(f"{key}: incomplete admission outcome latency fields")
-            if present:
-                for outcome, fields in OUTCOME_LATENCY_FIELDS.items():
-                    values = tuple(integer(sample, field) for field in fields)
-                    if not (0 <= values[0] <= values[1] <= values[2] <= max_p99_ns):
-                        raise ValidationError(f"{key}: invalid/over-limit {outcome} latency distribution {values}")
+            for outcome, fields in OUTCOME_LATENCY_FIELDS.items():
+                values = tuple(integer(sample, field) for field in fields)
+                if not (0 <= values[0] <= values[1] <= values[2] <= max_p99_ns):
+                    raise ValidationError(f"{key}: invalid/over-limit {outcome} latency distribution {values}")
         elif present:
             raise ValidationError(f"{key}: outcome latency fields are only valid for admission operations")
+        detail_fields = DETAIL_LATENCY_FIELDS.get(sample.get("operation"), ())
+        present_detail = {field for field in ALL_DETAIL_LATENCY_FIELDS if field in sample}
+        if present_detail != set(detail_fields):
+            raise ValidationError(f"{key}: missing or unexpected phase latency fields")
+        for phase in ("fill", "reclaim"):
+            fields = tuple(f"{phase}_{percentile}_ns" for percentile in ("p50", "p95", "p99"))
+            if fields[0] in detail_fields:
+                values = tuple(integer(sample, field) for field in fields)
+                if not (0 <= values[0] <= values[1] <= values[2] <= max_p99_ns):
+                    raise ValidationError(f"{key}: invalid/over-limit {phase} latency distribution {values}")
+        if sample.get("operation") == PRESSURE_RECLAIM_OPERATION:
+            reclaimed = integer(sample, "reclaimed_operations")
+            if not 0 < reclaimed <= denied:
+                raise ValidationError(f"{key}: reclaimed operation count is invalid")
+        elif "reclaimed_operations" in sample:
+            raise ValidationError(f"{key}: reclaimed operation count is unexpected")
         derived_throughput = round(timed * 1_000_000_000 / integer(sample, "elapsed_ns"))
         if abs(throughput - derived_throughput) > max(1, derived_throughput // 1_000):
             raise ValidationError(f"{key}: throughput does not match timed operations / elapsed time")
@@ -323,6 +356,9 @@ def validate_samples(
         if sample.get("operation") == PRESSURE_OUTCOME_OPERATION:
             if semantic_peak != 1:
                 raise ValidationError(f"{key}: pressure cycle must retain exactly one semantic byte")
+        elif sample.get("operation") == PRESSURE_RECLAIM_OPERATION:
+            if semantic_peak != 96:
+                raise ValidationError(f"{key}: contended pressure must start at its 96-byte hard cap")
         elif sample.get("operation") == "scheduler_admission_group_cardinality":
             if semantic_peak != 0:
                 raise ValidationError(f"{key}: scheduler admission must not retain semantic bytes")
@@ -347,11 +383,6 @@ def validate_samples(
             raise ValidationError(f"{key}: missing allocator telemetry for retained workload")
         if integer(sample, "busy_retries") < 0:
             raise ValidationError(f"{key}: busy retry count is negative")
-    for operation in OUTCOME_OPERATIONS:
-        outcome_samples = [sample for sample in samples if sample.get("operation") == operation]
-        split_count = sum("admitted_p99_ns" in sample for sample in outcome_samples)
-        if split_count not in (0, len(outcome_samples)):
-            raise ValidationError(f"mixed {operation} outcome latency generations")
     observed_keys = set(observed)
     if missing := expected - observed_keys:
         raise ValidationError(f"benchmark matrix is incomplete: {len(missing)} missing; first {sorted(missing)[:3]}")
@@ -412,9 +443,7 @@ def validate(
             or baseline_run.get(BUILD_CONFIG_FIELD) != run[BUILD_CONFIG_FIELD]
         ):
             raise ValidationError(f"baseline incompatible {BUILD_CONFIG_FIELD}")
-        baseline_samples, baseline_groups = validate_samples(
-            baseline_records, spec, max_p99_ns, require_outcome_latencies=False,
-        )
+        baseline_samples, baseline_groups = validate_samples(baseline_records, spec, max_p99_ns)
         validate_growth(baseline_samples)
         throughput_allowed = max_throughput_regression_percent / 100.0
         p99_allowed = max_p99_regression_percent / 100.0
@@ -432,9 +461,11 @@ def validate(
                 ("p99_ns", "p99"),
                 ("admitted_p99_ns", "admitted p99"),
                 ("denied_p99_ns", "denied p99"),
+                ("fill_p99_ns", "fill p99"),
+                ("reclaim_p99_ns", "reclaim p99"),
             ):
-                # Historic v3 baselines have no outcome split. They remain
-                # comparable for aggregate latency, not for either outcome.
+                # Only rows carrying this metric can be compared; every v4
+                # operation-specific field is mandatory for its owning row.
                 if field not in baseline[0]:
                     continue
                 current_p99 = statistics.median(integer(sample, field) for sample in current)
@@ -515,6 +546,9 @@ def run_cell_metrics(
         for field in ("admitted_p99_ns", "denied_p99_ns"):
             if field in samples[0]:
                 cell[field] = max(integer(row, field) for row in samples)
+        for field in ("fill_p99_ns", "reclaim_p99_ns"):
+            if field in samples[0]:
+                cell[field] = max(integer(row, field) for row in samples)
         metrics[key] = cell
     return metrics
 
@@ -582,7 +616,7 @@ def validate_release(
         }
         if candidate["throughput"] < baseline["throughput"] * (1.0 - throughput_limit):
             raise ValidationError(f"{key}: release throughput regressed")
-        for field in ("p99", "admitted_p99_ns", "denied_p99_ns"):
+        for field in ("p99", "admitted_p99_ns", "denied_p99_ns", "fill_p99_ns", "reclaim_p99_ns"):
             if field not in baseline:
                 continue
             allowed = max(

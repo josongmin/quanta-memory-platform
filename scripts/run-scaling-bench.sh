@@ -71,7 +71,7 @@ logical_cpus = os.cpu_count()
 if not logical_cpus:
     raise SystemExit("run-scaling-bench: logical CPU count is unavailable")
 print(json.dumps({
-    "schema": "qmp-scaling-run-v3",
+    "schema": "qmp-scaling-run-v4",
     "source_sha": sha,
     "source_tree": tree,
     "rustc": rustc,
@@ -112,7 +112,7 @@ logical_cpus = os.cpu_count()
 if not logical_cpus:
     raise SystemExit("run-scaling-bench: logical CPU count is unavailable")
 print(json.dumps({
-    "schema": "qmp-scaling-run-end-v3",
+    "schema": "qmp-scaling-run-end-v4",
     "source_sha": sha,
     "source_tree": tree,
     "bench_build_config_sha256": build_config,

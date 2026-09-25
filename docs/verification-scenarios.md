@@ -54,18 +54,25 @@ Correctness is managed as **tests**; benchmarks answer a different question
   owning unit/conformance suites. The scheduler-admission row retains its
   **combined** timed-call count, throughput and `p50/p95/p99_ns`,
   and also reports `admitted_*_ns` and `denied_*_ns` percentiles from the same
-  timed calls. New rows require both distributions. Historical v3 baselines
-  without the split compare aggregate latency only; outcome-specific regressions
-  require a baseline carrying both outcome distributions.
+  timed calls. Every v4 admission row requires both distributions. The
+  revocable fill/drain row additionally reports separate `fill_*_ns` and
+  `reclaim_*_ns` distributions; release comparison gates both p99 values.
   The revocable fill-and-drain 1k→10k complexity gate compares the median
   per-operation p95 across repetitions (maximum 4×). Wall elapsed and throughput
   remain reported and baseline-comparable, but are not used for that complexity
   gate because host scheduling gaps between calls are not store-operation cost.
-  The historical standard profile remains 48 smoke / 220 full rows. The
+  The standard profile remains 48 smoke / 220 full rows. The
   opt-in `--profile=in-memory-pressure` profile uses the in-memory `full`
-  feature set (no Redb) and requires 9 smoke / 40 full rows: one-byte
-  cap denial→refund→readmission with separate admitted/denied tails, plus
-  two charged stores writing through one broker at 1/8/32 threads. The
+  feature set (no Redb) and requires 12 smoke / 60 full v4 rows: one-byte
+  cap denial→refund→readmission with separate admitted/denied tails;
+  two charged stores writing through one broker at 1/8/32 threads; and
+  two revocable stores contending at an exact shared 96-byte cap at 8/32
+  threads. The last row reports admitted/denied tails, the latency of successful
+  reclaim episodes, actual reclaim count and Busy retries; its admission
+  throughput includes all reclaim attempts in wall time. Every row must close
+  with zero semantic and allocator drift.
+  Earlier v3 receipts are historical evidence and cannot be admitted by the
+  v4 verifier or used as v4 release baselines. The
   pressure-cycle wall throughput includes the untimed refund between measured
   admission calls; it is not a pure reserve-only throughput figure.
 

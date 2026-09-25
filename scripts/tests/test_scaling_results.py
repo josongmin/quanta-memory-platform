@@ -36,7 +36,7 @@ def sample(
         "revocable_fill_and_drain", "scheduler_admission_group_cardinality",
         "broker_pressure_cycle",
     } else 1)
-    successful = entries if operation in {
+    successful = entries // 2 if operation == "contended_pressure_reclaim" else entries if operation in {
         "scheduler_admission_group_cardinality", "broker_pressure_cycle",
     } else timed
     result = {
@@ -57,6 +57,7 @@ def sample(
         "semantic_peak_bytes": (
             0 if operation == "scheduler_admission_group_cardinality"
             else 1 if operation == "broker_pressure_cycle"
+            else 96 if operation == "contended_pressure_reclaim"
             else 100
         ),
         "semantic_after_close_bytes": 0,
@@ -67,10 +68,23 @@ def sample(
         "allocator_underflowed": False,
         "busy_retries": 0,
     }
-    if operation in {"scheduler_admission_group_cardinality", "broker_pressure_cycle"}:
+    if operation in {
+        "scheduler_admission_group_cardinality", "broker_pressure_cycle",
+        "contended_pressure_reclaim",
+    }:
         result.update({
             "admitted_p50_ns": 8, "admitted_p95_ns": 16, "admitted_p99_ns": 24,
             "denied_p50_ns": 12, "denied_p95_ns": 22, "denied_p99_ns": 32,
+        })
+    if operation == "revocable_fill_and_drain":
+        result.update({
+            "fill_p50_ns": 8, "fill_p95_ns": 16, "fill_p99_ns": 24,
+            "reclaim_p50_ns": 12, "reclaim_p95_ns": 22, "reclaim_p99_ns": 32,
+        })
+    if operation == "contended_pressure_reclaim":
+        result.update({
+            "reclaim_p50_ns": 12, "reclaim_p95_ns": 22, "reclaim_p99_ns": 32,
+            "reclaimed_operations": entries // 4,
         })
     return result
 
@@ -115,6 +129,10 @@ def valid_records(
                 records.extend(
                     sample("dual_store_write_contention", "shared-broker", entries, worker_count, repetition)
                     for worker_count in threads
+                )
+                records.extend(
+                    sample("contended_pressure_reclaim", "two-revocable-stores", entries, worker_count, repetition)
+                    for worker_count in threads if worker_count > 1
                 )
                 continue
             records.extend(sample(operation, "single-thread", entries, 1, repetition) for operation in SINGLE)
@@ -175,9 +193,9 @@ class ScalingResultTests(unittest.TestCase):
     def test_complete_default_and_smoke_matrix(self) -> None:
         self.assertEqual(MODULE.validate(valid_records()), 220)
         self.assertEqual(MODULE.validate(valid_records(["--smoke"])), 48)
-        self.assertEqual(MODULE.validate(valid_records(["--profile=in-memory-pressure"])), 40)
+        self.assertEqual(MODULE.validate(valid_records(["--profile=in-memory-pressure"])), 60)
         self.assertEqual(
-            MODULE.validate(valid_records(["--profile=in-memory-pressure", "--smoke"])), 9,
+            MODULE.validate(valid_records(["--profile=in-memory-pressure", "--smoke"])), 12,
         )
 
     def test_release_requires_independent_full_compatible_runs(self) -> None:
@@ -389,7 +407,7 @@ class ScalingResultTests(unittest.TestCase):
 
     def test_release_requires_explicit_policy_and_pressure_outcomes(self) -> None:
         candidates, baselines = release_receipts(["--profile=in-memory-pressure"])
-        self.assertEqual(MODULE.validate_release(candidates, baselines, RELEASE_POLICY), 40)
+        self.assertEqual(MODULE.validate_release(candidates, baselines, RELEASE_POLICY), 60)
         del baselines[0][1]["denied_p99_ns"]
         with self.assertRaisesRegex(MODULE.ValidationError, "incomplete admission outcome"):
             MODULE.validate_release(candidates, baselines, RELEASE_POLICY)
@@ -453,7 +471,7 @@ class ScalingResultTests(unittest.TestCase):
     def test_pressure_profile_is_independent_and_fail_closed(self) -> None:
         args = ["--smoke", "--profile=in-memory-pressure"]
         records = valid_records(args)
-        self.assertEqual(MODULE.validate(records), 9)
+        self.assertEqual(MODULE.validate(records), 12)
         self.assertEqual(
             MODULE.parse_benchmark_args(list(reversed(args))),
             MODULE.parse_benchmark_args(args),
@@ -480,6 +498,54 @@ class ScalingResultTests(unittest.TestCase):
         del pressure["denied_p99_ns"]
         with self.assertRaisesRegex(MODULE.ValidationError, "incomplete admission outcome latency"):
             MODULE.validate(missing_split)
+
+    def test_contended_pressure_reclaim_rows_and_metrics_are_required(self) -> None:
+        args = ["--smoke", "--profile=in-memory-pressure"]
+        records = valid_records(args)
+        missing = [row for row in records if row.get("operation") != "contended_pressure_reclaim"]
+        with self.assertRaisesRegex(MODULE.ValidationError, "matrix is incomplete"):
+            MODULE.validate(missing)
+        for field, value, message in (
+            ("reclaim_p99_ns", None, "phase latency fields"),
+            ("reclaim_p95_ns", 40, "reclaim latency distribution"),
+            ("reclaimed_operations", 0, "reclaimed operation count"),
+            ("semantic_peak_bytes", 95, "96-byte hard cap"),
+            ("denied_operations", 0, "counts disagree"),
+        ):
+            with self.subTest(field=field):
+                malformed = valid_records(args)
+                row = next(row for row in malformed if row.get("operation") == "contended_pressure_reclaim")
+                if value is None:
+                    del row[field]
+                else:
+                    row[field] = value
+                with self.assertRaisesRegex(MODULE.ValidationError, message):
+                    MODULE.validate(malformed)
+
+    def test_revocable_fill_and_reclaim_tails_are_independently_validated(self) -> None:
+        for field, value, message in (
+            ("fill_p99_ns", None, "phase latency fields"),
+            ("fill_p95_ns", 25, "fill latency distribution"),
+            ("reclaim_p99_ns", 1_000_000_001, "reclaim latency distribution"),
+        ):
+            with self.subTest(field=field):
+                records = valid_records(["--smoke"])
+                row = next(row for row in records if row.get("operation") == "revocable_fill_and_drain")
+                if value is None:
+                    del row[field]
+                else:
+                    row[field] = value
+                with self.assertRaisesRegex(MODULE.ValidationError, message):
+                    MODULE.validate(records)
+
+    def test_release_rejects_reclaim_tail_regression_even_if_aggregate_is_stable(self) -> None:
+        candidates, baselines = release_receipts(["--profile=in-memory-pressure"])
+        for records in candidates:
+            for row in records:
+                if row.get("operation") == "contended_pressure_reclaim":
+                    row["reclaim_p99_ns"] = 200
+        with self.assertRaisesRegex(MODULE.ValidationError, "release reclaim_p99_ns regressed"):
+            MODULE.validate_release(candidates, baselines, RELEASE_POLICY)
 
     def test_default_metadata_with_smoke_only_rows_is_rejected(self) -> None:
         records = valid_records([], (1_000,), (1, 2), 3)
@@ -636,7 +702,7 @@ class ScalingResultTests(unittest.TestCase):
                 with self.assertRaisesRegex(MODULE.ValidationError, message):
                     MODULE.validate(records)
 
-    def test_legacy_baseline_compares_aggregate_only(self) -> None:
+    def test_v4_baseline_requires_outcome_split(self) -> None:
         baseline = valid_records(["--smoke"])
         current = valid_records(["--smoke"])
         for record in baseline:
@@ -644,11 +710,10 @@ class ScalingResultTests(unittest.TestCase):
                 for fields in MODULE.OUTCOME_LATENCY_FIELDS.values():
                     for field in fields:
                         del record[field]
-        self.assertEqual(MODULE.validate(current, baseline), 48)
         with self.assertRaisesRegex(MODULE.ValidationError, "incomplete admission outcome latency"):
-            MODULE.validate(baseline)
+            MODULE.validate(current, baseline)
 
-    def test_mixed_baseline_outcome_generations_are_rejected(self) -> None:
+    def test_partial_baseline_outcome_split_is_rejected(self) -> None:
         baseline = valid_records(["--smoke"])
         scheduler = next(
             record for record in baseline
@@ -657,8 +722,14 @@ class ScalingResultTests(unittest.TestCase):
         for fields in MODULE.OUTCOME_LATENCY_FIELDS.values():
             for field in fields:
                 del scheduler[field]
-        with self.assertRaisesRegex(MODULE.ValidationError, "mixed scheduler_admission_group_cardinality outcome latency generations"):
+        with self.assertRaisesRegex(MODULE.ValidationError, "incomplete admission outcome latency"):
             MODULE.validate(valid_records(["--smoke"]), baseline)
+
+    def test_v3_receipt_is_not_misread_as_v4(self) -> None:
+        records = valid_records(["--smoke"])
+        records[0]["schema"] = "qmp-scaling-run-v3"
+        with self.assertRaisesRegex(MODULE.ValidationError, "benchmark run header"):
+            MODULE.validate(records)
 
     def test_outcome_specific_p99_regressions_are_rejected(self) -> None:
         for field, label in (("admitted_p99_ns", "admitted"), ("denied_p99_ns", "denied")):
@@ -775,10 +846,10 @@ class ScalingResultTests(unittest.TestCase):
     def test_truncated_jsonl_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "result.jsonl"
-            path.write_text('{"schema":"qmp-scaling-run-v3"}', encoding="utf-8")
+            path.write_text('{"schema":"qmp-scaling-run-v4"}', encoding="utf-8")
             with self.assertRaisesRegex(MODULE.ValidationError, "truncated final line"):
                 MODULE.load_jsonl(path)
-            path.write_text('{"schema":"qmp-scaling-run-v3"\n', encoding="utf-8")
+            path.write_text('{"schema":"qmp-scaling-run-v4"\n', encoding="utf-8")
             with self.assertRaisesRegex(MODULE.ValidationError, "invalid JSON"):
                 MODULE.load_jsonl(path)
             path.write_bytes(b"\xff\n")

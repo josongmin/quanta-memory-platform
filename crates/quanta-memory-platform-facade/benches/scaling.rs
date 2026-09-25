@@ -178,16 +178,46 @@ struct WorkerSample {
     busy_retries: u64,
 }
 
+#[derive(Debug)]
+struct PressureWorkerSample {
+    latencies: Vec<u64>,
+    admitted: Vec<u64>,
+    denied: Vec<u64>,
+    reclaim: Vec<u64>,
+    reclaimed_operations: usize,
+    busy_retries: u64,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct OperationCounts {
     successful: usize,
     denied: usize,
     outcome_latencies: Option<(LatencySample, LatencySample)>,
+    detail_latencies: DetailLatencies,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+enum DetailLatencies {
+    #[default]
+    None,
+    Revocable {
+        fill: LatencySample,
+        reclaim: LatencySample,
+    },
+    ContendedPressure {
+        reclaim: LatencySample,
+        reclaimed_operations: usize,
+    },
 }
 
 impl OperationCounts {
     fn all_successful(successful: usize) -> Self {
-        Self { successful, denied: 0, outcome_latencies: None }
+        Self {
+            successful,
+            denied: 0,
+            outcome_latencies: None,
+            detail_latencies: DetailLatencies::None,
+        }
     }
 
     fn timed(self) -> usize {
@@ -304,11 +334,15 @@ fn percentile(sorted: &[u64], percentile: usize) -> u64 {
 }
 
 fn summarize_latencies(mut latencies: Vec<u64>) -> LatencySample {
+    summarize_latencies_in_place(&mut latencies)
+}
+
+fn summarize_latencies_in_place(latencies: &mut [u64]) -> LatencySample {
     latencies.sort_unstable();
     LatencySample {
-        p50: percentile(&latencies, 50),
-        p95: percentile(&latencies, 95),
-        p99: percentile(&latencies, 99),
+        p50: percentile(latencies, 50),
+        p95: percentile(latencies, 95),
+        p99: percentile(latencies, 99),
     }
 }
 
@@ -336,9 +370,20 @@ fn emit(
             admitted.p50, admitted.p95, admitted.p99, denied.p50, denied.p95, denied.p99,
         )
     });
+    let detail_latency_fields = match operations.detail_latencies {
+        DetailLatencies::None => String::new(),
+        DetailLatencies::Revocable { fill, reclaim } => format!(
+            ",\"fill_p50_ns\":{},\"fill_p95_ns\":{},\"fill_p99_ns\":{},\"reclaim_p50_ns\":{},\"reclaim_p95_ns\":{},\"reclaim_p99_ns\":{}",
+            fill.p50, fill.p95, fill.p99, reclaim.p50, reclaim.p95, reclaim.p99,
+        ),
+        DetailLatencies::ContendedPressure { reclaim, reclaimed_operations } => format!(
+            ",\"reclaim_p50_ns\":{},\"reclaim_p95_ns\":{},\"reclaim_p99_ns\":{},\"reclaimed_operations\":{}",
+            reclaim.p50, reclaim.p95, reclaim.p99, reclaimed_operations,
+        ),
+    };
     println!(
         concat!(
-            "{{\"schema\":\"qmp-scaling-sample-v3\",",
+            "{{\"schema\":\"qmp-scaling-sample-v4\",",
             "\"operation\":\"{operation}\",\"mode\":\"{mode}\",",
             "\"entries\":{entries},\"threads\":{threads},\"repetition\":{repetition},",
             "\"timed_operations\":{timed_operations},",
@@ -353,7 +398,7 @@ fn emit(
             "\"allocator_live_bytes\":{live},",
             "\"allocator_high_water_bytes\":{high_water},",
             "\"allocator_underflowed\":{underflowed},",
-            "\"busy_retries\":{busy_retries}{outcome_latency_fields}}}"
+            "\"busy_retries\":{busy_retries}{outcome_latency_fields}{detail_latency_fields}}}"
         ),
         operation = operation,
         mode = mode,
@@ -377,6 +422,7 @@ fn emit(
         underflowed = allocation.underflowed,
         busy_retries = busy_retries,
         outcome_latency_fields = outcome_latency_fields,
+        detail_latency_fields = detail_latency_fields,
     );
 }
 
@@ -392,6 +438,9 @@ fn main() {
             for threads in &options.threads {
                 for repetition in 0..options.repetitions {
                     dual_store_write_contention(entries, *threads, repetition, allocations);
+                    if *threads > 1 {
+                        contended_pressure_reclaim(entries, *threads, repetition, allocations);
+                    }
                 }
             }
         }
@@ -553,6 +602,7 @@ fn broker_pressure_cycle(entries: usize, repetition: usize, allocations: &Alloca
             successful: entries,
             denied: entries,
             outcome_latencies: Some(outcome_latencies),
+            detail_latencies: DetailLatencies::None,
         },
         0,
     );
@@ -689,6 +739,222 @@ fn dual_store_write_contention(
     );
 }
 
+/// Two revocable instances compete for one two-entry class/global cap. A
+/// capacity denial triggers an explicit reclaim, so the fixture repeatedly
+/// crosses the full/not-full boundary while writers contend. Admission calls
+/// are the throughput denominator; wall time also includes reclaim episodes.
+fn contended_pressure_reclaim(
+    entries: usize,
+    threads: usize,
+    repetition: usize,
+    allocations: &AllocationCounters,
+) {
+    const ENTRY_BYTES: u64 = 48; // 8-byte key + 8-byte value + 32-byte revocable overhead.
+    const CAP_BYTES: u64 = ENTRY_BYTES * 2;
+    const MAX_BUSY_RETRIES: u64 = 100_000;
+    let class_budget = MemoryClassBudget {
+        reserved_bytes: 0,
+        soft_cap_bytes: CAP_BYTES,
+        hard_cap_bytes: CAP_BYTES,
+        borrow_from_shared_pool: false,
+        reclaim_priority: ReclaimPriority::Normal,
+    };
+    begin_allocation_epoch(allocations);
+    let manifest = MemoryBudgetManifest::new(
+        MemoryPreset::Production,
+        ExecutionBudget::default(),
+        ResidencyPolicy::new(CAP_BYTES).with_class_budget(MemoryClass::ArtifactCache, class_budget),
+    );
+    let platform = MemoryPlatformBuilder::new()
+        .with_manifest(manifest)
+        .build()
+        .expect("contended pressure platform");
+    let left = Arc::new(
+        platform
+            .revocable_store_builder::<Vec<u8>, Vec<u8>>()
+            .bind(StoreBindingHandle::new(
+                MemoryClass::ArtifactCache,
+                "bench:pressure-left".into(),
+                None,
+            ))
+            .build()
+            .expect("left revocable store"),
+    );
+    let right = Arc::new(
+        platform
+            .revocable_store_builder::<Vec<u8>, Vec<u8>>()
+            .bind(StoreBindingHandle::new(
+                MemoryClass::ArtifactCache,
+                "bench:pressure-right".into(),
+                None,
+            ))
+            .build()
+            .expect("right revocable store"),
+    );
+    left.insert_checked(vec![0; 8], vec![0; 8]).expect("seed left slot");
+    right.insert_checked(vec![1; 8], vec![1; 8]).expect("seed right slot");
+    assert_eq!(left.stats().expect("left seed stats").estimated_bytes, ENTRY_BYTES);
+    assert_eq!(right.stats().expect("right seed stats").estimated_bytes, ENTRY_BYTES);
+    let seed = platform.broker().ledger_snapshot().expect("pressure seed ledger");
+    assert_eq!(seed.total_owner_bytes(), CAP_BYTES);
+    assert_eq!(seed.live_ticket_count, 2);
+    drop(seed);
+
+    let barrier = Arc::new(Barrier::new(threads + 1));
+    let mut handles = Vec::with_capacity(threads);
+    for thread_id in 0..threads {
+        let left = Arc::clone(&left);
+        let right = Arc::clone(&right);
+        let barrier = Arc::clone(&barrier);
+        let count = entries / threads + usize::from(thread_id < entries % threads);
+        handles.push(thread::spawn(move || {
+            let mut sample = PressureWorkerSample {
+                latencies: Vec::with_capacity(count),
+                admitted: Vec::with_capacity(count),
+                denied: Vec::with_capacity(count),
+                reclaim: Vec::with_capacity(count),
+                reclaimed_operations: 0,
+                busy_retries: 0,
+            };
+            let (own, peer) = if thread_id % 2 == 0 { (&left, &right) } else { (&right, &left) };
+            barrier.wait();
+            for operation_id in 0..count {
+                let key =
+                    (((thread_id as u64) << 32) | (operation_id as u64 + 2)).to_be_bytes().to_vec();
+                let operation = Instant::now();
+                let mut admission_busy_retries = 0;
+                let result = loop {
+                    match own.insert_checked(key.clone(), vec![0; 8]) {
+                        Err(MemoryError::OperationInProgress(_)) => {
+                            sample.busy_retries += 1;
+                            admission_busy_retries += 1;
+                            assert!(
+                                admission_busy_retries <= MAX_BUSY_RETRIES,
+                                "pressure insert stalled"
+                            );
+                            thread::yield_now();
+                        }
+                        result => break result,
+                    }
+                };
+                let latency = operation.elapsed().as_nanos() as u64;
+                sample.latencies.push(latency);
+                match result {
+                    Ok(()) => sample.admitted.push(latency),
+                    Err(MemoryError::Capacity(_)) => {
+                        sample.denied.push(latency);
+                        let reclaim_started = Instant::now();
+                        let mut reclaimed = false;
+                        for store in [own, peer] {
+                            let mut reclaim_busy_retries = 0;
+                            let outcome = loop {
+                                match store.reclaim_one() {
+                                    Err(MemoryError::OperationInProgress(_)) => {
+                                        sample.busy_retries += 1;
+                                        reclaim_busy_retries += 1;
+                                        assert!(
+                                            reclaim_busy_retries <= MAX_BUSY_RETRIES,
+                                            "pressure reclaim stalled"
+                                        );
+                                        thread::yield_now();
+                                    }
+                                    result => break result,
+                                }
+                            };
+                            match outcome {
+                                Ok(Some(entry)) => {
+                                    drop(black_box(entry));
+                                    reclaimed = true;
+                                    break;
+                                }
+                                Ok(None) => {}
+                                Err(error) => panic!("pressure reclaim: {error}"),
+                            }
+                        }
+                        if reclaimed {
+                            sample.reclaim.push(reclaim_started.elapsed().as_nanos() as u64);
+                            sample.reclaimed_operations += 1;
+                        }
+                    }
+                    Err(error) => panic!("pressure insert: {error}"),
+                }
+            }
+            sample
+        }));
+    }
+    let started = Instant::now();
+    barrier.wait();
+    let mut latencies = Vec::with_capacity(entries);
+    let mut admitted = Vec::with_capacity(entries);
+    let mut denied = Vec::with_capacity(entries);
+    let mut reclaim = Vec::with_capacity(entries);
+    let mut reclaimed_operations = 0;
+    let mut busy_retries = 0;
+    for handle in handles {
+        let sample = handle.join().expect("pressure worker");
+        latencies.extend(sample.latencies);
+        admitted.extend(sample.admitted);
+        denied.extend(sample.denied);
+        reclaim.extend(sample.reclaim);
+        reclaimed_operations += sample.reclaimed_operations;
+        busy_retries += sample.busy_retries;
+    }
+    let elapsed = started.elapsed();
+    assert_eq!(latencies.len(), entries);
+    assert!(!admitted.is_empty(), "pressure churn must admit after reclaim");
+    assert!(!denied.is_empty(), "pressure churn must hit the hard cap");
+    assert!(reclaimed_operations > 0, "pressure churn must reclaim a live entry");
+    assert_eq!(reclaim.len(), reclaimed_operations);
+    let final_live = platform.broker().ledger_snapshot().expect("pressure final live ledger");
+    let left_stats = left.stats().expect("pressure left final stats");
+    let right_stats = right.stats().expect("pressure right final stats");
+    assert_eq!(
+        left_stats.estimated_bytes + right_stats.estimated_bytes,
+        final_live.total_owner_bytes()
+    );
+    assert_eq!(left_stats.item_count + right_stats.item_count, final_live.live_ticket_count);
+    assert!(final_live.total_owner_bytes() <= CAP_BYTES);
+    assert!(final_live.live_ticket_count <= 2);
+    drop(final_live);
+    left.close().expect("close left pressure store");
+    right.close().expect("close right pressure store");
+    drop(left);
+    drop(right);
+    drop(barrier);
+    let after = platform.broker().ledger_snapshot().expect("pressure closed ledger");
+    assert_eq!(after.live_ticket_count, 0);
+    let semantic_after = after.total_owner_bytes();
+    drop(platform);
+    let admitted_count = admitted.len();
+    let denied_count = denied.len();
+    let latency = summarize_latencies(latencies);
+    let outcome_latencies = (summarize_latencies(admitted), summarize_latencies(denied));
+    let reclaim_latency = summarize_latencies(reclaim);
+    let allocation = end_allocation_epoch(allocations);
+    emit(
+        "contended_pressure_reclaim",
+        "two-revocable-stores",
+        entries,
+        threads,
+        repetition,
+        elapsed,
+        latency,
+        CAP_BYTES,
+        semantic_after,
+        allocation,
+        OperationCounts {
+            successful: admitted_count,
+            denied: denied_count,
+            outcome_latencies: Some(outcome_latencies),
+            detail_latencies: DetailLatencies::ContendedPressure {
+                reclaim: reclaim_latency,
+                reclaimed_operations,
+            },
+        },
+        busy_retries,
+    );
+}
+
 fn payload_unique_fill_and_dedup_put(
     entries: usize,
     repetition: usize,
@@ -788,12 +1054,13 @@ fn revocable_fill_and_drain(entries: usize, repetition: usize, allocations: &All
         .bind(StoreBindingHandle::new(MemoryClass::ArtifactCache, "bench:revocable".into(), None))
         .build()
         .expect("revocable store");
-    let mut latencies = Vec::with_capacity(entries.checked_mul(2).expect("operation count"));
+    let mut fill_latencies = Vec::with_capacity(entries);
+    let mut reclaim_latencies = Vec::with_capacity(entries);
     let fill_started = Instant::now();
     for value in 0..entries {
         let operation = Instant::now();
         store.insert_checked(format!("key-{value}"), vec![0; 8]).expect("revocable insert");
-        latencies.push(operation.elapsed().as_nanos() as u64);
+        fill_latencies.push(operation.elapsed().as_nanos() as u64);
     }
     let fill_elapsed = fill_started.elapsed();
     let semantic_peak = store.stats().expect("stats").estimated_bytes;
@@ -801,7 +1068,7 @@ fn revocable_fill_and_drain(entries: usize, repetition: usize, allocations: &All
     for _ in 0..entries {
         let operation = Instant::now();
         black_box(store.reclaim_one().expect("reclaim").expect("entry"));
-        latencies.push(operation.elapsed().as_nanos() as u64);
+        reclaim_latencies.push(operation.elapsed().as_nanos() as u64);
     }
     let elapsed = fill_elapsed + drain_started.elapsed();
     store.close().expect("close revocable store");
@@ -809,7 +1076,10 @@ fn revocable_fill_and_drain(entries: usize, repetition: usize, allocations: &All
     let semantic_after =
         platform.broker().ledger_snapshot().expect("ledger after close").total_owner_bytes();
     drop(platform);
-    let latency = summarize_latencies(latencies);
+    let fill_latency = summarize_latencies_in_place(&mut fill_latencies);
+    let reclaim_latency = summarize_latencies_in_place(&mut reclaim_latencies);
+    fill_latencies.extend(reclaim_latencies);
+    let latency = summarize_latencies(fill_latencies);
     let allocation = end_allocation_epoch(allocations);
     emit(
         "revocable_fill_and_drain",
@@ -822,7 +1092,13 @@ fn revocable_fill_and_drain(entries: usize, repetition: usize, allocations: &All
         semantic_peak,
         semantic_after,
         allocation,
-        OperationCounts::all_successful(entries.checked_mul(2).expect("operation count")),
+        OperationCounts {
+            detail_latencies: DetailLatencies::Revocable {
+                fill: fill_latency,
+                reclaim: reclaim_latency,
+            },
+            ..OperationCounts::all_successful(entries.checked_mul(2).expect("operation count"))
+        },
         0,
     );
 }
@@ -1147,6 +1423,7 @@ fn scheduler_admission_group_cardinality(
             successful: entries,
             denied: entries,
             outcome_latencies: Some(outcome_latencies),
+            detail_latencies: DetailLatencies::None,
         },
         0,
     );
