@@ -274,9 +274,9 @@ fn traced_worker_with_dm_fault(
         &controller_log,
         format!(
             "finalize_marker=observed\nerror_target_result={:?}\nrelease_result={release_result:?}\nstdout_drain_result={stdout_result:?}\nchild_status={status_result:?}\nstderr_read_result={:?}\nrestore_result={:?}\n",
-            fault_result.as_ref().map(|()| ()),
+            fault_result.as_ref(),
             stderr_result.as_ref().map(|_| ()),
-            restore_result.as_ref().map(|()| ())
+            restore_result.as_ref()
         ),
     )?;
     let status = status_result?;
