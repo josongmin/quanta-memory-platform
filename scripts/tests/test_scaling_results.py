@@ -103,6 +103,7 @@ def valid_records(
         "feature_graph_sha256": "f" * 64,
         "dependency_lock_sha256": "e" * 64,
         "benchmark_source_sha256": "9" * 64,
+        "bench_build_config_sha256": "7" * 64,
         "package": "quanta-memory-platform-facade",
         "bench_target": "scaling",
         "benchmark_args": benchmark_args,
@@ -134,6 +135,7 @@ def valid_records(
         "source_sha": "a" * 40,
         "source_tree": "b" * 40,
         "source_clean": True,
+        "bench_build_config_sha256": "7" * 64,
         "bench_exit_code": 0,
     })
     return records
@@ -212,6 +214,24 @@ class ScalingResultTests(unittest.TestCase):
         del candidates[0][0]["benchmark_source_sha256"]
         with self.assertRaisesRegex(MODULE.ValidationError, "benchmark_source_sha256"):
             MODULE.validate_release(candidates, baselines, RELEASE_POLICY)
+
+    def test_release_rejects_changed_or_missing_build_configuration(self) -> None:
+        candidates, baselines = release_receipts()
+        for records in candidates:
+            records[0]["bench_build_config_sha256"] = records[-1]["bench_build_config_sha256"] = "6" * 64
+        with self.assertRaisesRegex(MODULE.ValidationError, "bench_build_config_sha256"):
+            MODULE.validate_release(candidates, baselines, RELEASE_POLICY)
+        candidates, baselines = release_receipts()
+        del candidates[0][0]["bench_build_config_sha256"]
+        del candidates[0][-1]["bench_build_config_sha256"]
+        with self.assertRaisesRegex(MODULE.ValidationError, "bench_build_config_sha256"):
+            MODULE.validate_release(candidates, baselines, RELEASE_POLICY)
+
+    def test_run_rejects_build_configuration_change_mid_benchmark(self) -> None:
+        records = valid_records(["--smoke"])
+        records[-1]["bench_build_config_sha256"] = "6" * 64
+        with self.assertRaisesRegex(MODULE.ValidationError, "build configuration changed"):
+            MODULE.validate(records)
 
     def test_release_requires_successful_recorded_bench_exit(self) -> None:
         candidates, baselines = release_receipts()
@@ -715,6 +735,17 @@ class ScalingResultTests(unittest.TestCase):
             MODULE.validate(current, baseline)
         baseline[0]["benchmark_source_sha256"] = "not-a-digest"
         with self.assertRaisesRegex(MODULE.ValidationError, "benchmark_source_sha256.*invalid"):
+            MODULE.validate(current, baseline)
+
+    def test_baseline_requires_same_build_configuration(self) -> None:
+        current = valid_records(["--smoke"])
+        baseline = valid_records(["--smoke"])
+        baseline[0]["bench_build_config_sha256"] = baseline[-1]["bench_build_config_sha256"] = "6" * 64
+        with self.assertRaisesRegex(MODULE.ValidationError, "baseline incompatible bench_build_config_sha256"):
+            MODULE.validate(current, baseline)
+        del baseline[0]["bench_build_config_sha256"]
+        del baseline[-1]["bench_build_config_sha256"]
+        with self.assertRaisesRegex(MODULE.ValidationError, "baseline incompatible bench_build_config_sha256"):
             MODULE.validate(current, baseline)
 
     def test_baseline_regressions_are_rejected(self) -> None:

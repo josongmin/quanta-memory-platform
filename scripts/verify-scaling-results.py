@@ -40,6 +40,7 @@ COMPAT_FIELDS = (
     "dependency_lock_sha256", "package", "bench_target",
 )
 BENCHMARK_SOURCE_FIELD = "benchmark_source_sha256"
+BUILD_CONFIG_FIELD = "bench_build_config_sha256"
 
 
 class ValidationError(RuntimeError):
@@ -216,15 +217,18 @@ def run_metadata(records: list[dict[str, object]]) -> tuple[dict[str, object], B
     for field in ("source_sha", "source_tree", *COMPAT_FIELDS):
         if not isinstance(run.get(field), str) or not run[field]:
             raise ValidationError(f"run metadata field {field!r} is missing")
-    benchmark_source = run.get(BENCHMARK_SOURCE_FIELD)
-    if benchmark_source is not None and (
-        not isinstance(benchmark_source, str)
-        or re.fullmatch(r"[0-9a-f]{64}", benchmark_source) is None
-    ):
-        raise ValidationError(f"run metadata field {BENCHMARK_SOURCE_FIELD!r} is invalid")
+    for field in (BENCHMARK_SOURCE_FIELD, BUILD_CONFIG_FIELD):
+        digest = run.get(field)
+        if digest is not None and (
+            not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+        ):
+            raise ValidationError(f"run metadata field {field!r} is invalid")
     for field in ("source_sha", "source_tree"):
         if end.get(field) != run[field]:
             raise ValidationError(f"source changed during benchmark: {field}")
+    if BUILD_CONFIG_FIELD in run or BUILD_CONFIG_FIELD in end:
+        if not run.get(BUILD_CONFIG_FIELD) or end.get(BUILD_CONFIG_FIELD) != run[BUILD_CONFIG_FIELD]:
+            raise ValidationError("build configuration changed during benchmark")
     if end.get("source_clean") is not True:
         raise ValidationError("source changed during benchmark: working tree is dirty")
     has_run_identity = "run_id" in run or "run_id" in end
@@ -403,6 +407,11 @@ def validate(
             or baseline_run.get(BENCHMARK_SOURCE_FIELD) != run[BENCHMARK_SOURCE_FIELD]
         ):
             raise ValidationError(f"baseline incompatible {BENCHMARK_SOURCE_FIELD}")
+        if (
+            not run.get(BUILD_CONFIG_FIELD)
+            or baseline_run.get(BUILD_CONFIG_FIELD) != run[BUILD_CONFIG_FIELD]
+        ):
+            raise ValidationError(f"baseline incompatible {BUILD_CONFIG_FIELD}")
         baseline_samples, baseline_groups = validate_samples(
             baseline_records, spec, max_p99_ns, require_outcome_latencies=False,
         )
@@ -464,6 +473,8 @@ def release_run(
         raise ValidationError("release run identity is missing")
     if not run.get(BENCHMARK_SOURCE_FIELD):
         raise ValidationError(f"release {BENCHMARK_SOURCE_FIELD} is missing")
+    if not run.get(BUILD_CONFIG_FIELD):
+        raise ValidationError(f"release {BUILD_CONFIG_FIELD} is missing")
     if "bench_exit_code" not in records[-1]:
         raise ValidationError("release bench exit status is missing")
     if (
@@ -532,10 +543,10 @@ def validate_release(
         for run, run_spec, _ in runs:
             if run_spec != spec:
                 raise ValidationError(f"{label} benchmark matrix differs")
-            for field in ("source_sha", "source_tree", "benchmark_args", BENCHMARK_SOURCE_FIELD, *COMPAT_FIELDS, "logical_cpus"):
+            for field in ("source_sha", "source_tree", "benchmark_args", BENCHMARK_SOURCE_FIELD, BUILD_CONFIG_FIELD, *COMPAT_FIELDS, "logical_cpus"):
                 if run[field] != reference[field]:
                     raise ValidationError(f"{label} runs disagree on {field}")
-    for field in (BENCHMARK_SOURCE_FIELD, *COMPAT_FIELDS, "logical_cpus"):
+    for field in (BENCHMARK_SOURCE_FIELD, BUILD_CONFIG_FIELD, *COMPAT_FIELDS, "logical_cpus"):
         if baseline_ref[field] != candidate_ref[field]:
             raise ValidationError(f"release baseline incompatible {field}")
     if (
