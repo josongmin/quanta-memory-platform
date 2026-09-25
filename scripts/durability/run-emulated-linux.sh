@@ -72,7 +72,11 @@ export QMP_SOURCE_HEAD="${source_head}"
 export QMP_SOURCE_DIGEST="${source_digest}"
 
 echo "L2 source_head=${source_head} test_source_digest=${source_digest} (Rust/Cargo/scripts; docs and tickets excluded)"
-echo "L2 mechanism=strace EIO injection; claim=Linux syscall error behavior only"
+if [[ "${QMP_DURABILITY_L2_MODE:-}" == device-mapper ]]; then
+  echo "L2 mechanism=dm-error table swap; claim=block-device I/O disruption and filesystem recovery only"
+else
+  echo "L2 mechanism=strace EIO injection; claim=Linux syscall error behavior only"
+fi
 cargo_status=0
 if cargo run --locked -p quanta-memory-platform-facade \
   --no-default-features --features durability-l2 \

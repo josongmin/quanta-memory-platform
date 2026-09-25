@@ -35,6 +35,7 @@
 
 #![cfg(feature = "durability-test-hooks")]
 
+use std::ffi::OsStr;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -110,23 +111,56 @@ fn finalize_kill_child_binary() -> PathBuf {
                 .parent()
                 .expect("workspace root")
                 .to_path_buf();
+            let workspace_manifest = workspace_root.join("Cargo.toml");
             // Use the Cargo binary that launched this test process. Resolving
             // the rustup shim by PATH can fail intermittently in large
             // all-features test runs even though the invoking Cargo is live.
             let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
-            let build = Command::new(cargo)
-                .arg("build")
-                .arg("--locked")
-                .arg("--offline")
-                .arg("-p")
-                .arg("quanta-memory-platform-facade")
-                .arg("--features")
-                .arg("spill-redb,durability-test-hooks,revocable_store")
-                .arg("--example")
-                .arg("spill_redb_finalize_kill_child")
-                .current_dir(&workspace_root)
-                .output()
-                .expect("freshness build for finalize-kill child");
+            let cargo_for_diagnostic = cargo.clone();
+            let run_build = |cargo: &OsStr| {
+                Command::new(cargo)
+                    .arg("build")
+                    .arg("--locked")
+                    .arg("--offline")
+                    .arg("--manifest-path")
+                    .arg(&workspace_manifest)
+                    .arg("-p")
+                    .arg("quanta-memory-platform-facade")
+                    .arg("--features")
+                    .arg("spill-redb,durability-test-hooks,revocable_store")
+                    .arg("--example")
+                    .arg("spill_redb_finalize_kill_child")
+                    .current_dir(&workspace_root)
+                    .output()
+            };
+            let build = match run_build(&cargo) {
+                Ok(build) => build,
+                Err(first_error)
+                    if first_error.kind() == std::io::ErrorKind::NotFound
+                        && cargo != OsStr::new("cargo") =>
+                {
+                    run_build(OsStr::new("cargo")).unwrap_or_else(|fallback_error| {
+                        panic!(
+                            "freshness build for finalize-kill child could not spawn: CARGO error={first_error}; PATH fallback error={fallback_error}; CARGO={cargo_for_diagnostic:?}; PATH={:?}; workspace_root={} (exists={}); manifest={} (exists={}); process_cwd={:?}",
+                            std::env::var_os("PATH"),
+                            workspace_root.display(),
+                            workspace_root.is_dir(),
+                            workspace_manifest.display(),
+                            workspace_manifest.is_file(),
+                            std::env::current_dir()
+                        )
+                    })
+                }
+                Err(error) => panic!(
+                    "freshness build for finalize-kill child could not spawn: {error}; CARGO={cargo_for_diagnostic:?}; PATH={:?}; workspace_root={} (exists={}); manifest={} (exists={}); process_cwd={:?}",
+                    std::env::var_os("PATH"),
+                    workspace_root.display(),
+                    workspace_root.is_dir(),
+                    workspace_manifest.display(),
+                    workspace_manifest.is_file(),
+                    std::env::current_dir()
+                ),
+            };
             assert!(
                 build.status.success(),
                 "finalize-kill child freshness build failed: {}",

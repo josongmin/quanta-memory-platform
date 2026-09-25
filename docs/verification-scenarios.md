@@ -486,7 +486,20 @@ check helpers that the control plane enforces (see group C/D).
   Raw traces, Redb files, source digest, and SHA-256 receipt are retained in a
   caller-selected temp artifact directory. This exercises syscall error
   handling only; it does not inject block-device failures or simulate power
-  loss. Device-mapper L2 and physical L3 remain unqualified.
+  loss. One device-mapper sample is recorded separately below; physical L3
+  remains unqualified.
+- 🧪 **Optional disposable device-mapper subrail (DURABILITY-001 L2, 1 sample)** —
+  `scripts/durability/run-device-mapper-linux.sh` creates an owned sparse image,
+  loop device and ext4 filesystem; at the finalize hook it swaps the DM table to
+  `error`, requires a post-marker syscall EIO, restores the table without
+  flushing failed I/O, repairs/unmounts, detaches the DM target, then cold-opens
+  the image through the loop device and checks the public state-machine oracle.
+  The 2026-09-25 ARM64 Linux 6.10.14 run passed `Present -> recovered ->
+  Finalized` on source digest
+  `afd110378590610d47d45a5e8cbc7cf7239ce9f51a86598010fdb9663b33e6c7`. This is
+  one disposable ext4 block-I/O disruption sample, not a power-loss claim or
+  general hardware qualification. Opt in only inside a disposable Linux VM by
+  setting `QMP_DURABILITY_L2_DM_ALLOW_DISPOSABLE=1`.
 
 **publish_pipeline is intentionally not charged.** It is a non-retaining
 *transition* stage (zero bytes held): it transforms a staged value into a

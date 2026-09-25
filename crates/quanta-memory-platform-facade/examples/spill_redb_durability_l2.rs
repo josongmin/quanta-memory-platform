@@ -16,11 +16,11 @@ use std::error::Error;
 #[cfg(target_os = "linux")]
 use std::fs;
 #[cfg(target_os = "linux")]
-use std::io::Write;
+use std::io::{BufRead, BufReader, Read, Write};
 #[cfg(target_os = "linux")]
 use std::path::{Path, PathBuf};
 #[cfg(target_os = "linux")]
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 #[cfg(target_os = "linux")]
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -75,6 +75,10 @@ fn mark_finalize_commit(_: FinalizeKillPoint, sequence: u64, generation: u64) {
     let mut out = stdout.lock();
     writeln!(out, "L2_FINALIZE_BEGIN {sequence} {generation}").expect("write finalize marker");
     out.flush().expect("flush finalize marker");
+    if std::env::var_os("QMP_DURABILITY_L2_DM_PAUSE_BEFORE_COMMIT").is_some() {
+        let mut release = [0u8; 1];
+        std::io::stdin().read_exact(&mut release).expect("wait for DM fault controller");
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -153,6 +157,249 @@ fn traced_worker(
     }
     let output = command.arg("--").arg(executable).arg("--worker").arg(db).output()?;
     Ok(output)
+}
+
+#[cfg(target_os = "linux")]
+fn run_command(command: &mut Command, label: &str) -> Result<(), Box<dyn Error>> {
+    let output = command.output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "{label} failed ({}): stdout={} stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .into());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn set_dm_table(name: &str, sectors: u64, target: &str) -> Result<(), Box<dyn Error>> {
+    let table = match target {
+        "error" => format!("0 {sectors} error"),
+        "linear" => {
+            let loop_device = std::env::var("QMP_DURABILITY_L2_DM_LOOP")?;
+            format!("0 {sectors} linear {loop_device} 0")
+        }
+        other => return Err(format!("unsupported device-mapper target {other}").into()),
+    };
+    run_command(
+        Command::new("dmsetup").arg("suspend").arg("--noflush").arg(name),
+        "suspend disposable DM mapping without flushing failed I/O",
+    )?;
+    if let Err(error) = run_command(
+        Command::new("dmsetup").arg("reload").arg(name).arg("--table").arg(&table),
+        "reload disposable DM mapping",
+    ) {
+        let _ = Command::new("dmsetup").arg("resume").arg(name).status();
+        return Err(error);
+    }
+    run_command(Command::new("dmsetup").arg("resume").arg(name), "resume disposable DM mapping")?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn traced_worker_with_dm_fault(
+    executable: &Path,
+    db: &Path,
+    trace_path: &Path,
+    dm_name: &str,
+    sectors: u64,
+) -> Result<Output, Box<dyn Error>> {
+    let mut command = Command::new("strace");
+    command
+        .arg("-f")
+        .arg("-qq")
+        .arg("-o")
+        .arg(trace_path)
+        .env("QMP_DURABILITY_L2_DM_PAUSE_BEFORE_COMMIT", "1")
+        .arg("--")
+        .arg(executable)
+        .arg("--worker")
+        .arg(db)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn()?;
+    let mut child_stdin = child.stdin.take().ok_or("DM worker stdin was not piped")?;
+    let child_stdout = child.stdout.take().ok_or("DM worker stdout was not piped")?;
+    let mut child_stderr = child.stderr.take().ok_or("DM worker stderr was not piped")?;
+    let stderr_reader = std::thread::spawn(move || {
+        let mut stderr = Vec::new();
+        child_stderr.read_to_end(&mut stderr).map(|_| stderr)
+    });
+    let mut stdout_reader = BufReader::new(child_stdout);
+    let mut stdout = Vec::new();
+    let mut reached_finalize = false;
+    loop {
+        let mut line = Vec::new();
+        let read = stdout_reader.read_until(b'\n', &mut line)?;
+        if read == 0 {
+            break;
+        }
+        reached_finalize |=
+            line.windows(b"L2_FINALIZE_BEGIN".len()).any(|window| window == b"L2_FINALIZE_BEGIN");
+        stdout.extend_from_slice(&line);
+        if reached_finalize {
+            break;
+        }
+    }
+    if !reached_finalize {
+        let _ = child.kill();
+        let status = child.wait()?;
+        let stderr = stderr_reader.join().map_err(|_| "stderr reader panicked")??;
+        return Err(format!(
+            "DM worker exited before finalize marker ({status}): stdout={} stderr={}",
+            String::from_utf8_lossy(&stdout),
+            String::from_utf8_lossy(&stderr)
+        )
+        .into());
+    }
+
+    let controller_log = PathBuf::from(std::env::var("QMP_DURABILITY_L2_ARTIFACT_ROOT")?)
+        .join("device-mapper-controller.log");
+    fs::write(&controller_log, b"finalize_marker=observed\n")?;
+    let fault_result = set_dm_table(dm_name, sectors, "error");
+    let release_result = child_stdin.write_all(&[1]).and_then(|()| child_stdin.flush());
+    drop(child_stdin);
+    let stdout_result = stdout_reader.read_to_end(&mut stdout);
+    let status_result = child.wait();
+    let stderr_result = stderr_reader
+        .join()
+        .map_err(|_| std::io::Error::other("stderr reader panicked"))
+        .and_then(|result| result);
+    let restore_result = set_dm_table(dm_name, sectors, "linear");
+    fs::write(
+        &controller_log,
+        format!(
+            "finalize_marker=observed\nerror_target_result={:?}\nrelease_result={release_result:?}\nstdout_drain_result={stdout_result:?}\nchild_status={status_result:?}\nstderr_read_result={:?}\nrestore_result={:?}\n",
+            fault_result.as_ref().map(|()| ()),
+            stderr_result.as_ref().map(|_| ()),
+            restore_result.as_ref().map(|()| ())
+        ),
+    )?;
+    let status = status_result?;
+    let stderr = stderr_result?;
+    fault_result?;
+    release_result?;
+    stdout_result?;
+    restore_result?;
+    Ok(Output { status, stdout, stderr })
+}
+
+#[cfg(target_os = "linux")]
+fn repair_and_remount_dm_filesystem(
+    dm_name: &str,
+    mount_path: &Path,
+    loop_device: &str,
+    artifact_root: &Path,
+) -> Result<i32, Box<dyn Error>> {
+    let device = format!("/dev/mapper/{dm_name}");
+    run_command(Command::new("umount").arg(mount_path), "unmount disposable DM filesystem")?;
+    let check = Command::new("e2fsck").args(["-fy", &device]).output()?;
+    fs::write(
+        artifact_root.join("device-mapper-e2fsck.log"),
+        [&check.stdout[..], &check.stderr[..]].concat(),
+    )?;
+    // e2fsck uses bit 0 to report that it corrected errors. Any other set bit
+    // means the disposable filesystem is not safe to remount for the oracle.
+    if !check.status.success() && check.status.code() != Some(1) {
+        return Err(format!(
+            "e2fsck failed ({}): {}",
+            check.status,
+            String::from_utf8_lossy(&check.stderr)
+        )
+        .into());
+    }
+    run_command(
+        Command::new("dmsetup").arg("remove").arg(dm_name),
+        "detach disposable fault-injection mapping before cold reopen",
+    )?;
+    run_command(
+        Command::new("mount").args(["-o", "noatime"]).arg(loop_device).arg(mount_path),
+        "cold-remount disposable filesystem through the backing loop device",
+    )?;
+    Ok(check.status.code().unwrap_or(0))
+}
+
+#[cfg(target_os = "linux")]
+fn run_dm_scenario(
+    root: &Path,
+    executable: &Path,
+    dm_name: &str,
+    mount_path: &Path,
+    sectors: u64,
+) -> Result<String, Box<dyn Error>> {
+    let artifact_root = PathBuf::from(std::env::var("QMP_DURABILITY_L2_ARTIFACT_ROOT")?);
+    let baseline_db = root.join("baseline-device-mapper.redb");
+    seed(&baseline_db)?;
+    let baseline_trace = artifact_root.join("baseline-device-mapper.strace");
+    let baseline = traced_worker(executable, &baseline_db, &baseline_trace, None)?;
+    fs::write(artifact_root.join("baseline-device-mapper.stdout"), &baseline.stdout)?;
+    fs::write(artifact_root.join("baseline-device-mapper.stderr"), &baseline.stderr)?;
+    if !baseline.status.success()
+        || !String::from_utf8_lossy(&baseline.stdout).contains("L2_FINALIZE_OK")
+    {
+        return Err(format!(
+            "DM baseline finalize failed ({}): stdout={} stderr={}",
+            baseline.status,
+            String::from_utf8_lossy(&baseline.stdout),
+            String::from_utf8_lossy(&baseline.stderr)
+        )
+        .into());
+    }
+    let baseline_backing = RedbSpillBacking::create(&baseline_db)?;
+    assert_eq!(
+        baseline_backing.resolve_record(DurableRecordId::new(0))?,
+        DurableRecordResolution::Finalized,
+        "uninjected DM baseline must finalize the victim"
+    );
+    drop(baseline_backing);
+
+    let fault_db = root.join("fault-device-mapper.redb");
+    seed(&fault_db)?;
+    let fault_trace = artifact_root.join("fault-device-mapper.strace");
+    let fault = traced_worker_with_dm_fault(executable, &fault_db, &fault_trace, dm_name, sectors)?;
+    fs::write(artifact_root.join("fault-device-mapper.stdout"), &fault.stdout)?;
+    fs::write(artifact_root.join("fault-device-mapper.stderr"), &fault.stderr)?;
+    let trace = fs::read_to_string(&fault_trace)?;
+    let marker = trace
+        .lines()
+        .position(|line| line.contains("L2_FINALIZE_BEGIN"))
+        .ok_or("DM trace did not observe the finalize boundary")?;
+    let failed_io = trace.lines().skip(marker + 1).find(|line| {
+        (line.contains("pwrite64(") || line.contains("fdatasync(")) && line.contains("= -1 EIO")
+    });
+    let failed_io = failed_io.ok_or(
+        "device-mapper error target caused no observed pwrite64/fdatasync EIO after finalize boundary",
+    )?;
+    if !String::from_utf8_lossy(&fault.stdout).contains("L2_FINALIZE_BEGIN") {
+        return Err("DM-faulted worker did not reach finalize boundary".into());
+    }
+    if fault.status.success() {
+        return Err(format!(
+            "DM EIO did not propagate as finalize failure (stdout={} stderr={})",
+            String::from_utf8_lossy(&fault.stdout),
+            String::from_utf8_lossy(&fault.stderr)
+        )
+        .into());
+    }
+
+    // The mapping has already been restored to its backing loop device. A
+    // real unmount/remount forces the oracle to reopen the filesystem cold.
+    let loop_device = std::env::var("QMP_DURABILITY_L2_DM_LOOP")?;
+    let fsck_status =
+        repair_and_remount_dm_filesystem(dm_name, mount_path, &loop_device, &artifact_root)?;
+    let outcome = verify_after_fault(&fault_db)?;
+    let receipt = format!(
+        "PASS mechanism=dm-error-table-swap boundary=finalize-before-commit worker_exit={} observed_io={} filesystem_repair_status={} oracle={outcome}",
+        fault.status,
+        failed_io.trim(),
+        fsck_status
+    );
+    println!("{receipt}");
+    Ok(receipt)
 }
 
 #[cfg(target_os = "linux")]
@@ -377,22 +624,49 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
     };
     fs::create_dir(&artifact_root)?;
+    let work_parent = std::env::var_os("QMP_DURABILITY_L2_STORAGE_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
     let work_root =
-        std::env::temp_dir().join(format!("qmp-durability-l2-work-{}-{nonce}", std::process::id()));
+        work_parent.join(format!("qmp-durability-l2-work-{}-{nonce}", std::process::id()));
     fs::create_dir(&work_root)?;
     let mut work_root = WorkRoot { path: work_root, active: true };
     println!("L2_ARTIFACT_DIR={}", artifact_root.display());
     let mut scenarios = Vec::new();
     let run_result = (|| -> Result<(), Box<dyn Error>> {
-        scenarios.push(run_scenario(&work_root.path, &executable, "pwrite64")?);
-        scenarios.push(run_scenario(&work_root.path, &executable, "fdatasync")?);
+        if std::env::var("QMP_DURABILITY_L2_MODE").as_deref() == Ok("device-mapper") {
+            let dm_name = std::env::var("QMP_DURABILITY_L2_DM_NAME")?;
+            let dm_mount = PathBuf::from(std::env::var("QMP_DURABILITY_L2_DM_MOUNT")?);
+            let sectors = std::env::var("QMP_DURABILITY_L2_DM_SECTORS")?.parse::<u64>()?;
+            scenarios.push(run_dm_scenario(
+                &work_root.path,
+                &executable,
+                &dm_name,
+                &dm_mount,
+                sectors,
+            )?);
+        } else {
+            scenarios.push(run_scenario(&work_root.path, &executable, "pwrite64")?);
+            scenarios.push(run_scenario(&work_root.path, &executable, "fdatasync")?);
+        }
         Ok(())
     })();
-    let fs_type = Command::new("stat").args(["-f", "-c", "%T"]).arg(&work_root.path).output()?;
-    if !fs_type.status.success() {
-        return Err("could not identify the L2 database filesystem".into());
-    }
-    let fs_type = String::from_utf8_lossy(&fs_type.stdout).trim().to_string();
+    let fs_type = if std::env::var("QMP_DURABILITY_L2_MODE").as_deref() == Ok("device-mapper") {
+        let output = Command::new("findmnt")
+            .args(["--noheadings", "--output", "FSTYPE", "--target"])
+            .arg(&work_root.path)
+            .output()?;
+        if !output.status.success() {
+            return Err("findmnt could not identify the disposable DM filesystem".into());
+        }
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    } else {
+        let output = Command::new("stat").args(["-f", "-c", "%T"]).arg(&work_root.path).output()?;
+        if !output.status.success() {
+            return Err("could not identify the L2 database filesystem".into());
+        }
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    };
     let device = Command::new("stat").args(["-c", "%D"]).arg(&work_root.path).output()?;
     if !device.status.success() {
         return Err("could not identify the L2 database filesystem device".into());
@@ -420,14 +694,26 @@ fn main() -> Result<(), Box<dyn Error>> {
         format!("attempts={}\npassed={}\n", scenarios.len(), scenarios.len())
     };
     let hashes = artifact_hashes(&artifact_root)?.join("\n");
+    let mechanism = if std::env::var("QMP_DURABILITY_L2_MODE").as_deref() == Ok("device-mapper") {
+        format!(
+            "mechanism=dm-error-table-swap\ndm_name={}\ndm_loop={}\ndm_sectors={}\n",
+            std::env::var("QMP_DURABILITY_L2_DM_NAME").unwrap_or_default(),
+            std::env::var("QMP_DURABILITY_L2_DM_LOOP").unwrap_or_default(),
+            std::env::var("QMP_DURABILITY_L2_DM_SECTORS").unwrap_or_default()
+        )
+    } else {
+        "mechanism=strace-syscall-eio\n".to_string()
+    };
     let receipt = format!(
-        "level=L2\nsource_head={source_head}\nsource_digest={source_digest}\neffective_uid={effective_uid}\narchitecture={architecture}\nkernel={kernel}\nfilesystem={fs_type}\nfilesystem_device_id_hex={device}\nstrace={strace_version}\n{receipt_status}power_loss_proven=false\n{}\nartifact_sha256:\n{hashes}\n",
+        "level=L2\n{mechanism}source_head={source_head}\nsource_digest={source_digest}\neffective_uid={effective_uid}\narchitecture={architecture}\nkernel={kernel}\nfilesystem={fs_type}\nfilesystem_device_id_hex={device}\nstrace={strace_version}\n{receipt_status}power_loss_proven=false\n{}\nartifact_sha256:\n{hashes}\n",
         scenarios.join("\n")
     );
     fs::write(artifact_root.join("receipt.txt"), &receipt)?;
     run_result?;
     println!(
-        "L2_RESULT attempts=2 passed=2 source_head={source_head} source_digest={source_digest} effective_uid={effective_uid} architecture={architecture} kernel={kernel} filesystem={fs_type} strace={strace_version} receipt={}",
+        "L2_RESULT attempts={} passed={} source_head={source_head} source_digest={source_digest} effective_uid={effective_uid} architecture={architecture} kernel={kernel} filesystem={fs_type} strace={strace_version} receipt={}",
+        scenarios.len(),
+        scenarios.len(),
         artifact_root.join("receipt.txt").display()
     );
     Ok(())

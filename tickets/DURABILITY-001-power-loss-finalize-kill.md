@@ -1,6 +1,6 @@
 # DURABILITY-001 — finalize instruction-point kill and physical power-loss qualification
 
-Status: `HISTORICAL / OUT OF CURRENT PRODUCT SCOPE. L1 committed at edfef66; L2 Linux+root+strace candidate implemented but exact-current-source Linux receipt pending; block-device L2 and physical L3 were not qualified. Do not schedule these as current release gates.`
+Status: `HISTORICAL / OUT OF CURRENT PRODUCT SCOPE. L1, Linux syscall-EIO L2 (2/2), and disposable device-mapper L2 (1/1) verified on the recorded source snapshot; physical power-loss L3 remains unqualified. Do not schedule these as current release gates.`
 Contract: `option 1 (existing contract accepted)` per §2 planning default; no host contract presented requiring a durable publication ACK. The L1 after-oracle asserts no resurrection and no replay expectation, and asserts nothing about the killed process's volatile resident copy.
 Priority: `historical conditional P1; no current product/release priority`
 Source freeze: `f637d424724aade94564ca76bb5ca6d9b73b28ae` (`main == origin/main`, clean when planned)
@@ -181,21 +181,22 @@ Proposed files:
 | File | Purpose |
 | --- | --- |
 | `scripts/durability/run-emulated-linux.sh` | Fail-closed Linux-only runner for syscall-level EIO injection. Uses disposable Redb files, requires effective UID 0 plus `strace`, rejects artifact paths inside the repo/home, and returns exit 77 `UNAVAILABLE` when OS or privilege prerequisites are absent. |
-| `crates/quanta-memory-platform-facade/examples/spill_redb_durability_l2.rs` | Calibrates the first `pwrite64`/`fdatasync` after staged finalize, injects EIO at that exact ordinal, cold-reopens, and verifies whole-state convergence. Retains raw trace/database files and an artifact-hash receipt. |
+| `scripts/durability/run-device-mapper-linux.sh` | Explicit-opt-in Linux/UID-0 runner. Creates its own 128 MiB sparse image, loop device, ext4 filesystem and UUID-named DM mapping; never accepts a caller-supplied raw device. Retains the backing image/receipt and cleans up its mapping and loop device. |
+| `crates/quanta-memory-platform-facade/examples/spill_redb_durability_l2.rs` | Calibrates/injects syscall EIO or pauses at staged finalize while a disposable DM mapping is changed to `error`. It requires an observed post-marker syscall `EIO`, restores via `--noflush`, unmounts, runs `e2fsck`, detaches the DM target, remounts from the backing loop, cold-reopens and verifies whole-state convergence. Raw traces, DBs, filesystem-check output and hashes are retained outside the image. |
 
 Safety requirements:
 
-- refuse `/`, `$HOME`, the repository filesystem, mounted non-disposable
-  devices, unresolved variables, and raw device globs for a future device-mapper
-  extension;
-- require an explicit created image path or allowlisted device identity before
-  adding a block-device backend;
+- refuse `/`, `$HOME`, repository paths, caller-supplied devices, and absent
+  explicit disposable-VM opt-in;
+- create and use only the runner-owned sparse image/loop/DM target; do not add a
+  raw-device backend without a separate allowlist and safety review;
 - preserve failed trace/database artifacts and receipts for forensics;
 - never describe VM shutdown or device-mapper faults as physical power loss.
 
-L2 is not required on every PR. Run the syscall subrail nightly or before a
-durability release. The current runner proves syscall-error convergence only;
-device-mapper interruption and kernel/filesystem recovery remain OPEN.
+L2 is not required on every PR. Run both subrails nightly or before a
+durability release. Syscall injection proves syscall-error convergence; the
+DM rail demonstrates one disposable block-I/O EIO, filesystem recovery and
+cold reopen for its exact source/environment. Neither rail proves power loss.
 
 ## 5. L3 — physical power-loss qualification
 
@@ -604,3 +605,128 @@ fails. `bash -n`, ShellCheck, rustfmt, recursive feature-exclusion inspection,
 Darwin exit 77, and `git diff --check` pass. No Linux compile or runtime claim
 is made by those static checks; an exact-current-source root+strace Linux 2/2
 receipt remains required.
+
+### Session-hardening review (2026-09-25)
+
+Base at review start: `5ea34c647ddf6027f470dd1e027ae3108d0ffdd6`; the shared
+branch advanced during this review to `aec55dac1132709df5253333005638928942deec`
+and is now equal to `origin/main`. Unrelated dirty owners at closeout are
+`src/publish_pipeline/prepared_publication.rs` and
+`scripts/lib/self-hosting-manifest.sh`; they were preserved.
+
+The L2 proof owner had three missing assertions: the uninjected worker was not
+required to print successful finalize completion; the fault trace did not
+prove the injected syscall was after the finalize marker and at the calibrated
+ordinal; and the faulted worker was not required to return an error. These
+guards were added to `spill_redb_durability_l2.rs` and landed in `aec55da`.
+The current ARM64 Linux run at executable-input digest
+`1f76b6ae388ac42a4caef0759a42446204ea4f1e58627c2dd396dd9f80b9cf63` passed
+both EIO cases with non-zero worker exits and exact cold-reopen outcomes:
+`/private/tmp/qmp-durability-hardening/run-01/receipt.txt`.
+
+The first canonical run then exposed a stale failure-injection fixture in
+`scripts/tests/extraction-contracts.sh`: it looked for the removed
+`get("default")` parser, so the feature-parser error injection never happened
+and the test returned 0. The fixture now targets `json.load(sys.stdin)`, and
+the focused contract script plus the full `scripts/check-workspace.sh` both
+pass. The full rail reports 89 Python contract tests, 18 PM tests, all feature
+combinations warning-free, 10 capability selectors, 293 documented selectors,
+and `check-workspace: clean`.
+
+That contract-test correction changes the broad executable-input digest to
+`0faa707506a686e8f31d951fc747acad4f21a028526cab8f86197b1cbda212ae`, so the
+`1f76b6ae…` L2 receipt is not current-digest evidence. A rerun was attempted,
+but the ephemeral Docker container could not resolve the Debian package mirror
+and had no installed `strace`; that attempt did not start L2. A network retry
+then passed both cases on the exact `0faa7075…` digest; receipt and raw files:
+`/private/tmp/qmp-durability-hardening/run-03/receipt.txt`. At that review
+point, this did not yet qualify device-mapper L2 or physical power-loss L3.
+This ticket remains historical/out of the current release scope.
+
+### Device-mapper L2 completion (2026-09-25)
+
+At HEAD `58a268d92131a52fa8016da94ae2cda244f79174`, executable-input digest
+`afd110378590610d47d45a5e8cbc7cf7239ce9f51a86598010fdb9663b33e6c7`, the ARM64
+Linux 6.10.14 Docker Desktop VM passed both syscall cases (2/2) and one
+device-mapper case (1/1). The DM case paused at `L2_FINALIZE_BEGIN`, swapped the
+runner-owned ext4 loop mapping to `error`, observed a post-marker
+`fdatasync(3) = -1 EIO`, and propagated failure from the worker. After restoring
+the map without flushing failed I/O, `e2fsck` returned 0, the DM mapping was
+detached, and the filesystem was reopened through its loop backing device. The
+public-API oracle saw `Present -> recovered -> Finalized`; unrelated record
+drain and duplicate-ID rejection also passed. `power_loss_proven=false`.
+
+On the same final source tree, the L1 focused selector passed 3/3 and the
+canonical `scripts/check-workspace.sh` passed: 89 Python contract tests, 18 PM
+tests, warning-free feature matrix, workspace all-features tests, 10 capability
+selectors, 293 documented selectors, PM lint and cargo-deny. An earlier
+workspace run had transient `NotFound` while spawning a nested Cargo freshness
+build; the added failure diagnostic did not reproduce it on the final full
+gate. Treat that one initial failure as an unresolved intermittent test-runner
+risk, not as durability proof.
+
+Receipts and raw artifacts remain outside Git:
+
+- syscall rail: `/tmp/qmp-durability-artifacts.vUV7eI/syscall-final/receipt.txt`;
+- device-mapper rail: `/tmp/qmp-durability-artifacts.vUV7eI/dm-final/receipt.txt`;
+- DM backing-image SHA-256: `2849d413ce208bc2cdce658ed1d5836732e63bfecac0be874202aa5efbf4eef6`.
+
+This is one positive DM recovery sample on a disposable ext4 image, not a
+statistical durability claim or physical power-loss qualification. Three
+earlier failed harness prototypes left inert deferred-remove `error` mappings
+in the ephemeral Docker Desktop Linux VM (`qmpdurability162`,
+`qmpd4ba621427aa24974b39f63c8dea0b06d`, and
+`qmpd4d875cf83be44c04a18691fd2612b199`); their backing loop devices are
+detached and they have no dependencies. The final runner passed cleanup and
+did not leave its own mapping behind. A Docker VM restart is needed to reclaim
+those earlier kernel mappings; no host disk or repository data is involved.
+The ticket remains historical/out of the current release scope, and L3 stays
+unqualified until tested with a production-equivalent DUT and external PDU.
+
+### Runner RCA and exact-current-source requalification (2026-09-25)
+
+The earlier nested-Cargo `NotFound` was an opaque `Command::spawn` failure:
+Rust reports the same error kind when either the executable or explicit
+working directory is absent. The original run did not retain enough process
+environment to prove which one caused that historical failure. The freshness
+builds now set an absolute workspace manifest and explicit workspace working
+directory, retry PATH `cargo` only when the `CARGO` executable itself returns
+`NotFound`, and report both spawn errors plus path/existence diagnostics. This
+was adversarially exercised by launching the integration test from a deleted
+inherited cwd with `CARGO=/qmp-test-invalid-cargo`; PATH fallback and the L1
+pre-commit kill oracle passed. The normal focused L1/FUP-006 selectors passed
+7/7, and the canonical workspace gate passed afterward.
+
+The first exact-source DM rerun found two harness issues rather than a QMP
+durability failure: Docker's `/tmp` tmpfs was non-executable, so Cargo could
+not execute the Redb build script (`EACCES`); then the wrapper attempted to
+append DM metadata before creating its artifact directory, obscuring that
+first error with a missing-receipt-path error. The DM wrapper now creates a
+failure receipt before appending metadata and records umount/remove/detach
+failures without skipping later cleanup. Running Cargo targets under
+`/var/tmp` avoids the non-executable `/tmp` mount.
+
+After those fixes, both L2 subrails passed on the same current executable
+digest `f818ce9ecc9a190c327486d82df54ed00013fe9d22c2abcdeded1095b0a82f90`
+and HEAD `58a268d92131a52fa8016da94ae2cda244f79174`:
+
+- syscall EIO: 2/2 (`pwrite64` ordinal 9 and `fdatasync` ordinal 4), each with
+  the expected cold-reopen oracle;
+- disposable ext4 device-mapper error-table swap: 1/1, observed post-marker
+  `fdatasync = EIO`, filesystem repair status 0, oracle
+  `Present -> recovered -> Finalized`, with the runner-owned map detached.
+
+Receipts:
+
+- `/tmp/qmp-durability-artifacts.vUV7eI/syscall-final-rerun-01/receipt.txt`;
+- `/tmp/qmp-durability-artifacts.vUV7eI/dm-final-rerun-01/receipt.txt`.
+
+The three older orphan error mappings remain the only environment residue.
+Reinspection found zero dependencies, no mounts or process file descriptors,
+and `dmsetup remove --force` still returned `Device or resource busy` for all
+three. The final runner itself left no mapping. Reclaiming the orphan kernel
+references requires restarting the Docker Desktop Linux VM; an active BuildKit
+container is currently running there, so this task did not disrupt it. These
+maps have no backing devices or data and are not repository/host-disk changes.
+Physical L3 remains unqualified: it still requires the separate disposable
+DUT and external power controller specified above.
