@@ -4,6 +4,16 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${repo_root}"
 
+mode="full"
+if [[ "${1:-}" == "--in-memory" ]]; then
+  mode="in-memory"
+  shift
+fi
+if [[ "$#" -ne 0 ]]; then
+  echo "usage: scripts/verify-feature-capabilities.sh [--in-memory]" >&2
+  exit 2
+fi
+
 run_lib() {
   local features="$1"
   local selector="$2"
@@ -43,9 +53,12 @@ run_lib "publish_pipeline" \
   "default_pipeline_runs_stage_then_commit_each_exactly_once_no_rollback"
 run_lib "spill" \
   "in_memory_target_write_then_restore_round_trips_the_payload"
-run_lib "revocable_store,spill-redb" \
-  "durable_redb_round_trip_transfers_charge_exactly_once"
-run_lib "full-backings" \
-  "many_spills_share_large_binding_identity_without_unbilled_clones"
-
-echo "feature-capability: OK (10 advertised feature paths executed non-zero tests)"
+if [[ "${mode}" == "full" ]]; then
+  run_lib "revocable_store,spill-redb" \
+    "durable_redb_round_trip_transfers_charge_exactly_once"
+  run_lib "full-backings" \
+    "many_spills_share_large_binding_identity_without_unbilled_clones"
+  echo "feature-capability: OK (10 advertised feature paths executed non-zero tests)"
+else
+  echo "feature-capability: OK (8 in-memory/fixture feature paths executed non-zero tests)"
+fi

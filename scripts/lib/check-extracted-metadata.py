@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Reject Cargo graphs that are not self-contained QMP workspaces."""
 
+import argparse
 import json
 from pathlib import Path
 import sys
@@ -21,7 +22,9 @@ FORBIDDEN_EDGES = {
 }
 
 
-def check_metadata(metadata: dict, root: Path) -> None:
+def check_metadata(
+    metadata: dict, root: Path, extra_forbidden_packages: frozenset[str] = frozenset()
+) -> None:
     root = root.resolve()
     members = set(metadata["workspace_members"])
     member_names = {
@@ -43,6 +46,8 @@ def check_metadata(metadata: dict, root: Path) -> None:
 
     for package in metadata["packages"]:
         name = package["name"]
+        if name in extra_forbidden_packages:
+            raise ValueError(f"forbidden selected dependency: {name}")
         if name in FORBIDDEN_PACKAGES or name.startswith("semantica-"):
             raise ValueError(f"forbidden host dependency: {name}")
         if package["source"] is None:
@@ -54,9 +59,15 @@ def check_metadata(metadata: dict, root: Path) -> None:
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 2:
-        raise SystemExit("usage: check-extracted-metadata.py <workspace-root>")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("workspace_root", type=Path)
+    parser.add_argument("--forbid-package", action="append", default=[])
+    args = parser.parse_args()
     try:
-        check_metadata(json.load(sys.stdin), Path(sys.argv[1]))
+        check_metadata(
+            json.load(sys.stdin),
+            args.workspace_root,
+            frozenset(args.forbid_package),
+        )
     except ValueError as error:
         raise SystemExit(f"extraction metadata rejected: {error}") from error

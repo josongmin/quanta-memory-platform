@@ -4,6 +4,20 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${repo_root}"
 
+mode="full"
+if [[ "${1:-}" == "--in-memory" ]]; then
+  mode="in-memory"
+  shift
+fi
+if [[ "$#" -ne 0 ]]; then
+  echo "usage: scripts/check-workspace.sh [--in-memory]" >&2
+  exit 2
+fi
+
+in_memory_features="quanta-memory-platform-core/full,quanta-memory-platform-facade/full,quanta-memory-platform-testkit/full"
+# The capability rail also exercises the explicit unbudgeted fixture slice.
+# Check the union so no selected test can quietly pull in Redb.
+in_memory_graph_features="${in_memory_features},quanta-memory-platform-facade/unbudgeted-stores"
 workspace_test_output=""
 regression_output=""
 regression_pid=""
@@ -39,22 +53,35 @@ fi
 shellcheck "${shell_scripts[@]}"
 
 echo "[check-workspace] resolved workspace graph"
-cargo metadata --locked --format-version 1 | \
-  python3 scripts/lib/check-extracted-metadata.py "${repo_root}"
+if [[ "${mode}" == "full" ]]; then
+  metadata_features=(--all-features)
+else
+  metadata_features=(--no-default-features --features "${in_memory_graph_features}")
+fi
+workspace_metadata="$(cargo metadata --locked --format-version 1 "${metadata_features[@]}")"
+if [[ "${mode}" == "in-memory" ]]; then
+  python3 scripts/lib/check-extracted-metadata.py "${repo_root}" \
+    --forbid-package redb <<<"${workspace_metadata}"
+else
+  python3 scripts/lib/check-extracted-metadata.py "${repo_root}" \
+    <<<"${workspace_metadata}"
+fi
 
 echo "[check-workspace] workspace policy"
 python3 scripts/verify-workspace-policy.py
 
-# Crash tests build child examples with --offline to prove binary freshness.
-# Fetch host dependencies before those tests so a cold cache fails here instead
-# of after compiling and running most of the workspace suite.
-echo "[check-workspace] host dependency cache"
-host_target="$(rustc -vV | sed -n 's/^host: //p')"
-if [[ -z "${host_target}" ]]; then
-  echo "check-workspace: could not determine Rust host target" >&2
-  exit 1
+if [[ "${mode}" == "full" ]]; then
+  # Crash tests build child examples with --offline to prove binary freshness.
+  # Fetch host dependencies before those tests so a cold cache fails here
+  # instead of after compiling and running most of the workspace suite.
+  echo "[check-workspace] host dependency cache"
+  host_target="$(rustc -vV | sed -n 's/^host: //p')"
+  if [[ -z "${host_target}" ]]; then
+    echo "check-workspace: could not determine Rust host target" >&2
+    exit 1
+  fi
+  cargo fetch --locked --target "${host_target}"
 fi
-cargo fetch --locked --target "${host_target}"
 
 echo "[check-workspace] regression-guards (parallel with Python contract tests)"
 regression_output="$(mktemp /tmp/qmp-regression-guards.XXXXXX)"
@@ -75,18 +102,31 @@ if [[ "${regression_status}" -ne 0 ]]; then
   exit "${regression_status}"
 fi
 
-echo "[check-workspace] feature-matrix"
-scripts/verify-feature-matrix.sh
+if [[ "${mode}" == "full" ]]; then
+  echo "[check-workspace] feature-matrix"
+  scripts/verify-feature-matrix.sh
 
-echo "[check-workspace] cargo test --workspace --all-features"
-workspace_test_output="$(mktemp /tmp/qmp-workspace-tests.XXXXXX)"
-cargo test --locked --workspace --all-features 2>&1 | tee "${workspace_test_output}"
+  echo "[check-workspace] cargo test --workspace --all-features"
+  workspace_test_output="$(mktemp /tmp/qmp-workspace-tests.XXXXXX)"
+  cargo test --locked --workspace --all-features 2>&1 | tee "${workspace_test_output}"
 
-echo "[check-workspace] advertised feature runtime capabilities"
-scripts/verify-feature-capabilities.sh
+  echo "[check-workspace] advertised feature runtime capabilities"
+  scripts/verify-feature-capabilities.sh
 
-echo "[check-workspace] documented test selectors"
-scripts/verify-doc-test-selectors.py --test-output "${workspace_test_output}"
+  echo "[check-workspace] documented test selectors"
+  scripts/verify-doc-test-selectors.py --test-output "${workspace_test_output}"
+else
+  echo "[check-workspace] in-memory workspace Clippy"
+  cargo clippy --locked --workspace --all-targets --no-default-features \
+    --features "${in_memory_features}" -- -D warnings
+
+  echo "[check-workspace] in-memory workspace tests"
+  cargo test --locked --workspace --no-default-features \
+    --features "${in_memory_features}"
+
+  echo "[check-workspace] in-memory feature capabilities"
+  scripts/verify-feature-capabilities.sh --in-memory
+fi
 
 echo "[check-workspace] generated guidance"
 python3 tools/pm/pm.py lint
@@ -98,4 +138,8 @@ fi
 echo "[check-workspace] cargo deny"
 cargo deny --locked --all-features check -D warnings
 
-echo "check-workspace: clean"
+if [[ "${mode}" == "full" ]]; then
+  echo "check-workspace: clean (full repository gate)"
+else
+  echo "check-workspace: clean (in-memory scope only; full repository gate not run)"
+fi

@@ -22,6 +22,36 @@ fi
 
 echo "[regression-guards] semgrep ${config}"
 # --error makes any finding non-zero; --strict fails on rule/parse errors.
+scan_output="$(mktemp /tmp/qmp-semgrep-scan.XXXXXX)"
+trap 'rm -f -- "${scan_output}"' EXIT
+scan_status=0
 semgrep --config "${config}" --error --strict --metrics=off \
-  --disable-version-check --jobs=1 --include 'crates/**/*.rs' .
+  --disable-version-check --jobs=1 --include 'crates/**/*.rs' --json . \
+  >"${scan_output}" || scan_status=$?
+python3 - "${scan_output}" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+scan = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+scanned = set(scan["paths"]["scanned"])
+production = {
+    path.as_posix() for path in Path("crates").glob("*/src/**/*.rs")
+}
+missing = sorted(production - scanned)
+if not production or missing:
+    raise SystemExit(
+        "regression-guards: production Rust files not scanned: "
+        + ", ".join(missing or ["<no production files found>"])
+    )
+if scan.get("errors") or scan.get("results"):
+    for result in scan.get("results", []):
+        print(f"regression-guards: {result['check_id']}: {result['path']}", file=sys.stderr)
+    raise SystemExit("regression-guards: Semgrep reported findings or errors")
+print(f"[regression-guards] scanned {len(scanned)} Rust files, including all {len(production)} production files")
+PY
+if [[ "${scan_status}" -ne 0 ]]; then
+  echo "regression-guards: Semgrep failed (${scan_status})" >&2
+  exit "${scan_status}"
+fi
 echo "[regression-guards] semgrep: clean"

@@ -10,9 +10,11 @@ from dataclasses import asdict, dataclass
 
 
 RESULT_LINE = re.compile(
-    r"test result: (?:ok|FAILED)\. "
+    r"^test result: (?:ok|FAILED)\. "
     r"(?P<passed>\d+) passed; (?P<failed>\d+) failed; "
-    r"(?P<ignored>\d+) ignored; (?P<measured>\d+) measured;"
+    r"(?P<ignored>\d+) ignored; (?P<measured>\d+) measured; "
+    r"\d+ filtered out; finished in [0-9]+(?:\.[0-9]+)?s$",
+    re.MULTILINE,
 )
 
 
