@@ -71,7 +71,7 @@ Correctness is managed as **tests**; benchmarks answer a different question
   reclaim episodes, actual reclaim count and Busy retries; its admission
   throughput includes all reclaim attempts in wall time. Every row must close
   with zero semantic and allocator drift. All v4 rows also report
-  `successful_throughput_ops_per_sec`; baseline and release comparison gate it
+  the successful_throughput_ops_per_sec metric; baseline and release comparison gate it
   separately from total attempted throughput, so extra denials cannot appear
   as a throughput improvement.
   Earlier v3 receipts are historical evidence and cannot be admitted by the
