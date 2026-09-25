@@ -730,3 +730,25 @@ container is currently running there, so this task did not disrupt it. These
 maps have no backing devices or data and are not repository/host-disk changes.
 Physical L3 remains unqualified: it still requires the separate disposable
 DUT and external power controller specified above.
+
+### Clean-HEAD requalification and VM cleanup (2026-09-25)
+
+During closeout, `main` advanced to `5ec6068e87c03cffcfba1642598ce920645839f0`
+and became clean/equal to `origin/main`. The new commit contains the already
+tested durability sources; nevertheless, evidence was regenerated against
+this exact HEAD. Executable digest is
+`ec6f6692817ed4342362f4add168b7285bf56c4ee64853e053be51cf798c38c4`:
+
+- clean-HEAD `scripts/check-workspace.sh`: exit 0, full repository gate;
+- syscall EIO: 2/2, receipt
+  `/tmp/qmp-durability-final-20260925/syscall-current-head/receipt.txt`;
+- device-mapper ext4 EIO: 1/1, receipt
+  `/tmp/qmp-durability-final-20260925/dm-current-head/receipt.txt`.
+
+The three old orphan mappings were not individually removable while the
+original Docker Desktop VM was stopped/unavailable. Starting Docker Desktop
+recreated its Linux VM; a fresh `dmsetup` inventory then contained no `qmpd*`
+mapping. The BuildKit builder also returned and is running. The filesystem and
+device-mapper experiments therefore leave no remaining VM kernel residue.
+Only physical L3 remains an external hardware qualification, not an automated
+runner/code defect.
