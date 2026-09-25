@@ -528,6 +528,36 @@ class ScalingResultTests(unittest.TestCase):
                 with self.assertRaisesRegex(MODULE.ValidationError, message):
                     MODULE.validate(records)
 
+    def test_allocator_telemetry_cannot_silently_disappear(self) -> None:
+        records = valid_records(["--smoke"])
+        payload = next(record for record in records if record.get("operation") == "payload_unique_fill")
+        for field in (
+            "allocator_allocated_bytes", "allocator_deallocated_bytes",
+            "allocator_high_water_bytes",
+        ):
+            payload[field] = 0
+        with self.assertRaisesRegex(MODULE.ValidationError, "missing allocator telemetry"):
+            MODULE.validate(records)
+
+        records = valid_records(["--smoke"])
+        records[1]["allocator_high_water_bytes"] = 0
+        with self.assertRaisesRegex(MODULE.ValidationError, "allocator high-water"):
+            MODULE.validate(records)
+
+        # Scheduler admission deliberately starts allocation tracking after
+        # fixture construction and may have an allocation-free measured loop.
+        records = valid_records(["--smoke"])
+        scheduler = next(
+            record for record in records
+            if record.get("operation") == "scheduler_admission_group_cardinality"
+        )
+        for field in (
+            "allocator_allocated_bytes", "allocator_deallocated_bytes",
+            "allocator_high_water_bytes",
+        ):
+            scheduler[field] = 0
+        self.assertEqual(MODULE.validate(records), 48)
+
     def test_falsified_outcome_counts_are_rejected(self) -> None:
         records = valid_records(["--smoke"])
         scheduler = next(

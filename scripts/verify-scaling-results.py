@@ -336,8 +336,11 @@ def validate_samples(
             )
         if sample.get("allocator_underflowed") is not False:
             raise ValidationError(f"{key}: allocator live-byte counter underflowed")
-        if integer(sample, "allocator_high_water_bytes") < live:
-            raise ValidationError(f"{key}: allocator high-water is below live bytes")
+        high_water = integer(sample, "allocator_high_water_bytes")
+        if high_water < live or high_water > allocated or (allocated > 0 and high_water == 0):
+            raise ValidationError(f"{key}: allocator high-water is inconsistent with allocated/live bytes")
+        if sample.get("operation") != "scheduler_admission_group_cardinality" and allocated == 0:
+            raise ValidationError(f"{key}: missing allocator telemetry for retained workload")
         if integer(sample, "busy_retries") < 0:
             raise ValidationError(f"{key}: busy retry count is negative")
     for operation in OUTCOME_OPERATIONS:

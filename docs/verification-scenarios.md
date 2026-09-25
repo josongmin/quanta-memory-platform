@@ -46,7 +46,11 @@ Correctness is managed as **tests**; benchmarks answer a different question
   store/broker paths with repeated latency/throughput distributions and a real
   tracking allocator. `scripts/verify-scaling-results.py` owns the executable
   absolute and optional same-host baseline thresholds; its negative fixtures
-  prove drift and regressed results are rejected. Correctness remains in the
+  prove drift and regressed results are rejected. Retained store/broker rows
+  must report nonzero allocator activity, and a nonzero allocation total must
+  have a consistent high-water mark. Scheduler admission may legitimately
+  allocate zero bytes because its epoch starts after fixture construction.
+  Correctness remains in the
   owning unit/conformance suites. The scheduler-admission row retains its
   **combined** timed-call count, throughput and `p50/p95/p99_ns`,
   and also reports `admitted_*_ns` and `denied_*_ns` percentiles from the same
