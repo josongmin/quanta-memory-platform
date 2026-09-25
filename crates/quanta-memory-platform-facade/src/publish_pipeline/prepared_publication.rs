@@ -1346,6 +1346,33 @@ mod tests {
             }
         }
 
+        #[derive(Clone)]
+        struct ReentrantMeasurePayload {
+            bytes: Vec<u8>,
+            service: Arc<OnceLock<Weak<PreparedPublicationService<Self, Budgeted>>>>,
+            measure_hits: Arc<AtomicUsize>,
+        }
+
+        impl ByteSized for ReentrantMeasurePayload {
+            fn byte_size(&self) -> u64 {
+                let service = self.service.get().and_then(Weak::upgrade).expect("bound service");
+                assert!(matches!(
+                    service.stats(),
+                    Err(PreparedPublicationErrorV1::Storage(
+                        MemoryError::OperationInProgress(resource)
+                    )) if resource == "prepared publication service"
+                ));
+                self.measure_hits.fetch_add(1, Ordering::SeqCst);
+                self.bytes.len() as u64
+            }
+        }
+
+        impl CanonicalKey for ReentrantMeasurePayload {
+            fn canonical_key(&self) -> Vec<u8> {
+                self.bytes.clone()
+            }
+        }
+
         #[derive(Debug)]
         struct OneShotPanicPayload {
             bytes: Vec<u8>,
@@ -1563,6 +1590,47 @@ mod tests {
             assert_eq!(
                 broker.ledger_snapshot().expect("unchanged charge").total_owner_bytes(),
                 live_cost("clone-reentry", b"owned")
+            );
+            service.close().expect("close");
+            assert_eq!(broker.ledger_snapshot().expect("refunded").total_owner_bytes(), 0);
+        }
+
+        #[test]
+        fn prepare_measurement_reentry_is_typed_busy_and_replay_skips_measurement() {
+            let broker = broker(1_000_000);
+            let service = Arc::new(
+                PreparedPublicationService::<ReentrantMeasurePayload, Budgeted>::new_budgeted(
+                    binding(),
+                    None,
+                    None,
+                    broker.clone(),
+                ),
+            );
+            let probe = Arc::new(OnceLock::new());
+            assert!(probe.set(Arc::downgrade(&service)).is_ok());
+            let measure_hits = Arc::new(AtomicUsize::new(0));
+            let request = || {
+                PreparedPublicationRequestV1::new(
+                    PreparedPublicationIdentityV1::new(b"measure-reentry".to_vec())
+                        .expect("identity"),
+                    ReentrantMeasurePayload {
+                        bytes: b"owned".to_vec(),
+                        service: Arc::clone(&probe),
+                        measure_hits: Arc::clone(&measure_hits),
+                    },
+                )
+            };
+
+            let first = service.prepare(request()).expect("first prepare");
+            assert_eq!(first.disposition(), PrepareDispositionV1::Applied);
+            assert_eq!(measure_hits.load(Ordering::SeqCst), 1);
+            let replay = service.prepare(request()).expect("replay");
+            assert_eq!(replay.disposition(), PrepareDispositionV1::Replayed);
+            assert_eq!(first.token(), replay.token());
+            assert_eq!(measure_hits.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                broker.ledger_snapshot().expect("exact charge").total_owner_bytes(),
+                live_cost("measure-reentry", b"owned")
             );
             service.close().expect("close");
             assert_eq!(broker.ledger_snapshot().expect("refunded").total_owner_bytes(), 0);
