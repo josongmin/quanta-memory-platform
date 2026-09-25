@@ -77,7 +77,7 @@ done
 # 0b. Cargo's resolved graph is the authority for dependency direction, host
 #     back-edges, local packages, and path dependencies escaping the workspace.
 #     This catches renamed dependencies and ignores comments/string lookalikes.
-cargo metadata --locked --format-version 1 | \
+cargo metadata --locked --all-features --format-version 1 | \
   python3 scripts/lib/check-extracted-metadata.py "${repo_root}"
 
 # Freeze the exact committed source tree. The manifest binds tree ID, Git mode,

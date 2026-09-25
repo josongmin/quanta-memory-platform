@@ -44,6 +44,18 @@ class ExtractionMetadataTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "forbidden host dependency"):
             MODULE.check_metadata(self.metadata, self.root)
 
+    def test_optional_product_dependency_rejected_when_forbidden(self):
+        self.metadata["packages"].append(
+            {
+                "id": "redb",
+                "name": "redb",
+                "source": "registry+https://example.invalid",
+                "manifest_path": "/tmp/cargo-registry/redb/Cargo.toml",
+            }
+        )
+        with self.assertRaisesRegex(ValueError, "forbidden selected dependency: redb"):
+            MODULE.check_metadata(self.metadata, self.root, frozenset({"redb"}))
+
     def test_external_renamed_path_dependency_rejected(self):
         self.metadata["packages"].append(
             {

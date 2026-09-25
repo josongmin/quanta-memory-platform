@@ -102,6 +102,7 @@ def valid_records(
         "feature_set": "full" if pressure else "all-features",
         "feature_graph_sha256": "f" * 64,
         "dependency_lock_sha256": "e" * 64,
+        "benchmark_source_sha256": "9" * 64,
         "package": "quanta-memory-platform-facade",
         "bench_target": "scaling",
         "benchmark_args": benchmark_args,
@@ -195,6 +196,21 @@ class ScalingResultTests(unittest.TestCase):
         for records in candidates:
             records[0]["source_tree"] = records[-1]["source_tree"] = baselines[0][0]["source_tree"]
         with self.assertRaisesRegex(MODULE.ValidationError, "same source tree"):
+            MODULE.validate_release(candidates, baselines, RELEASE_POLICY)
+
+    def test_release_rejects_changed_or_missing_benchmark_implementation(self) -> None:
+        candidates, baselines = release_receipts()
+        candidates[0][0]["benchmark_source_sha256"] = "8" * 64
+        with self.assertRaisesRegex(MODULE.ValidationError, "benchmark_source_sha256"):
+            MODULE.validate_release(candidates, baselines, RELEASE_POLICY)
+        candidates, baselines = release_receipts()
+        for records in candidates:
+            records[0]["benchmark_source_sha256"] = "8" * 64
+        with self.assertRaisesRegex(MODULE.ValidationError, "benchmark_source_sha256"):
+            MODULE.validate_release(candidates, baselines, RELEASE_POLICY)
+        candidates, baselines = release_receipts()
+        del candidates[0][0]["benchmark_source_sha256"]
+        with self.assertRaisesRegex(MODULE.ValidationError, "benchmark_source_sha256"):
             MODULE.validate_release(candidates, baselines, RELEASE_POLICY)
 
     def test_release_requires_successful_recorded_bench_exit(self) -> None:
@@ -657,6 +673,19 @@ class ScalingResultTests(unittest.TestCase):
         baseline[0]["source_sha"] = baseline[-1]["source_sha"] = "c" * 40
         baseline[0]["source_tree"] = baseline[-1]["source_tree"] = "d" * 40
         self.assertEqual(MODULE.validate(current, baseline), 48)
+
+    def test_baseline_requires_same_benchmark_implementation(self) -> None:
+        current = valid_records(["--smoke"])
+        baseline = valid_records(["--smoke"])
+        baseline[0]["benchmark_source_sha256"] = "8" * 64
+        with self.assertRaisesRegex(MODULE.ValidationError, "baseline incompatible benchmark_source_sha256"):
+            MODULE.validate(current, baseline)
+        del baseline[0]["benchmark_source_sha256"]
+        with self.assertRaisesRegex(MODULE.ValidationError, "baseline incompatible benchmark_source_sha256"):
+            MODULE.validate(current, baseline)
+        baseline[0]["benchmark_source_sha256"] = "not-a-digest"
+        with self.assertRaisesRegex(MODULE.ValidationError, "benchmark_source_sha256.*invalid"):
+            MODULE.validate(current, baseline)
 
     def test_baseline_regressions_are_rejected(self) -> None:
         baseline = valid_records(["--smoke"])

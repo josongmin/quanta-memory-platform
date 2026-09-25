@@ -38,6 +38,13 @@ mkdir -p "${fixture}/scripts"
 cp scripts/regression-guards.sh "${fixture}/scripts/regression-guards.sh"
 expect_failure "missing semgrep config" "${fixture}/scripts/regression-guards.sh"
 expect_failure "missing semgrep binary" env PATH=/usr/bin:/bin scripts/regression-guards.sh
+mkdir -p "${fixture}/bin"
+cat > "${fixture}/bin/semgrep" <<'EOF'
+#!/usr/bin/env bash
+printf '{"paths":{"scanned":[]},"results":[],"errors":[]}\n'
+EOF
+chmod +x "${fixture}/bin/semgrep"
+expect_failure "zero-target semgrep scan" env PATH="${fixture}/bin:${PATH}" scripts/regression-guards.sh
 
 # Build one fixture corpus so Semgrep starts once. The result check below proves
 # every historical rule ID bites and the documented clean/suppressed cases stay

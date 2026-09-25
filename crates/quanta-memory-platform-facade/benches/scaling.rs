@@ -1233,8 +1233,10 @@ fn payload_contention(
             WorkerSample { latencies, busy_retries }
         }));
     }
-    barrier.wait();
+    // Start before releasing workers: some may finish their first operation
+    // before the main thread returns from the barrier.
     let started = Instant::now();
+    barrier.wait();
     let mut latencies = Vec::with_capacity(entries);
     let mut busy_retries = 0u64;
     for handle in handles {

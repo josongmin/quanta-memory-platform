@@ -23,6 +23,15 @@ drift, and dependency policy.
 scripts/check-workspace.sh
 ```
 
+For a shorter local check of the in-memory feature set, run
+`scripts/check-workspace.sh --in-memory`. It runs the same static and contract
+checks, then checks that the selected dependency graph contains no Redb, runs
+workspace Clippy and tests with `core/full`, `facade/full`, and `testkit/full`,
+and executes eight in-memory/fixture feature capability selectors. It does not
+run the per-feature Clippy matrix, Redb-backed tests, or documented selector
+validation. Its success is explicitly scoped and is not extraction or full
+workspace qualification.
+
 Run focused commands while developing, but do not report them as equivalent to
 the canonical rail. The feature matrix discovers feature names from Cargo
 metadata and covers default, bare, every feature other than the `default`/`full`

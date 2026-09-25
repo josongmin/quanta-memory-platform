@@ -114,6 +114,9 @@ deliberate non-accounted use. It is absent from `default`, `full`, and
 # authoritative repo-local static, contract, feature, test, and dependency rail
 scripts/check-workspace.sh
 
+# shorter local in-memory check; does not build/test Redb or qualify extraction
+scripts/check-workspace.sh --in-memory
+
 # public broker/store scaling and final semantic/allocator-drift checks
 scripts/run-scaling-bench.sh --smoke
 scripts/run-scaling-bench.sh

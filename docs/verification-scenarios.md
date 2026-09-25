@@ -72,7 +72,11 @@ Correctness is managed as **tests**; benchmarks answer a different question
   standard profile), then invoke `scripts/verify-scaling-results.py --release`
   with three `--baseline` and three `--input` paths. Supply every
   `--release-*` limit explicitly from the consumer's approved policy. The release
-  comparator takes each process's slowest repetition for throughput,
+  comparison requires the same `scaling.rs` benchmark-source SHA-256 on both
+  sides; receipts collected before this fingerprint was recorded cannot serve
+  as release baselines. The contention wall timer starts before workers leave
+  the start barrier, so all worker operations are included in throughput.
+  The release comparator takes each process's slowest repetition for throughput,
   highest repetition p99 (including admitted/denied tails), and highest Busy
   retry rate, then compares the median of three independent processes. A
   one-process spike below the absolute cap but beyond the run-noise bound is
