@@ -171,7 +171,9 @@ exit 2
 EOF
 cat > "${fixture}/matrix-bin/python3" <<'EOF'
 #!/usr/bin/env bash
-if [[ "$1" == "-c" && "$2" == *'json.load(sys.stdin)'* ]]; then
+# Match the feature-list invocation by its crate argument, not by incidental
+# Python source text. If the invocation changes, this negative test must fail.
+if [[ "$1" == "-c" && "${3:-}" == "quanta-memory-platform-core" ]]; then
   exit 37
 fi
 exec "${QMP_REAL_PYTHON}" "$@"
