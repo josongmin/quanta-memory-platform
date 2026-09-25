@@ -1709,24 +1709,24 @@ impl LiveProcessMemoryBroker {
     ///   permit cannot open another coordinator's fence.
     pub fn begin_rebuild(&self) -> MemoryResult<RebuildFence> {
         let mut core = self.lock()?;
-        if core.ledger.rebuild_in_progress() {
-            if !core.rebuild_abandoned {
-                return Err(MemoryError::InvalidState(
-                    "rebuild already in progress: a second live coordinator cannot open over \
-                     the active fence"
-                        .to_string(),
-                ));
-            }
-            // Explicit recovery: re-adopt the abandoned fence under a new
-            // epoch. Deferred authorities stay queued and exact.
-            core.rebuild_abandoned = false;
+        if core.ledger.rebuild_in_progress() && !core.rebuild_abandoned {
+            return Err(MemoryError::InvalidState(
+                "rebuild already in progress: a second live coordinator cannot open over \
+                 the active fence"
+                    .to_string(),
+            ));
         }
-        // Resolve every fallible step BEFORE mutating the ledger fence: an
-        // exhausted epoch must not strand a fence with no permit.
+        // Resolve every fallible step BEFORE mutating any fence state: an
+        // exhausted epoch must not strand a fence with no permit and must
+        // not flip an abandoned fence to active on the Err path.
         let epoch = core
             .rebuild_epoch
             .checked_add(1)
             .ok_or_else(|| MemoryError::InvalidState("rebuild epoch exhausted u64".to_string()))?;
+        // Explicit recovery: re-adopt the abandoned fence under a new epoch.
+        // Deferred authorities stay queued and exact; the clear happens only
+        // now that every fallible step has succeeded.
+        core.rebuild_abandoned = false;
         core.ledger.begin_rebuild();
         core.rebuild_epoch = epoch;
         drop(core);
@@ -3731,6 +3731,37 @@ mod tests {
     // A second broker clone must not be able to begin over a live fence, and
     // the tokenless finish path is structurally gone: no public API lets a
     // clone open another coordinator's fence.
+    // An exhausted epoch must fail closed WITHOUT mutating fence state: an
+    // abandoned fence stays observably abandoned and a fresh fence is never
+    // opened, so no Err path can strand a fence with no permit.
+    #[test]
+    fn begin_rebuild_epoch_exhaustion_leaves_fence_state_untouched() {
+        let b = broker();
+        {
+            let mut core = b.inner.lock().expect("core");
+            core.ledger.begin_rebuild();
+            core.rebuild_epoch = u64::MAX;
+            core.rebuild_abandoned = true;
+        }
+        assert_eq!(
+            b.rebuild_fence_status().expect("status"),
+            crate::api::control::RebuildFenceStatus::Abandoned
+        );
+
+        let denied = b.begin_rebuild();
+        assert!(
+            matches!(denied, Err(MemoryError::InvalidState(_))),
+            "the exhausted epoch must be a typed rejection, got {denied:?}"
+        );
+        // The Err path must not have re-adopted the fence: it stays
+        // abandoned (recoverable-by-inspection), never active-with-no-permit.
+        assert_eq!(
+            b.rebuild_fence_status().expect("status"),
+            crate::api::control::RebuildFenceStatus::Abandoned,
+            "a rejected begin must leave the abandoned fence observable"
+        );
+    }
+
     #[test]
     fn rebuild_fence_rejects_foreign_clone_finish_and_second_live_begin() {
         let b = broker();

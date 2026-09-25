@@ -947,10 +947,13 @@ where
         // Session resolution and the message-id probe run on BORROWED caller
         // keys, so an Ord panic unwinds nothing caller-owned inside this
         // boundary; the in-flight guards above retire the frame's owned
-        // caller values before the panic resumes. The two final std-BTreeMap
-        // insertions (new session, new message evidence) are the sole
-        // residual: std offers no insertion that avoids an owned-key Ord
-        // descent, so a compound hostile key can still abort exactly there.
+        // caller values before the panic resumes. The message-evidence slot
+        // is resolved by an owned-key Ord descent BEFORE anything is
+        // published (a panic there rolls back completely). The sole
+        // post-publication residual is the final new-session keyed insert:
+        // std offers no insertion that avoids an owned-key Ord descent, so a
+        // panic there drops the closure-local session (charges release via
+        // Drop) and only a compound hostile destructor can abort.
         // The u64-keyed row/evidence maps need no client callbacks.
         let publication = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             if let Some(session) = state.sessions.get_mut(session_id.get()) {
@@ -2190,7 +2193,7 @@ mod tests {
 
         #[test]
         fn panicking_message_id_clone_at_each_publication_point_leaves_append_atomic() {
-            for panic_after in [1, 2] {
+            for panic_after in [1, 2, 3] {
                 let broker = broker(1_000_000);
                 let store = callback_store(&broker);
                 let clones = CallbackTrap::new();
@@ -2230,7 +2233,7 @@ mod tests {
 
         #[test]
         fn panicking_message_id_clone_cannot_publish_an_empty_new_session() {
-            for panic_after in [1, 2] {
+            for panic_after in [1, 2, 3] {
                 let broker = broker(1_000_000);
                 let store = callback_store(&broker);
                 let clones = CallbackTrap::new();
