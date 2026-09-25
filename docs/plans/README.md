@@ -1,5 +1,9 @@
 # Historical plan status (2026-09-24) and current receipt lookup
 
+The [Sep-26 engine architecture bugbash](bugbash-sep-26-engine/README.md) records
+read-only findings at QMP `96d0a25`; it is an audit queue, not an implementation
+or exact-source qualification receipt.
+
 The `db0b03c` snapshot below is the last audited implementation base, not
 current HEAD. Current local qualification is asserted only when an annotated
 `qmp-local-qualified-*` tag peels to exact `HEAD`; its annotation binds the
