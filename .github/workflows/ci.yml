@@ -36,7 +36,7 @@ jobs:
       - name: Install pinned verification tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y shellcheck
+          sudo apt-get install -y ripgrep shellcheck
           if ! command -v rustup >/dev/null 2>&1; then
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs |
               sh -s -- -y --profile minimal --default-toolchain none

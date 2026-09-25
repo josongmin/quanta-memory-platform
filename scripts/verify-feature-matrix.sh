@@ -23,6 +23,11 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${repo_root}"
 
+if ! command -v rg >/dev/null 2>&1; then
+  echo "feature-matrix: rg unavailable" >&2
+  exit 1
+fi
+
 # Cargo metadata is the feature-list authority. Every public feature except the
 # `default` and `full` aggregates is checked alone, so a new feature cannot be
 # added to a manifest without entering this matrix automatically. The default

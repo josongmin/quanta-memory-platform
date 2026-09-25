@@ -20,6 +20,30 @@ def executable(path: Path, contents: str) -> None:
 
 
 class GateFailurePathsTests(unittest.TestCase):
+    def test_feature_matrix_rejects_missing_ripgrep_before_cargo(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="qmp-missing-rg-") as directory:
+            root = Path(directory)
+            scripts = root / "scripts"
+            binary = root / "bin"
+            scripts.mkdir()
+            binary.mkdir()
+            shutil.copy2(ROOT / "scripts/verify-feature-matrix.sh", scripts)
+            for command in ("bash", "dirname"):
+                source = shutil.which(command)
+                self.assertIsNotNone(source)
+                (binary / command).symlink_to(source)
+            executable(binary / "cargo", "#!/bin/sh\nexit 99\n")
+            result = subprocess.run(
+                [str(binary / "bash"), str(scripts / "verify-feature-matrix.sh")],
+                cwd=root,
+                env={**os.environ, "PATH": str(binary)},
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertIn("feature-matrix: rg unavailable", result.stderr)
+
     def test_partial_find_failure_stops_before_shellcheck(self) -> None:
         with tempfile.TemporaryDirectory(prefix="qmp-find-failure-") as directory:
             root = Path(directory)
