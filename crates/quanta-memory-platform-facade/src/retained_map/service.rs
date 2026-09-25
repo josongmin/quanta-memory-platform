@@ -19,10 +19,7 @@ use crate::retained_map::{
 #[cfg(feature = "unbudgeted-stores")]
 use crate::shared::accounting::Unbudgeted;
 use crate::shared::accounting::{Budgeted, StoreAccounting};
-use crate::shared::lifecycle::{
-    invoke_client_read_while_locked, retire_client_value, BeginClose, DropTransition,
-    StoreLifecycle,
-};
+use crate::shared::lifecycle::{retire_client_value, BeginClose, DropTransition, StoreLifecycle};
 use crate::shared::measure::{semantic_cost_v1, ByteSized, RetainedCostV1};
 
 #[derive(Debug)]
@@ -170,15 +167,6 @@ impl<Key, Value, Mode> SimpleRetainedMapStore<Key, Value, Mode> {
         self.lifecycle.try_lock_state(&self.state)
     }
 
-    /// Return only a complete preimage or postimage. A read during an in-flight
-    /// accounting plan returns typed busy instead of spinning on reentry.
-    fn lock_for_read(&self) -> Result<MutexGuard<'_, MapState<Key, Value>>, MemoryError> {
-        self.lifecycle.ensure_readable()?;
-        let state = self.lock()?;
-        self.lifecycle.ensure_readable()?;
-        Ok(state)
-    }
-
     fn take_state(&self) -> Result<MapStatePlan<'_, Key, Value>, MemoryError> {
         let mut state = self.lock()?;
         let owned = std::mem::replace(&mut *state, MapState::empty());
@@ -277,7 +265,7 @@ where
 {
     /// Committed retained bytes (sum of live entry charges).
     pub fn committed_bytes(&self) -> Result<u64, MemoryError> {
-        Ok(self.lock_for_read()?.committed_bytes)
+        self.lifecycle.with_read_state(&self.state, |state| state.committed_bytes)
     }
 
     fn committed_bytes_after_replace_v1(
@@ -507,10 +495,9 @@ where
     }
 
     fn get_checked(&self, key: &Key) -> Result<Option<Value>, MemoryError> {
-        let state = self.lock_for_read()?;
-        Ok(invoke_client_read_while_locked(state, |state| {
+        self.lifecycle.with_read_state(&self.state, |state| {
             state.entries.get(key).map(|entry| entry.value.clone())
-        }))
+        })
     }
 
     fn remove(&self, key: &Key) -> Result<Option<Value>, MemoryError> {
@@ -664,18 +651,22 @@ where
     }
 
     fn stats_checked(&self) -> Result<StoreStats, MemoryError> {
-        let state = self.lock_for_read()?;
-        Ok(StoreStats { item_count: state.entries.len(), estimated_bytes: state.committed_bytes })
+        self.lifecycle.with_read_state(&self.state, |state| StoreStats {
+            item_count: state.entries.len(),
+            estimated_bytes: state.committed_bytes,
+        })
     }
 
     fn keys_checked(&self) -> Result<Vec<Key>, MemoryError>
     where
         Key: Clone + Ord,
     {
-        let state = self.lock_for_read()?;
-        let mut keys: Vec<Key> =
-            invoke_client_read_while_locked(state, |state| state.entries.keys().cloned().collect());
-        // Deterministic, key-sorted order independent of insertion order.
+        let mut keys = self.lifecycle.with_read_state(&self.state, |state| {
+            state.entries.keys().cloned().collect::<Vec<Key>>()
+        })?;
+        // Deterministic, key-sorted order independent of insertion order. The
+        // sort runs outside the store boundary so a caller `Ord` panic cannot
+        // hold or poison the state mutex.
         keys.sort();
         Ok(keys)
     }
@@ -685,11 +676,14 @@ where
         Key: Clone + Ord,
         Value: Clone,
     {
-        let state = self.lock_for_read()?;
-        let mut entries: Vec<(Key, Value)> = invoke_client_read_while_locked(state, |state| {
-            state.entries.iter().map(|(key, entry)| (key.clone(), entry.value.clone())).collect()
-        });
-        // Same deterministic key order as `keys`.
+        let mut entries = self.lifecycle.with_read_state(&self.state, |state| {
+            state
+                .entries
+                .iter()
+                .map(|(key, entry)| (key.clone(), entry.value.clone()))
+                .collect::<Vec<(Key, Value)>>()
+        })?;
+        // Same deterministic key order as `keys`, outside the boundary.
         entries.sort_by(|a, b| a.0.cmp(&b.0));
         Ok(entries)
     }
@@ -1933,6 +1927,34 @@ mod tests {
             assert!(caught.is_err());
             assert_eq!(store.stats_checked().expect("state not poisoned"), StoreStats::default());
             assert_eq!(broker.ledger_snapshot().expect("no charge").total_owner_bytes(), 0);
+        }
+
+        #[test]
+        fn counter_reads_show_open_busy_and_closed_images() {
+            let broker = live_broker(1_000_000);
+            let store = charged(&broker);
+            store.insert_checked("key".to_string(), vec![1, 2, 3]).expect("insert");
+            // Open image: the plain counters mirror the authoritative ledger charge.
+            let charged = broker.ledger_snapshot().expect("open ledger").total_owner_bytes();
+            assert!(charged > 0, "seed entry must hold a live charge");
+            assert_eq!(
+                store.stats_checked().expect("open stats"),
+                StoreStats { item_count: 1, estimated_bytes: charged }
+            );
+            assert_eq!(store.committed_bytes().expect("open bytes"), charged);
+
+            // Busy image: while the mutation lane is held, counter reads are
+            // typed contention — never an empty success masking a detached plan.
+            let permit = store.lifecycle.begin_mutation().expect("own lane");
+            assert!(matches!(store.stats_checked(), Err(MemoryError::OperationInProgress(_))));
+            assert!(matches!(store.committed_bytes(), Err(MemoryError::OperationInProgress(_))));
+            drop(permit);
+
+            // Closed image: the terminal empty image stays readable and consistent.
+            store.close().expect("close");
+            assert_eq!(store.stats_checked().expect("closed stats"), StoreStats::default());
+            assert_eq!(store.committed_bytes().expect("closed bytes"), 0);
+            assert_eq!(broker.ledger_snapshot().expect("drained ledger").total_owner_bytes(), 0);
         }
 
         #[derive(Clone, Debug)]

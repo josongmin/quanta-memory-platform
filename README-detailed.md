@@ -412,15 +412,16 @@ to run Loom models.
 | --- | --- | --- |
 | `scripts/check-workspace.sh` | Formatting, shell safety, resolved workspace graph/policy, Python contracts, Semgrep guards, feature combinations, workspace tests, isolated capability tests, documented selector resolution, generated guidance, dependency policy. | Scaling, actual extraction, host adoption, deployment, activation. |
 | `scripts/run-scaling-bench.sh --smoke` | Public broker/store smoke with repeated measurements and final semantic/allocator checks. | Portable throughput guarantee. |
-| `scripts/run-scaling-bench.sh` | 1k/10k plus 1/2/8/32-thread read/write/mixed matrix; schema, final-zero, drift, latency, and growth validation. | Cross-machine comparison without an explicit same-host baseline. |
+| `scripts/run-scaling-bench.sh` | 1k/10k sizes plus a multithreaded set (1/2/8/32 threads standard, 1/8/32 in-memory-pressure) for the contending write/reclaim/payload rows; the retained-map point-read rows are single-threaded. Schema, final-zero, drift, latency, and growth validation. | Cross-machine comparison without an explicit same-host baseline. |
 | `scripts/extract-to-standalone-repo.sh --dry-run <dest>` | Clean-tree, resolved-graph, manifest, and self-hosting preflight. | A copied repo's full qualification. |
 | `scripts/extract-to-standalone-repo.sh <dest>` | Exact-tree export, digest/mode equality, extracted canonical rail, and clean bootstrap commit. | Semantica host compilation/activation. |
 
 Missing ShellCheck, Semgrep, cargo-deny, lockfile, or required source inputs
 fails closed. The Semgrep rail guards six known regression classes; it is not a
-general security certification. There is intentionally no GitHub Actions
-workflow; a nonexistent remote CI job is not part of this repository's
-acceptance model.
+general security certification. The GitHub Actions workflow in
+`.github/workflows/ci.yml` is manual `workflow_dispatch` only; the automatic
+repository CI is the `main`-filtered CircleCI full-extraction job (which also
+runs both public examples on the extracted source).
 
 The full scaling rail records source SHA/tree, toolchain, machine, repeated
 latencies and throughput, busy retries, semantic bytes, and allocator signals.

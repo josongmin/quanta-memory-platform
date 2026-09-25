@@ -48,13 +48,25 @@ use crate::domain::policy::ResidencyPolicy;
 #[cfg(feature = "live_control")]
 static LEDGER_INSTANCE: AtomicU64 = AtomicU64::new(1);
 
-/// Why a charge is held: a payload byte, a metadata byte, or a live scratch
-/// reservation. Invariant 2 partitions all owner usage across these kinds.
+/// Why a charge is held: one semantic charge bucket per owned lifetime
+/// component. Invariant 2 partitions all owner usage across these kinds.
+///
+/// A bucket classifies the *whole* semantic cost of one owned lifetime
+/// component — the retained object together with the key/index/entry
+/// overhead held under the same lease — not a literal per-field byte
+/// measurement. Each store lifetime component carries exactly one kind, so
+/// a facade's `RetainedCostV1`-style component formulas calculate one
+/// component's total while this enum classifies which lifetime owns it.
+/// Kind totals are semantic budgeting buckets, not allocator-accurate
+/// field-byte telemetry or an RSS bound.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ChargeKind {
-    /// Retained payload bytes.
+    /// Payload-lifetime component: the retained payload object plus the
+    /// key/index/entry overhead held with it until delete/close/Drop.
     RetainedPayload,
-    /// Retained metadata bytes (pin tables, indexes, generation metadata).
+    /// Metadata-lifetime component: independently retained identity, index,
+    /// tombstone, or bookkeeping state, which may outlive the payload
+    /// component of the same entry.
     RetainedMetadata,
     /// Live scratch reservation (temporary working buffer, not yet released).
     LiveScratch,

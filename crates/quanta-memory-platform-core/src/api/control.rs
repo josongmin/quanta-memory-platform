@@ -1505,13 +1505,47 @@ impl LiveProcessMemoryBroker {
 
     /// Atomically release active managed charges issued by this broker.
     ///
-    /// Broker affinity and active authority are checked before the ledger is
-    /// touched. Any validation/rebuild failure leaves every lease unchanged.
+    /// The whole slice is preflighted before any proportional ticket vector
+    /// is built, in a fixed precedence: batch length against the broker's
+    /// live-ticket cap (a longer active batch cannot exist), broker affinity,
+    /// active lease state, then the checked byte sum. Any validation or
+    /// rebuild failure leaves every lease unchanged. An empty batch is a
+    /// successful no-op.
     pub fn release_managed_many(&self, charges: &mut [ManagedCharge]) -> MemoryResult<()> {
+        // Preflight with no ticket vector: an invalid batch is rejected before
+        // an O(batch length) allocation. A batch larger than the live-ticket
+        // cap can never be a valid active batch of this broker.
+        if charges.len() > crate::domain::management_limits::MAX_LIVE_TICKETS_PER_BROKER {
+            let result = Err(MemoryError::InvalidState(format!(
+                "managed release batch of {} leases exceeds the maximum live tickets per broker ({})",
+                charges.len(),
+                crate::domain::management_limits::MAX_LIVE_TICKETS_PER_BROKER
+            )));
+            self.emit_result(MemoryOperation::Release, None, &result);
+            return result;
+        }
+        for charge in charges.iter() {
+            if !Arc::ptr_eq(&self.inner, &charge.broker.inner) {
+                let result = Err(MemoryError::InvalidState(
+                    "managed charge batch contains a foreign broker lease".to_string(),
+                ));
+                self.emit_result(MemoryOperation::Release, None, &result);
+                return result;
+            }
+            if charge.charge.is_none() {
+                let result = Err(MemoryError::InvalidState(
+                    "managed charge batch contains an already released lease".to_string(),
+                ));
+                self.emit_result(MemoryOperation::Release, None, &result);
+                return result;
+            }
+        }
+        // Every lease is now proven active, so `bytes()` cannot silently map
+        // an inactive lease onto a zero-byte release.
         let bytes = charges.iter().try_fold(0u64, |sum, charge| {
-            sum.checked_add(charge.bytes().unwrap_or(0)).ok_or_else(|| {
-                MemoryError::InvalidState("managed release byte total exceeds u64".into())
-            })
+            sum.checked_add(charge.bytes().expect("preflight proved the lease active")).ok_or_else(
+                || MemoryError::InvalidState("managed release byte total exceeds u64".into()),
+            )
         });
         let bytes = match bytes {
             Ok(bytes) => bytes,
@@ -1523,27 +1557,9 @@ impl LiveProcessMemoryBroker {
         };
         let mut tickets = Vec::with_capacity(charges.len());
         for charge in charges.iter() {
-            if !Arc::ptr_eq(&self.inner, &charge.broker.inner) {
-                let result = Err(MemoryError::InvalidState(
-                    "managed charge batch contains a foreign broker lease".to_string(),
-                ));
-                self.emit_result(MemoryOperation::Release, Some(bytes), &result);
-                return result;
-            }
-            let committed = charge.charge.as_ref().ok_or_else(|| {
-                MemoryError::InvalidState(
-                    "managed charge batch contains an already released lease".to_string(),
-                )
-            });
-            let committed = match committed {
-                Ok(committed) => committed,
-                Err(error) => {
-                    let result = Err(error);
-                    self.emit_result(MemoryOperation::Release, Some(bytes), &result);
-                    return result;
-                }
-            };
-            tickets.push(committed.ticket.clone());
+            tickets.push(
+                charge.charge.as_ref().expect("preflight proved the lease active").ticket.clone(),
+            );
         }
 
         let result = (|| {
@@ -2298,6 +2314,176 @@ mod tests {
         drop(charges);
         assert_eq!(a.ledger_snapshot().expect("a drop cleanup").total_owner_bytes(), 0);
         assert_eq!(b.ledger_snapshot().expect("b drop cleanup").total_owner_bytes(), 0);
+    }
+
+    #[test]
+    fn managed_batch_invalid_lease_rejects_before_ticket_collection() {
+        use crate::domain::management_limits::MAX_LIVE_TICKETS_PER_BROKER;
+
+        fn metadata_charge(b: &LiveProcessMemoryBroker, bytes: u64) -> ManagedCharge {
+            b.reserve_managed_charge(
+                MemoryClass::ArtifactCache,
+                "owner:a".to_string(),
+                MemoryContextKind::Request,
+                ChargeKind::RetainedMetadata,
+                bytes,
+            )
+            .expect("reserve metadata charge")
+        }
+
+        // An inactive lease at the FIRST position rejects before any ticket
+        // collection; the live tail keeps exact ids, flags, and authority.
+        {
+            let b = broker();
+            let mut batch =
+                [managed_charge(&b, 10), managed_charge(&b, 20), managed_charge(&b, 30)];
+            batch[0].release().expect("retire the head lease");
+            let before = b.ledger_snapshot().expect("before");
+            assert_eq!(before.total_owner_bytes(), 50);
+            assert_eq!(before.live_ticket_count, 2);
+            let ids = [batch[1].id(), batch[2].id()];
+
+            assert!(matches!(
+                b.release_managed_many(&mut batch),
+                Err(MemoryError::InvalidState(_))
+            ));
+            assert_eq!(
+                [batch[0].is_active(), batch[1].is_active(), batch[2].is_active()],
+                [false, true, true]
+            );
+            assert_eq!([batch[1].id(), batch[2].id()], ids);
+            let after = b.ledger_snapshot().expect("after");
+            assert_eq!(after, before);
+
+            // A valid retry over the active tail drains the broker exactly.
+            b.release_managed_many(&mut batch[1..]).expect("valid tail retry");
+            assert!(batch[1..].iter().all(|charge| !charge.is_active()));
+            let drained = b.ledger_snapshot().expect("drained");
+            assert_eq!(drained.total_owner_bytes(), 0);
+            assert_eq!(drained.live_ticket_count, 0);
+        }
+
+        // An inactive lease at the LAST position rejects identically.
+        {
+            let b = broker();
+            let mut batch =
+                [managed_charge(&b, 10), managed_charge(&b, 20), managed_charge(&b, 30)];
+            batch[2].release().expect("retire the tail lease");
+            let before = b.ledger_snapshot().expect("before");
+            assert_eq!(before.total_owner_bytes(), 30);
+            assert_eq!(before.live_ticket_count, 2);
+            let ids = [batch[0].id(), batch[1].id()];
+
+            assert!(matches!(
+                b.release_managed_many(&mut batch),
+                Err(MemoryError::InvalidState(_))
+            ));
+            assert_eq!(
+                [batch[0].is_active(), batch[1].is_active(), batch[2].is_active()],
+                [true, true, false]
+            );
+            assert_eq!([batch[0].id(), batch[1].id()], ids);
+            assert_eq!(b.ledger_snapshot().expect("unchanged"), before);
+        }
+
+        // One foreign broker lease inside an otherwise valid batch.
+        {
+            let a = broker();
+            let b = broker();
+            let mut batch =
+                [managed_charge(&b, 10), managed_charge(&a, 20), managed_charge(&b, 30)];
+            let b_before = b.ledger_snapshot().expect("b before");
+            let a_before = a.ledger_snapshot().expect("a before");
+            assert!(matches!(
+                b.release_managed_many(&mut batch),
+                Err(MemoryError::InvalidState(_))
+            ));
+            assert!(batch.iter().all(ManagedCharge::is_active));
+            assert_eq!(b.ledger_snapshot().expect("b unchanged"), b_before);
+            assert_eq!(a.ledger_snapshot().expect("a unchanged"), a_before);
+        }
+
+        // A valid mixed zero/nonzero batch with mixed kinds drains atomically
+        // on every axis.
+        {
+            let b = broker();
+            let mut batch = [
+                managed_charge(&b, 0),
+                metadata_charge(&b, 0),
+                managed_charge(&b, 40),
+                metadata_charge(&b, 60),
+            ];
+            let before = b.ledger_snapshot().expect("before");
+            assert_eq!(
+                (
+                    before.total_retained_payload_bytes(),
+                    before.total_retained_metadata_bytes(),
+                    before.total_live_scratch_bytes(),
+                    before.total_owner_bytes(),
+                    before.live_ticket_count
+                ),
+                (40, 60, 0, 100, 4)
+            );
+            let usage = before.owner_usage.values().next().expect("single owner");
+            assert_eq!((usage.retained_payload_bytes, usage.retained_metadata_bytes), (40, 60));
+
+            b.release_managed_many(&mut batch).expect("mixed valid batch");
+            assert!(batch.iter().all(|charge| !charge.is_active()));
+            let drained = b.ledger_snapshot().expect("drained");
+            assert_eq!(
+                (
+                    drained.total_retained_payload_bytes(),
+                    drained.total_retained_metadata_bytes(),
+                    drained.total_live_scratch_bytes(),
+                    drained.total_owner_bytes(),
+                    drained.live_ticket_count
+                ),
+                (0, 0, 0, 0, 0)
+            );
+        }
+
+        // A rebuild-fenced valid batch keeps every lease for an exact retry.
+        {
+            let b = broker();
+            let mut batch = [managed_charge(&b, 40), metadata_charge(&b, 60)];
+            let ids = [batch[0].id(), batch[1].id()];
+            b.begin_rebuild().expect("begin rebuild");
+            assert!(matches!(
+                b.release_managed_many(&mut batch),
+                Err(MemoryError::InvalidState(_))
+            ));
+            assert!(batch.iter().all(ManagedCharge::is_active));
+            assert_eq!([batch[0].id(), batch[1].id()], ids);
+            let fenced = b.ledger_snapshot().expect("fenced");
+            assert_eq!(fenced.total_owner_bytes(), 100);
+            assert_eq!(fenced.live_ticket_count, 2);
+
+            b.finish_rebuild().expect("finish rebuild");
+            b.release_managed_many(&mut batch).expect("retry after fence");
+            let drained = b.ledger_snapshot().expect("drained");
+            assert_eq!(drained.total_owner_bytes(), 0);
+            assert_eq!(drained.live_ticket_count, 0);
+        }
+
+        // An impossibly large slice (above the live-ticket cap) is rejected by
+        // length alone, before any per-lease work or ticket vector.
+        {
+            let b = broker();
+            let mut oversized: Vec<ManagedCharge> = (0..=MAX_LIVE_TICKETS_PER_BROKER)
+                .map(|_| {
+                    let mut charge = managed_charge(&b, 0);
+                    charge.release().expect("retire immediately");
+                    charge
+                })
+                .collect();
+            let before = b.ledger_snapshot().expect("before");
+            assert_eq!(before.live_ticket_count, 0);
+            assert!(matches!(
+                b.release_managed_many(&mut oversized),
+                Err(MemoryError::InvalidState(_))
+            ));
+            assert_eq!(b.ledger_snapshot().expect("unchanged"), before);
+        }
     }
 
     #[test]
@@ -3516,6 +3702,67 @@ mod tests {
 
         reservation.release().expect("explicit release");
         assert_eq!(b.ledger_snapshot().expect("after release").total_owner_bytes(), 0);
+    }
+
+    #[test]
+    fn scratch_peak_denial_release_and_drop_keep_authority_exact() {
+        // Explicit-release scope: peak observations never lower the recorded
+        // high-water mark, an over-ceiling observation is denied fail-closed,
+        // and the broker-backed scratch authority drains exactly on release.
+        {
+            let b = runtime_scratch_broker(1000);
+            let runtime = b
+                .attach_runtime("runtime-peak-release".to_string(), RuntimeKind::Runtime)
+                .expect("attach runtime");
+            let context =
+                runtime.context(MemoryContextKind::Request, "owner:scratch-peak".to_string());
+            let mut reservation = runtime
+                .scratch()
+                .reserve_scratch_scope(&context, ScratchRequest::new("peak-scope", 1000))
+                .expect("reserve the exact scratch ceiling");
+
+            assert_eq!(reservation.observed_bytes(), 0);
+            reservation.grow_to_observed(800).expect("observe 800");
+            assert_eq!(reservation.observed_bytes(), 800);
+            reservation.grow_to_observed(200).expect("smaller observation accepted");
+            assert_eq!(reservation.observed_bytes(), 800, "the runtime scratch peak is monotonic");
+            assert!(
+                matches!(reservation.grow_to_observed(1001), Err(MemoryError::Capacity(_))),
+                "an observation over the reserved ceiling is a typed Capacity error"
+            );
+            assert_eq!(reservation.observed_bytes(), 800, "denied observation keeps the peak");
+
+            let live = b.ledger_snapshot().expect("live snapshot");
+            assert_eq!(live.total_live_scratch_bytes(), 1000);
+            assert_eq!(live.live_ticket_count, 1);
+
+            reservation.release().expect("explicit release");
+            let drained = b.ledger_snapshot().expect("drained snapshot");
+            assert_eq!(drained.total_live_scratch_bytes(), 0);
+            assert_eq!(drained.live_ticket_count, 0);
+        }
+
+        // Drop scope: the same peak discipline with Drop-driven cleanup.
+        {
+            let b = runtime_scratch_broker(1000);
+            let runtime = b
+                .attach_runtime("runtime-peak-drop".to_string(), RuntimeKind::Runtime)
+                .expect("attach runtime");
+            let context =
+                runtime.context(MemoryContextKind::Request, "owner:scratch-peak".to_string());
+            let mut reservation = runtime
+                .scratch()
+                .reserve_scratch_scope(&context, ScratchRequest::new("peak-scope", 1000))
+                .expect("reserve the exact scratch ceiling");
+            reservation.grow_to_observed(800).expect("observe 800");
+            reservation.grow_to_observed(200).expect("smaller observation accepted");
+            assert_eq!(reservation.observed_bytes(), 800, "peak survives a smaller observation");
+
+            drop(reservation);
+            let drained = b.ledger_snapshot().expect("drop-drained snapshot");
+            assert_eq!(drained.total_live_scratch_bytes(), 0);
+            assert_eq!(drained.live_ticket_count, 0);
+        }
     }
 
     #[test]

@@ -125,6 +125,49 @@ mutex normally so later operations are not rejected solely because that read
 poisoned the lock. This does not bound callback duration or roll back
 caller-owned interior side effects.
 
+## Sep-26 engine remediation (`main` post-`438b869`)
+
+### `PressureThresholds` fields are private (source-breaking)
+
+`PressureThresholds` no longer accepts direct struct literals: the three
+rung fields are private and the only construction paths are the validating
+`PressureThresholds::new` (fail-closed `MemoryError::Config` on inverted or
+out-of-range ladders) and the valid `Default` (75/90/98). Read the rungs
+through the new `soft_percent()`, `hard_percent()`, and `fatal_percent()`
+getters. This closes the path where a caller-forged literal bypassed
+validation and reached `LadderPressureController::new` unvalidated. Treat
+this as a source API change in the next versioned release; a repository and
+host-source scan found no production struct-literal construction outside
+core's own tests, but any external literal must migrate to
+`PressureThresholds::new`.
+
+### Scratch peak observation is monotonic
+
+`ScratchReservation::grow_to_observed` now records
+`peak = max(peak, observed)`: a smaller valid observation is accepted
+without lowering the recorded high-water mark. Over-ceiling and
+post-release observations keep their previous typed errors and leave the
+peak unchanged.
+
+### Prepared-publication kind buckets and bounded orphan roots
+
+The prepared-publication service now charges its two owned lifetime
+components in their semantic charge buckets: the active payload component is
+`RetainedPayload` and the persistent identity/index/tombstone evidence is
+`RetainedMetadata`. Previously both leases were charged as payload, so an
+aborted empty-payload entry left a metadata-only tombstone in the payload
+axis. Admission totals, refunds, and ticket counts are unchanged; only the
+public payload/metadata kind split moved. Consumers projecting
+`total_retained_payload_bytes`/`total_retained_metadata_bytes` from ledger
+snapshots see the persistent evidence move from the payload bucket to the
+metadata bucket after this change.
+
+`orphan_tokens` and `gc_orphans` now bound the raw caller-supplied
+reference-root slice at 16,384 tokens (duplicates count toward the bound).
+A larger slice is rejected with `Storage(MemoryError::Capacity(_))` before
+any state lock or mutation; empty, duplicate, unknown, and aborted
+references keep their previous typed semantics under the cap.
+
 ## Required consumer changes
 
 - Construct live authority through `MemoryPlatformBuilder`,

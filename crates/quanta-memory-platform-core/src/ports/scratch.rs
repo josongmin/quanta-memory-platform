@@ -107,11 +107,14 @@ impl ScratchReservation {
 
     /// Record the peak observed scratch usage for this scope.
     ///
-    /// Misuse-resistant: growing an already-released reservation is a typed
-    /// `MemoryError::InvalidState` (the scope's bytes have already been returned
-    /// to the ledger, so further growth would be silently lost). The check runs
-    /// before any mutation, so a rejected call leaves `observed_bytes`
-    /// byte-for-byte unchanged (fail-closed).
+    /// The recorded value is a monotonic high-water mark: a smaller valid
+    /// observation is accepted without lowering the peak
+    /// (`peak = max(peak, observed)`). Misuse-resistant: growing an
+    /// already-released reservation is a typed `MemoryError::InvalidState`
+    /// (the scope's bytes have already been returned to the ledger, so
+    /// further growth would be silently lost). The checks run before any
+    /// mutation, so a rejected call leaves `observed_bytes` byte-for-byte
+    /// unchanged (fail-closed).
     pub fn grow_to_observed(&mut self, observed_bytes: u64) -> Result<(), CapacityError> {
         if self.released {
             return Err(MemoryError::InvalidState(
@@ -121,7 +124,7 @@ impl ScratchReservation {
         if observed_bytes > self.reserved_bytes {
             return Err(MemoryError::capacity("observed scratch exceeds reserved bytes"));
         }
-        self.observed_bytes = observed_bytes;
+        self.observed_bytes = self.observed_bytes.max(observed_bytes);
         Ok(())
     }
 
@@ -236,6 +239,42 @@ mod tests {
             "over-reserved growth is a typed Capacity error, got {denied:?}"
         );
         assert_eq!(res.observed_bytes(), before, "denied growth leaves observed bytes unchanged");
+    }
+
+    // scenario N: the observed value is a monotonic peak. A smaller valid
+    // observation is accepted without lowering the recorded high-water mark;
+    // a later equal or larger observation still updates it; an over-ceiling
+    // request is denied and leaves the peak intact; after release, growth is
+    // rejected without touching the peak.
+    #[test]
+    fn scratch_peak_never_decreases_on_smaller_observation() {
+        let mut res = reservation(1000);
+        assert_eq!(res.observed_bytes(), 0, "fresh reservation observes nothing");
+        res.grow_to_observed(800).expect("first observation");
+        assert_eq!(res.observed_bytes(), 800, "first observation records the peak");
+        res.grow_to_observed(200).expect("smaller valid observation is accepted");
+        assert_eq!(
+            res.observed_bytes(),
+            800,
+            "a smaller observation must not lower the recorded peak"
+        );
+        res.grow_to_observed(800).expect("equal observation is accepted");
+        assert_eq!(res.observed_bytes(), 800, "equal observation keeps the peak");
+        res.grow_to_observed(1000).expect("new peak within ceiling");
+        assert_eq!(res.observed_bytes(), 1000, "larger observation raises the peak");
+
+        assert!(
+            matches!(res.grow_to_observed(1001), Err(MemoryError::Capacity(_))),
+            "an over-ceiling request is a typed Capacity error"
+        );
+        assert_eq!(res.observed_bytes(), 1000, "denied request leaves the peak unchanged");
+
+        res.release().expect("release");
+        assert!(
+            matches!(res.grow_to_observed(1), Err(MemoryError::InvalidState(_))),
+            "growth after release is typed InvalidState"
+        );
+        assert_eq!(res.observed_bytes(), 1000, "rejected post-release growth keeps the peak");
     }
 
     // scenario N: operating on an already-released reservation is rejected.

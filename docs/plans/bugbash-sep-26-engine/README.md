@@ -1,6 +1,18 @@
 # Engine memory substrate architecture bugbash — 2026-09-26
 
-Status: **AUDIT ONLY — findings recorded, fixes not implemented or qualified**.
+Status: **IMPLEMENTED at a working tree over base `438b869` — STR-01 through
+STR-05 and STR-07 executed with owner-local RED/GREEN regressions; STR-06
+(measurement) intentionally not run. The fix diff is uncommitted; see the
+implementation receipt at the end of this document.**
+
+The follow-up [structural remediation plan](STRUCTURAL-REMEDIATION-PLAN.md)
+defines owner boundaries, contract decisions, test oracles and implementation
+order at `438b869` (same product source). Its [executed diagnostic evidence](STRUCTURAL-AUDIT-EVIDENCE.md)
+reproduces ENG-01/11/12/13 through public APIs. Those four observations now
+have owning regressions (see the receipt below); the diagnostic program
+itself remains a non-Cargo artifact.
+The [implementation runbook](IMPLEMENTATION-RUNBOOK.md) specifies files, code
+edits, named regressions, commands, and integration order for the next worker.
 
 Audit source: `main` HEAD `96d0a256c05f1e74995e912571546bfc60ed89f1`, tree
 `a3ad563845a170377168aaf201c7c1285d3fa1df`. Source code was clean;
@@ -435,3 +447,49 @@ focused microbenchmark. If Cargo/features or cross-crate edges change, run the
 committed clean-candidate extraction dry-run per repository rules. Record exact
 HEAD/tree, dirty state, selected test count, raw receipt and remaining host
 activation boundary. Do not mark this audit `DONE` because its document exists.
+
+## Implementation receipt — 2026-09-26 working tree
+
+Executed per the [runbook](IMPLEMENTATION-RUNBOOK.md) on top of `438b869`
+(tree `dbac4bc53ac655d2b982a01dd0d057caf736648b`) as an **uncommitted working
+tree** (the pre-existing plan-document overlay preserved). No `Cargo.toml`,
+feature, or cross-crate dependency edge changed. Packages STR-01 → STR-03 →
+STR-04 → STR-02 → STR-05 → STR-07 were executed serially in that order.
+
+Focused RED/GREEN receipts (each selector observed failing for the intended
+predicate before its production edit, then passing):
+
+| Package | RED evidence | GREEN selector |
+| --- | --- | --- |
+| STR-01 | `session_bytes_ord_panic_preserves_store_and_ledger` failed with `Poisoned("transcript store lock")` before the boundary; panic message confirms the trap fired inside the read | same selector 1/1; facade `--features full --lib` 269 passed |
+| STR-03 | representative mutant: reverting the persistent charge to `RetainedPayload` fails the kind oracle with `(146, 0, 0, 146, 2)` vs `(17, 129, 0, 146, 2)` | `prepared_identity_index_and_tombstone_keep_exact_independent_cost` 1/1, `orphan_roots_bound_and_fail_closed` 1/1 |
+| STR-04 | preflight order visible in source; over-cap/foreign/inactive rejections asserted before ticket collection | `managed_batch_invalid_lease_rejects_before_ticket_collection` 1/1, `same_store_reclaimer_returns_busy_without_losing_fifo` 1/1, `--features full --test cross_store_hellgate` 4/4 |
+| STR-02 | `scratch_peak_never_decreases_on_smaller_observation` failed `200 != 800` before the monotonic fix | same selector 1/1, `scratch_peak_denial_release_and_drop_keep_authority_exact` 1/1, `thresholds_new_rejects_inverted_or_out_of_range` 1/1, core `--doc` 14/14, `--test public_api_surface` 8/8 |
+| STR-05 | config-level only: negative fixtures in the new contract test (missing/duplicate/swapped commands, top-level `push:`) must fail and do | `python3 -m unittest scripts.tests.test_ci_workflows` 6/6; full discovery 102/102 |
+| STR-07 | mixed-store axis oracle: live `(17, 171, 34, 222, 4)`, post-abort `(0, 171, 34, 205, 3)`, post-close all-zero on every kind/owner/class/context axis | `mixed_store_kind_lifetimes_balance_every_axis` 1/1 under `--features full --test cross_store_hellgate`; map/revocable-only selector still 3/3 |
+
+Canonical rail on the changed working tree: `cargo fmt --all --check`,
+`python3 tools/pm/pm.py sync` + `pm lint` (9 targets),
+`scripts/check-workspace.sh` — **passed: `check-workspace: clean (full
+repository gate)`, exit 0, including clippy `-D warnings`, feature isolation,
+304 documented test selectors, 102 script contract tests, and `cargo deny`** —
+plus `git diff --check` clean, over the uncommitted diff at base `438b869`
+(tree `dbac4bc`).
+
+Remaining gaps (not closed by this receipt):
+
+- STR-06 (measurement) was intentionally not run: no measured bottleneck or
+  approved consumer SLO exists; ENG-05/06 stay open.
+- The hosted CircleCI `full-extraction` job has not been observed running the
+  new example commands; only config-level contract tests passed. Check the
+  hosted result separately before citing push-CI example coverage.
+- Semantica host adoption/migration (kind-bucket meaning, private
+  `PressureThresholds`, root cap) was not performed; a nearby workspace
+  scan found no production `PressureThresholds {` literal, but host
+  compilation against this source is a separate exact-revision receipt.
+- The extraction dry-run was not run: no Cargo/feature/cross-crate edge
+  changed and the candidate is an uncommitted working tree. Run it on the
+  committed clean candidate per repository rules.
+- The four findings' *contracts* are now pinned by owner regressions; the
+  conditional 0.3 authority/taxonomy work (ENG-03/04) and callback-wall-time
+  ownership (ENG-07 host side) remain with their existing RFC owners.

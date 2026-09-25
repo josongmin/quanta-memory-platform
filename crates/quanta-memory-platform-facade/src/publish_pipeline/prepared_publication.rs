@@ -11,15 +11,18 @@ use quanta_memory_platform_core::{
 #[cfg(feature = "unbudgeted-stores")]
 use crate::shared::accounting::Unbudgeted;
 use crate::shared::accounting::{Budgeted, StoreAccounting};
-use crate::shared::lifecycle::{
-    invoke_client_read_while_locked, retire_client_value, BeginClose, DropTransition,
-    StoreLifecycle,
-};
+use crate::shared::lifecycle::{retire_client_value, BeginClose, DropTransition, StoreLifecycle};
 use crate::shared::measure::{semantic_cost_v1, ByteSized, CanonicalKey, RetainedCostV1};
 
 const TOKEN_DOMAIN: &[u8] = b"qmp.prepared-publication.v1\0";
 const DEFAULT_TOMBSTONE_COUNT_CAPACITY: usize = 4_096;
 const DEFAULT_TOMBSTONE_BYTES_CAPACITY: u64 = 4 * 1024 * 1024;
+/// Upper bound on the raw caller-supplied reference-root slice accepted by
+/// orphan enumeration and GC. Duplicates count toward the raw length. This is
+/// a conservative management bound aligned with the broker's live-ticket cap,
+/// not a latency or RSS guarantee; normalization runs before any state lock
+/// or mutation permit is acquired.
+const MAX_REFERENCED_ROOT_TOKENS: usize = 16_384;
 // The persistent lease covers the identity-index key and state token, plus
 // the token key/index that moves from the prepared map to the aborted set.
 // The active lease covers only fields destroyed by abort/GC.
@@ -391,25 +394,30 @@ impl<Payload, Mode> PreparedPublicationService<Payload, Mode> {
         self.lifecycle.try_lock_state(&self.state).map_err(PreparedPublicationErrorV1::Storage)
     }
 
-    /// Readers never observe entries while their accounting authority is in an
-    /// out-of-lock release plan.
-    fn lock_read(
+    /// One public read through the store-owned boundary: lifecycle preflight,
+    /// nonblocking state lock, and unwind containment for caller code on the
+    /// locked state. Readers never observe entries while their accounting
+    /// authority is in an out-of-lock release plan.
+    fn with_read<R>(
         &self,
-    ) -> Result<MutexGuard<'_, PreparedState<Payload>>, PreparedPublicationErrorV1> {
-        self.lifecycle.ensure_readable().map_err(PreparedPublicationErrorV1::Storage)?;
-        let state = self.lock_state()?;
-        self.lifecycle.ensure_readable().map_err(PreparedPublicationErrorV1::Storage)?;
-        Ok(state)
+        read: impl FnOnce(&PreparedState<Payload>) -> R,
+    ) -> Result<R, PreparedPublicationErrorV1> {
+        self.lifecycle
+            .with_read_state(&self.state, read)
+            .map_err(PreparedPublicationErrorV1::Storage)
     }
 
     fn require_charge_shape(
         &self,
         charge: Option<&ManagedCharge>,
+        expected_kind: ChargeKind,
         bytes: u64,
         operation: &str,
     ) -> Result<(), PreparedPublicationErrorV1> {
         if self.accounting.broker().is_some() == charge.is_some()
-            && charge.is_none_or(|charge| charge.bytes() == Some(bytes))
+            && charge.is_none_or(|charge| {
+                charge.bytes() == Some(bytes) && charge.kind() == Some(expected_kind)
+            })
         {
             Ok(())
         } else {
@@ -444,6 +452,7 @@ impl<Payload, Mode> PreparedPublicationService<Payload, Mode> {
             for entry in state.entries.values() {
                 if let Err(error) = self.require_charge_shape(
                     entry.active_charge.as_ref(),
+                    ChargeKind::RetainedPayload,
                     entry.active_bytes,
                     "close active",
                 ) {
@@ -454,6 +463,7 @@ impl<Payload, Mode> PreparedPublicationService<Payload, Mode> {
             for evidence in state.identity_index.values() {
                 if let Err(error) = self.require_charge_shape(
                     evidence.charge.as_ref(),
+                    ChargeKind::RetainedMetadata,
                     evidence.retained_bytes,
                     "close identity evidence",
                 ) {
@@ -607,13 +617,16 @@ where
         }
 
         drop(state);
+        // The persistent lease is the identity/index/tombstone lifetime
+        // component: a semantic metadata bucket that survives abort as the
+        // tombstone. Only the active lease covers the payload component.
         let persistent_charge = self
             .accounting
             .charge(
                 self.binding.class.clone(),
                 self.binding.owner.clone(),
                 MemoryContextKind::Request,
-                ChargeKind::RetainedPayload,
+                ChargeKind::RetainedMetadata,
                 persistent_bytes,
             )
             .map_err(PreparedPublicationErrorV1::Accounting)?;
@@ -666,8 +679,7 @@ where
         &self,
         token: &PreparedPublicationTokenV1,
     ) -> Result<Payload, PreparedPublicationErrorV1> {
-        let state = self.lock_read()?;
-        invoke_client_read_while_locked(state, |state| {
+        self.with_read(|state| {
             if let Some(entry) = state.entries.get(token) {
                 return Ok(entry.payload.clone());
             }
@@ -675,7 +687,7 @@ where
                 return Err(PreparedPublicationErrorV1::AbortedToken { token: token.clone() });
             }
             Err(PreparedPublicationErrorV1::UnknownToken { token: token.clone() })
-        })
+        })?
     }
 
     pub fn abort(
@@ -695,6 +707,7 @@ where
                 .ok_or_else(|| PreparedPublicationErrorV1::UnknownToken { token: token.clone() })?;
             self.require_charge_shape(
                 entry.active_charge.as_ref(),
+                ChargeKind::RetainedPayload,
                 entry.active_bytes,
                 "abort active",
             )?;
@@ -710,6 +723,7 @@ where
             }
             self.require_charge_shape(
                 evidence.charge.as_ref(),
+                ChargeKind::RetainedMetadata,
                 evidence.retained_bytes,
                 "abort identity evidence",
             )?;
@@ -761,13 +775,14 @@ where
     /// QMP validates the supplied references but does not own activation state.
     /// Callers must therefore stabilize their root snapshot for the duration of
     /// this call and supply every referenced token; a missing or aborted
-    /// reference fails closed.
+    /// reference fails closed. The raw slice is bounded and normalized before
+    /// the read boundary is acquired.
     pub fn orphan_tokens(
         &self,
         referenced_tokens: &[PreparedPublicationTokenV1],
     ) -> Result<Vec<PreparedPublicationTokenV1>, PreparedPublicationErrorV1> {
-        let state = self.lock_read()?;
-        classify_orphan_tokens(&state, referenced_tokens)
+        let referenced = normalize_referenced_tokens(referenced_tokens)?;
+        self.with_read(|state| classify_orphan_tokens(state, &referenced))?
     }
 
     /// Collect every prepared entry absent from the caller's complete
@@ -781,11 +796,12 @@ where
         &self,
         referenced_tokens: &[PreparedPublicationTokenV1],
     ) -> Result<usize, PreparedPublicationErrorV1> {
+        let referenced = normalize_referenced_tokens(referenced_tokens)?;
         let _permit =
             self.lifecycle.begin_mutation().map_err(PreparedPublicationErrorV1::Storage)?;
         let (prepared_tokens, charged_tokens, next_total, next_tombstone_bytes, mut charges) = {
             let mut state = self.lock_state()?;
-            let prepared_tokens = classify_orphan_tokens(&state, referenced_tokens)?;
+            let prepared_tokens = classify_orphan_tokens(&state, &referenced)?;
             let tombstone_entries = prepared_tokens
                 .iter()
                 .map(|token| state.entries.get(token).expect("classified token is live"))
@@ -793,6 +809,7 @@ where
             for (token, entry) in prepared_tokens.iter().zip(&tombstone_entries) {
                 self.require_charge_shape(
                     entry.active_charge.as_ref(),
+                    ChargeKind::RetainedPayload,
                     entry.active_bytes,
                     "orphan GC active",
                 )?;
@@ -809,6 +826,7 @@ where
                 }
                 self.require_charge_shape(
                     evidence.charge.as_ref(),
+                    ChargeKind::RetainedMetadata,
                     evidence.retained_bytes,
                     "orphan GC identity evidence",
                 )?;
@@ -882,8 +900,7 @@ where
     }
 
     pub fn stats(&self) -> Result<PreparedPublicationStatsV1, PreparedPublicationErrorV1> {
-        let state = self.lock_read()?;
-        Ok(PreparedPublicationStatsV1 {
+        self.with_read(|state| PreparedPublicationStatsV1 {
             prepared_count: state.entries.len(),
             charged_bytes: state.charged_bytes,
             tombstone_count: state.aborted_tokens.len(),
@@ -935,12 +952,35 @@ where
     }
 }
 
+/// Bound and normalize a raw caller-supplied reference-root slice.
+///
+/// The raw length (duplicates included) is rejected above
+/// [`MAX_REFERENCED_ROOT_TOKENS`] with a typed storage capacity error before
+/// any proportional set is built, so an oversized input cannot allocate or
+/// hold the state lock. The fixed-size tokens are then cloned and
+/// deduplicated into the set the state validation consumes.
+fn normalize_referenced_tokens(
+    referenced_tokens: &[PreparedPublicationTokenV1],
+) -> Result<BTreeSet<PreparedPublicationTokenV1>, PreparedPublicationErrorV1> {
+    if referenced_tokens.len() > MAX_REFERENCED_ROOT_TOKENS {
+        return Err(PreparedPublicationErrorV1::Storage(MemoryError::capacity(format!(
+            "prepared publication referenced-root slice exceeds the maximum of \
+             {MAX_REFERENCED_ROOT_TOKENS} raw tokens (got {})",
+            referenced_tokens.len()
+        ))));
+    }
+    Ok(referenced_tokens.iter().cloned().collect())
+}
+
+/// Validate every referenced token as live and non-aborted, then return the
+/// prepared entries absent from the normalized reference set. An unknown or
+/// aborted reference rejects the whole classification before any entry is
+/// chosen or removed, so GC can never partially collect a valid store.
 fn classify_orphan_tokens<Payload>(
     state: &PreparedState<Payload>,
-    referenced_tokens: &[PreparedPublicationTokenV1],
+    referenced_tokens: &BTreeSet<PreparedPublicationTokenV1>,
 ) -> Result<Vec<PreparedPublicationTokenV1>, PreparedPublicationErrorV1> {
-    let referenced: BTreeSet<_> = referenced_tokens.iter().cloned().collect();
-    for token in &referenced {
+    for token in referenced_tokens {
         if state.aborted_tokens.contains(token) {
             return Err(PreparedPublicationErrorV1::AbortedToken { token: token.clone() });
         }
@@ -948,7 +988,7 @@ fn classify_orphan_tokens<Payload>(
             return Err(PreparedPublicationErrorV1::UnknownToken { token: token.clone() });
         }
     }
-    Ok(state.entries.keys().filter(|token| !referenced.contains(*token)).cloned().collect())
+    Ok(state.entries.keys().filter(|token| !referenced_tokens.contains(*token)).cloned().collect())
 }
 
 fn derive_token(
@@ -1492,27 +1532,216 @@ mod tests {
 
         #[test]
         fn prepared_identity_index_and_tombstone_keep_exact_independent_cost() {
+            use quanta_memory_platform_core::UsageBreakdown;
+            use std::collections::BTreeMap;
+
+            // Independent numeric oracle: identity `[b'i']` with an empty payload.
+            // The numbers are pinned literally and never computed through production
+            // cost helpers. The active lease charges 17 semantic bytes (1 identity +
+            // 16 entry state) in the RetainedPayload bucket; the persistent
+            // identity/index/tombstone lease charges 129 semantic bytes (1 identity +
+            // 48 ordered-index + 80 token/fixed overhead) in the RetainedMetadata
+            // bucket.
+            const ACTIVE_PAYLOAD_BUCKET: u64 = 17;
+            const PERSISTENT_METADATA_BUCKET: u64 = 129;
+            const LIVE_TOTAL: u64 = ACTIVE_PAYLOAD_BUCKET + PERSISTENT_METADATA_BUCKET;
+
+            fn kind_axes(broker: &LiveProcessMemoryBroker) -> (u64, u64, u64, u64, usize) {
+                let snap = broker.ledger_snapshot().expect("snapshot");
+                (
+                    snap.total_retained_payload_bytes(),
+                    snap.total_retained_metadata_bytes(),
+                    snap.total_live_scratch_bytes(),
+                    snap.total_owner_bytes(),
+                    snap.live_ticket_count,
+                )
+            }
+
+            fn sole_axis<K: Ord>(axis: &BTreeMap<K, UsageBreakdown>) -> (u64, u64, u64) {
+                assert_eq!(axis.len(), 1, "fixture owns exactly one axis entry");
+                let usage = axis.values().next().expect("sole axis entry");
+                (
+                    usage.retained_payload_bytes,
+                    usage.retained_metadata_bytes,
+                    usage.live_scratch_bytes,
+                )
+            }
+
+            fn assert_axes(broker: &LiveProcessMemoryBroker, payload: u64, metadata: u64) {
+                let snap = broker.ledger_snapshot().expect("snapshot");
+                assert_eq!(sole_axis(&snap.class_usage), (payload, metadata, 0));
+                assert_eq!(sole_axis(&snap.owner_usage), (payload, metadata, 0));
+                assert_eq!(sole_axis(&snap.context_usage), (payload, metadata, 0));
+            }
+
             let broker = broker(1_000_000);
             let service = charged(&broker);
-            let identity = "identity-with-no-payload";
-            let receipt = service.prepare(request(identity, b"")).expect("prepare identity");
-            let live = live_cost(identity, b"");
-            assert_eq!(service.stats().expect("live stats").charged_bytes, live);
-            assert_eq!(broker.ledger_snapshot().expect("live ledger").total_owner_bytes(), live);
 
-            service.abort(receipt.token()).expect("abort");
-            let persistent = evidence_cost(identity);
+            // Empty preimage: no charge on any axis.
+            assert_eq!(kind_axes(&broker), (0, 0, 0, 0, 0));
+
+            let receipt = service.prepare(request("i", b"")).expect("prepare");
+            // Two owned lifetime components, two exact leases, two kind buckets.
+            assert_eq!(
+                kind_axes(&broker),
+                (ACTIVE_PAYLOAD_BUCKET, PERSISTENT_METADATA_BUCKET, 0, LIVE_TOTAL, 2)
+            );
+            assert_axes(&broker, ACTIVE_PAYLOAD_BUCKET, PERSISTENT_METADATA_BUCKET);
+
+            // Identical replay returns the same token without another lease pair.
+            let replay = service.prepare(request("i", b"")).expect("replay");
+            assert_eq!(replay.token(), receipt.token());
+            assert_eq!(
+                kind_axes(&broker),
+                (ACTIVE_PAYLOAD_BUCKET, PERSISTENT_METADATA_BUCKET, 0, LIVE_TOTAL, 2)
+            );
+
+            // Failed prepare (broker rebuild fence denies the reservation) charges
+            // nothing and leaves the live entry untouched.
+            broker.begin_rebuild().expect("begin rebuild");
+            assert!(matches!(
+                service.prepare(request("j", b"")),
+                Err(PreparedPublicationErrorV1::Accounting(_))
+            ));
+            assert_eq!(
+                kind_axes(&broker),
+                (ACTIVE_PAYLOAD_BUCKET, PERSISTENT_METADATA_BUCKET, 0, LIVE_TOTAL, 2)
+            );
+
+            // Failed release retry under the same fence: the abort is denied and both
+            // leases keep their original kinds, bytes, and data.
+            assert!(matches!(
+                service.abort(receipt.token()),
+                Err(PreparedPublicationErrorV1::Accounting(_))
+            ));
+            assert_eq!(
+                kind_axes(&broker),
+                (ACTIVE_PAYLOAD_BUCKET, PERSISTENT_METADATA_BUCKET, 0, LIVE_TOTAL, 2)
+            );
+            assert_eq!(service.resolve(receipt.token()).expect("data intact"), Vec::new());
+            broker.finish_rebuild().expect("finish rebuild");
+
+            // Orphan GC refunds only the active payload component of the collected
+            // entry; its identity evidence stays behind as a metadata tombstone.
+            let collected = service.prepare(request("j", b"")).expect("second entry");
+            assert_eq!(
+                kind_axes(&broker),
+                (2 * ACTIVE_PAYLOAD_BUCKET, 2 * PERSISTENT_METADATA_BUCKET, 0, 2 * LIVE_TOTAL, 4)
+            );
+            assert_axes(&broker, 2 * ACTIVE_PAYLOAD_BUCKET, 2 * PERSISTENT_METADATA_BUCKET);
+            assert_eq!(service.gc_orphans(&[receipt.token().clone()]).expect("gc"), 1);
+            assert!(matches!(
+                service.resolve(collected.token()),
+                Err(PreparedPublicationErrorV1::AbortedToken { .. })
+            ));
+            assert_eq!(
+                kind_axes(&broker),
+                (
+                    ACTIVE_PAYLOAD_BUCKET,
+                    2 * PERSISTENT_METADATA_BUCKET,
+                    0,
+                    ACTIVE_PAYLOAD_BUCKET + 2 * PERSISTENT_METADATA_BUCKET,
+                    3
+                )
+            );
+            assert_axes(&broker, ACTIVE_PAYLOAD_BUCKET, 2 * PERSISTENT_METADATA_BUCKET);
+
+            // Abort of the remaining live entry refunds its active lease; both
+            // identity tombstones stay in the metadata bucket until close.
+            assert_eq!(service.abort(receipt.token()).expect("abort"), AbortDispositionV1::Aborted);
             let stats = service.stats().expect("tombstone stats");
             assert_eq!(stats.prepared_count, 0);
-            assert_eq!(stats.tombstone_count, 1);
-            assert_eq!(stats.tombstone_bytes, persistent);
-            assert_eq!(stats.charged_bytes, persistent);
+            assert_eq!(stats.tombstone_count, 2);
+            assert_eq!(stats.tombstone_bytes, 2 * PERSISTENT_METADATA_BUCKET);
+            assert_eq!(stats.charged_bytes, 2 * PERSISTENT_METADATA_BUCKET);
             assert_eq!(
-                broker.ledger_snapshot().expect("tombstone ledger").total_owner_bytes(),
-                persistent
+                kind_axes(&broker),
+                (0, 2 * PERSISTENT_METADATA_BUCKET, 0, 2 * PERSISTENT_METADATA_BUCKET, 2)
             );
+            assert_axes(&broker, 0, 2 * PERSISTENT_METADATA_BUCKET);
+
             service.close().expect("close evidence");
-            assert_eq!(broker.ledger_snapshot().expect("closed ledger").total_owner_bytes(), 0);
+            assert_eq!(kind_axes(&broker), (0, 0, 0, 0, 0));
+        }
+
+        #[test]
+        fn orphan_roots_bound_and_fail_closed() {
+            let broker = broker(1_000_000);
+            let service = charged(&broker);
+            let receipt = service.prepare(request("id", b"payload")).expect("prepare");
+            let token = receipt.token().clone();
+            let unknown = PreparedPublicationTokenV1::from_bytes([0xA5; 32]);
+            let before_stats = service.stats().expect("stats");
+            let before_ledger = broker.ledger_snapshot().expect("ledger");
+
+            // At the cap (raw duplicates count toward the bound): the input is
+            // normalized and the call behaves normally.
+            let at_cap = vec![token.clone(); MAX_REFERENCED_ROOT_TOKENS];
+            assert!(service.orphan_tokens(&at_cap).expect("at-cap read").is_empty());
+            assert_eq!(service.gc_orphans(&at_cap).expect("at-cap gc"), 0);
+
+            // One token above the cap: typed storage capacity error before any
+            // state lock or mutation, leaving payload, stats, and the ledger
+            // byte-identical for both public entry points.
+            let above_cap = vec![token.clone(); MAX_REFERENCED_ROOT_TOKENS + 1];
+            assert!(matches!(
+                service.orphan_tokens(&above_cap),
+                Err(PreparedPublicationErrorV1::Storage(MemoryError::Capacity(_)))
+            ));
+            assert!(matches!(
+                service.gc_orphans(&above_cap),
+                Err(PreparedPublicationErrorV1::Storage(MemoryError::Capacity(_)))
+            ));
+            assert_eq!(service.stats().expect("stats unchanged"), before_stats);
+            assert_eq!(broker.ledger_snapshot().expect("ledger unchanged"), before_ledger);
+            assert_eq!(service.resolve(&token).expect("payload unchanged"), b"payload".to_vec());
+
+            // A valid call after the denial still succeeds.
+            assert!(service
+                .orphan_tokens(std::slice::from_ref(&token))
+                .expect("valid after denial")
+                .is_empty());
+
+            // An unknown token mixed with valid references is a typed prior
+            // error that never partially collects the store.
+            let mixed = vec![token.clone(), unknown];
+            assert!(matches!(
+                service.orphan_tokens(&mixed),
+                Err(PreparedPublicationErrorV1::UnknownToken { .. })
+            ));
+            assert!(matches!(
+                service.gc_orphans(&mixed),
+                Err(PreparedPublicationErrorV1::UnknownToken { .. })
+            ));
+            assert_eq!(service.stats().expect("no partial gc"), before_stats);
+            assert_eq!(broker.ledger_snapshot().expect("ledger unchanged"), before_ledger);
+
+            // A same-thread read while the GC mutation lane is held is typed
+            // Busy, never a blocking lock or an empty success.
+            let permit = service.lifecycle.begin_mutation().expect("own lane");
+            assert!(matches!(
+                service.orphan_tokens(std::slice::from_ref(&token)),
+                Err(PreparedPublicationErrorV1::Storage(MemoryError::OperationInProgress(_)))
+            ));
+            drop(permit);
+            assert!(service
+                .orphan_tokens(std::slice::from_ref(&token))
+                .expect("reopened")
+                .is_empty());
+
+            // An aborted reference is likewise a typed prior error.
+            assert_eq!(service.abort(&token).expect("abort"), AbortDispositionV1::Aborted);
+            assert!(matches!(
+                service.orphan_tokens(std::slice::from_ref(&token)),
+                Err(PreparedPublicationErrorV1::AbortedToken { .. })
+            ));
+            assert!(matches!(
+                service.gc_orphans(std::slice::from_ref(&token)),
+                Err(PreparedPublicationErrorV1::AbortedToken { .. })
+            ));
+
+            service.close().expect("close");
+            assert_eq!(broker.ledger_snapshot().expect("drained").total_owner_bytes(), 0);
         }
 
         #[derive(Clone)]
@@ -1975,6 +2204,14 @@ mod tests {
                 service.stats().expect("reopened").charged_bytes,
                 live_cost("id", b"payload")
             );
+            // Closed image: the terminal empty stats stay readable and consistent.
+            service.close().expect("close");
+            let closed = service.stats().expect("closed stats");
+            assert_eq!(closed.prepared_count, 0);
+            assert_eq!(closed.charged_bytes, 0);
+            assert_eq!(closed.tombstone_count, 0);
+            assert_eq!(closed.tombstone_bytes, 0);
+            assert_eq!(broker.ledger_snapshot().expect("drained").total_owner_bytes(), 0);
         }
 
         #[test]

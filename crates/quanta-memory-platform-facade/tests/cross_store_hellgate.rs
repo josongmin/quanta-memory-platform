@@ -5,13 +5,13 @@
     feature = "revocable_store"
 ))]
 
-use std::sync::{Arc, Barrier};
+use std::sync::{Arc, Barrier, Mutex, OnceLock};
 
 use quanta_memory_platform_core::{
     ChargeKind, ExecutionBudget, LedgerSnapshot, ManagedCharge, MemoryBudgetManifest, MemoryClass,
-    MemoryClassBudget, MemoryContextKind, MemoryError, MemoryPreset, ProcessMemoryBroker,
-    ReclaimPriority, ResidencyPolicy, ResourceGroup, RuntimeKind, ScratchRequest,
-    StoreBindingHandle, UsageBreakdown,
+    MemoryClassBudget, MemoryContextKind, MemoryError, MemoryPreset, MemoryReclaimer, MemoryResult,
+    ProcessMemoryBroker, ReclaimOutcome, ReclaimPriority, ReclaimRequest, ResidencyPolicy,
+    ResourceGroup, RuntimeKind, ScratchRequest, StoreBindingHandle, SweepStats, UsageBreakdown,
 };
 use quanta_memory_platform_facade::{
     Budgeted, LiveMemoryPlatform, MemoryPlatformBuilder, RetainedMapStore, RevocableStore,
@@ -319,4 +319,270 @@ fn store_scratch_and_zero_byte_authorities_survive_denied_remap_and_legal_raise(
     scratch.release().expect("release runtime scratch");
     zero.release().expect("release zero-byte authority");
     assert_drained(&platform.broker().ledger_snapshot().expect("all authorities drained"));
+}
+
+/// A host reclaimer evicting from one revocable store unblocks a hard-cap
+/// denied insert into a *different* revocable store on the same broker. The
+/// callback deliberately under-reports its reclaimed bytes: admission must
+/// succeed from the broker's own remeasurement of the ledger, never from the
+/// advisory [`ReclaimOutcome`] number.
+#[test]
+fn other_store_reclaim_frees_admission_and_drains_every_ticket() {
+    const VICTIM_OWNER: &str = "owner:cross-revict";
+
+    struct OtherStoreReclaimer {
+        victim: OnceLock<Arc<SimpleRevocableStore<String, Vec<u8>, Budgeted>>>,
+        inner_results: Mutex<Vec<MemoryResult<SweepStats>>>,
+    }
+
+    impl MemoryReclaimer for OtherStoreReclaimer {
+        fn reclaim(&self, request: &ReclaimRequest) -> MemoryResult<ReclaimOutcome> {
+            let victim = self.victim.get().expect("victim store registered before use");
+            let swept = victim.reclaim_until(request.requested_bytes)?;
+            self.inner_results.lock().expect("results").push(Ok(swept));
+            // Advisory lie: report zero reclaimed bytes while the victim store
+            // actually released its FIFO head. The broker must remeasure.
+            Ok(ReclaimOutcome { reclaimed_bytes: 0 })
+        }
+    }
+
+    fn revocable_store_for(
+        platform: &LiveMemoryPlatform,
+        owner: &str,
+    ) -> SimpleRevocableStore<String, Vec<u8>, Budgeted> {
+        platform
+            .revocable_store_builder::<String, Vec<u8>>()
+            .bind(StoreBindingHandle::new(
+                MemoryClass::ExecutionScratchRevocable,
+                owner.into(),
+                None,
+            ))
+            .build()
+            .expect("budgeted revocable store")
+    }
+
+    // The revocable class cap is shared by both stores' owners.
+    let victim_entry = revocable_cost("v1", 4);
+    let admitted_entry = revocable_cost("a", 4);
+    assert_eq!(victim_entry, 38);
+    assert_eq!(admitted_entry, 37);
+    let class_cap = 2 * victim_entry; // 76: two victims fit, the third insert does not.
+
+    let reclaimer = Arc::new(OtherStoreReclaimer {
+        victim: OnceLock::new(),
+        inner_results: Mutex::new(Vec::new()),
+    });
+    let platform = MemoryPlatformBuilder::new()
+        .with_manifest(MemoryBudgetManifest::new(
+            MemoryPreset::Production,
+            ExecutionBudget::default(),
+            ResidencyPolicy::new(10_000)
+                .with_class_budget(MemoryClass::ExecutionScratchRevocable, class_budget(class_cap))
+                .with_class_budget(MemoryClass::MemoResidency, class_budget(10_000)),
+        ))
+        .with_reclaimer(Arc::clone(&reclaimer) as Arc<dyn MemoryReclaimer>)
+        .build()
+        .expect("platform with registered reclaimer");
+
+    let victim = Arc::new(revocable_store_for(&platform, VICTIM_OWNER));
+    let admitting = revocable_store_for(&platform, REVOCABLE_OWNER);
+    assert!(reclaimer.victim.set(Arc::clone(&victim)).is_ok());
+
+    // Two FIFO victims fill the shared class budget.
+    victim.insert_checked("v1".into(), vec![0; 4]).expect("first victim");
+    victim.insert_checked("v2".into(), vec![0; 4]).expect("second victim");
+    let before = platform.broker().ledger_snapshot().expect("before denial");
+    assert_balanced(&before);
+    assert_eq!(before.total_owner_bytes(), 2 * victim_entry);
+    assert_eq!(before.live_ticket_count, 2);
+    assert_eq!(before.owner_usage[VICTIM_OWNER].live_scratch_bytes, 2 * victim_entry);
+
+    // The other store's insert is hard-cap denied, the callback evicts the
+    // victim FIFO head, and the broker's remeasurement admits the insert.
+    admitting.insert_checked("a".into(), vec![0; 4]).expect("admitted after cross-store reclaim");
+
+    let inner = reclaimer.inner_results.lock().expect("results").clone();
+    assert_eq!(inner.len(), 1, "exactly one reclaim callback");
+    let swept = inner[0].as_ref().expect("victim reclaim succeeds");
+    assert_eq!(swept.reclaimed_items, 1);
+    assert_eq!(swept.reclaimed_bytes, victim_entry);
+
+    let after = platform.broker().ledger_snapshot().expect("after admission");
+    assert_balanced(&after);
+    assert_eq!(after.total_owner_bytes(), victim_entry + admitted_entry);
+    assert_eq!(after.live_ticket_count, 2);
+    assert_eq!(after.owner_usage[VICTIM_OWNER].live_scratch_bytes, victim_entry);
+    assert_eq!(after.owner_usage[REVOCABLE_OWNER].live_scratch_bytes, admitted_entry);
+    assert_eq!(victim.committed_bytes().expect("victim counter"), victim_entry);
+    assert_eq!(admitting.committed_bytes().expect("admitting counter"), admitted_entry);
+
+    // The victim's FIFO lost its head, not its tail.
+    assert_eq!(victim.reclaim_one().expect("victim tail"), Some(("v2".into(), vec![0; 4])));
+    victim.close().expect("close victim");
+    admitting.close().expect("close admitting store");
+    assert_drained(&platform.broker().ledger_snapshot().expect("final drain"));
+}
+
+/// One mixed-store lifecycle pins every charge-kind axis with independent
+/// numeric constants (no production cost helpers): a retained-map entry owns
+/// one metadata bucket, a revocable entry owns one scratch bucket, and a
+/// prepared publication splits its payload and persistent identity evidence
+/// across the payload and metadata buckets. Grand totals alone cannot pass:
+/// each owner/class/context entry is asserted separately so a wrong
+/// attribution with the right sum fails.
+#[test]
+#[cfg(feature = "publish_pipeline")]
+fn mixed_store_kind_lifetimes_balance_every_axis() {
+    use quanta_memory_platform_facade::{
+        PreparedPublicationIdentityV1, PreparedPublicationRequestV1,
+    };
+
+    const PREPARED_OWNER: &str = "owner:cross-prepared";
+
+    // Independent constants for one-byte keys/values (see the shared oracle
+    // helpers above): map = 1+1+24+16 = 42 metadata; revocable = 1+1+16+16
+    // = 34 scratch; prepared identity [b'i'] with an empty payload = 17
+    // payload + 129 metadata.
+    const MAP_ENTRY_BYTES: u64 = 42;
+    const REVOCABLE_ENTRY_BYTES: u64 = 34;
+    const PREPARED_ACTIVE_BYTES: u64 = 17;
+    const PREPARED_PERSISTENT_BYTES: u64 = 129;
+
+    let platform = MemoryPlatformBuilder::new()
+        .with_manifest(MemoryBudgetManifest::new(
+            MemoryPreset::Production,
+            ExecutionBudget::default(),
+            ResidencyPolicy::new(10_000)
+                .with_class_budget(MemoryClass::MemoResidency, class_budget(10_000))
+                .with_class_budget(MemoryClass::ExecutionScratchRevocable, class_budget(10_000))
+                .with_class_budget(MemoryClass::ArtifactCache, class_budget(10_000)),
+        ))
+        .build()
+        .expect("mixed-store platform");
+
+    let map = map_store(&platform);
+    let revocable = revocable_store(&platform);
+    let prepared = platform
+        .prepared_publication_builder::<Vec<u8>>()
+        .bind(StoreBindingHandle::new(MemoryClass::ArtifactCache, PREPARED_OWNER.into(), None))
+        .build()
+        .expect("budgeted prepared publication service");
+
+    // One entry per store.
+    map.insert_checked("m".into(), vec![9]).expect("map entry");
+    revocable.insert_checked("r".into(), vec![8]).expect("revocable entry");
+    let receipt = prepared
+        .prepare(PreparedPublicationRequestV1::new(
+            PreparedPublicationIdentityV1::new(vec![b'i']).expect("identity"),
+            Vec::new(),
+        ))
+        .expect("prepared entry");
+
+    let expected = |payload: u64, metadata: u64, scratch: u64, total: u64, tickets: usize| {
+        let snap = platform.broker().ledger_snapshot().expect("snapshot");
+        assert_balanced(&snap);
+        assert_eq!(snap.total_retained_payload_bytes(), payload, "payload bucket");
+        assert_eq!(snap.total_retained_metadata_bytes(), metadata, "metadata bucket");
+        assert_eq!(snap.total_live_scratch_bytes(), scratch, "scratch bucket");
+        assert_eq!(snap.total_owner_bytes(), total, "grand total");
+        assert_eq!(snap.live_ticket_count, tickets, "live tickets");
+        // Per-owner attribution: each owner holds exactly its own bucket.
+        assert_eq!(
+            (
+                snap.owner_usage[MAP_OWNER].retained_payload_bytes,
+                snap.owner_usage[MAP_OWNER].retained_metadata_bytes,
+                snap.owner_usage[MAP_OWNER].live_scratch_bytes
+            ),
+            (0, MAP_ENTRY_BYTES, 0),
+            "map owner holds one metadata bucket"
+        );
+        assert_eq!(
+            (
+                snap.owner_usage[REVOCABLE_OWNER].retained_payload_bytes,
+                snap.owner_usage[REVOCABLE_OWNER].retained_metadata_bytes,
+                snap.owner_usage[REVOCABLE_OWNER].live_scratch_bytes
+            ),
+            (0, 0, REVOCABLE_ENTRY_BYTES),
+            "revocable owner holds one scratch bucket"
+        );
+        assert_eq!(
+            (
+                snap.owner_usage[PREPARED_OWNER].retained_payload_bytes,
+                snap.owner_usage[PREPARED_OWNER].retained_metadata_bytes,
+                snap.owner_usage[PREPARED_OWNER].live_scratch_bytes
+            ),
+            (payload, metadata - MAP_ENTRY_BYTES, 0),
+            "prepared owner splits payload and identity evidence buckets"
+        );
+        // Per-class attribution detects a correct grand total with the wrong
+        // class bucket.
+        assert_eq!(
+            (
+                snap.class_usage[&MemoryClass::MemoResidency].retained_payload_bytes,
+                snap.class_usage[&MemoryClass::MemoResidency].retained_metadata_bytes,
+                snap.class_usage[&MemoryClass::MemoResidency].live_scratch_bytes
+            ),
+            (0, MAP_ENTRY_BYTES, 0)
+        );
+        assert_eq!(
+            (
+                snap.class_usage[&MemoryClass::ExecutionScratchRevocable].retained_payload_bytes,
+                snap.class_usage[&MemoryClass::ExecutionScratchRevocable].retained_metadata_bytes,
+                snap.class_usage[&MemoryClass::ExecutionScratchRevocable].live_scratch_bytes
+            ),
+            (0, 0, REVOCABLE_ENTRY_BYTES)
+        );
+        assert_eq!(
+            (
+                snap.class_usage[&MemoryClass::ArtifactCache].retained_payload_bytes,
+                snap.class_usage[&MemoryClass::ArtifactCache].retained_metadata_bytes,
+                snap.class_usage[&MemoryClass::ArtifactCache].live_scratch_bytes
+            ),
+            (payload, metadata - MAP_ENTRY_BYTES, 0)
+        );
+        // Per-context attribution: map and prepared bind Request; the
+        // revocable store charges its entries under Runtime.
+        assert_eq!(
+            (
+                snap.context_usage[&MemoryContextKind::Request].retained_payload_bytes,
+                snap.context_usage[&MemoryContextKind::Request].retained_metadata_bytes,
+                snap.context_usage[&MemoryContextKind::Request].live_scratch_bytes
+            ),
+            (payload, metadata, 0)
+        );
+        assert_eq!(
+            snap.context_usage[&MemoryContextKind::Runtime].live_scratch_bytes,
+            REVOCABLE_ENTRY_BYTES
+        );
+        assert_eq!(snap.context_usage[&MemoryContextKind::Runtime].retained_payload_bytes, 0);
+        assert_eq!(snap.context_usage[&MemoryContextKind::Runtime].retained_metadata_bytes, 0);
+    };
+
+    // Live postimage: payload 17, metadata 42+129=171, scratch 34, total 222,
+    // four tickets (one map, one revocable, two prepared leases).
+    expected(
+        PREPARED_ACTIVE_BYTES,
+        MAP_ENTRY_BYTES + PREPARED_PERSISTENT_BYTES,
+        REVOCABLE_ENTRY_BYTES,
+        PREPARED_ACTIVE_BYTES + MAP_ENTRY_BYTES + PREPARED_PERSISTENT_BYTES + REVOCABLE_ENTRY_BYTES,
+        4,
+    );
+
+    // Abort refunds only the prepared payload lease; the identity tombstone
+    // stays in the metadata bucket.
+    use quanta_memory_platform_facade::AbortDispositionV1;
+    assert_eq!(prepared.abort(receipt.token()).expect("abort"), AbortDispositionV1::Aborted);
+    expected(
+        0,
+        MAP_ENTRY_BYTES + PREPARED_PERSISTENT_BYTES,
+        REVOCABLE_ENTRY_BYTES,
+        MAP_ENTRY_BYTES + PREPARED_PERSISTENT_BYTES + REVOCABLE_ENTRY_BYTES,
+        3,
+    );
+
+    // Closing every store drains every axis.
+    map.close().expect("close map");
+    revocable.close().expect("close revocable");
+    prepared.close().expect("close prepared");
+    assert_drained(&platform.broker().ledger_snapshot().expect("drained"));
 }

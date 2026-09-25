@@ -332,3 +332,37 @@ fn report_only_builder_returns_data_without_runtime_authority() {
         .expect("preset resolves");
     assert_eq!(report.preset, MemoryPreset::Production);
 }
+
+/// Positive external-path proof that `PressureThresholds` exists, validates on
+/// construction, and exposes its rungs only through read-only getters. The
+/// type/import resolution here also anchors the adjacent `compile_fail` doc on
+/// the type: a failing unresolved-name error cannot be mistaken for
+/// private-field protection, because this test proves the name resolves.
+#[test]
+#[cfg(feature = "live_control")]
+fn pressure_thresholds_construct_and_getters_reach_the_external_path() {
+    let thresholds =
+        PressureThresholds::new(75, 90, 98).expect("a monotonic in-range ladder must construct");
+    assert_eq!(
+        (thresholds.soft_percent(), thresholds.hard_percent(), thresholds.fatal_percent()),
+        (75, 90, 98),
+        "getters expose exactly the validated construction values"
+    );
+    assert_eq!(
+        (
+            PressureThresholds::default().soft_percent(),
+            PressureThresholds::default().hard_percent(),
+            PressureThresholds::default().fatal_percent()
+        ),
+        (75, 90, 98),
+        "the Default ladder is the documented 75/90/98"
+    );
+    assert!(
+        PressureThresholds::new(90, 75, 50).is_err(),
+        "an inverted ladder is rejected on the external path"
+    );
+    assert!(
+        PressureThresholds::new(75, 90, 101).is_err(),
+        "an out-of-range rung is rejected on the external path"
+    );
+}

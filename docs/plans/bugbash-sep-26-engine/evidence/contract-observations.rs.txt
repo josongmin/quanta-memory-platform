@@ -1,0 +1,81 @@
+use std::cmp::Ordering;
+use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::{Arc, atomic::{AtomicBool, Ordering as AtomicOrdering}};
+
+use quanta_memory_platform_core::{
+    LadderPressureController, MemoryClass, MemoryContextKind, PressureState,
+    PressureThresholds, ProcessMemoryBroker, RuntimeKind, ScratchRequest, StoreBindingHandle,
+};
+use quanta_memory_platform_facade::{
+    ByteSized, LiveMemoryPlatform, MemoryPlatformBuilder, PortableMemoryPresets,
+    PreparedPublicationIdentityV1, PreparedPublicationRequestV1, SessionTranscriptStore,
+    TranscriptAppendIdentityV1, TranscriptAppendRequestV1,
+};
+
+fn platform() -> LiveMemoryPlatform {
+    MemoryPlatformBuilder::new()
+        .with_manifest(PortableMemoryPresets::development())
+        .build().unwrap()
+}
+
+#[derive(Clone, Debug)]
+struct SessionKey { name: &'static str, armed: Arc<AtomicBool> }
+impl ByteSized for SessionKey { fn byte_size(&self) -> u64 { self.name.len() as u64 } }
+impl PartialEq for SessionKey { fn eq(&self, other: &Self) -> bool { self.name == other.name } }
+impl Eq for SessionKey {}
+impl PartialOrd for SessionKey {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> { Some(self.cmp(other)) }
+}
+impl Ord for SessionKey {
+    fn cmp(&self, other: &Self) -> Ordering {
+        assert!(!self.armed.load(AtomicOrdering::SeqCst), "armed SessionKey::Ord");
+        self.name.cmp(other.name)
+    }
+}
+
+fn main() {
+    let p = platform();
+    let runtime = p.attach_runtime("audit-runtime".into(), RuntimeKind::Runtime).unwrap();
+    let context = runtime.context(MemoryContextKind::Request, "audit-scratch".into());
+    let mut scratch = runtime.scratch()
+        .reserve_scratch_scope(&context, ScratchRequest::new("peak", 1000)).unwrap();
+    scratch.grow_to_observed(800).unwrap();
+    scratch.grow_to_observed(200).unwrap();
+    println!("ENG-11 peak_after_800_then_200={} reserved={}", scratch.observed_bytes(), scratch.reserved_bytes());
+    scratch.release().unwrap();
+    println!("ENG-11 after_release_total={}", p.broker().ledger_snapshot().unwrap().total_owner_bytes());
+
+    let invalid = PressureThresholds { soft_percent: 90, hard_percent: 75, fatal_percent: 50 };
+    let controller = LadderPressureController::new(100, invalid, PressureState::Normal);
+    println!("ENG-12 validation={:?} accepted_controller_at_50={:?}", invalid.validate(), controller.classify_semantic(50));
+
+    let prepared = p.prepared_publication_builder::<Vec<u8>>()
+        .bind(StoreBindingHandle::new(MemoryClass::ArtifactCache, "audit-prepared".into(), None))
+        .build().unwrap();
+    let receipt = prepared.prepare(PreparedPublicationRequestV1::new(
+        PreparedPublicationIdentityV1::new(vec![b'i']).unwrap(), vec![])).unwrap();
+    prepared.abort(receipt.token()).unwrap();
+    let snap = p.broker().ledger_snapshot().unwrap();
+    println!("ENG-13 aborted_empty_payload payload={} metadata={} total={} tombstone={}",
+        snap.total_retained_payload_bytes(), snap.total_retained_metadata_bytes(),
+        snap.total_owner_bytes(), prepared.stats().unwrap().tombstone_bytes);
+    prepared.close().unwrap();
+    println!("ENG-13 after_close_total={}", p.broker().ledger_snapshot().unwrap().total_owner_bytes());
+
+    let armed = Arc::new(AtomicBool::new(false));
+    let key = SessionKey { name: "session", armed: armed.clone() };
+    let transcript = p.transcript_store_builder::<SessionKey, String, String>()
+        .bind(StoreBindingHandle::new(MemoryClass::SessionTranscript, "audit-transcript".into(), None))
+        .build().unwrap();
+    transcript.append(TranscriptAppendRequestV1::new(
+        TranscriptAppendIdentityV1::new(key.clone(), 0, "m0".into()), "body".into())).unwrap();
+    let before = p.broker().ledger_snapshot().unwrap();
+    armed.store(true, AtomicOrdering::SeqCst);
+    let caught = catch_unwind(AssertUnwindSafe(|| transcript.session_bytes(&key)));
+    armed.store(false, AtomicOrdering::SeqCst);
+    println!("ENG-01 lookup_panicked={} stats_after={:?} close_after={:?} ledger_unchanged={}",
+        caught.is_err(), transcript.checked_stats(), transcript.close(),
+        before == p.broker().ledger_snapshot().unwrap());
+    drop(transcript);
+    println!("ENG-01 after_drop_total={}", p.broker().ledger_snapshot().unwrap().total_owner_bytes());
+}

@@ -53,7 +53,10 @@ Boundary rules (hexagonal direction is inward-only):
 - **`domain/`** is pure: no I/O, no `std::fs`, no `std::env`, no wall-clock
   (`SystemTime::now` / `Instant::now`), and it must NOT import `crate::adapters`.
   It depends on its own types plus the `ports/` trait shapes.
-- **`ports/`** holds trait definitions only — no concrete adapters, no I/O.
+- **`ports/`** holds pure ports contracts: traits, contract DTOs, and inert
+  pure helpers/implementations (for example `NoopMemoryEventSink`,
+  `StaticAllocatorTelemetry`) — no concrete stateful adapters, no host I/O,
+  no clocks.
 - **`adapters/`** implement port traits; infra types (hdrhistogram, metrics) live
   here. Allocator telemetry from adapters is **advisory**: it never mutates ledger
   counters. The in-memory pin registry is explicitly named `UnbudgetedPinRegistry`

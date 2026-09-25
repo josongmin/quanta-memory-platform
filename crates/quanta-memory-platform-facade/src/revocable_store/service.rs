@@ -1531,6 +1531,101 @@ mod tests {
         );
     }
 
+    #[test]
+    fn same_store_reclaimer_returns_busy_without_losing_fifo() {
+        use quanta_memory_platform_core::{
+            MemoryError, MemoryReclaimer, MemoryResult, ReclaimOutcome, ReclaimRequest,
+        };
+        use std::sync::OnceLock;
+
+        struct SameStoreReclaimer {
+            store: OnceLock<Arc<Store>>,
+            inner_results: Mutex<Vec<MemoryResult<SweepStats>>>,
+        }
+
+        impl MemoryReclaimer for SameStoreReclaimer {
+            fn reclaim(&self, request: &ReclaimRequest) -> MemoryResult<ReclaimOutcome> {
+                let store = self.store.get().expect("store registered before use");
+                // The inserting thread holds this store's mutation lane while
+                // the broker runs the callback, so a synchronous same-store
+                // reclaim observes typed Busy instead of blocking or evicting.
+                let inner = store.reclaim_until(request.requested_bytes);
+                let busy = matches!(inner, Err(MemoryError::OperationInProgress(_)));
+                self.inner_results.lock().expect("results").push(inner);
+                if busy {
+                    return Err(MemoryError::operation_in_progress(
+                        "same-store reclaim during its own admission",
+                    ));
+                }
+                Ok(ReclaimOutcome { reclaimed_bytes: 0 })
+            }
+        }
+
+        let reclaimer = Arc::new(SameStoreReclaimer {
+            store: OnceLock::new(),
+            inner_results: Mutex::new(Vec::new()),
+        });
+        let broker = ProcessMemoryBrokerBuilder::new()
+            .with_manifest(MemoryBudgetManifest::new(
+                MemoryPreset::Production,
+                ExecutionBudget::default(),
+                ResidencyPolicy::new(10_000_000).with_class_budget(
+                    MemoryClass::ExecutionScratchRevocable,
+                    MemoryClassBudget {
+                        reserved_bytes: 0,
+                        soft_cap_bytes: 100,
+                        hard_cap_bytes: 100,
+                        borrow_from_shared_pool: false,
+                        reclaim_priority: ReclaimPriority::First,
+                    },
+                ),
+            ))
+            .with_reclaimer(reclaimer.clone() as Arc<dyn MemoryReclaimer>)
+            .build()
+            .expect("valid broker");
+        let store = Arc::new(store_with_broker(&broker));
+        assert!(reclaimer.store.set(Arc::clone(&store)).is_ok());
+
+        // Two FIFO entries consume 74 of the 100-byte class budget.
+        store.insert_checked("a".to_string(), vec![0; 4]).expect("a");
+        store.insert_checked("b".to_string(), vec![0; 4]).expect("b");
+        let live = expected_entry_cost("a", 4) + expected_entry_cost("b", 4);
+        assert_eq!(live, 74);
+
+        // The third insert is hard-cap denied. The broker callback runs while
+        // this thread still owns the mutation lane, so the same-store reclaim
+        // is typed Busy, no bytes are freed, and admission stays a Capacity
+        // denial with the FIFO and charges byte-identical.
+        let denied = store.insert_checked("c".to_string(), vec![0; 4]);
+        assert!(
+            matches!(denied, Err(MemoryError::Capacity(_))),
+            "hard-cap denial without freed bytes must surface as Capacity, got {denied:?}"
+        );
+        let inner_results = reclaimer.inner_results.lock().expect("results").clone();
+        assert_eq!(inner_results.len(), 1, "exactly one reclaim callback");
+        assert!(
+            matches!(&inner_results[0], Err(MemoryError::OperationInProgress(_))),
+            "same-store reclaim inside the admission callback must be typed Busy"
+        );
+        assert_eq!(store.stats().expect("stats preserved").estimated_bytes, live);
+        assert_eq!(store.committed_bytes().expect("committed preserved"), live);
+        assert_eq!(broker.ledger_snapshot().expect("ledger preserved").total_owner_bytes(), live);
+
+        // Outside the denied admission, the same store reclaims its FIFO head
+        // and the retried insert is admitted.
+        let swept = store.reclaim_until(expected_entry_cost("a", 4)).expect("reclaim after denial");
+        assert_eq!(swept.reclaimed_items, 1);
+        assert_eq!(swept.reclaimed_bytes, expected_entry_cost("a", 4));
+        store.insert_checked("c".to_string(), vec![0; 4]).expect("insert after reclaim");
+        assert_eq!(store.stats().expect("retried stats").item_count, 2);
+
+        // FIFO order survived the denial: the head is now the untouched "b".
+        let (key, _) = store.reclaim_one().expect("reclaim").expect("b still ahead of c");
+        assert_eq!(key.as_str(), "b");
+        store.close().expect("close");
+        assert_eq!(broker.ledger_snapshot().expect("drained").total_owner_bytes(), 0);
+    }
+
     #[cfg(feature = "spill")]
     #[test]
     fn reclaim_to_in_memory_tier_keeps_bytes_charged() {

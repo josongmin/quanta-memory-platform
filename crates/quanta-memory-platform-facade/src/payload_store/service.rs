@@ -154,15 +154,6 @@ impl<PayloadRef, Bytes, Mode> SimplePayloadStore<PayloadRef, Bytes, Mode> {
         self.lifecycle.try_lock_state(&self.state)
     }
 
-    fn lock_read(
-        &self,
-    ) -> MemoryResult<std::sync::MutexGuard<'_, PayloadState<PayloadRef, Bytes>>> {
-        self.lifecycle.ensure_readable()?;
-        let state = self.lock()?;
-        self.lifecycle.ensure_readable()?;
-        Ok(state)
-    }
-
     fn context_kind(&self, value: &RetainedEnvelope<Bytes>) -> MemoryContextKind {
         value
             .context
@@ -172,7 +163,7 @@ impl<PayloadRef, Bytes, Mode> SimplePayloadStore<PayloadRef, Bytes, Mode> {
     }
 
     pub fn charged_bytes(&self) -> MemoryResult<u64> {
-        Ok(self.lock_read()?.charged_total)
+        self.lifecycle.with_read_state(&self.state, |state| state.charged_total)
     }
 
     /// Release every live charge and enter the terminal closed state. A repeated
@@ -265,12 +256,12 @@ where
     }
 
     pub fn pin_count(&self, payload_ref: &PayloadRef) -> MemoryResult<u64> {
-        let digest = reference_digest(payload_ref);
-        Ok(invoke_client_read_while_locked(self.lock_read()?, |state| {
+        self.lifecycle.with_read_state(&self.state, |state| {
+            let digest = reference_digest(payload_ref);
             find_reference_slot(state, digest, payload_ref)
                 .and_then(|index| state.entries[index].as_ref())
                 .map_or(0, |entry| entry.pin_count)
-        }))
+        })
     }
 }
 
@@ -445,8 +436,10 @@ where
     }
 
     fn stats(&self) -> MemoryResult<StoreStats> {
-        let state = self.lock_read()?;
-        Ok(StoreStats { item_count: state.live_entries, estimated_bytes: state.charged_total })
+        self.lifecycle.with_read_state(&self.state, |state| StoreStats {
+            item_count: state.live_entries,
+            estimated_bytes: state.charged_total,
+        })
     }
 
     fn close(&self) -> MemoryResult<()> {
@@ -831,6 +824,66 @@ mod tests {
         ));
         assert_eq!(store.stats().expect("unchanged stats").item_count, 0);
         assert_eq!(broker.ledger_snapshot().expect("unchanged ledger").total_owner_bytes(), 0);
+    }
+
+    #[test]
+    fn composite_entry_charges_one_payload_bucket() {
+        let broker = live_broker(1_000_000, 600_000);
+        let store = SimplePayloadStore::<String, Vec<u8>, Budgeted>::new_budgeted(
+            binding(),
+            None,
+            broker.clone(),
+        );
+        store.put_canonical(envelope(b"payload")).expect("put");
+        let charged = store.charged_bytes().expect("charged total");
+        assert!(charged > 0, "a published payload holds a live charge");
+        // One owned lifetime component, one bucket: the composite
+        // payload+key/index/entry cost is charged entirely as RetainedPayload.
+        let snap = broker.ledger_snapshot().expect("snapshot");
+        assert_eq!(snap.total_retained_payload_bytes(), charged);
+        assert_eq!(snap.total_retained_metadata_bytes(), 0);
+        assert_eq!(snap.total_live_scratch_bytes(), 0);
+        assert_eq!(snap.total_owner_bytes(), charged);
+        assert_eq!(snap.live_ticket_count, 1);
+        let usage = snap.owner_usage.values().next().expect("sole owner");
+        assert_eq!(
+            (usage.retained_payload_bytes, usage.retained_metadata_bytes, usage.live_scratch_bytes),
+            (charged, 0, 0)
+        );
+        store.close().expect("close");
+        assert_eq!(broker.ledger_snapshot().expect("drained").total_owner_bytes(), 0);
+    }
+
+    #[test]
+    fn counter_reads_show_open_busy_and_closed_images() {
+        let broker = live_broker(1_000_000, 600_000);
+        let store = SimplePayloadStore::<String, Vec<u8>, Budgeted>::new_budgeted(
+            binding(),
+            None,
+            broker.clone(),
+        );
+        store.put_canonical(envelope(b"payload")).expect("put");
+        // Open image: the plain counters mirror the authoritative ledger charge.
+        let charged = broker.ledger_snapshot().expect("open ledger").total_owner_bytes();
+        assert!(charged > 0, "seed payload must hold a live charge");
+        assert_eq!(
+            store.stats().expect("open stats"),
+            StoreStats { item_count: 1, estimated_bytes: charged }
+        );
+        assert_eq!(store.charged_bytes().expect("open bytes"), charged);
+
+        // Busy image: while the mutation lane is held, counter reads are typed
+        // contention — never an empty success masking an in-flight plan.
+        let permit = store.lifecycle.begin_mutation().expect("own lane");
+        assert!(matches!(store.stats(), Err(MemoryError::OperationInProgress(_))));
+        assert!(matches!(store.charged_bytes(), Err(MemoryError::OperationInProgress(_))));
+        drop(permit);
+
+        // Closed image: the terminal empty image stays readable and consistent.
+        store.close().expect("close");
+        assert_eq!(store.stats().expect("closed stats"), StoreStats::default());
+        assert_eq!(store.charged_bytes().expect("closed bytes"), 0);
+        assert_eq!(broker.ledger_snapshot().expect("drained ledger").total_owner_bytes(), 0);
     }
 
     #[test]

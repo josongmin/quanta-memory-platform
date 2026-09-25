@@ -35,6 +35,12 @@ pub mod semantic_cost_v1 {
 /// instead of remeasuring mutable or caller-owned data on the release path.
 /// A value's [`ByteSized`] implementation remains caller-reported: this model
 /// does not claim to meter arbitrary heap allocations or allocator overhead.
+///
+/// These components *calculate* one charge's total; the core
+/// `ChargeKind` enum separately *classifies* which owned lifetime component
+/// that whole total belongs to. A kind bucket therefore includes the key,
+/// index, and fixed overhead carried by the same lease and is not a promise
+/// of per-field byte-accurate payload/metadata telemetry.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RetainedCostV1 {
     pub payload_bytes: u64,

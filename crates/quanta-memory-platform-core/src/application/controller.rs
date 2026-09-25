@@ -34,11 +34,21 @@ pub enum ReclaimRung {
 
 /// Deterministic ladder thresholds expressed as percent of the global hard
 /// limit. `soft <= hard <= fatal` is required and validated.
+///
+/// The fields are private: the only construction paths are the validating
+/// [`PressureThresholds::new`] and the valid [`Default`], so a caller cannot
+/// forge an inverted or out-of-range ladder with a struct literal.
+///
+/// ```compile_fail
+/// use quanta_memory_platform_core::PressureThresholds;
+/// // A caller-forged literal must not compile: validation is unavoidable.
+/// let _forged = PressureThresholds { soft_percent: 90, hard_percent: 75, fatal_percent: 50 };
+/// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PressureThresholds {
-    pub soft_percent: u8,
-    pub hard_percent: u8,
-    pub fatal_percent: u8,
+    soft_percent: u8,
+    hard_percent: u8,
+    fatal_percent: u8,
 }
 
 impl Default for PressureThresholds {
@@ -60,6 +70,24 @@ impl PressureThresholds {
         let candidate = Self { soft_percent, hard_percent, fatal_percent };
         candidate.validate()?;
         Ok(candidate)
+    }
+
+    /// The soft rung in percent of the global hard limit.
+    #[must_use]
+    pub fn soft_percent(&self) -> u8 {
+        self.soft_percent
+    }
+
+    /// The hard rung in percent of the global hard limit.
+    #[must_use]
+    pub fn hard_percent(&self) -> u8 {
+        self.hard_percent
+    }
+
+    /// The fatal rung in percent of the global hard limit.
+    #[must_use]
+    pub fn fatal_percent(&self) -> u8 {
+        self.fatal_percent
     }
 
     /// Validate monotonicity and bounds. Returns the typed error describing the
@@ -326,14 +354,28 @@ mod tests {
     fn thresholds_new_accepts_monotonic_and_default_is_valid() {
         let ok = PressureThresholds::new(75, 90, 98).expect("monotonic thresholds are accepted");
         assert_eq!(
-            ok,
-            PressureThresholds { soft_percent: 75, hard_percent: 90, fatal_percent: 98 }
+            (ok.soft_percent(), ok.hard_percent(), ok.fatal_percent()),
+            (75, 90, 98),
+            "getters expose exactly the validated construction values"
         );
         // Equal rungs are still monotonic (non-strict) and must be accepted.
-        PressureThresholds::new(50, 50, 50).expect("equal rungs are monotonic");
+        let equal = PressureThresholds::new(50, 50, 50).expect("equal rungs are monotonic");
+        // Classification oracle on the equal ladder: every rung boundary is
+        // the fatal boundary, so 49% stays Normal and 50% is already Fatal.
+        let equal_controller = LadderPressureController::new(100, equal, PressureState::Normal);
+        assert_eq!(equal_controller.classify_semantic(49), PressureState::Normal);
+        assert_eq!(equal_controller.classify_semantic(50), PressureState::Fatal);
         // The Default must remain usable: it constructs and validates.
         assert!(PressureThresholds::default().is_monotonic());
         PressureThresholds::default().validate().expect("Default thresholds must be valid");
+        assert_eq!(
+            (
+                PressureThresholds::default().soft_percent(),
+                PressureThresholds::default().hard_percent(),
+                PressureThresholds::default().fatal_percent()
+            ),
+            (75, 90, 98)
+        );
     }
 
     // scenario E: inverted / out-of-range ladders are rejected fail-closed with

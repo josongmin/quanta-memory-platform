@@ -4,6 +4,13 @@ The [Sep-26 engine architecture bugbash](bugbash-sep-26-engine/README.md) record
 read-only findings at QMP `96d0a25`; it is an audit queue, not an implementation
 or exact-source qualification receipt.
 
+Its [structural remediation plan](bugbash-sep-26-engine/STRUCTURAL-REMEDIATION-PLAN.md)
+maps all 13 findings to owner-level repairs, explicit contracts, conditional SDK
+work, and measurement gates at `438b869`; four public-API diagnostic reproductions
+are recorded separately. Implementation remains planned.
+The [file-by-file runbook](bugbash-sep-26-engine/IMPLEMENTATION-RUNBOOK.md)
+gives future workers concrete edit and test instructions.
+
 The `db0b03c` snapshot below is the last audited implementation base, not
 current HEAD. Current local qualification is asserted only when an annotated
 `qmp-local-qualified-*` tag peels to exact `HEAD`; its annotation binds the
@@ -31,7 +38,10 @@ explains the exact source boundary.
 Do not infer current qualification from this historical table. Resolve the
 newest `qmp-local-qualified-*` tag and require its peeled target to equal HEAD;
 the annotation records exact-source canonical CI, full benchmark, and
-extraction dry-run evidence. B07 metadata cardinality and J06 deferred-work
-bounds are implementation/test contracts in the current source, not open plan
-items. Semantica deployment and activation remain host-owned. Physical power
+extraction dry-run evidence. B07/J06 live-ticket, identifier-byte and
+deferred-batch bounds are implemented. Broader policy-map/lifetime-metadata
+bounds remain family-specific work; the
+[Sep-26 plan](bugbash-sep-26-engine/STRUCTURAL-REMEDIATION-PLAN.md) tracks that
+distinction without reopening the completed zero-byte authority fix.
+Semantica deployment and activation remain host-owned. Physical power
 loss and the Redb failure model are outside the active in-memory release scope.

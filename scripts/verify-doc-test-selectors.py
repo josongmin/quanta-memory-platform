@@ -25,14 +25,18 @@ DOCUMENTS = (
 NON_TEST_IDENTIFIERS = {
     "FACADE_STORE_SUITE",
     "allocator_observation_is_inert",
+    "grow_to_observed",
     "hard_cap_bytes",
     "payload_dedup_refund",
     "pin_safe_delete",
+    "release_managed_many",
     "retained_map_refunds",
     "run_facade_store_suite",
     "soft_cap_bytes",
     "spill_round_trip",
     "spill_unavailable_fail_closed",
+    "total_retained_metadata_bytes",
+    "total_retained_payload_bytes",
     "transcript_truncate_refund",
 }
 

@@ -296,7 +296,7 @@ impl<SessionId, MessageId, Message, Mode>
     }
 
     pub fn retention_policy(&self) -> MemoryResult<TranscriptRetentionPolicyV2> {
-        Ok(self.lock_read()?.retention)
+        self.lifecycle.with_read_state(&self.state, |state| state.retention)
     }
 
     fn lock_state(
@@ -305,33 +305,23 @@ impl<SessionId, MessageId, Message, Mode>
         self.lifecycle.try_lock_state(&self.state)
     }
 
-    /// Checked reads cannot observe the temporary preimage extracted by a
-    /// two-phase accounting mutation.
-    fn lock_read(
-        &self,
-    ) -> MemoryResult<MutexGuard<'_, TranscriptState<SessionId, MessageId, Message>>> {
-        self.lifecycle.ensure_readable()?;
-        let state = self.lock_state()?;
-        self.lifecycle.ensure_readable()?;
-        Ok(state)
-    }
-
     pub fn retained_bytes(&self) -> MemoryResult<u64> {
-        Ok(self.lock_read()?.retained_bytes)
+        self.lifecycle.with_read_state(&self.state, |state| state.retained_bytes)
     }
 
     pub fn retention_stats(&self) -> MemoryResult<TranscriptRetentionStatsV2> {
-        let state = self.lock_read()?;
-        validate_component_counters(&state)?;
-        Ok(TranscriptRetentionStatsV2 {
-            active_row_count: state.active_row_count,
-            active_bytes: state.active_bytes,
-            evidence_count: state.evidence_count,
-            evidence_bytes: state.evidence_bytes,
-            session_count: state.sessions.len(),
-            session_key_bytes: state.session_key_bytes,
-            total_retained_bytes: state.retained_bytes,
-        })
+        self.lifecycle.with_read_state(&self.state, |state| {
+            validate_component_counters(state)?;
+            Ok(TranscriptRetentionStatsV2 {
+                active_row_count: state.active_row_count,
+                active_bytes: state.active_bytes,
+                evidence_count: state.evidence_count,
+                evidence_bytes: state.evidence_bytes,
+                session_count: state.sessions.len(),
+                session_key_bytes: state.session_key_bytes,
+                total_retained_bytes: state.retained_bytes,
+            })
+        })?
     }
 
     pub fn try_reconfigure_retention(
@@ -459,21 +449,30 @@ where
     SessionId: Clone + Ord + ByteSized,
 {
     pub fn session_bytes(&self, session_id: &SessionId) -> MemoryResult<u64> {
-        self.lock_read()?.sessions.get(session_id).map_or(Ok(0), |session| {
-            let checked = semantic_session_bytes(session)?;
-            if checked != session.retained_bytes {
-                return Err(MemoryError::InvalidState(
-                    "transcript session cost counter disagrees with owned leases".to_string(),
-                ));
-            }
-            Ok(checked)
-        })
+        // The caller-implemented Ord probe runs inside the owned read
+        // boundary: a comparison panic cannot poison the state mutex, and a
+        // missing session still reports zero rather than an error.
+        self.lifecycle.with_read_state(&self.state, |state| {
+            state.sessions.get(session_id).map_or(Ok(0), |session| {
+                let checked = semantic_session_bytes(session)?;
+                if checked != session.retained_bytes {
+                    return Err(MemoryError::InvalidState(
+                        "transcript session cost counter disagrees with owned leases".to_string(),
+                    ));
+                }
+                Ok(checked)
+            })
+        })?
     }
 
     pub fn checked_stats(&self) -> MemoryResult<StoreStats> {
-        let state = self.lock_read()?;
-        validate_component_counters(&state)?;
-        Ok(StoreStats { item_count: state.active_row_count, estimated_bytes: state.retained_bytes })
+        self.lifecycle.with_read_state(&self.state, |state| {
+            validate_component_counters(state)?;
+            Ok(StoreStats {
+                item_count: state.active_row_count,
+                estimated_bytes: state.retained_bytes,
+            })
+        })?
     }
 
     fn retain_sequences_owned(
@@ -635,8 +634,7 @@ where
         &self,
         session_id: &SessionId,
     ) -> MemoryResult<TranscriptSnapshotV1<MessageId, Message>> {
-        let state = self.lock_read()?;
-        let snapshot = invoke_client_read_while_locked(state, |state| {
+        self.lifecycle.with_read_state(&self.state, |state| {
             let version = state.sessions.get(session_id).map_or(0, |session| session.version);
             let records = state.sessions.get(session_id).map_or_else(Vec::new, |session| {
                 session
@@ -650,8 +648,7 @@ where
                     .collect()
             });
             TranscriptSnapshotV1 { version, records }
-        });
-        Ok(snapshot)
+        })
     }
 
     /// Retain rows only if no append or retention mutation occurred after the
@@ -1018,8 +1015,7 @@ where
         MessageId: Clone,
         Message: Clone,
     {
-        let state = self.lock_read()?;
-        Ok(invoke_client_read_while_locked(state, |state| {
+        self.lifecycle.with_read_state(&self.state, |state| {
             state.sessions.get(session_id).map_or_else(Vec::new, |session| {
                 session
                     .rows
@@ -1031,7 +1027,7 @@ where
                     })
                     .collect()
             })
-        }))
+        })
     }
 
     fn retain_sequences(
@@ -2758,6 +2754,56 @@ mod tests {
         }
 
         #[test]
+        fn active_row_and_session_evidence_own_separate_kind_buckets() {
+            let broker = broker(1_000_000);
+            let store =
+                SimpleSessionTranscriptStore::<String, String, String, Budgeted>::new_budgeted(
+                    StoreBindingHandle::new(
+                        MemoryClass::SessionTranscript,
+                        "transcript-kind-bucket-test".to_string(),
+                        None,
+                    ),
+                    TranscriptRetentionPolicyV2::default(),
+                    broker.clone(),
+                );
+            store
+                .append(TranscriptAppendRequestV1::new(
+                    TranscriptAppendIdentityV1::new("session".to_string(), 0, "m0".to_string()),
+                    "body".to_string(),
+                ))
+                .expect("append");
+
+            // Two owned lifetime components, two buckets: the active row is
+            // RetainedPayload; the session key and persistent identity
+            // evidence are RetainedMetadata. Cross-check each bucket against
+            // the independent retention component counters.
+            let retention = store.retention_stats().expect("retention stats");
+            let snap = broker.ledger_snapshot().expect("snapshot");
+            assert!(retention.active_bytes > 0);
+            assert!(retention.evidence_bytes + retention.session_key_bytes > 0);
+            assert_eq!(snap.total_retained_payload_bytes(), retention.active_bytes);
+            assert_eq!(
+                snap.total_retained_metadata_bytes(),
+                retention.evidence_bytes + retention.session_key_bytes
+            );
+            assert_eq!(snap.total_live_scratch_bytes(), 0);
+            assert_eq!(
+                snap.total_owner_bytes(),
+                retention.active_bytes + retention.evidence_bytes + retention.session_key_bytes
+            );
+            let usage = snap.owner_usage.values().next().expect("sole owner");
+            assert_eq!(usage.retained_payload_bytes, retention.active_bytes);
+            assert_eq!(
+                usage.retained_metadata_bytes,
+                retention.evidence_bytes + retention.session_key_bytes
+            );
+            assert_eq!(usage.live_scratch_bytes, 0);
+
+            store.close().expect("close");
+            assert_eq!(broker.ledger_snapshot().expect("drained").total_owner_bytes(), 0);
+        }
+
+        #[test]
         fn session_order_panic_before_mutation_keeps_public_transcript_available() {
             for operation in ["retain", "truncate", "versioned retain"] {
                 let broker = broker(1_000_000);
@@ -2810,6 +2856,63 @@ mod tests {
                 store.close().expect("public close after panic");
                 assert_eq!(broker.ledger_snapshot().expect("drained").total_owner_bytes(), 0);
             }
+        }
+
+        #[test]
+        fn session_bytes_ord_panic_preserves_store_and_ledger() {
+            let broker = broker(1_000_000);
+            let trap = ComparisonTrap::new();
+            let id = OrderedSessionId { name: "session", trap: Arc::clone(&trap) };
+            let store = SimpleSessionTranscriptStore::<
+                OrderedSessionId,
+                String,
+                String,
+                Budgeted,
+            >::new_budgeted(
+                StoreBindingHandle::new(
+                    MemoryClass::SessionTranscript,
+                    "transcript-session-bytes-panic-test".to_string(),
+                    None,
+                ),
+                TranscriptRetentionPolicyV2::default(),
+                broker.clone(),
+            );
+            store
+                .append(TranscriptAppendRequestV1::new(
+                    TranscriptAppendIdentityV1::new(id.clone(), 0, "m0".to_string()),
+                    "body0".to_string(),
+                ))
+                .expect("seed row");
+            let before = broker.ledger_snapshot().expect("before");
+            // Arm exactly the session_bytes lookup: one seeded session means the
+            // BTreeMap probe performs exactly one SessionId::Ord comparison.
+            let calls = trap.calls.load(AtomicOrdering::SeqCst);
+            trap.panic_at.store(calls + 1, AtomicOrdering::SeqCst);
+            let panicked =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| store.session_bytes(&id)));
+            assert!(panicked.is_err(), "Ord trap must fire inside the session_bytes lookup");
+            trap.disarm();
+            assert_eq!(broker.ledger_snapshot().expect("after panic"), before);
+            assert_eq!(
+                store.checked_stats().expect("checked_stats after panic").item_count,
+                1,
+                "a read-side Ord panic must not poison the transcript store"
+            );
+            assert_eq!(store.load(&id).expect("load after panic").len(), 1);
+            assert!(
+                store.session_bytes(&id).expect("session_bytes after panic") > 0,
+                "same read must succeed once the trap is disarmed"
+            );
+            store
+                .append(TranscriptAppendRequestV1::new(
+                    TranscriptAppendIdentityV1::new(id.clone(), 1, "m1".to_string()),
+                    "body1".to_string(),
+                ))
+                .expect("append after panic");
+            store.close().expect("close after panic");
+            let drained = broker.ledger_snapshot().expect("drained");
+            assert_eq!(drained.total_owner_bytes(), 0);
+            assert_eq!(drained.live_ticket_count, 0);
         }
 
         #[test]

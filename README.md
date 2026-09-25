@@ -81,6 +81,17 @@ are limited to 256 UTF-8 bytes, and deferred ticket cleanup processes at most
 MAX_DEFERRED_TICKET_DRAIN_BATCH authorities per broker-lock acquisition. These
 are logical bookkeeping bounds, not an RSS guarantee.
 
+Public payload/metadata totals are semantic **charge buckets per owned
+lifetime component**, not per-field byte telemetry: a bucket covers the
+retained object together with the key/index/entry overhead held under the
+same lease. The prepared-publication service splits its two leases across
+buckets — the active payload component is charged as payload and the
+persistent identity/index/tombstone evidence is charged as metadata, so an
+aborted entry leaves a metadata-only tombstone. Prepared-publication
+orphan enumeration and GC also bound the raw caller-supplied
+reference-root slice at 16,384 tokens (duplicates counted) and reject a
+larger slice with a typed storage capacity error before any state lock.
+
 The detailed authority map, feature choices, lifecycle transitions, failure
 semantics, and verification scope are in [README-detailed.md](README-detailed.md).
 

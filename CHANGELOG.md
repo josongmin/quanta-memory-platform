@@ -1,5 +1,42 @@
 # Changelog
 
+## Unreleased - 2026-09-26
+
+- Store read boundary (ENG-01): every facade public read now runs through
+  one owned `StoreLifecycle::with_read_state` boundary (lifecycle preflight,
+  nonblocking state lock, unwind containment), so a caller-trait panic in a
+  read such as transcript `session_bytes` can no longer poison an intact
+  store. Regression: `session_bytes_ord_panic_preserves_store_and_ledger`.
+- Prepared-publication kind buckets (ENG-13): the persistent
+  identity/index/tombstone lease is charged as `RetainedMetadata` (previously
+  `RetainedPayload`); the active lease stays `RetainedPayload`. Admission
+  totals and ticket counts are unchanged. Independent numeric oracle:
+  `prepared_identity_index_and_tombstone_keep_exact_independent_cost`.
+- Bounded orphan roots (ENG-10): `orphan_tokens`/`gc_orphans` reject a raw
+  reference-root slice above 16,384 tokens (duplicates counted) with a typed
+  storage capacity error before acquiring any state lock or mutation permit.
+  Regression: `orphan_roots_bound_and_fail_closed`.
+- Broker batch preflight (ENG-08): `release_managed_many` validates batch
+  length (against the live-ticket cap), broker affinity, active lease state,
+  and the checked byte sum before building the ticket vector; the byte sum
+  can no longer mask an inactive lease as zero. Regression:
+  `managed_batch_invalid_lease_rejects_before_ticket_collection`.
+- Reclaim contract documented (ENG-02/07): `MemoryReclaimer` callback
+  contract rustdoc (synchronous, same-store reentry is bounded
+  `OperationInProgress`, claimed bytes advisory with broker remeasurement, no
+  deadline/RSS guarantee). Owner regressions:
+  `same_store_reclaimer_returns_busy_without_losing_fifo` and
+  `other_store_reclaim_frees_admission_and_drains_every_ticket`.
+- Scratch peak monotonicity (ENG-11): `grow_to_observed` keeps the recorded
+  high-water mark (`peak = max(peak, observed)`). Regressions:
+  `scratch_peak_never_decreases_on_smaller_observation` and
+  `scratch_peak_denial_release_and_drop_keep_authority_exact`.
+- Validated pressure thresholds (ENG-12, source-breaking): `PressureThresholds`
+  fields are private; construction goes through validating `new`/`Default`
+  with read-only getters. External-path proof:
+  `pressure_thresholds_construct_and_getters_reach_the_external_path` plus a
+  `compile_fail` doc on the type.
+
 ## Unreleased - 2026-09-24
 
 - Added two in-memory cross-store accounting E2E cases and strengthened the

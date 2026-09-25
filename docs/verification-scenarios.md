@@ -289,6 +289,18 @@ check helpers that the control plane enforces (see group C/D).
   postimages and live-ticket counts, including a zero-byte authority.
 - ✅ revocable FIFO/revoke/eviction — `reclaim_one_is_fifo_and_releases_its_bytes`, `revoke_makes_entry_unretrievable_and_decrements_accounting`, `reclaim_eviction_order_is_deterministic_fifo_at_capacity_boundary`.
 - ✅ publish_pipeline commit transition — `default_pipeline_runs_stage_then_commit_each_exactly_once_no_rollback`, `failed_commit_never_publishes_and_never_increments_count`.
+- ✅ **Prepared publication kind buckets and bounded orphan roots** —
+  `prepared_identity_index_and_tombstone_keep_exact_independent_cost`
+  (`facade/src/publish_pipeline/prepared_publication.rs`) pins an independent
+  numeric oracle (identity `[b'i']`, empty payload: active lease 17 bytes in
+  the payload bucket, persistent identity/index/tombstone lease 129 bytes in
+  the metadata bucket) across prepare/replay/failed-prepare/GC/abort/close,
+  asserting the same per-kind breakdown on every class/owner/context axis.
+  `orphan_roots_bound_and_fail_closed` bounds the raw caller-supplied
+  reference-root slice at 16,384 tokens (duplicates counted): over-cap input
+  is a typed storage capacity error before any state lock, unknown/aborted
+  references are typed prior errors without partial GC, and a read while the
+  GC mutation lane is held is typed Busy.
 - ✅ CanonicalKey/MeasuredValue — `cloning_measured_arc_shares_the_allocation_not_a_deep_copy`, `measured_value_charges_caller_supplied_size_not_inner_len`, `cloning_measured_value_preserves_size_and_value_context`.
 - ✅ spill routing fail-closed — `routed_spill_to_available_target_succeeds_and_counts`, `spill_to_unavailable_target_fails_closed_and_does_not_count`, `routed_spill_after_target_goes_offline_fails_closed_leaving_inventory_unchanged`.
 - ✅ **spill write → restore (inverse) round-trips** — the restore inverse landed: `in_memory_target_write_then_restore_round_trips_the_payload`, `in_memory_target_restore_of_missing_handle_is_none_not_an_error`, `in_memory_target_restore_after_offline_fails_closed_leaving_retained_state_unchanged` (`facade/src/spill/service.rs`).
@@ -306,6 +318,21 @@ check helpers that the control plane enforces (see group C/D).
   (`facade/src/transcript_store/service.rs`) exercise SessionId/MessageId Ord
   and retained CanonicalKey panics before mutation. The public load/stats/close
   path remains available, and ledger/source postimages stay exact.
+- ✅ **Public store reads run through one owned read boundary** —
+  `StoreLifecycle::with_read_state` (`facade/src/shared/lifecycle.rs`) owns
+  the lifecycle preflight, the nonblocking state lock, and unwind containment
+  for facade public reads, so a caller-trait panic can no longer poison an
+  intact store. RED-turned-GREEN oracle:
+  `session_bytes_ord_panic_preserves_store_and_ledger` arms the SessionId Ord
+  probe inside the `session_bytes` lookup; after the panic the same store
+  still serves checked_stats/load/session_bytes/append/close and drains every
+  owner byte and ticket. Read-mechanism and plain-counter coverage continues
+  in `reference_eq_panic_before_mutation_keeps_public_store_available` (pin
+  count lookup), `checked_reads_propagate_client_clone_panics_without_poisoning_owner_mutex_v1`
+  (map get/entries clones), `resolve_clone_panic_preserves_readability_and_charge`
+  (prepared payload clone), and the `counter_reads_show_open_busy_and_closed_images`
+  family (open/Busy/closed counter images for payload, retained map, and
+  prepared publication).
 - ✅ charged facade mutators are fail-closed before store mutation — `charged_remove_during_rebuild_is_fail_closed`, `charged_sweep_during_rebuild_is_fail_closed`, `reclaim_one_during_rebuild_is_fail_closed`, `reclaim_until_during_rebuild_is_fail_closed`, `truncate_refund_failure_preserves_rows_indexes_and_accounting`.
 - ✅ transcript charged breadth now matches the closeout bar — `append_identity_is_partitioned_by_session` proves session-local identity partitioning, and `truncate_refund_failure_preserves_rows_indexes_and_accounting` proves refund denial leaves both ledger and store untouched.
 - ✅ **Durable record exact terminal state** —

@@ -33,15 +33,11 @@ pub(crate) fn retire_client_value<T>(value: T) {
 /// ensure an unwind releases the mutex normally before propagating the panic.
 ///
 /// This does not make a slow callback bounded or roll back its own interior
-/// side effects. These call sites use it only for read-side `Clone`, `Ord`, or
-/// identity work; it prevents such a panic from permanently poisoning an
-/// otherwise intact container.
-#[cfg(any(
-    feature = "payload_store",
-    feature = "retained_map",
-    feature = "transcript",
-    feature = "publish_pipeline"
-))]
+/// side effects. Mutation preflight call sites (which already hold a permit)
+/// use it for read-side `Clone`, `Ord`, or identity work; public reads go
+/// through [`StoreLifecycle::with_read_state`] instead. It prevents such a
+/// panic from permanently poisoning an otherwise intact container.
+#[cfg(any(feature = "payload_store", feature = "transcript"))]
 pub(crate) fn invoke_client_read_while_locked<G, R>(guard: G, callback: impl FnOnce(&G) -> R) -> R {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| callback(&guard)));
     drop(guard);
@@ -117,6 +113,41 @@ impl StoreLifecycle {
             StoreLifecyclePhase::OperationInProgress | StoreLifecyclePhase::Closing => {
                 Err(MemoryError::operation_in_progress(self.resource))
             }
+        }
+    }
+
+    /// Run one whole public read through this store-owned boundary.
+    ///
+    /// This method owns every guarantee a public read must keep, so individual
+    /// call sites cannot forget one: the lifecycle preflight above, a
+    /// nonblocking state lock (reentrant reads get typed
+    /// `OperationInProgress`, never block), a second lifecycle check so a
+    /// temporarily detached mutation plan is never mistaken for readable
+    /// data, and unwind containment for caller code (`Clone`/`Ord`/`Hash`)
+    /// executed on the locked state. The guard is released before a caught
+    /// panic resumes, so a caller-trait panic cannot poison an otherwise
+    /// intact container; a genuinely poisoned mutex still maps to a typed
+    /// error. Like [`invoke_client_read_while_locked`], this does not make a
+    /// slow callback bounded or roll back its own interior side effects.
+    #[cfg(any(
+        feature = "payload_store",
+        feature = "retained_map",
+        feature = "transcript",
+        feature = "publish_pipeline"
+    ))]
+    pub(crate) fn with_read_state<T, R>(
+        &self,
+        state: &Mutex<T>,
+        read: impl FnOnce(&T) -> R,
+    ) -> MemoryResult<R> {
+        self.ensure_readable()?;
+        let guard = self.try_lock_state(state)?;
+        self.ensure_readable()?;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| read(&guard)));
+        drop(guard);
+        match result {
+            Ok(value) => Ok(value),
+            Err(payload) => std::panic::resume_unwind(payload),
         }
     }
 
