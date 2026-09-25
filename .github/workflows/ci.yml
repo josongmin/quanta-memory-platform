@@ -6,17 +6,27 @@ on:
       verification:
         description: Verification scope
         required: true
-        type: choice
-        options:
-          - probe
-          - full
-          - benchmark
+        type: string
         default: probe
 
 permissions:
   contents: read
 
 jobs:
+  dispatch-input:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Reject unknown verification scope
+        env:
+          QMP_VERIFICATION: ${{ inputs.verification }}
+        run: |
+          case "$QMP_VERIFICATION" in
+            probe|full|benchmark) ;;
+            *) printf 'Unknown verification scope: %s\n' "$QMP_VERIFICATION" >&2; exit 2 ;;
+          esac
+
   billing-probe:
     if: github.event_name == 'workflow_dispatch' && inputs.verification == 'probe'
     runs-on: ubuntu-24.04
