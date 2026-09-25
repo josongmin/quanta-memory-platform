@@ -59,4 +59,9 @@ jobs:
           qmp_extract_dir="$(mktemp -d "$RUNNER_TEMP/qmp-extraction.XXXXXX")"
           echo "Source SHA: $GITHUB_SHA"
           scripts/extract-to-standalone-repo.sh "$qmp_extract_dir"
+          (
+            cd "$qmp_extract_dir"
+            cargo run --locked -p quanta-memory-platform-facade --example hello_world
+            cargo run --locked -p quanta-memory-platform-facade --example effective_budget_report
+          )
           test -z "$(git -C "$qmp_extract_dir" status --porcelain)"

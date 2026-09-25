@@ -21,18 +21,23 @@ jobs:
             rustup toolchain install 1.92.0 --profile minimal
             printf 'export PATH="%s:$PATH"\n' "$HOME/.cargo/bin" >> "$BASH_ENV"
       - run:
-          name: Collect full in-memory pressure receipt
+          name: Collect three independent full in-memory pressure receipts
           no_output_timeout: 20m
           command: |
             set -euo pipefail
+            test "$(git rev-parse HEAD)" = "$CIRCLE_SHA1"
             mkdir -p /tmp/qmp-benchmark
             echo "Source SHA: $CIRCLE_SHA1"
-            QMP_SCALING_ARTIFACT=/tmp/qmp-benchmark/results.jsonl \
-              scripts/run-scaling-bench.sh --profile=in-memory-pressure
-            sha256sum /tmp/qmp-benchmark/results.jsonl
+            for run in 1 2 3; do
+              result="/tmp/qmp-benchmark/results-${run}.jsonl"
+              QMP_SCALING_ARTIFACT="$result" \
+                scripts/run-scaling-bench.sh --profile=in-memory-pressure
+              sha256sum "$result"
+            done
+            test "$(git rev-parse HEAD)" = "$CIRCLE_SHA1"
       - store_artifacts:
-          path: /tmp/qmp-benchmark/results.jsonl
-          destination: qmp-in-memory-pressure/results.jsonl
+          path: /tmp/qmp-benchmark
+          destination: qmp-in-memory-pressure
 
 workflows:
   manual-benchmark:
