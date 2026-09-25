@@ -14,18 +14,12 @@ if (( EUID != 0 )); then
   echo "UNAVAILABLE: L2 syscall injection requires effective UID 0" >&2
   exit 77
 fi
-if ! command -v strace >/dev/null 2>&1; then
-  echo "UNAVAILABLE: install strace to run the opt-in L2 syscall rail" >&2
-  exit 77
-fi
-if ! command -v cargo >/dev/null 2>&1; then
-  echo "UNAVAILABLE: cargo is required to build the exact local source" >&2
-  exit 77
-fi
-if ! command -v python3 >/dev/null 2>&1; then
-  echo "UNAVAILABLE: python3 is required to fingerprint source inputs" >&2
-  exit 77
-fi
+for tool in strace cargo python3 timeout; do
+  if ! command -v "${tool}" >/dev/null 2>&1; then
+    echo "UNAVAILABLE: ${tool} is required for the opt-in L2 rail" >&2
+    exit 77
+  fi
+done
 if [[ ! -f Cargo.lock || ! -f crates/quanta-memory-platform-facade/Cargo.toml ]]; then
   echo "error: run from the QMP workspace" >&2
   exit 2
@@ -43,6 +37,11 @@ if [[ -e "${artifact_root}" ]]; then
   exit 2
 fi
 export QMP_DURABILITY_L2_ARTIFACT_ROOT="${artifact_root}"
+run_timeout_secs="${QMP_DURABILITY_L2_RUN_TIMEOUT_SECS:-300}"
+if [[ ! "${run_timeout_secs}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "error: QMP_DURABILITY_L2_RUN_TIMEOUT_SECS must be a positive integer" >&2
+  exit 2
+fi
 
 source_head="$(git rev-parse HEAD)"
 # The Python digest filter below is intentionally a literal program.
@@ -78,7 +77,8 @@ else
   echo "L2 mechanism=strace EIO injection; claim=Linux syscall error behavior only"
 fi
 cargo_status=0
-if cargo run --locked -p quanta-memory-platform-facade \
+if timeout --signal=TERM --kill-after=10s "${run_timeout_secs}s" \
+  cargo run --locked -p quanta-memory-platform-facade \
   --no-default-features --features durability-l2 \
   --example spill_redb_durability_l2; then
   :

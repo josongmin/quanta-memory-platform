@@ -18,11 +18,15 @@ use std::fs;
 #[cfg(target_os = "linux")]
 use std::io::{BufRead, BufReader, Read, Write};
 #[cfg(target_os = "linux")]
+use std::os::unix::process::CommandExt;
+#[cfg(target_os = "linux")]
 use std::path::{Path, PathBuf};
 #[cfg(target_os = "linux")]
 use std::process::{Command, Output, Stdio};
 #[cfg(target_os = "linux")]
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::mpsc;
+#[cfg(target_os = "linux")]
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[cfg(target_os = "linux")]
 use quanta_memory_platform_facade::spill::backings::redb::{
@@ -71,10 +75,12 @@ fn seed(path: &Path) -> Result<(), Box<dyn Error>> {
 /// actual Redb finalize commit, not seed/recovery work.
 #[cfg(target_os = "linux")]
 fn mark_finalize_commit(_: FinalizeKillPoint, sequence: u64, generation: u64) {
-    let stdout = std::io::stdout();
-    let mut out = stdout.lock();
-    writeln!(out, "L2_FINALIZE_BEGIN {sequence} {generation}").expect("write finalize marker");
-    out.flush().expect("flush finalize marker");
+    if std::env::var_os("QMP_DURABILITY_L2_TEST_SKIP_MARKER").is_none() {
+        let stdout = std::io::stdout();
+        let mut out = stdout.lock();
+        writeln!(out, "L2_FINALIZE_BEGIN {sequence} {generation}").expect("write finalize marker");
+        out.flush().expect("flush finalize marker");
+    }
     if std::env::var_os("QMP_DURABILITY_L2_DM_PAUSE_BEFORE_COMMIT").is_some() {
         let mut release = [0u8; 1];
         std::io::stdin().read_exact(&mut release).expect("wait for DM fault controller");
@@ -220,7 +226,11 @@ fn traced_worker_with_dm_fault(
         .arg(db)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stderr(Stdio::piped())
+        // `strace` forks the actual worker. Give both processes one dedicated
+        // group so a marker timeout can terminate the whole trace tree rather
+        // than orphaning the worker while it still owns pipes and the DB.
+        .process_group(0);
     let mut child = command.spawn()?;
     let mut child_stdin = child.stdin.take().ok_or("DM worker stdin was not piped")?;
     let child_stdout = child.stdout.take().ok_or("DM worker stdout was not piped")?;
@@ -229,28 +239,65 @@ fn traced_worker_with_dm_fault(
         let mut stderr = Vec::new();
         child_stderr.read_to_end(&mut stderr).map(|_| stderr)
     });
-    let mut stdout_reader = BufReader::new(child_stdout);
-    let mut stdout = Vec::new();
-    let mut reached_finalize = false;
-    loop {
-        let mut line = Vec::new();
-        let read = stdout_reader.read_until(b'\n', &mut line)?;
-        if read == 0 {
-            break;
+    let (marker_tx, marker_rx) = mpsc::sync_channel(1);
+    let stdout_reader = std::thread::spawn(move || {
+        let mut reader = BufReader::new(child_stdout);
+        let mut stdout = Vec::new();
+        let mut marker_sent = false;
+        loop {
+            let mut line = Vec::new();
+            let read = reader.read_until(b'\n', &mut line)?;
+            if read == 0 {
+                break;
+            }
+            if !marker_sent
+                && line
+                    .windows(b"L2_FINALIZE_BEGIN".len())
+                    .any(|window| window == b"L2_FINALIZE_BEGIN")
+            {
+                let _ = marker_tx.send(());
+                marker_sent = true;
+            }
+            stdout.extend_from_slice(&line);
         }
-        reached_finalize |=
-            line.windows(b"L2_FINALIZE_BEGIN".len()).any(|window| window == b"L2_FINALIZE_BEGIN");
-        stdout.extend_from_slice(&line);
-        if reached_finalize {
-            break;
+        Ok::<Vec<u8>, std::io::Error>(stdout)
+    });
+    let marker_timeout_secs = match std::env::var("QMP_DURABILITY_L2_MARKER_TIMEOUT_SECS") {
+        Ok(value) => value
+            .parse::<u64>()
+            .ok()
+            .filter(|seconds| *seconds > 0)
+            .ok_or("QMP_DURABILITY_L2_MARKER_TIMEOUT_SECS must be a positive integer")?,
+        Err(std::env::VarError::NotPresent) => 30,
+        Err(error) => return Err(error.into()),
+    };
+    let marker_result = marker_rx.recv_timeout(Duration::from_secs(marker_timeout_secs));
+    if let Err(marker_error) = marker_result {
+        drop(child_stdin);
+        let group_kill = if marker_error == mpsc::RecvTimeoutError::Timeout {
+            Some(
+                Command::new("kill")
+                    .args(["-KILL", "--"])
+                    .arg(format!("-{}", child.id()))
+                    .output()?,
+            )
+        } else {
+            None
+        };
+        if let Some(kill) = group_kill.as_ref().filter(|kill| !kill.status.success()) {
+            let _ = child.kill();
+            return Err(format!(
+                "failed to terminate timed-out DM worker process group ({}): {}",
+                kill.status,
+                String::from_utf8_lossy(&kill.stderr)
+            )
+            .into());
         }
-    }
-    if !reached_finalize {
-        let _ = child.kill();
         let status = child.wait()?;
+        let stdout = stdout_reader.join().map_err(|_| "stdout reader panicked")??;
         let stderr = stderr_reader.join().map_err(|_| "stderr reader panicked")??;
         return Err(format!(
-            "DM worker exited before finalize marker ({status}): stdout={} stderr={}",
+            "DM worker did not reach finalize marker within {marker_timeout_secs}s ({marker_error}; {status}): stdout={} stderr={}",
             String::from_utf8_lossy(&stdout),
             String::from_utf8_lossy(&stderr)
         )
@@ -263,8 +310,11 @@ fn traced_worker_with_dm_fault(
     let fault_result = set_dm_table(dm_name, sectors, "error");
     let release_result = child_stdin.write_all(&[1]).and_then(|()| child_stdin.flush());
     drop(child_stdin);
-    let stdout_result = stdout_reader.read_to_end(&mut stdout);
     let status_result = child.wait();
+    let stdout_result = stdout_reader
+        .join()
+        .map_err(|_| std::io::Error::other("stdout reader panicked"))
+        .and_then(|result| result);
     let stderr_result = stderr_reader
         .join()
         .map_err(|_| std::io::Error::other("stderr reader panicked"))
@@ -280,10 +330,10 @@ fn traced_worker_with_dm_fault(
         ),
     )?;
     let status = status_result?;
+    let stdout = stdout_result?;
     let stderr = stderr_result?;
     fault_result?;
     release_result?;
-    stdout_result?;
     restore_result?;
     Ok(Output { status, stdout, stderr })
 }

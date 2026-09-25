@@ -14,7 +14,7 @@ if [[ "$(uname -s)" != Linux || "${EUID}" != 0 ]]; then
   echo "UNAVAILABLE: device-mapper L2 requires Linux and effective UID 0" >&2
   exit 77
 fi
-for tool in cargo python3 strace dmsetup losetup blockdev mkfs.ext4 mount umount mountpoint findmnt e2fsck realpath sha256sum; do
+for tool in cargo python3 strace timeout kill dmsetup losetup blockdev mkfs.ext4 mount umount mountpoint findmnt e2fsck realpath sha256sum; do
   if ! command -v "${tool}" >/dev/null 2>&1; then
     echo "UNAVAILABLE: required tool missing: ${tool}" >&2
     exit 77

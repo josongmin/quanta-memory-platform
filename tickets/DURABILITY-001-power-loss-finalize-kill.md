@@ -782,3 +782,89 @@ full `python3 tools/pm/pm.py sync && scripts/check-workspace.sh` rail also
 passed after the cleanup change. The only unclosed item remains physical L3:
 this environment has no production-equivalent DUT or independent power
 controller.
+
+### Final freeze after CI-gate updates (2026-09-25)
+
+The branch later advanced cleanly to `9e56200cecc06be29462c979a8287ea981ca0b3f`
+(`origin/main` equal). This includes the intervening CI fail-path coverage and
+the final DM cleanup hardening; earlier `f9a7e62` receipts do not bind this
+tree. Requalification on the final executable digest
+`a60e2eada2b187f6bf7b86a197f2bb4ef47f9ecdf1ea819fedc5e222dd6d0cc5`:
+
+- `python3 tools/pm/pm.py sync && scripts/check-workspace.sh`: exit 0;
+  90 Python contract tests, 18 PM tests, full all-features workspace tests,
+  10 feature capability selectors, 293 documented selectors, PM lint, and
+  cargo-deny all passed;
+- Linux Clippy for the durability L2 example: passed on Rust 1.92;
+- syscall L2: 2/2, receipt
+  `/tmp/qmp-durability-final-20260925/syscall-final-9e56200/receipt.txt`;
+- disposable ext4 device-mapper L2: 1/1, receipt
+  `/tmp/qmp-durability-final-20260925/dm-final-9e56200/receipt.txt`;
+- injected read-only artifact failure: expected non-zero result and zero
+  residual mapping, loop device, or mount.
+
+All automated/local L1/L2 and cleanup rails are closed for this exact tree.
+Physical L3 remains the only explicit qualification gap and requires an
+external DUT/PDU topology; it is not claimed as solved.
+
+### Bounded-runner RCA and final overlay qualification (2026-09-25)
+
+Adversarial timeout injection found a real harness defect after the earlier
+cleanup fix. The device-mapper controller performed a blocking
+`BufRead::read_until` while waiting for `L2_FINALIZE_BEGIN`; a worker that
+failed before emitting the marker could therefore hang the rail indefinitely.
+The first bounded-read prototype killed only `strace`. Because `strace` had
+forked the worker, that left the worker blocked on stdin with the output pipe
+open, so joining the reader still hung. This was a runner orchestration defect,
+not a Redb recovery failure.
+
+The controller now starts `strace` and its worker in a dedicated process group,
+reads stdout on a separate thread, and waits for the marker through a bounded
+channel. `QMP_DURABILITY_L2_MARKER_TIMEOUT_SECS` defaults to 30 seconds. On
+timeout it sends `SIGKILL` to the complete trace process group, waits for the
+leader, joins both pipe readers, and returns RED with the timeout and exit
+status. The outer Linux runner also has an independent 300-second default
+budget (`QMP_DURABILITY_L2_RUN_TIMEOUT_SECS`) using GNU `timeout`, so hangs
+outside the marker protocol terminate non-zero. Both knobs reject invalid
+values rather than silently disabling the bound. Required `kill` and `timeout`
+tools are fail-closed preflight dependencies.
+
+Fault-injection evidence:
+
+- suppressed marker plus a 1-second marker budget failed in 1 second with the
+  worker group terminated by `SIGKILL`; independent post-run inventory found
+  zero runner mappings, loop devices, mounts, or worker processes. Receipt:
+  `/tmp/qmp-durability-final-20260925/dm-timeout-injection-02/receipt.txt`;
+- suppressed marker plus a 10-second outer budget returned status 124 and the
+  DM wrapper still cleaned its resources; independent inventory again found
+  zero mappings, loop devices, mounts, or workers. Receipt:
+  `/tmp/qmp-durability-final-20260925/dm-run-timeout-injection-01/receipt.txt`;
+- a deliberately interrupted prototype left one test-owned mapping and loop;
+  both exact resources were identified from the mapping table and removed
+  before qualification. No broad or unrelated cleanup command was used.
+
+The final tested tree is an uncommitted durability overlay on base HEAD
+`2a50fdab998f070e2a3e5f5c0693ef822dbb8b8c` (equal to `origin/main`) with
+executable-input digest
+`97cafe2940ff3c25104eafef12edef615e3559209a24328ddff1fe3296b68aa3`.
+Current-source results:
+
+- syscall L2: 2/2, source stable, receipt
+  `/tmp/qmp-durability-final-20260925/syscall-final-2a50fda/receipt.txt`;
+- disposable ext4 device-mapper L2: 1/1, source stable, observed post-marker
+  `fdatasync = EIO`, `e2fsck` status 0, oracle
+  `Present -> recovered -> Finalized`, receipt
+  `/tmp/qmp-durability-final-20260925/dm-final-2a50fda/receipt.txt`;
+- focused L1/FUP process-kill tests: 7/7;
+- `bash -n`, ShellCheck, and Linux Clippy for the L2 example: pass;
+- `python3 tools/pm/pm.py sync && scripts/check-workspace.sh`: exit 0, including
+  90 Python contract tests, 18 PM tests, the warning-free feature matrix,
+  all-features workspace tests, 10 feature capability selectors, 293
+  documented selectors, PM lint, and cargo-deny.
+
+The final device-mapper inventory has zero `qmpd*` mappings, test loop devices,
+or test mounts. Automated L1/L2 behavior and runner failure containment are
+closed for this exact overlay. Physical power-loss L3 is still an external
+qualification gap: it requires a production-equivalent disposable DUT and an
+independent PDU/controller, and `power_loss_proven=false` remains explicit in
+the receipts.
