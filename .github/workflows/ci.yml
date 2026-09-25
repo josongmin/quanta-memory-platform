@@ -1,0 +1,56 @@
+name: QMP CI
+
+on:
+  workflow_dispatch:
+    inputs:
+      verification:
+        description: Verification scope
+        required: true
+        type: choice
+        options:
+          - probe
+          - full
+        default: probe
+
+permissions:
+  contents: read
+
+jobs:
+  billing-probe:
+    if: github.event_name == 'workflow_dispatch' && inputs.verification == 'probe'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Confirm hosted runner starts
+        run: |
+          printf 'Runner started for %s at %s\n' "$GITHUB_SHA" "$(date -u +%FT%TZ)"
+
+  full-extraction:
+    if: github.event_name != 'workflow_dispatch' || inputs.verification == 'full'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Install pinned verification tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck
+          rustup toolchain install 1.92.0 --profile minimal --component clippy --component rustfmt
+          python3 -m venv "$RUNNER_TEMP/qmp-semgrep"
+          "$RUNNER_TEMP/qmp-semgrep/bin/pip" install semgrep==1.157.0
+          cargo install cargo-deny --version 0.19.7 --locked
+          echo "$RUNNER_TEMP/qmp-semgrep/bin" >> "$GITHUB_PATH"
+      - name: Verify pinned tools
+        run: |
+          rustc --version
+          cargo-deny --version
+          semgrep --version
+          shellcheck --version
+      - name: Verify actual standalone extraction and full workspace gate
+        run: |
+          qmp_extract_dir="$(mktemp -d "$RUNNER_TEMP/qmp-extraction.XXXXXX")"
+          echo "Source SHA: $GITHUB_SHA"
+          scripts/extract-to-standalone-repo.sh "$qmp_extract_dir"
+          test -z "$(git -C "$qmp_extract_dir" status --porcelain)"
