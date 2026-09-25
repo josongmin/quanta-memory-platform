@@ -1,4 +1,4 @@
-# Current plan status (2026-09-24)
+# Historical plan status (2026-09-24) and current receipt lookup
 
 The `db0b03c` snapshot below is the last audited implementation base, not
 current HEAD. Current local qualification is asserted only when an annotated
@@ -24,6 +24,10 @@ that work. Its old audit tables are historical snapshots, not a current
 `receipt pending` queue. The [receipt index](../../tickets/FINAL-CLOSEOUT.md)
 explains the exact source boundary.
 
-Hosted CI, deployment, activation, physical power loss, broad B07 metadata
-cardinality, and J06 backlog/work limits have no current completion receipt.
-The Redb failure-model work is outside the active in-memory release scope.
+Do not infer current qualification from this historical table. Resolve the
+newest `qmp-local-qualified-*` tag and require its peeled target to equal HEAD;
+the annotation records exact-source canonical CI, full benchmark, and
+extraction dry-run evidence. B07 metadata cardinality and J06 deferred-work
+bounds are implementation/test contracts in the current source, not open plan
+items. Semantica deployment and activation remain host-owned. Physical power
+loss and the Redb failure model are outside the active in-memory release scope.
