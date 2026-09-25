@@ -64,6 +64,7 @@ SELF_HOSTING_REQUIRED_PATHS=(
   "scripts/tests/test_extraction_metadata.py"
   "scripts/tests/test_scaling_results.py"
   "scripts/tests/test_doc_test_selectors.py"
+  "scripts/tests/test_gate_failure_paths.py"
   "scripts/tests/test_run_cargo_test.py"
   "scripts/tests/test_workspace_policy.py"
   "scripts/regression-guards.sh"

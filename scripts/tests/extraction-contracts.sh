@@ -171,7 +171,7 @@ exit 2
 EOF
 cat > "${fixture}/matrix-bin/python3" <<'EOF'
 #!/usr/bin/env bash
-if [[ "$1" == "-c" && "$2" == *'get("default"'* ]]; then
+if [[ "$1" == "-c" && "$2" == *'json.load(sys.stdin)'* ]]; then
   exit 37
 fi
 exec "${QMP_REAL_PYTHON}" "$@"

@@ -539,9 +539,6 @@ where
         let _permit =
             self.lifecycle.begin_mutation().map_err(PreparedPublicationErrorV1::Storage)?;
         let payload_key = request.payload.canonical_key();
-        // Client measurement may panic; run it before acquiring the state lock
-        // so a read-only failure cannot poison intact publication state.
-        let payload_bytes = request.payload.byte_size();
         let token = derive_token(&request.identity, &payload_key)?;
         let state = self.lock_state()?;
 
@@ -578,6 +575,17 @@ where
         }
 
         let persistent_bytes = persistent_cost(request.identity.as_bytes().len())?;
+        // Only fresh tokens need measurement. Catch a client panic, release the
+        // state guard, then resume unwinding so the intact state is not poisoned.
+        let payload_bytes = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            request.payload.byte_size()
+        })) {
+            Ok(bytes) => bytes,
+            Err(payload) => {
+                drop(state);
+                std::panic::resume_unwind(payload);
+            }
+        };
         let active_bytes =
             active_cost(payload_bytes, request.identity.as_bytes().len(), payload_key.len())?;
         let requested_bytes = persistent_bytes.checked_add(active_bytes).ok_or_else(|| {
@@ -1589,6 +1597,12 @@ mod tests {
                 .prepare(one_shot_request("measure-panic", &panic_measure, &panic_clone))
                 .expect("retry after client panic");
             assert_eq!(service.resolve(receipt.token()).expect("retry payload").bytes, b"owned");
+            panic_measure.store(true, Ordering::SeqCst);
+            let replay = service
+                .prepare(one_shot_request("measure-panic", &panic_measure, &panic_clone))
+                .expect("replay needs no measurement");
+            assert_eq!(replay.disposition(), PrepareDispositionV1::Replayed);
+            assert!(panic_measure.load(Ordering::SeqCst), "replay must not call ByteSized");
             assert_eq!(
                 broker.ledger_snapshot().expect("exact charge").total_owner_bytes(),
                 live_cost("measure-panic", b"owned")
