@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
+use std::hash::{BuildHasher, Hash, RandomState};
 use std::marker::PhantomData;
 use std::sync::{Mutex, PoisonError};
 
@@ -14,21 +14,22 @@ use crate::payload_store::PayloadStore;
 use crate::shared::accounting::Unbudgeted;
 use crate::shared::accounting::{Budgeted, StoreAccounting};
 use crate::shared::lifecycle::{
-    invoke_client_read_while_locked, retire_client_value, BeginClose, DropTransition,
+    invoke_client_read_while_locked, retire_client_value, BeginClose, DropTransition, InFlight,
     StoreLifecycle,
 };
 use crate::shared::measure::{semantic_cost_v1, ByteSized, CanonicalKey, RetainedCostV1};
 
-fn canonical_digest(key: &[u8]) -> u64 {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    key.hash(&mut hasher);
-    hasher.finish()
+/// Randomized digest seed mirroring the retained map's hardening: fixed-key
+/// hashing would let attacker-chosen canonical keys be ground into one index
+/// bucket, degrading every dedup/pin/delete point operation to O(bucket)
+/// caller-trait work. A per-store [`RandomState`] makes the bucket assignment
+/// non-deterministic across processes.
+fn canonical_digest(seed: &RandomState, key: &[u8]) -> u64 {
+    seed.hash_one(key)
 }
 
-fn reference_digest<PayloadRef: Hash>(payload_ref: &PayloadRef) -> u64 {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    payload_ref.hash(&mut hasher);
-    hasher.finish()
+fn reference_digest<PayloadRef: Hash>(seed: &RandomState, payload_ref: &PayloadRef) -> u64 {
+    seed.hash_one(payload_ref)
 }
 
 #[derive(Debug)]
@@ -102,6 +103,7 @@ pub struct SimplePayloadStore<PayloadRef, Bytes, Mode> {
     context: Option<MemoryContextHandle>,
     accounting: StoreAccounting,
     lifecycle: StoreLifecycle,
+    digest_seed: RandomState,
     state: Mutex<PayloadState<PayloadRef, Bytes>>,
     _mode: PhantomData<fn() -> Mode>,
 }
@@ -137,6 +139,7 @@ impl<PayloadRef, Bytes, Mode> SimplePayloadStore<PayloadRef, Bytes, Mode> {
             context,
             accounting,
             lifecycle: StoreLifecycle::new("payload store"),
+            digest_seed: RandomState::new(),
             state: Mutex::new(PayloadState {
                 entries: Vec::new(),
                 free_slots: Vec::new(),
@@ -224,7 +227,7 @@ where
 {
     pub fn pin(&self, payload_ref: &PayloadRef) -> MemoryResult<()> {
         let _permit = self.lifecycle.begin_mutation()?;
-        let digest = reference_digest(payload_ref);
+        let digest = reference_digest(&self.digest_seed, payload_ref);
         let index = invoke_client_read_while_locked(self.lock()?, |state| {
             find_reference_slot(state, digest, payload_ref)
         })
@@ -241,7 +244,7 @@ where
 
     pub fn unpin(&self, payload_ref: &PayloadRef) -> MemoryResult<()> {
         let _permit = self.lifecycle.begin_mutation()?;
-        let digest = reference_digest(payload_ref);
+        let digest = reference_digest(&self.digest_seed, payload_ref);
         let index = invoke_client_read_while_locked(self.lock()?, |state| {
             find_reference_slot(state, digest, payload_ref)
         })
@@ -257,7 +260,7 @@ where
 
     pub fn pin_count(&self, payload_ref: &PayloadRef) -> MemoryResult<u64> {
         self.lifecycle.with_read_state(&self.state, |state| {
-            let digest = reference_digest(payload_ref);
+            let digest = reference_digest(&self.digest_seed, payload_ref);
             find_reference_slot(state, digest, payload_ref)
                 .and_then(|index| state.entries[index].as_ref())
                 .map_or(0, |entry| entry.pin_count)
@@ -280,9 +283,13 @@ where
         value: RetainedEnvelope<Bytes>,
     ) -> Result<PublishedPayload<PayloadRef>, StoreWriteError> {
         let _permit = self.lifecycle.begin_mutation()?;
-        let context_kind = self.context_kind(&value);
-        let canonical_key = value.bytes.canonical_key();
-        let digest = canonical_digest(&canonical_key);
+        // Caller-trait code (CanonicalKey/ByteSized/Clone/Eq) runs while the
+        // owned envelope is guarded, so a trait panic can never unwind through
+        // a caller destructor (compound-hostile containment).
+        let mut value = InFlight::new(value);
+        let context_kind = self.context_kind(value.get());
+        let canonical_key = value.get().bytes.canonical_key();
+        let digest = canonical_digest(&self.digest_seed, &canonical_key);
 
         let existing = {
             let state = self.lock()?;
@@ -316,12 +323,12 @@ where
         // panic or reentry cannot poison the authoritative state or charge the
         // broker before the complete semantic cost is known.
         let payload_ref = PayloadRef::from(payload_ref_text);
-        let payload_ref_digest = reference_digest(&payload_ref);
+        let payload_ref_digest = reference_digest(&self.digest_seed, &payload_ref);
         let index_bytes = semantic_cost_v1::DIGEST_BYTES
             .checked_mul(2)
             .ok_or_else(|| MemoryError::capacity("payload index cost exceeds u64"))?;
         let charged_bytes = RetainedCostV1 {
-            payload_bytes: value.bytes.byte_size(),
+            payload_bytes: value.get().bytes.byte_size(),
             key_identity_bytes: payload_ref.byte_size(),
             index_bytes,
             fixed_overhead_bytes: semantic_cost_v1::ENTRY_STATE_BYTES,
@@ -360,7 +367,7 @@ where
             charged_bytes,
             pin_count: 0,
             charge,
-            bytes: value.bytes,
+            bytes: value.take().bytes,
         };
         let slot = if let Some(slot) = state.free_slots.pop() {
             debug_assert!(state.entries[slot].is_none(), "free slot must be vacant");
@@ -384,7 +391,7 @@ where
 
     fn delete_if_unpinned(&self, payload_ref: &PayloadRef) -> Result<(), StoreDeleteError> {
         let _permit = self.lifecycle.begin_mutation()?;
-        let reference_digest = reference_digest(payload_ref);
+        let reference_digest = reference_digest(&self.digest_seed, payload_ref);
         let index = invoke_client_read_while_locked(self.lock()?, |state| {
             find_reference_slot(state, reference_digest, payload_ref)
         })
@@ -479,6 +486,7 @@ fn remove_index_slot(index: &mut HashMap<u64, Vec<usize>>, digest: u64, slot: us
 mod tests {
     use super::*;
     use std::cell::{Cell, RefCell};
+    use std::hash::Hasher;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier, OnceLock, Weak};
 
@@ -855,6 +863,22 @@ mod tests {
     }
 
     #[test]
+    fn canonical_digests_are_randomized_per_store_seed() {
+        // Fixed-key hashing would let an attacker grind canonical keys into
+        // one index bucket offline; per-store random seeds must not reproduce
+        // a deterministic digest (collision probability 2^-64).
+        let a = RandomState::new();
+        let b = RandomState::new();
+        let key = b"adversarial-canonical-key".as_slice();
+        assert_ne!(
+            canonical_digest(&a, key),
+            canonical_digest(&b, key),
+            "per-store random seeds must not reproduce a grindable fixed-key digest"
+        );
+        assert_eq!(canonical_digest(&a, key), canonical_digest(&a, key));
+    }
+
+    #[test]
     fn counter_reads_show_open_busy_and_closed_images() {
         let broker = live_broker(1_000_000, 600_000);
         let store = SimplePayloadStore::<String, Vec<u8>, Budgeted>::new_budgeted(
@@ -1207,7 +1231,7 @@ mod tests {
     fn put_and_delete_during_rebuild_are_fail_closed_then_resume() {
         let (broker, store) = store();
         let published = store.put_canonical(envelope(&[0; 80])).expect("seed");
-        broker.begin_rebuild().expect("begin rebuild");
+        let rebuild_fence1 = broker.begin_rebuild().expect("begin rebuild");
 
         assert!(matches!(
             store.put_canonical(envelope(&[1; 40])),
@@ -1224,7 +1248,7 @@ mod tests {
             retained_cost(80, 0)
         );
 
-        broker.finish_rebuild().expect("finish rebuild");
+        rebuild_fence1.finish().expect("finish rebuild");
         store.delete_if_unpinned(published.payload_ref()).expect("delete resumes");
         assert_eq!(broker.ledger_snapshot().expect("released").total_owner_bytes(), 0);
     }
@@ -1258,7 +1282,7 @@ mod tests {
     fn close_refund_failure_preserves_entries_and_charge_ownership() {
         let (broker, store) = store();
         store.put_canonical(envelope(b"owned")).expect("put");
-        broker.begin_rebuild().expect("begin rebuild");
+        let rebuild_fence2 = broker.begin_rebuild().expect("begin rebuild");
         assert!(matches!(store.close(), Err(MemoryError::InvalidState(_))));
         assert_eq!(store.stats().expect("preserved stats").item_count, 1);
         assert_eq!(store.charged_bytes().expect("preserved bytes"), retained_cost(5, 0));
@@ -1266,7 +1290,7 @@ mod tests {
             broker.ledger_snapshot().expect("preserved ledger").total_owner_bytes(),
             retained_cost(5, 0)
         );
-        broker.finish_rebuild().expect("finish rebuild");
+        rebuild_fence2.finish().expect("finish rebuild");
         store.close().expect("retry close");
         assert_eq!(broker.ledger_snapshot().expect("released").total_owner_bytes(), 0);
     }
@@ -1275,13 +1299,13 @@ mod tests {
     fn drop_during_rebuild_defers_then_finish_drains_capacity() {
         let (broker, store) = store();
         store.put_canonical(envelope(b"owned")).expect("put");
-        broker.begin_rebuild().expect("begin rebuild");
+        let rebuild_fence3 = broker.begin_rebuild().expect("begin rebuild");
         drop(store);
         assert_eq!(
             broker.ledger_snapshot().expect("deferred").total_owner_bytes(),
             retained_cost(5, 0)
         );
-        broker.finish_rebuild().expect("finish drains");
+        rebuild_fence3.finish().expect("finish drains");
         assert_eq!(broker.ledger_snapshot().expect("drained").total_owner_bytes(), 0);
     }
 

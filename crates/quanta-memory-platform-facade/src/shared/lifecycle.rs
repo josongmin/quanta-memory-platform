@@ -29,6 +29,67 @@ pub(crate) fn retire_client_value<T>(value: T) {
     }
 }
 
+/// Holds one store-owned, caller-supplied value while a mutation executes, so
+/// a caller-trait panic can never unwind through that value's destructor.
+///
+/// A Rust unwind drops every frame local. If a caller type pairs a panicking
+/// trait (`Hash`/`Eq`/`Ord`/`Clone`/`ByteSized`/`CanonicalKey`) with a
+/// panicking `Drop`, that combination turns the store's own unwinding frame
+/// into a process abort — `catch_unwind` cannot intercept it. Moving the
+/// value into this guard changes its unwind drop into a contained
+/// [`retire_client_value`]; on a normal (non-panicking) path the value drops
+/// exactly as before, preserving today's destructor-panic propagation.
+#[cfg(any(
+    feature = "payload_store",
+    feature = "retained_map",
+    feature = "transcript",
+    feature = "publish_pipeline"
+))]
+pub(crate) struct InFlight<T>(Option<T>);
+
+#[cfg(any(
+    feature = "payload_store",
+    feature = "retained_map",
+    feature = "transcript",
+    feature = "publish_pipeline"
+))]
+impl<T> InFlight<T> {
+    pub(crate) fn new(value: T) -> Self {
+        Self(Some(value))
+    }
+
+    /// Borrow the value for caller-trait probes (hash, equality, ordering).
+    pub(crate) fn get(&self) -> &T {
+        self.0.as_ref().expect("in-flight value is still held")
+    }
+
+    /// Take the value for a caller-trait-free terminal step (map insertion
+    /// with a precomputed hash, field replacement).
+    pub(crate) fn take(&mut self) -> T {
+        self.0.take().expect("in-flight value is still held")
+    }
+}
+
+#[cfg(any(
+    feature = "payload_store",
+    feature = "retained_map",
+    feature = "transcript",
+    feature = "publish_pipeline"
+))]
+impl<T> Drop for InFlight<T> {
+    fn drop(&mut self) {
+        if let Some(value) = self.0.take() {
+            if std::thread::panicking() {
+                // Contain the destructor: a second panic during this unwind
+                // would abort the process.
+                retire_client_value(value);
+            } else {
+                drop(value);
+            }
+        }
+    }
+}
+
 /// Run read-only client code that needs a reference into locked state, but
 /// ensure an unwind releases the mutex normally before propagating the panic.
 ///
@@ -127,8 +188,9 @@ impl StoreLifecycle {
     /// executed on the locked state. The guard is released before a caught
     /// panic resumes, so a caller-trait panic cannot poison an otherwise
     /// intact container; a genuinely poisoned mutex still maps to a typed
-    /// error. Like [`invoke_client_read_while_locked`], this does not make a
-    /// slow callback bounded or roll back its own interior side effects.
+    /// error. Like `invoke_client_read_while_locked` (the mutation-preflight
+    /// helper), this does not make a slow callback bounded or roll back its
+    /// own interior side effects.
     #[cfg(any(
         feature = "payload_store",
         feature = "retained_map",

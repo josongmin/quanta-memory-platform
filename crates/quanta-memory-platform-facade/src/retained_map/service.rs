@@ -4,7 +4,7 @@ use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
-use hashlink::linked_hash_map::{Entry, RawEntryMut};
+use hashlink::linked_hash_map::RawEntryMut;
 use hashlink::LinkedHashMap;
 
 use quanta_memory_platform_core::{
@@ -19,7 +19,9 @@ use crate::retained_map::{
 #[cfg(feature = "unbudgeted-stores")]
 use crate::shared::accounting::Unbudgeted;
 use crate::shared::accounting::{Budgeted, StoreAccounting};
-use crate::shared::lifecycle::{retire_client_value, BeginClose, DropTransition, StoreLifecycle};
+use crate::shared::lifecycle::{
+    retire_client_value, BeginClose, DropTransition, InFlight, StoreLifecycle,
+};
 use crate::shared::measure::{semantic_cost_v1, ByteSized, RetainedCostV1};
 
 #[derive(Debug)]
@@ -310,10 +312,15 @@ where
         inserted: Outcome,
     ) -> Result<Outcome, StoreWriteError> {
         let _permit = self.lifecycle.begin_mutation()?;
-        let value_bytes = value.byte_size();
-        let key_bytes = key.byte_size();
+        // Measurement, the occupied probe, and the caller's occupied callback
+        // all run while the owned pair is guarded: a trait panic unwinds
+        // through contained retirement instead of a caller destructor.
+        let mut key_in_flight = InFlight::new(key);
+        let mut value_in_flight = InFlight::new(value);
+        let value_bytes = value_in_flight.get().byte_size();
+        let key_bytes = key_in_flight.get().byte_size();
         let mut state = self.take_state()?;
-        if let Some(entry) = state.entries.get(&key) {
+        if let Some(entry) = state.entries.get(key_in_flight.get()) {
             let outcome = on_occupied(&entry.value);
             self.restore_state(state);
             return Ok(outcome);
@@ -345,10 +352,22 @@ where
                 return Err(error);
             }
         };
-        state.entries.insert(
-            key,
+        // Borrowed-key probe with a precomputed hash; the insertion itself
+        // runs no caller trait, so no owned caller value is ever in flight
+        // during caller code.
+        let hash = state.entries.hasher().hash_one(key_in_flight.get());
+        let RawEntryMut::Vacant(vacant) =
+            state.entries.raw_entry_mut().from_key_hashed_nocheck(hash, key_in_flight.get())
+        else {
+            return Err(MemoryError::InvalidState(
+                "retained-map entry appeared between probe and insertion".to_string(),
+            ));
+        };
+        vacant.insert_hashed_nocheck(
+            hash,
+            key_in_flight.take(),
             MapEntry {
-                value,
+                value: value_in_flight.take(),
                 retained_cost,
                 charged_bytes: reserved_bytes,
                 charge,
@@ -395,16 +414,25 @@ where
 
     fn insert_checked(&self, key: Key, value: Value) -> Result<(), StoreWriteError> {
         let _permit = self.lifecycle.begin_mutation()?;
-        let value_bytes = value.byte_size();
-        let incoming_key_bytes = key.byte_size();
+        // Caller measurement and probes run while the owned pair is guarded:
+        // a trait panic unwinds through the guard's contained retirement, not
+        // through a caller destructor (compound-hostile containment).
+        let mut key_in_flight = InFlight::new(key);
+        let mut value_in_flight = InFlight::new(value);
+        let value_bytes = value_in_flight.get().byte_size();
+        let incoming_key_bytes = key_in_flight.get().byte_size();
         let mut state = self.take_state()?;
         let mut retired_value = None;
         let MapState { entries, committed_bytes } = &mut *state;
         // One keyed entry probe preserves the prior O(1) point-path contract.
-        // The entry borrow owns only the detached map, never the container mutex;
-        // broker admission/recharge is therefore safe outside the store lock.
-        match entries.entry(key) {
-            Entry::Occupied(mut occupied) => {
+        // The probe borrows the in-flight key (caller Hash/Eq never see an
+        // owned value in flight); the entry borrow owns only the detached map,
+        // never the container mutex, so broker admission/recharge is safe
+        // outside the store lock.
+        let hash = entries.hasher().hash_one(key_in_flight.get());
+        let probe = entries.raw_entry_mut().from_key_hashed_nocheck(hash, key_in_flight.get());
+        match probe {
+            RawEntryMut::Occupied(mut occupied) => {
                 let old_bytes = occupied.get().charged_bytes;
                 let retained_cost =
                     RetainedCostV1 { payload_bytes: value_bytes, ..occupied.get().retained_cost };
@@ -445,24 +473,30 @@ where
                     }
                 }
                 let entry = occupied.get_mut();
-                retired_value = Some(std::mem::replace(&mut entry.value, value));
+                retired_value = Some(std::mem::replace(&mut entry.value, value_in_flight.take()));
                 entry.retained_cost = retained_cost;
                 entry.charged_bytes = reserved_bytes;
                 *committed_bytes = next;
             }
-            Entry::Vacant(vacant) => {
+            RawEntryMut::Vacant(vacant) => {
                 let retained_cost = Self::retained_cost_v1(incoming_key_bytes, value_bytes);
                 let reserved_bytes = retained_cost.total()?;
                 let next =
                     Self::committed_bytes_after_replace_v1(*committed_bytes, 0, reserved_bytes)?;
                 let charge = self.charge_new_entry_v1(reserved_bytes)?;
-                vacant.insert(MapEntry {
-                    value,
-                    retained_cost,
-                    charged_bytes: reserved_bytes,
-                    charge,
-                    sweep_selected: false,
-                });
+                // Insertion with the precomputed hash runs no caller trait,
+                // so the owned key is never in flight during caller code.
+                vacant.insert_hashed_nocheck(
+                    hash,
+                    key_in_flight.take(),
+                    MapEntry {
+                        value: value_in_flight.take(),
+                        retained_cost,
+                        charged_bytes: reserved_bytes,
+                        charge,
+                        sweep_selected: false,
+                    },
+                );
                 *committed_bytes = next;
             }
         }
@@ -470,6 +504,8 @@ where
         // Value::drop is client code. It must observe a fully published
         // postimage, never an in-flight accounting plan.
         drop(retired_value);
+        drop(value_in_flight);
+        drop(key_in_flight);
         Ok(())
     }
 
@@ -504,7 +540,14 @@ where
         let _permit = self.lifecycle.begin_mutation()?;
         let mut state = self.take_state()?;
         let MapState { entries, committed_bytes } = &mut *state;
-        let Entry::Occupied(mut occupied) = entries.entry(key.clone()) else {
+        // Caller Hash/Eq run on the borrowed caller key with no store-owned
+        // caller value in flight, so a trait panic cannot unwind through a
+        // caller destructor (the compound-hostile abort path). The detached
+        // plan's Drop restores the map during any unwind.
+        let hash = entries.hasher().hash_one(key);
+        let RawEntryMut::Occupied(mut occupied) =
+            entries.raw_entry_mut().from_key_hashed_nocheck(hash, key)
+        else {
             return Ok(None);
         };
         let next = Self::committed_bytes_after_replace_v1(
@@ -1004,7 +1047,6 @@ mod tests {
         store: Arc<OnceLock<Weak<ReentrantReadStore>>>,
         callbacks: Arc<AtomicUsize>,
     }
-
     impl ByteSized for ReentrantReadKey {
         fn byte_size(&self) -> u64 {
             1
@@ -1036,6 +1078,160 @@ mod tests {
             }
             self.id.hash(state);
         }
+    }
+
+    /// A compound hostile caller type: panicking `Hash` AND panicking `Drop`.
+    /// A store mutation that runs the trait while the value is in flight
+    /// turns its own unwind into a double-panic process abort; these child
+    /// scenarios pin that remove/insert must stay contained.
+    #[derive(Clone)]
+    struct CompoundHostileKey {
+        name: String,
+        hash_panics: Arc<AtomicBool>,
+        drop_panics: Arc<AtomicBool>,
+    }
+
+    impl ByteSized for CompoundHostileKey {
+        fn byte_size(&self) -> u64 {
+            self.name.len() as u64
+        }
+    }
+
+    impl PartialEq for CompoundHostileKey {
+        fn eq(&self, other: &Self) -> bool {
+            self.name == other.name
+        }
+    }
+
+    impl Eq for CompoundHostileKey {}
+
+    impl Hash for CompoundHostileKey {
+        fn hash<H: Hasher>(&self, state: &mut H) {
+            assert!(!self.hash_panics.load(Ordering::SeqCst), "armed compound-hostile Hash");
+            self.name.hash(state);
+        }
+    }
+
+    impl Drop for CompoundHostileKey {
+        fn drop(&mut self) {
+            assert!(!self.drop_panics.load(Ordering::SeqCst), "armed compound-hostile Drop");
+        }
+    }
+
+    const COMPOUND_CHILD: &str = "QMP_RETAINED_MAP_COMPOUND_CHILD";
+
+    fn compound_scenario_remove() {
+        use quanta_memory_platform_core::{MemoryPreset, ProcessMemoryBrokerBuilder};
+        let broker = ProcessMemoryBrokerBuilder::new()
+            .with_preset(MemoryPreset::Development)
+            .build()
+            .expect("broker");
+        let binding = StoreBindingHandle::new(
+            MemoryClass::MemoResidency,
+            "owner-compound-hostile".to_string(),
+            None,
+        );
+        let store: SimpleRetainedMapStore<CompoundHostileKey, Vec<u8>, Budgeted> =
+            SimpleRetainedMapStore::new_budgeted(binding, broker);
+        let hash_panics = Arc::new(AtomicBool::new(false));
+        let drop_panics = Arc::new(AtomicBool::new(false));
+        let key = CompoundHostileKey {
+            name: "target".to_string(),
+            hash_panics: Arc::clone(&hash_panics),
+            drop_panics: Arc::clone(&drop_panics),
+        };
+        store.insert_checked(key.clone(), vec![1, 2, 3]).expect("seed while disarmed");
+
+        hash_panics.store(true, Ordering::SeqCst);
+        drop_panics.store(true, Ordering::SeqCst);
+        let panicked =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| store.remove(&key)));
+        assert!(panicked.is_err(), "armed Hash must panic inside remove");
+        hash_panics.store(false, Ordering::SeqCst);
+        drop_panics.store(false, Ordering::SeqCst);
+
+        // The store (and the process) must remain usable with the exact
+        // preimage still charged.
+        assert_eq!(store.stats_checked().expect("stats after contained panic").item_count, 1);
+        assert_eq!(store.get_checked(&key).expect("entry intact"), Some(vec![1, 2, 3]));
+        store.close().expect("close after contained panic");
+        let _ = key;
+    }
+
+    fn compound_scenario_insert() {
+        use quanta_memory_platform_core::{MemoryPreset, ProcessMemoryBrokerBuilder};
+        let broker = ProcessMemoryBrokerBuilder::new()
+            .with_preset(MemoryPreset::Development)
+            .build()
+            .expect("broker");
+        let binding = StoreBindingHandle::new(
+            MemoryClass::MemoResidency,
+            "owner-compound-hostile-insert".to_string(),
+            None,
+        );
+        let store: SimpleRetainedMapStore<CompoundHostileKey, Vec<u8>, Budgeted> =
+            SimpleRetainedMapStore::new_budgeted(binding, broker);
+        let hash_panics = Arc::new(AtomicBool::new(false));
+        let drop_panics = Arc::new(AtomicBool::new(false));
+        let key = CompoundHostileKey {
+            name: "target".to_string(),
+            hash_panics: Arc::clone(&hash_panics),
+            drop_panics: Arc::clone(&drop_panics),
+        };
+
+        hash_panics.store(true, Ordering::SeqCst);
+        drop_panics.store(true, Ordering::SeqCst);
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            store.insert_checked(key, vec![9, 9])
+        }));
+        assert!(panicked.is_err(), "armed Hash must panic inside insert");
+        hash_panics.store(false, Ordering::SeqCst);
+        drop_panics.store(false, Ordering::SeqCst);
+
+        assert_eq!(store.stats_checked().expect("stats after contained panic").item_count, 0);
+        store.close().expect("close after contained panic");
+    }
+
+    #[test]
+    fn compound_hostile_remove_panic_cannot_abort_process() {
+        if std::env::var_os(COMPOUND_CHILD).is_some() {
+            compound_scenario_remove();
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .arg("--exact")
+            .arg("retained_map::service::tests::compound_hostile_remove_panic_cannot_abort_process")
+            .arg("--nocapture")
+            .env(COMPOUND_CHILD, "remove")
+            .output()
+            .expect("isolated compound-hostile remove child");
+        assert!(
+            output.status.success(),
+            "a compound hostile caller type must not abort remove: status={} stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn compound_hostile_insert_panic_cannot_abort_process() {
+        if std::env::var_os(COMPOUND_CHILD).is_some() {
+            compound_scenario_insert();
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .arg("--exact")
+            .arg("retained_map::service::tests::compound_hostile_insert_panic_cannot_abort_process")
+            .arg("--nocapture")
+            .env(COMPOUND_CHILD, "insert")
+            .output()
+            .expect("isolated compound-hostile insert child");
+        assert!(
+            output.status.success(),
+            "a compound hostile caller type must not abort insert: status={} stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]
@@ -2429,7 +2625,7 @@ mod tests {
             let broker = live_broker(1_000);
             let store = charged(&broker);
             store.insert_checked("key".to_string(), vec![1u8; 30]).expect("seed charged entry");
-            broker.begin_rebuild().expect("begin rebuild");
+            let rebuild_fence1 = broker.begin_rebuild().expect("begin rebuild");
             let error = store
                 .insert_checked("key".to_string(), vec![2u8; 20])
                 .expect_err("fenced recharge must fail closed");
@@ -2448,7 +2644,7 @@ mod tests {
                 retained_cost("key", 30),
                 "store and ledger retain the same charge authority"
             );
-            broker.finish_rebuild().expect("finish rebuild");
+            rebuild_fence1.finish().expect("finish rebuild");
         }
 
         #[test]
@@ -2642,7 +2838,7 @@ mod tests {
                 retained_cost("k", 40)
             );
 
-            broker.begin_rebuild().expect("begin rebuild");
+            let rebuild_fence2 = broker.begin_rebuild().expect("begin rebuild");
             let denied = store.insert_checked("k".to_string(), vec![2u8; 20]);
             assert!(
                 matches!(denied, Err(MemoryError::InvalidState(_))),
@@ -2655,7 +2851,7 @@ mod tests {
             );
 
             // After rebuild the entry is still live: it overwrites and removes cleanly.
-            broker.finish_rebuild().expect("finish");
+            rebuild_fence2.finish().expect("finish");
             store.insert_checked("k".to_string(), vec![2u8; 20]).expect("overwrite resumes");
             assert_eq!(
                 broker.ledger_snapshot().expect("snap").total_owner_bytes(),
@@ -2716,7 +2912,7 @@ mod tests {
             let broker = live_broker(1_000_000);
             let store = charged(&broker);
             store.insert_checked("k".to_string(), vec![0u8; 7]).expect("seed");
-            broker.begin_rebuild().expect("begin rebuild");
+            let _rebuild_fence3 = broker.begin_rebuild().expect("begin rebuild");
 
             let denied = store.remove(&"k".to_string());
             assert!(
@@ -2771,7 +2967,7 @@ mod tests {
             store.insert_checked("a".to_string(), vec![0u8; 5]).expect("a");
             store.insert_checked("b".to_string(), vec![0u8; 5]).expect("b");
             store.insert_checked("c".to_string(), vec![0u8; 5]).expect("c");
-            broker.begin_rebuild().expect("begin rebuild");
+            let rebuild_fence4 = broker.begin_rebuild().expect("begin rebuild");
 
             let denied = store.sweep(SweepHint { target_bytes: retained_cost("a", 5) + 1 });
             assert!(
@@ -2788,7 +2984,7 @@ mod tests {
             // A failed refund_many must also leave internal insertion order intact.
             // Once the accounting gate reopens, the original newest entry is still
             // the first one reclaimed.
-            broker.finish_rebuild().expect("finish rebuild");
+            rebuild_fence4.finish().expect("finish rebuild");
             let swept = store
                 .sweep(SweepHint { target_bytes: retained_cost("c", 5) })
                 .expect("sweep after retry");

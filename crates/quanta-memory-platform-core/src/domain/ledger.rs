@@ -294,11 +294,24 @@ impl LedgerSnapshot {
         Ok(())
     }
 
+    /// Total bytes on the class axis.
+    ///
+    /// # Panics
+    /// Panics when the axis total exceeds `u64`. Broker-issued snapshots can
+    /// never overflow (every mutation preflights with checked arithmetic),
+    /// but the all-public fields make an externally assembled snapshot
+    /// forgeable; use [`Self::checked_total_class_bytes`] on untrusted
+    /// snapshots.
     #[must_use]
     pub fn total_class_bytes(&self) -> u64 {
         self.checked_total_class_bytes().expect("ledger class total exceeds u64")
     }
 
+    /// Total bytes on the owner axis.
+    ///
+    /// # Panics
+    /// Panics when the axis total exceeds `u64`; see [`Self::total_class_bytes`]
+    /// and use [`Self::checked_total_owner_bytes`] on untrusted snapshots.
     #[must_use]
     pub fn total_owner_bytes(&self) -> u64 {
         self.checked_total_owner_bytes().expect("ledger owner total exceeds u64")
@@ -307,6 +320,10 @@ impl LedgerSnapshot {
     /// Total bytes on the context axis. The context axis is the third accounting
     /// dimension (alongside class and owner); every reserve/release touches all
     /// three, so this total must equal the owner total at every point.
+    ///
+    /// # Panics
+    /// Panics when the axis total exceeds `u64`; see [`Self::total_class_bytes`]
+    /// and use [`Self::checked_total_context_bytes`] on untrusted snapshots.
     #[must_use]
     pub fn total_context_bytes(&self) -> u64 {
         self.checked_total_context_bytes().expect("ledger context total exceeds u64")
@@ -319,16 +336,34 @@ impl LedgerSnapshot {
         self.total_context_bytes() == self.total_owner_bytes()
     }
 
+    /// Total retained payload bytes across owners.
+    ///
+    /// # Panics
+    /// Panics when the kind total exceeds `u64`; see
+    /// [`Self::total_class_bytes`] and use
+    /// [`Self::checked_total_retained_payload_bytes`] on untrusted snapshots.
     #[must_use]
     pub fn total_retained_payload_bytes(&self) -> u64 {
         self.checked_total_retained_payload_bytes().expect("ledger payload total exceeds u64")
     }
 
+    /// Total retained metadata bytes across owners.
+    ///
+    /// # Panics
+    /// Panics when the kind total exceeds `u64`; see
+    /// [`Self::total_class_bytes`] and use
+    /// [`Self::checked_total_retained_metadata_bytes`] on untrusted snapshots.
     #[must_use]
     pub fn total_retained_metadata_bytes(&self) -> u64 {
         self.checked_total_retained_metadata_bytes().expect("ledger metadata total exceeds u64")
     }
 
+    /// Total live scratch bytes across owners.
+    ///
+    /// # Panics
+    /// Panics when the kind total exceeds `u64`; see
+    /// [`Self::total_class_bytes`] and use
+    /// [`Self::checked_total_live_scratch_bytes`] on untrusted snapshots.
     #[must_use]
     pub fn total_live_scratch_bytes(&self) -> u64 {
         self.checked_total_live_scratch_bytes().expect("ledger scratch total exceeds u64")
@@ -1682,6 +1717,27 @@ mod tests {
         );
         assert!(matches!(snapshot.validate_exact(), Err(MemoryError::InvalidState(_))));
         assert!(std::panic::catch_unwind(|| snapshot.total_owner_bytes()).is_err());
+    }
+
+    // The all-public snapshot fields make an externally assembled snapshot
+    // forgeable: the panicking total accessors document that contract, and
+    // the checked companions are the safe path for untrusted snapshots.
+    #[test]
+    #[should_panic(expected = "ledger owner total exceeds u64")]
+    fn forged_snapshot_total_owner_bytes_panics_as_documented() {
+        let mut snapshot = LedgerSnapshot::default();
+        for owner in ["owner:one", "owner:two"] {
+            snapshot.owner_usage.insert(
+                owner.into(),
+                UsageBreakdown {
+                    retained_payload_bytes: u64::MAX,
+                    retained_metadata_bytes: 0,
+                    live_scratch_bytes: 0,
+                },
+            );
+        }
+        assert!(snapshot.checked_total_owner_bytes().is_err());
+        let _ = snapshot.total_owner_bytes();
     }
 
     // ---- scenario A: bytes > i64::MAX must not wrap to a negative delta ----

@@ -33,6 +33,8 @@ impl LifecycleFake {
 }
 
 impl StoreLifecycleConformanceTarget for LifecycleFake {
+    type RebuildFence = ();
+
     fn populate(&mut self) -> Result<(), String> {
         self.retained = 21;
         self.ledger = 21;
@@ -72,12 +74,12 @@ impl StoreLifecycleConformanceTarget for LifecycleFake {
         self.closed
     }
 
-    fn begin_rebuild(&mut self) -> Result<(), String> {
+    fn begin_rebuild(&mut self) -> Result<Self::RebuildFence, String> {
         self.rebuild = true;
         Ok(())
     }
 
-    fn finish_rebuild(&mut self) -> Result<(), String> {
+    fn finish_rebuild(&mut self, _fence: Self::RebuildFence) -> Result<(), String> {
         self.rebuild = false;
         if self.deferred_drop {
             self.ledger -= 21;

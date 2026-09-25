@@ -91,7 +91,8 @@ pub use api::builder::ProcessMemoryBrokerBuilder;
 #[cfg(feature = "live_control")]
 pub use api::control::{
     LiveProcessMemoryBroker, ManagedCharge, ManagedChargeRechargeError,
-    ManagedChargeRechargeRecovery, PendingReservation,
+    ManagedChargeRechargeRecovery, PendingReservation, RebuildFence, RebuildFenceStatus,
+    RebuildReceipt,
 };
 #[cfg(feature = "live_control")]
 pub use application::controller::{

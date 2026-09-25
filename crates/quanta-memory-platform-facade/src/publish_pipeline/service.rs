@@ -73,6 +73,7 @@ where
 {
     /// Build a pipeline whose commit transition is the infallible identity
     /// `Published: From<Stage>` conversion.
+    #[deprecated = "legacy staging pipeline: prefer the prepared-publication service; this constructor will be removed with the legacy transition trait"]
     pub fn new(binding: StoreBindingHandle) -> Self {
         Self {
             binding,
@@ -85,6 +86,7 @@ where
 
 impl<Stage, Commit, Published, T> SimplePublishPipeline<Stage, Commit, Published, T> {
     /// Build a pipeline with an explicit, possibly-fallible commit transition.
+    #[deprecated = "legacy staging pipeline: prefer the prepared-publication service; this constructor will be removed with the legacy transition trait"]
     pub fn with_transition(binding: StoreBindingHandle, transition: T) -> Self {
         Self { binding, transition, published_count: Mutex::new(0), _marker: PhantomData }
     }
@@ -95,6 +97,7 @@ impl<Stage, Commit, Published, T> SimplePublishPipeline<Stage, Commit, Published
 
     /// Number of values that have actually been published (committed). Never
     /// counts a staged-but-uncommitted value.
+    #[deprecated = "legacy staging pipeline surface: prefer the prepared-publication service"]
     pub fn published_count(&self) -> Result<u64, MemoryError> {
         self.published_count
             .lock()

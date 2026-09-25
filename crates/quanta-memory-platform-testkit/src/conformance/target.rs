@@ -139,11 +139,16 @@ pub trait BrokerConformanceTarget {
     /// Release a ticket (rollback or eviction).
     fn do_release(&mut self, ticket: &Self::Ticket) -> Result<(), String>;
 
-    /// Open the rebuild window.
-    fn do_begin_rebuild(&mut self) -> Result<(), String>;
+    /// Permit issued by opening the rebuild window; consumed by
+    /// [`BrokerConformanceTarget::do_finish_rebuild`]. Production targets use
+    /// the non-Clone epoch-bound fence; fakes use `()`.
+    type RebuildFence;
 
-    /// Close the rebuild window.
-    fn do_finish_rebuild(&mut self) -> Result<(), String>;
+    /// Open the rebuild window.
+    fn do_begin_rebuild(&mut self) -> Result<Self::RebuildFence, String>;
+
+    /// Close the rebuild window with the permit that opened it.
+    fn do_finish_rebuild(&mut self, fence: Self::RebuildFence) -> Result<(), String>;
 
     /// The class axes available on this target, in stable order. Provided: the
     /// two conformance axes the suite addresses by index. Targets are not forced
@@ -229,12 +234,14 @@ impl BrokerConformanceTarget for FakeProcessBroker {
         self.release(ticket).map_err(|e| e.to_string())
     }
 
-    fn do_begin_rebuild(&mut self) -> Result<(), String> {
+    type RebuildFence = ();
+
+    fn do_begin_rebuild(&mut self) -> Result<Self::RebuildFence, String> {
         self.begin_rebuild();
         Ok(())
     }
 
-    fn do_finish_rebuild(&mut self) -> Result<(), String> {
+    fn do_finish_rebuild(&mut self, _fence: Self::RebuildFence) -> Result<(), String> {
         self.finish_rebuild();
         Ok(())
     }
@@ -400,12 +407,14 @@ impl BrokerConformanceTarget for LiveProcessMemoryBroker {
         }
     }
 
-    fn do_begin_rebuild(&mut self) -> Result<(), String> {
+    type RebuildFence = quanta_memory_platform_core::RebuildFence;
+
+    fn do_begin_rebuild(&mut self) -> Result<Self::RebuildFence, String> {
         LiveProcessMemoryBroker::begin_rebuild(self).map_err(|e| e.to_string())
     }
 
-    fn do_finish_rebuild(&mut self) -> Result<(), String> {
-        LiveProcessMemoryBroker::finish_rebuild(self).map_err(|e| e.to_string())
+    fn do_finish_rebuild(&mut self, fence: Self::RebuildFence) -> Result<(), String> {
+        fence.finish().map(|_| ()).map_err(|e| e.to_string())
     }
 
     // class_axes: uses the trait's provided default (CONFORMANCE_CLASS_AXES).

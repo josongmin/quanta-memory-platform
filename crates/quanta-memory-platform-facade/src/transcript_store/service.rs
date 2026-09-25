@@ -1,4 +1,3 @@
-use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet};
 use std::marker::PhantomData;
 use std::sync::{Mutex, MutexGuard, PoisonError};
@@ -12,7 +11,7 @@ use quanta_memory_platform_core::{
 use crate::shared::accounting::Unbudgeted;
 use crate::shared::accounting::{Budgeted, StoreAccounting};
 use crate::shared::lifecycle::{
-    invoke_client_read_while_locked, retire_client_value, BeginClose, DropTransition,
+    invoke_client_read_while_locked, retire_client_value, BeginClose, DropTransition, InFlight,
     StoreLifecycle,
 };
 use crate::shared::measure::{semantic_cost_v1, ByteSized, CanonicalKey, RetainedCostV1};
@@ -487,8 +486,11 @@ where
             ));
         }
 
-        // Resolve caller-controlled Ord before the state-mutation lock. The
-        // enclosing mutation permit keeps this ordinal stable until commit.
+        // Resolve caller-controlled Ord before the state-mutation lock; the
+        // positional ordinal keeps every later block caller-trait-free while
+        // the plan is detached (pinned by the no-Ord-after-detach contract).
+        // The scan runs inside the containment helper, and session count is
+        // budget-bounded because every session owns a positive key charge.
         let session_ordinal = invoke_client_read_while_locked(self.lock_state()?, |state| {
             state.sessions.keys().position(|candidate| candidate.cmp(session_id).is_eq())
         });
@@ -694,17 +696,23 @@ where
     ) -> Result<TranscriptAppendDispositionV1, TranscriptAppendErrorV1> {
         let _mutation =
             self.lifecycle.begin_mutation().map_err(TranscriptAppendErrorV1::Storage)?;
-        let body_key = request.body.canonical_key();
+        // Caller-trait code (CanonicalKey/ByteSized/Ord/Eq/Clone) runs while
+        // every owned caller value is guarded, so a trait panic can never
+        // unwind through a caller destructor (compound-hostile containment).
+        // The two std-BTreeMap insertions below are the sole residual: the
+        // std API has no insertion that avoids an owned-key Ord descent.
+        let mut body = InFlight::new(request.body);
+        let session_id = InFlight::new(request.identity.session_id);
+        let message_id = InFlight::new(request.identity.message_id);
+        let body_key = body.get().canonical_key();
         let body_digest = canonical_body_digest(&body_key);
-        let session_id = request.identity.session_id;
         let sequence = request.identity.sequence;
-        let message_id = request.identity.message_id;
-        let message_id_bytes = message_id.byte_size();
-        let active_bytes = active_row_cost(request.body.byte_size(), message_id_bytes)
+        let message_id_bytes = message_id.get().byte_size();
+        let active_bytes = active_row_cost(body.get().byte_size(), message_id_bytes)
             .map_err(TranscriptAppendErrorV1::Accounting)?;
         let evidence_bytes = identity_evidence_cost(message_id_bytes)
             .map_err(TranscriptAppendErrorV1::Accounting)?;
-        let key_bytes = session_key_cost(session_id.byte_size())
+        let key_bytes = session_key_cost(session_id.get().byte_size())
             .map_err(TranscriptAppendErrorV1::Accounting)?;
         // Identity comparison and replay decoding invoke caller Ord and
         // CanonicalKey. Finish that read-only work and release the guard before
@@ -717,11 +725,11 @@ where
         let prior = invoke_client_read_while_locked(
             self.lock_state().map_err(TranscriptAppendErrorV1::Storage)?,
             |state| -> Result<ExistingSession, TranscriptAppendErrorV1> {
-                let Some(session) = state.sessions.get(&session_id) else {
+                let Some(session) = state.sessions.get(session_id.get()) else {
                     return Ok(ExistingSession::New);
                 };
                 if let Some(evidence) = session.sequence_evidence.get(&sequence) {
-                    if evidence.message_id != message_id {
+                    if evidence.message_id != *message_id.get() {
                         return Err(TranscriptAppendErrorV1::SequenceConflict { sequence });
                     }
                     let exact_replay = session.rows.get(&sequence).map_or_else(
@@ -734,7 +742,7 @@ where
                         Err(TranscriptAppendErrorV1::PayloadConflict { sequence })
                     };
                 }
-                if let Some(evidence) = session.message_evidence.get(&message_id) {
+                if let Some(evidence) = session.message_evidence.get(message_id.get()) {
                     if evidence.sequence != sequence {
                         return Err(TranscriptAppendErrorV1::MessageIdConflict);
                     }
@@ -866,8 +874,8 @@ where
 
         // Client Clone may panic or reenter. Complete both copies before
         // acquiring a charge or mutating any store-owned state.
-        let row_message_id = message_id.clone();
-        let evidence_message_id = message_id.clone();
+        let row_message_id = message_id.get().clone();
+        let evidence_message_id = message_id.get().clone();
 
         let active_charge = self
             .accounting
@@ -915,7 +923,7 @@ where
         let mut row = Some(TranscriptEntry {
             sequence,
             message_id: row_message_id,
-            body: request.body,
+            body: body.take(),
             active_bytes,
             active_charge,
         });
@@ -927,59 +935,55 @@ where
         });
         let mut key_charge = key_charge;
 
-        // Both BTreeMap::entry lookups may invoke client Ord. Resolve their
-        // insertion positions before publishing a row, evidence, version, or
-        // retained bytes. VacantEntry::insert and the u64-keyed maps need no
-        // client callbacks. Catch an Ord panic while the guard is held, then
-        // resume it only after releasing the guard so the state stays readable.
+        // Session resolution and the message-id probe run on BORROWED caller
+        // keys, so an Ord panic unwinds nothing caller-owned inside this
+        // boundary; the in-flight guards above retire the frame's owned
+        // caller values before the panic resumes. The two final std-BTreeMap
+        // insertions (new session, new message evidence) are the sole
+        // residual: std offers no insertion that avoids an owned-key Ord
+        // descent, so a compound hostile key can still abort exactly there.
+        // The u64-keyed row/evidence maps need no client callbacks.
         let publication = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            match state.sessions.entry(session_id) {
-                Entry::Occupied(mut occupied) => {
-                    let session = occupied.get_mut();
-                    if session.rows.contains_key(&sequence)
-                        || session.sequence_evidence.contains_key(&sequence)
-                    {
-                        return Err(TranscriptAppendErrorV1::Storage(MemoryError::InvalidState(
-                            "transcript sequence index changed during append publication"
-                                .to_string(),
-                        )));
-                    }
-                    let Entry::Vacant(message_slot) = session.message_evidence.entry(message_id)
-                    else {
-                        return Err(TranscriptAppendErrorV1::Storage(MemoryError::InvalidState(
-                            "transcript message-id index changed during append publication"
-                                .to_string(),
-                        )));
-                    };
-                    session.rows.insert(sequence, row.take().expect("planned row"));
-                    session.sequence_evidence.insert(
-                        sequence,
-                        sequence_evidence.take().expect("planned sequence evidence"),
-                    );
-                    message_slot.insert(MessageEvidence { sequence, body_digest });
-                    session.version = next_version;
-                    session.retained_bytes = next_session_bytes;
+            if let Some(session) = state.sessions.get_mut(session_id.get()) {
+                if session.rows.contains_key(&sequence)
+                    || session.sequence_evidence.contains_key(&sequence)
+                {
+                    return Err(TranscriptAppendErrorV1::Storage(MemoryError::InvalidState(
+                        "transcript sequence index changed during append publication".to_string(),
+                    )));
                 }
-                Entry::Vacant(session_slot) => {
-                    // A new session is assembled off-map; only the final
-                    // VacantEntry insertion makes it visible.
-                    let mut session = SessionState {
-                        key_bytes,
-                        key_charge: key_charge.take(),
-                        retained_bytes: next_session_bytes,
-                        ..SessionState::default()
-                    };
-                    session.rows.insert(sequence, row.take().expect("planned row"));
-                    session.sequence_evidence.insert(
-                        sequence,
-                        sequence_evidence.take().expect("planned sequence evidence"),
-                    );
-                    session
-                        .message_evidence
-                        .insert(message_id, MessageEvidence { sequence, body_digest });
-                    session.version = next_version;
-                    session_slot.insert(session);
+                if session.message_evidence.contains_key(message_id.get()) {
+                    return Err(TranscriptAppendErrorV1::Storage(MemoryError::InvalidState(
+                        "transcript message-id index changed during append publication".to_string(),
+                    )));
                 }
+                session.rows.insert(sequence, row.take().expect("planned row"));
+                session
+                    .sequence_evidence
+                    .insert(sequence, sequence_evidence.take().expect("planned sequence evidence"));
+                session
+                    .message_evidence
+                    .insert(message_id.get().clone(), MessageEvidence { sequence, body_digest });
+                session.version = next_version;
+                session.retained_bytes = next_session_bytes;
+            } else {
+                // A new session is assembled off-map; only the final keyed
+                // insertion makes it visible (documented residual above).
+                let mut session = SessionState {
+                    key_bytes,
+                    key_charge: key_charge.take(),
+                    retained_bytes: next_session_bytes,
+                    ..SessionState::default()
+                };
+                session.rows.insert(sequence, row.take().expect("planned row"));
+                session
+                    .sequence_evidence
+                    .insert(sequence, sequence_evidence.take().expect("planned sequence evidence"));
+                session
+                    .message_evidence
+                    .insert(message_id.get().clone(), MessageEvidence { sequence, body_digest });
+                session.version = next_version;
+                state.sessions.insert(session_id.get().clone(), session);
             }
             state.active_row_count = next_active_row_count;
             state.active_bytes = next_active_bytes;
@@ -2468,7 +2472,10 @@ mod tests {
                 1
             );
             let before_retry = comparisons.calls.load(AtomicOrdering::SeqCst);
-            comparisons.arm_after(3);
+            // Three MessageId comparisons follow on the retry (preflight
+            // probe, borrowed publication probe, keyed insert); arm past all
+            // of them so the disarmed retry completes.
+            comparisons.arm_after(4);
             assert_eq!(
                 store
                     .append(TranscriptAppendRequestV1::new(
@@ -2484,8 +2491,8 @@ mod tests {
             );
             assert_eq!(
                 comparisons.calls.load(AtomicOrdering::SeqCst),
-                before_retry + 2,
-                "append compared MessageId after its vacant slot was resolved"
+                before_retry + 3,
+                "append compares MessageId once in preflight, once in the                  borrowed publication probe, and once in the final keyed insert"
             );
             comparisons.disarm();
             let expected = cost("s", &[("m0", "one", true), ("m1", "four", true)]);
@@ -2674,7 +2681,7 @@ mod tests {
                 before_cost
             );
 
-            broker.begin_rebuild().expect("fence release");
+            let rebuild_fence1 = broker.begin_rebuild().expect("fence release");
             let before = trap.arm_after_one_more_comparison();
             assert!(matches!(store.retain_sequences(&id, &[0]), Err(MemoryError::InvalidState(_))));
             assert_eq!(trap.calls.load(AtomicOrdering::SeqCst), before + 1);
@@ -2686,7 +2693,7 @@ mod tests {
                 before_cost
             );
 
-            broker.finish_rebuild().expect("open fence");
+            rebuild_fence1.finish().expect("open fence");
             let before = trap.arm_after_one_more_comparison();
             store.retain_sequences(&id, &[0]).expect("retain after fence");
             assert_eq!(trap.calls.load(AtomicOrdering::SeqCst), before + 1);
@@ -2801,6 +2808,129 @@ mod tests {
 
             store.close().expect("close");
             assert_eq!(broker.ledger_snapshot().expect("drained").total_owner_bytes(), 0);
+        }
+
+        #[test]
+        fn compound_hostile_session_ord_panic_cannot_abort_append() {
+            use std::sync::atomic::AtomicBool;
+
+            const CHILD: &str = "QMP_TRANSCRIPT_COMPOUND_CHILD";
+
+            #[derive(Clone)]
+            struct CompoundSessionKey {
+                name: String,
+                ord_panics: Arc<AtomicBool>,
+                drop_panics: Arc<AtomicBool>,
+            }
+
+            impl ByteSized for CompoundSessionKey {
+                fn byte_size(&self) -> u64 {
+                    self.name.len() as u64
+                }
+            }
+
+            impl PartialEq for CompoundSessionKey {
+                fn eq(&self, other: &Self) -> bool {
+                    self.name == other.name
+                }
+            }
+
+            impl Eq for CompoundSessionKey {}
+            impl PartialOrd for CompoundSessionKey {
+                fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+                    Some(self.cmp(other))
+                }
+            }
+            impl Ord for CompoundSessionKey {
+                fn cmp(&self, other: &Self) -> Ordering {
+                    assert!(
+                        !self.ord_panics.load(AtomicOrdering::SeqCst),
+                        "armed compound-hostile Ord"
+                    );
+                    self.name.cmp(&other.name)
+                }
+            }
+
+            impl Drop for CompoundSessionKey {
+                fn drop(&mut self) {
+                    assert!(
+                        !self.drop_panics.load(AtomicOrdering::SeqCst),
+                        "armed compound-hostile Drop"
+                    );
+                }
+            }
+
+            let scenario = || {
+                let broker = broker(1_000_000);
+                let ord_panics = Arc::new(AtomicBool::new(false));
+                let drop_panics = Arc::new(AtomicBool::new(false));
+                let key = CompoundSessionKey {
+                    name: "session".to_string(),
+                    ord_panics: Arc::clone(&ord_panics),
+                    drop_panics: Arc::clone(&drop_panics),
+                };
+                let store = SimpleSessionTranscriptStore::<
+                    CompoundSessionKey,
+                    String,
+                    String,
+                    Budgeted,
+                >::new_budgeted(
+                    StoreBindingHandle::new(
+                        MemoryClass::SessionTranscript,
+                        "transcript-compound-hostile".to_string(),
+                        None,
+                    ),
+                    TranscriptRetentionPolicyV2::default(),
+                    broker.clone(),
+                );
+                store
+                    .append(TranscriptAppendRequestV1::new(
+                        TranscriptAppendIdentityV1::new(key.clone(), 0, "m0".to_string()),
+                        "body0".to_string(),
+                    ))
+                    .expect("seed while disarmed");
+
+                ord_panics.store(true, AtomicOrdering::SeqCst);
+                drop_panics.store(true, AtomicOrdering::SeqCst);
+                let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    store.append(TranscriptAppendRequestV1::new(
+                        TranscriptAppendIdentityV1::new(key.clone(), 1, "m1".to_string()),
+                        "body1".to_string(),
+                    ))
+                }));
+                assert!(panicked.is_err(), "armed Ord must panic inside append");
+                ord_panics.store(false, AtomicOrdering::SeqCst);
+                drop_panics.store(false, AtomicOrdering::SeqCst);
+
+                assert_eq!(
+                    store.checked_stats().expect("stats after contained panic").item_count,
+                    1
+                );
+                assert_eq!(store.load(&key).expect("load after contained panic").len(), 1);
+                store.close().expect("close after contained panic");
+                assert_eq!(broker.ledger_snapshot().expect("drained").total_owner_bytes(), 0);
+            };
+
+            if std::env::var_os(CHILD).is_some() {
+                scenario();
+                return;
+            }
+            let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+                .arg("--exact")
+                .arg(
+                    "transcript_store::service::tests::accounting::\
+                     compound_hostile_session_ord_panic_cannot_abort_append",
+                )
+                .arg("--nocapture")
+                .env(CHILD, "1")
+                .output()
+                .expect("isolated compound-hostile append child");
+            assert!(
+                output.status.success(),
+                "a compound hostile session key must not abort append: status={} stderr={}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
         }
 
         #[test]
@@ -3158,14 +3288,14 @@ mod tests {
             let store = charged(&broker);
             store.append(request("s", 0, "m0", "one")).expect("first");
             store.append(request("s", 1, "m1", "four")).expect("second");
-            broker.begin_rebuild().expect("begin rebuild");
+            let rebuild_fence2 = broker.begin_rebuild().expect("begin rebuild");
             let denied = store.truncate_to(&"s".to_string(), 1);
             assert!(matches!(denied, Err(MemoryError::InvalidState(_))));
             assert_eq!(store.load(&"s".to_string()).expect("load").len(), 2);
             let expected = cost("s", &[("m0", "one", true), ("m1", "four", true)]);
             assert_eq!(store.retained_bytes().expect("bytes"), expected);
             assert_eq!(broker.ledger_snapshot().expect("snapshot").total_owner_bytes(), expected);
-            broker.finish_rebuild().expect("finish rebuild");
+            rebuild_fence2.finish().expect("finish rebuild");
         }
 
         #[test]
@@ -3211,7 +3341,7 @@ mod tests {
             store.append(request("b", 1, "m1", "four")).expect("second");
             let version =
                 store.load_versioned_snapshot(&"a".to_string()).expect("before").version();
-            broker.begin_rebuild().expect("fence");
+            let rebuild_fence3 = broker.begin_rebuild().expect("fence");
             assert!(matches!(store.close(), Err(MemoryError::InvalidState(_))));
             assert_eq!(
                 broker.ledger_snapshot().expect("fenced ledger").total_owner_bytes(),
@@ -3227,7 +3357,7 @@ mod tests {
                 store.append(request("a", 0, "m0", "one")).expect("restored evidence"),
                 TranscriptAppendDispositionV1::Replayed
             );
-            broker.finish_rebuild().expect("open fence");
+            rebuild_fence3.finish().expect("open fence");
             store.close().expect("retry close");
             assert_eq!(broker.ledger_snapshot().expect("after retry").total_owner_bytes(), 0);
         }
@@ -3260,13 +3390,13 @@ mod tests {
             let store = charged(&broker);
             store.append(request("a", 0, "m0", "one")).expect("first");
             store.append(request("b", 1, "m1", "four")).expect("second");
-            broker.begin_rebuild().expect("fence");
+            let rebuild_fence4 = broker.begin_rebuild().expect("fence");
             drop(store);
             assert_eq!(
                 broker.ledger_snapshot().expect("fenced").total_owner_bytes(),
                 cost("a", &[("m0", "one", true)]) + cost("b", &[("m1", "four", true)])
             );
-            broker.finish_rebuild().expect("drain deferred charges");
+            rebuild_fence4.finish().expect("drain deferred charges");
             assert_eq!(broker.ledger_snapshot().expect("drained").total_owner_bytes(), 0);
         }
 
@@ -3333,7 +3463,7 @@ mod tests {
             }
             let before = store.load_versioned_snapshot(&"s".to_string()).expect("snapshot");
             let before_bytes = store.retained_bytes().expect("bytes");
-            broker.begin_rebuild().expect("fence");
+            let rebuild_fence5 = broker.begin_rebuild().expect("fence");
             assert!(matches!(
                 store.retain_sequences_if_version(&"s".to_string(), before.version(), &[2, 9]),
                 Err(MemoryError::InvalidState(_))
@@ -3344,7 +3474,7 @@ mod tests {
                 broker.ledger_snapshot().expect("unchanged ledger").total_owner_bytes(),
                 before_bytes
             );
-            broker.finish_rebuild().expect("finish");
+            rebuild_fence5.finish().expect("finish");
             assert_eq!(
                 store
                     .retain_sequences_if_version(&"s".to_string(), before.version(), &[2, 9])

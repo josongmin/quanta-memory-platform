@@ -162,7 +162,7 @@ check helpers that the control plane enforces (see group C/D).
 - ✅ reconfigure atomicity — `denied_reconfigure_leaves_scheduler_controller_and_report_unchanged`.
 - ✅ reconfigure accept rebuilds — `accepted_reconfigure_rebuilds_controller_to_new_global_limit`.
 - ✅ pressure boundaries — `pressure_thresholds_are_inclusive_at_exact_boundary_fractions`.
-- ✅ rebuild re-entrancy — `rebuild_is_reentrant_double_begin_single_finish_then_idle_finish_is_noop`.
+- ✅ rebuild re-entrancy — `rebuild_fence_is_single_owner_finishes_once_and_recovers_after_abandon`.
 - ✅ trait report not fabricated on poison — `trait_effective_report_matches_inherent_and_is_not_fabricated`.
 - ✅ build() validates — `build_with_invalid_residency_returns_config_error`, `build_with_soft_above_hard_returns_config_error`, `build_without_manifest_returns_build_error`, `build_with_valid_residency_succeeds_and_reports_that_residency`.
 - ✅ reconfig deny rules + pressure-from-semantic + advisory-non-mutating — existing `live_reconfig_*`, `pressure_classifies_from_semantic_usage`, `allocator_advisory_mismatch_does_not_mutate_accounting`.

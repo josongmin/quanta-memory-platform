@@ -24,6 +24,7 @@ DOCUMENTS = (
 # silently treating an arbitrary stale selector as prose.
 NON_TEST_IDENTIFIERS = {
     "FACADE_STORE_SUITE",
+    "do_begin_rebuild",
     "allocator_observation_is_inert",
     "grow_to_observed",
     "hard_cap_bytes",

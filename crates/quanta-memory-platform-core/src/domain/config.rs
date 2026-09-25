@@ -172,7 +172,11 @@ impl EffectiveBudgetResolver {
     ///
     /// Fails closed with a typed [`MemoryError::Config`] when the resolved
     /// residency policy violates the `reserved <= soft <= hard` ordering or the
-    /// global-hard-vs-reserved-plus-headroom floor.
+    /// global-hard-vs-reserved-plus-headroom floor. A layer claiming the
+    /// [`OverrideSource::RuntimeReconfigure`] provenance is rejected: that
+    /// source is minted only by an accepted live policy replacement and must
+    /// never be supplied at build time, where its derived ordering would
+    /// silently outrank every static layer and mislabel the initial report.
     pub fn resolve(self) -> MemoryResult<ResolvedBudget> {
         let preset = self.manifest.preset.clone();
         let mut residency = self.manifest.residency.clone();
@@ -183,6 +187,12 @@ impl EffectiveBudgetResolver {
 
         // Apply layers in canonical precedence, not call order.
         let mut ordered = self.layers;
+        if ordered.iter().any(|(source, _)| matches!(source, OverrideSource::RuntimeReconfigure)) {
+            return Err(MemoryError::config(
+                "runtime-reconfigure override layers cannot be supplied at build time: that \
+                 provenance is minted only by an accepted live policy replacement",
+            ));
+        }
         ordered.sort_by_key(|entry| entry.0);
 
         for (source, layer) in ordered {
@@ -229,6 +239,54 @@ fn validate_residency_inner(residency: &ResidencyPolicy) -> MemoryResult<()> {
                 "mandatory memory class {class:?} is absent from residency policy"
             )));
         }
+    }
+
+    // Policy maps are bounded trusted configuration: the scheduler and
+    // reclaim planning do map-scale work under the broker lock, so an
+    // over-capacity dynamic policy is rejected fail-closed before any broker
+    // is constructed from it.
+    if residency.classes.len() > crate::domain::management_limits::MAX_POLICY_CLASSES_PER_POLICY {
+        return Err(MemoryError::config(format!(
+            "residency policy declares {} classes; maximum is {}",
+            residency.classes.len(),
+            crate::domain::management_limits::MAX_POLICY_CLASSES_PER_POLICY
+        )));
+    }
+    if residency.owner_quotas.len() > crate::domain::management_limits::MAX_OWNER_QUOTAS_PER_POLICY
+    {
+        return Err(MemoryError::config(format!(
+            "residency policy declares {} owner quotas; maximum is {}",
+            residency.owner_quotas.len(),
+            crate::domain::management_limits::MAX_OWNER_QUOTAS_PER_POLICY
+        )));
+    }
+    if residency.resource_groups.len()
+        > crate::domain::management_limits::MAX_RESOURCE_GROUPS_PER_POLICY
+    {
+        return Err(MemoryError::config(format!(
+            "residency policy declares {} resource groups; maximum is {}",
+            residency.resource_groups.len(),
+            crate::domain::management_limits::MAX_RESOURCE_GROUPS_PER_POLICY
+        )));
+    }
+    if residency.owner_groups.len()
+        > crate::domain::management_limits::MAX_OWNER_GROUP_MAPPINGS_PER_POLICY
+    {
+        return Err(MemoryError::config(format!(
+            "residency policy declares {} owner-to-group mappings; maximum is {}",
+            residency.owner_groups.len(),
+            crate::domain::management_limits::MAX_OWNER_GROUP_MAPPINGS_PER_POLICY
+        )));
+    }
+
+    // The shared burst pool is advertised as a real oversubscription bound
+    // (invariant 6): a pool above the global hard limit can never bind and
+    // would make the report's bound vacuous.
+    if residency.shared_burst_pool_bytes > residency.global_hard_limit_bytes {
+        return Err(MemoryError::config(format!(
+            "shared burst pool {} exceeds the global hard limit {}",
+            residency.shared_burst_pool_bytes, residency.global_hard_limit_bytes
+        )));
     }
 
     let mut total_reserved: u64 = 0;
@@ -314,6 +372,17 @@ fn validate_residency_inner(residency: &ResidencyPolicy) -> MemoryResult<()> {
         if policy.burst_percent > 100 {
             return Err(MemoryError::config(format!(
                 "resource group {group} burst_percent {} exceeds 100",
+                policy.burst_percent
+            )));
+        }
+        // A zero-weight group's weighted burst share is provably zero, so a
+        // positive burst demand on it would advertise capacity the split can
+        // never deliver. Zero weight with zero burst stays a legal no-burst
+        // group.
+        if policy.admission_weight == 0 && policy.burst_percent > 0 {
+            return Err(MemoryError::config(format!(
+                "resource group {group} demands burst_percent {} with admission_weight 0: its \
+                 weighted burst share is always zero",
                 policy.burst_percent
             )));
         }
@@ -548,6 +617,157 @@ mod tests {
                 },
             );
         assert!(validate_residency(&residency).is_ok());
+    }
+
+    // ---- policy cardinality bounds (ENG-05 validation half): the policy
+    // maps are bounded trusted configuration, so scheduler clones and
+    // reclaim planning under the broker lock stay O(bounded). Latency
+    // claims remain with the scaling rail; these are logical bookkeeping
+    // bounds like the other MAX_* management limits.
+    #[test]
+    fn validate_rejects_policy_map_cardinality_above_the_caps() {
+        use crate::domain::management_limits::{
+            MAX_OWNER_GROUP_MAPPINGS_PER_POLICY, MAX_OWNER_QUOTAS_PER_POLICY,
+            MAX_RESOURCE_GROUPS_PER_POLICY,
+        };
+        use crate::domain::policy::{OwnerQuota, ResourceGroup};
+
+        let group = || ResourceGroup {
+            reserved_bytes: 0,
+            soft_cap_bytes: 1_000,
+            hard_cap_bytes: 1_000,
+            burst_percent: 0,
+            reclaim_priority: ReclaimPriority::Normal,
+            admission_weight: 1,
+        };
+
+        // Resource groups: exactly at the cap is a valid trusted policy; one
+        // above is rejected fail-closed.
+        let groups_at_cap = (0..MAX_RESOURCE_GROUPS_PER_POLICY)
+            .fold(ResidencyPolicy::new(100_000_000), |policy, index| {
+                policy.with_resource_group(format!("g{index}"), group())
+            });
+        assert!(
+            validate_residency(&groups_at_cap).is_ok(),
+            "at-cap resource-group count must remain a valid policy"
+        );
+        let groups_over = groups_at_cap.clone().with_resource_group("g-over", group());
+        assert!(
+            matches!(validate_residency(&groups_over), Err(MemoryError::Config(_))),
+            "a resource-group cardinality above the cap must be rejected"
+        );
+
+        // Owner->group mappings: at cap accepted, one above rejected.
+        let mappings_at_cap = (0..MAX_OWNER_GROUP_MAPPINGS_PER_POLICY)
+            .fold(groups_at_cap, |policy, index| {
+                policy.with_owner_group(format!("o{index}"), "g0".to_string())
+            });
+        assert!(
+            validate_residency(&mappings_at_cap).is_ok(),
+            "at-cap owner mapping count must remain a valid policy"
+        );
+        let mappings_over =
+            mappings_at_cap.with_owner_group("o-over".to_string(), "g0".to_string());
+        assert!(
+            matches!(validate_residency(&mappings_over), Err(MemoryError::Config(_))),
+            "an owner-mapping cardinality above the cap must be rejected"
+        );
+
+        // Per-owner quotas: at cap accepted, one above rejected.
+        let quotas_at_cap = (0..MAX_OWNER_QUOTAS_PER_POLICY).fold(
+            ResidencyPolicy::new(100_000_000),
+            |policy, index| {
+                policy.with_owner_quota(
+                    format!("q{index}"),
+                    OwnerQuota { soft_cap_bytes: 1_000, hard_cap_bytes: 2_000 },
+                )
+            },
+        );
+        assert!(
+            validate_residency(&quotas_at_cap).is_ok(),
+            "at-cap owner quota count must remain a valid policy"
+        );
+        let quotas_over = quotas_at_cap.with_owner_quota(
+            "q-over".to_string(),
+            OwnerQuota { soft_cap_bytes: 1_000, hard_cap_bytes: 2_000 },
+        );
+        assert!(
+            matches!(validate_residency(&quotas_over), Err(MemoryError::Config(_))),
+            "an owner-quota cardinality above the cap must be rejected"
+        );
+        // The class axis needs no cardinality cap: it is keyed by the closed
+        // MemoryClass enum, so its size is structurally bounded by the
+        // taxonomy itself.
+    }
+
+    // ---- provenance authority: RuntimeReconfigure is a runtime-minted
+    // provenance only. A build-time layer claiming it would silently outrank
+    // every static layer (derived Ord) and mislabel the initial report as an
+    // accepted live replacement, so resolution rejects it fail-closed.
+    #[test]
+    fn runtime_reconfigure_layers_are_rejected_at_build_time() {
+        let resolver = EffectiveBudgetResolver::from_manifest(manifest()).with_layer(
+            OverrideSource::RuntimeReconfigure,
+            BudgetOverrideLayer::empty().with_global_hard_limit_bytes(700),
+        );
+        let denied = resolver.resolve();
+        assert!(
+            matches!(denied, Err(MemoryError::Config(_))),
+            "build-time runtime-reconfigure layer must be rejected, got {denied:?}"
+        );
+
+        // Static sources keep their documented precedence unchanged.
+        let static_stack = EffectiveBudgetResolver::from_manifest(manifest())
+            .with_layer(
+                OverrideSource::TestFixture,
+                BudgetOverrideLayer::empty().with_global_hard_limit_bytes(900),
+            )
+            .with_layer(
+                OverrideSource::Env,
+                BudgetOverrideLayer::empty().with_global_hard_limit_bytes(700),
+            )
+            .resolve()
+            .expect("static layers resolve");
+        assert_eq!(static_stack.residency.global_hard_limit_bytes, 900);
+    }
+
+    // ---- invariant-6 coherence: the shared burst pool is advertised as a
+    // real oversubscription bound, so it may not exceed the global hard limit.
+    #[test]
+    fn validate_rejects_shared_burst_pool_above_global_hard_limit() {
+        let oversized = ResidencyPolicy::new(10_000).with_shared_burst_pool_bytes(20_000);
+        assert!(
+            matches!(validate_residency(&oversized), Err(MemoryError::Config(_))),
+            "a burst pool above the global hard limit is incoherent"
+        );
+        let bounded = ResidencyPolicy::new(10_000).with_shared_burst_pool_bytes(10_000);
+        assert!(validate_residency(&bounded).is_ok(), "a pool at the global limit is legal");
+    }
+
+    // ---- burst-share coherence: a zero-weight group demands no burst, so a
+    // positive burst_percent on it would silently advertise capacity the
+    // weighted split can never deliver.
+    #[test]
+    fn validate_rejects_zero_admission_weight_with_burst_demand() {
+        use crate::domain::policy::ResourceGroup;
+        let group = |weight: u16, burst: u8| ResourceGroup {
+            reserved_bytes: 0,
+            soft_cap_bytes: 100,
+            hard_cap_bytes: 100,
+            burst_percent: burst,
+            reclaim_priority: ReclaimPriority::Normal,
+            admission_weight: weight,
+        };
+        let demanding = ResidencyPolicy::new(10_000).with_resource_group("g", group(0, 50));
+        assert!(
+            matches!(validate_residency(&demanding), Err(MemoryError::Config(_))),
+            "zero admission weight with positive burst demand is silently vacuous"
+        );
+        let silent = ResidencyPolicy::new(10_000).with_resource_group("g", group(0, 0));
+        assert!(
+            validate_residency(&silent).is_ok(),
+            "zero weight with zero burst demand stays a legal no-burst group"
+        );
     }
 
     #[test]

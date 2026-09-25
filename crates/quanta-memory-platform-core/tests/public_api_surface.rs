@@ -82,9 +82,9 @@ use quanta_memory_platform_core::{
 #[cfg(feature = "live_control")]
 use quanta_memory_platform_core::{
     LadderPressureController, LiveProcessMemoryBroker, ManagedCharge, MemoryReclaimer,
-    PendingReservation, PressureController, PressureThresholds, ReclaimCandidate,
-    ReclaimGroupCandidate, ReclaimOutcome, ReclaimRequest, ReclaimRung, ReclaimTrigger,
-    ResourceGroupScheduler, WeightedResourceGroupScheduler,
+    PendingReservation, PressureController, PressureThresholds, RebuildFence, RebuildFenceStatus,
+    RebuildReceipt, ReclaimCandidate, ReclaimGroupCandidate, ReclaimOutcome, ReclaimRequest,
+    ReclaimRung, ReclaimTrigger, ResourceGroupScheduler, WeightedResourceGroupScheduler,
 };
 
 /// Names EVERY public re-export from the crate root in type position. Never
@@ -104,6 +104,9 @@ fn names_every_public_reexport() {
         LadderPressureController,
         Box<dyn PressureController>,
         PressureThresholds,
+        RebuildFence,
+        RebuildFenceStatus,
+        RebuildReceipt,
         ReclaimRung,
         WeightedResourceGroupScheduler,
         Box<dyn ResourceGroupScheduler>,

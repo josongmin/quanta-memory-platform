@@ -127,6 +127,33 @@ caller-owned interior side effects.
 
 ## Sep-26 engine remediation (`main` post-`438b869`)
 
+### Rebuild fence requires a permit (source-breaking)
+
+`begin_rebuild` now returns a non-`Clone`, epoch-bound `RebuildFence` and the
+tokenless `finish_rebuild()` method is gone: closing the fence consumes its
+permit via `RebuildFence::finish()`, which returns a `RebuildReceipt` that
+separates the fence-open transition from the deferred-authority drain
+(remaining queue depths plus an optional `drain_error`). A second
+`begin_rebuild` while a fence is live is rejected; a permit dropped without
+finishing leaves the fence observably abandoned
+(`rebuild_fence_status() -> RebuildFenceStatus`) and writes stay rejected
+until an explicit new `begin_rebuild` re-adopts it. Migration:
+
+```rust
+// Before
+broker.begin_rebuild()?;
+broker.finish_rebuild()?;
+
+// After
+let fence = broker.begin_rebuild()?;
+let receipt = fence.finish()?;   // receipt.fence_open == true
+```
+
+The testkit conformance traits grew an associated `RebuildFence` type: both
+`do_begin_rebuild` (returns the permit) and
+`do_finish_rebuild(permit)` (consumes it) now pair the window with its
+authority. Fakes use `type RebuildFence = ();`.
+
 ### `PressureThresholds` fields are private (source-breaking)
 
 `PressureThresholds` no longer accepts direct struct literals: the three

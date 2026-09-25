@@ -11,7 +11,9 @@ use quanta_memory_platform_core::{
 #[cfg(feature = "unbudgeted-stores")]
 use crate::shared::accounting::Unbudgeted;
 use crate::shared::accounting::{Budgeted, StoreAccounting};
-use crate::shared::lifecycle::{retire_client_value, BeginClose, DropTransition, StoreLifecycle};
+use crate::shared::lifecycle::{
+    retire_client_value, BeginClose, DropTransition, InFlight, StoreLifecycle,
+};
 use crate::shared::measure::{semantic_cost_v1, ByteSized, CanonicalKey, RetainedCostV1};
 
 const TOKEN_DOMAIN: &[u8] = b"qmp.prepared-publication.v1\0";
@@ -548,7 +550,11 @@ where
     ) -> Result<PreparedPublicationReceiptV1, PreparedPublicationErrorV1> {
         let _permit =
             self.lifecycle.begin_mutation().map_err(PreparedPublicationErrorV1::Storage)?;
-        let payload_key = request.payload.canonical_key();
+        // Caller-trait code (CanonicalKey/ByteSized) runs while the owned
+        // payload is guarded, so a trait panic can never unwind through a
+        // caller destructor (compound-hostile containment).
+        let mut payload_in_flight = InFlight::new(request.payload);
+        let payload_key = payload_in_flight.get().canonical_key();
         let token = derive_token(&request.identity, &payload_key)?;
         let state = self.lock_state()?;
 
@@ -585,10 +591,13 @@ where
         }
 
         let persistent_bytes = persistent_cost(request.identity.as_bytes().len())?;
-        // Only fresh tokens need measurement. Catch a client panic, release the
-        // state guard, then resume unwinding so the intact state is not poisoned.
+        // Only fresh tokens need measurement. Catch a client panic, release
+        // the state guard, then resume unwinding so the intact state is not
+        // poisoned; the in-flight guard retires the payload before that
+        // resumed unwind drops it, so a compound hostile payload cannot
+        // abort the process.
         let payload_bytes = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            request.payload.byte_size()
+            payload_in_flight.get().byte_size()
         })) {
             Ok(bytes) => bytes,
             Err(payload) => {
@@ -658,7 +667,7 @@ where
             PreparedEntry {
                 identity: identity.clone(),
                 canonical_key: payload_key,
-                payload: request.payload,
+                payload: payload_in_flight.take(),
                 active_bytes,
                 active_charge,
             },
@@ -1598,7 +1607,7 @@ mod tests {
 
             // Failed prepare (broker rebuild fence denies the reservation) charges
             // nothing and leaves the live entry untouched.
-            broker.begin_rebuild().expect("begin rebuild");
+            let rebuild_fence1 = broker.begin_rebuild().expect("begin rebuild");
             assert!(matches!(
                 service.prepare(request("j", b"")),
                 Err(PreparedPublicationErrorV1::Accounting(_))
@@ -1619,7 +1628,7 @@ mod tests {
                 (ACTIVE_PAYLOAD_BUCKET, PERSISTENT_METADATA_BUCKET, 0, LIVE_TOTAL, 2)
             );
             assert_eq!(service.resolve(receipt.token()).expect("data intact"), Vec::new());
-            broker.finish_rebuild().expect("finish rebuild");
+            rebuild_fence1.finish().expect("finish rebuild");
 
             // Orphan GC refunds only the active payload component of the collected
             // entry; its identity evidence stays behind as a metadata tombstone.
@@ -1970,7 +1979,7 @@ mod tests {
             let broker = broker(1_000_000);
             let service = charged(&broker);
             let receipt = service.prepare(request("id", b"payload")).expect("prepare");
-            broker.begin_rebuild().expect("begin rebuild");
+            let rebuild_fence2 = broker.begin_rebuild().expect("begin rebuild");
 
             let denied = service.abort(receipt.token());
             assert!(matches!(denied, Err(PreparedPublicationErrorV1::Accounting(_))));
@@ -1981,7 +1990,7 @@ mod tests {
                 live_cost("id", b"payload")
             );
 
-            broker.finish_rebuild().expect("finish rebuild");
+            rebuild_fence2.finish().expect("finish rebuild");
             assert_eq!(service.abort(receipt.token()).expect("abort"), AbortDispositionV1::Aborted);
         }
 
@@ -2004,7 +2013,7 @@ mod tests {
             let service = charged(&broker);
             let first = service.prepare(request("id-1", b"one")).expect("first");
             let second = service.prepare(request("id-2", b"two")).expect("second");
-            broker.begin_rebuild().expect("begin rebuild");
+            let rebuild_fence3 = broker.begin_rebuild().expect("begin rebuild");
 
             let denied = service.gc_orphans(&[]);
             assert!(matches!(denied, Err(PreparedPublicationErrorV1::Accounting(_))));
@@ -2023,7 +2032,7 @@ mod tests {
                 live_cost("id-1", b"one") + live_cost("id-2", b"two")
             );
 
-            broker.finish_rebuild().expect("finish rebuild");
+            rebuild_fence3.finish().expect("finish rebuild");
             assert_eq!(service.gc_orphans(&[]).expect("retry GC"), 2);
             assert_eq!(
                 broker.ledger_snapshot().expect("snapshot").total_owner_bytes(),
@@ -2080,7 +2089,7 @@ mod tests {
             let first = service.prepare(request("id-1", b"one")).expect("first");
             let second = service.prepare(request("id-2", b"two")).expect("second");
             let before = service.stats().expect("before");
-            broker.begin_rebuild().expect("begin rebuild");
+            let rebuild_fence4 = broker.begin_rebuild().expect("begin rebuild");
 
             assert!(matches!(service.close(), Err(PreparedPublicationErrorV1::Accounting(_))));
             assert_eq!(service.stats().expect("after failed close"), before);
@@ -2091,7 +2100,7 @@ mod tests {
                 live_cost("id-1", b"one") + live_cost("id-2", b"two")
             );
 
-            broker.finish_rebuild().expect("finish rebuild");
+            rebuild_fence4.finish().expect("finish rebuild");
             service.close().expect("retry close");
             assert_eq!(broker.ledger_snapshot().expect("refunded").total_owner_bytes(), 0);
         }
@@ -2110,10 +2119,14 @@ mod tests {
             }
             assert_eq!(broker.ledger_snapshot().expect("healthy drop").total_owner_bytes(), 0);
 
+            // The fence must outlive the dropped service: bind it outside
+            // the inner scope (initialized after the last prepare) so the
+            // deferred drain below owns it.
+            let rebuild_fence5;
             {
                 let service = charged(&broker);
                 service.prepare(request("id-3", b"three")).expect("third");
-                broker.begin_rebuild().expect("begin rebuild");
+                rebuild_fence5 = broker.begin_rebuild().expect("begin rebuild");
                 assert_eq!(
                     broker.ledger_snapshot().expect("before drop").total_owner_bytes(),
                     live_cost("id-3", b"three")
@@ -2123,7 +2136,7 @@ mod tests {
                 broker.ledger_snapshot().expect("deferred").total_owner_bytes(),
                 live_cost("id-3", b"three")
             );
-            broker.finish_rebuild().expect("drain deferred");
+            rebuild_fence5.finish().expect("drain deferred");
             assert_eq!(broker.ledger_snapshot().expect("drained").total_owner_bytes(), 0);
         }
 

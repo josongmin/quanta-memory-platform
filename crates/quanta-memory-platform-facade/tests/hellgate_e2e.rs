@@ -128,7 +128,7 @@ fn failed_close_during_rebuild_preserves_store_and_retries_after_fence() {
     let platform = broker(10_000_000, 1_000_000);
     let store = charged_map(&platform);
     store.insert_checked("kept".to_string(), vec![0; 200]).expect("insert");
-    platform.broker().begin_rebuild().expect("begin fence");
+    let rebuild_fence_h1 = platform.broker().begin_rebuild().expect("begin fence");
     let before = platform.broker().ledger_snapshot().expect("before");
 
     let denied = store.close();
@@ -140,7 +140,7 @@ fn failed_close_during_rebuild_preserves_store_and_retries_after_fence() {
     assert_eq!(store.get_checked(&"kept".to_string()).expect("checked read"), Some(vec![0; 200]));
     assert_eq!(store.committed_bytes().expect("counter"), map_cost("kept", 200));
 
-    platform.broker().finish_rebuild().expect("end fence");
+    rebuild_fence_h1.finish().expect("end fence");
     store.close().expect("retry close");
     assert_eq!(platform.broker().ledger_snapshot().expect("after close").total_owner_bytes(), 0);
 }
@@ -150,7 +150,7 @@ fn store_drop_during_rebuild_defers_refund_until_finish() {
     let platform = broker(10_000_000, 1_000_000);
     let store = charged_map(&platform);
     store.insert_checked("dropped".to_string(), vec![0; 321]).expect("insert");
-    platform.broker().begin_rebuild().expect("begin fence");
+    let rebuild_fence_h2 = platform.broker().begin_rebuild().expect("begin fence");
     drop(store);
 
     let fenced = platform.broker().ledger_snapshot().expect("fenced snapshot");
@@ -160,7 +160,7 @@ fn store_drop_during_rebuild_defers_refund_until_finish() {
         "rebuild must not silently zero the ledger"
     );
     assert_balanced(&fenced);
-    platform.broker().finish_rebuild().expect("drain deferred cleanup");
+    rebuild_fence_h2.finish().expect("drain deferred cleanup");
     let drained = platform.broker().ledger_snapshot().expect("drained snapshot");
     assert_eq!(drained.total_owner_bytes(), 0);
     assert_balanced(&drained);
@@ -267,7 +267,7 @@ fn rebuild_fences_charged_store_writes_then_resumes() {
     let b = broker(10_000_000, 1_000_000);
     let store = charged_map(&b);
     store.insert_checked("pre".to_string(), vec![0u8; 500]).expect("pre-rebuild insert");
-    b.broker().begin_rebuild().expect("begin rebuild");
+    let rebuild_fence_h2 = b.broker().begin_rebuild().expect("begin rebuild");
 
     let during = store.insert_checked("during".to_string(), vec![0u8; 500]);
     assert!(
@@ -280,7 +280,7 @@ fn rebuild_fences_charged_store_writes_then_resumes() {
         map_cost("pre", 500)
     );
 
-    b.broker().finish_rebuild().expect("finish rebuild");
+    rebuild_fence_h2.finish().expect("finish rebuild");
     store.insert_checked("post".to_string(), vec![0u8; 300]).expect("writes resume after rebuild");
     assert_eq!(
         b.broker().ledger_snapshot().expect("snap").total_owner_bytes(),
@@ -514,7 +514,7 @@ fn release_many_with_an_already_released_ticket_is_fail_closed() {
 fn release_many_during_rebuild_is_fail_closed() {
     let b = broker(10_000_000, 1_000_000);
     let mut charges = [committed(&b, 100), committed(&b, 200)];
-    b.broker().begin_rebuild().expect("begin rebuild");
+    let rebuild_fence_h3 = b.broker().begin_rebuild().expect("begin rebuild");
     let before = b.broker().ledger_snapshot().expect("snap");
     let denied = b.broker().release_managed_many(&mut charges);
     assert!(
@@ -527,7 +527,7 @@ fn release_many_during_rebuild_is_fail_closed() {
         "a rebuild-rejected batch strands nothing",
     );
     assert!(charges.iter().all(ManagedCharge::is_active));
-    b.broker().finish_rebuild().expect("finish rebuild");
+    rebuild_fence_h3.finish().expect("finish rebuild");
     b.broker().release_managed_many(&mut charges).expect("retry exact batch release");
     assert_eq!(b.broker().ledger_snapshot().expect("snap").total_owner_bytes(), 0);
 }

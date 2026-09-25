@@ -19,9 +19,10 @@ pub enum RetainedMapInsertOutcomeV1 {
 /// Result of an atomic insert-if-absent operation that returns the occupied
 /// value when the key already exists.
 ///
-/// The occupied value is cloned while the canonical state lock is held. This
-/// lets callers validate immutable value metadata without a split point-read
-/// and insert race.
+/// The occupied value is cloned under the store's exclusive mutation lane
+/// with the state detached from the container mutex. This lets callers
+/// validate immutable value metadata without a split point-read and insert
+/// race.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RetainedMapInsertOrExistingV1<Value> {
     Inserted,
@@ -57,7 +58,8 @@ where
     fn binding(&self) -> &StoreBindingHandle;
     fn insert_checked(&self, key: Key, value: Value) -> Result<(), StoreWriteError>;
     /// Publish only when `key` is absent; when occupied, clone and return the
-    /// existing value under the same canonical state lock.
+    /// existing value under the same exclusive mutation lane (state detached
+    /// from the container mutex).
     fn insert_if_absent_or_get_checked(
         &self,
         key: Key,
@@ -66,7 +68,7 @@ where
     where
         Value: Clone;
     /// Publish only when `key` is absent, deciding presence and mutation under
-    /// the store's canonical state lock. An `AlreadyPresent` result leaves the
+    /// the store's exclusive mutation lane. An `AlreadyPresent` result leaves the
     /// existing payload, charge, and insertion order unchanged.
     fn insert_if_absent_checked(
         &self,

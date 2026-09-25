@@ -420,8 +420,9 @@ Missing ShellCheck, Semgrep, cargo-deny, lockfile, or required source inputs
 fails closed. The Semgrep rail guards six known regression classes; it is not a
 general security certification. The GitHub Actions workflow in
 `.github/workflows/ci.yml` is manual `workflow_dispatch` only; the automatic
-repository CI is the `main`-filtered CircleCI full-extraction job (which also
-runs both public examples on the extracted source).
+repository CI is the `main`-filtered CircleCI full-extraction job, configured
+to also run both public examples on the extracted source (hosted observation
+of that example step is still pending a recorded run).
 
 The full scaling rail records source SHA/tree, toolchain, machine, repeated
 latencies and throughput, busy retries, semantic bytes, and allocator signals.

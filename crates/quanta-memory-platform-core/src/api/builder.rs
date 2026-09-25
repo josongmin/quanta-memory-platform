@@ -54,6 +54,8 @@ impl ProcessMemoryBrokerBuilder {
         Self::default()
     }
 
+    /// Replaces any previously set manifest (last call wins).
+    #[must_use]
     pub fn with_manifest(mut self, manifest: MemoryBudgetManifest) -> Self {
         self.manifest = Some(manifest);
         self
@@ -137,6 +139,10 @@ impl ProcessMemoryBrokerBuilder {
         Ok(EffectiveMemoryBudgetReport::from_resolved(execution, resolved))
     }
 
+    /// Select a preset manifest. This replaces any previously set manifest
+    /// (last call wins), so a `with_manifest` → `with_preset` sequence keeps
+    /// the preset, not the custom manifest.
+    #[must_use]
     pub fn with_preset(self, preset: MemoryPreset) -> Self {
         let manifest = MemoryBudgetManifest::for_preset(preset);
         self.with_manifest(manifest)

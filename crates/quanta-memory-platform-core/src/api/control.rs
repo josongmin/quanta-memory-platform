@@ -165,6 +165,15 @@ struct BrokerCore {
     /// instead of being silently discarded, and retried on the next
     /// `finish_rebuild` or accepted reconfigure; failures stay queued.
     deferred_pending_rollbacks: VecDeque<ReservationTicket>,
+    /// Monotonic epoch of the current rebuild fence. Only the permit minted
+    /// with the matching epoch may finish the fence; a stale or foreign
+    /// permit is rejected fail-closed.
+    rebuild_epoch: u64,
+    /// True when the owning [`RebuildFence`] was dropped without finishing:
+    /// the fence stays closed (writes rejected) and is observable through
+    /// [`LiveProcessMemoryBroker::rebuild_fence_status`]; only an explicit
+    /// new `begin_rebuild` re-adopts it.
+    rebuild_abandoned: bool,
     reclaimer: Option<Arc<dyn MemoryReclaimer>>,
     reclaim_stats: ReclaimRuntimeStats,
 }
@@ -458,6 +467,81 @@ impl Drop for ManagedCharge {
     }
 }
 
+/// Observable state of the rebuild fence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RebuildFenceStatus {
+    /// No fence: admission is open.
+    Unfenced,
+    /// One live coordinator holds the fence permit.
+    Active,
+    /// The owning permit was dropped without finishing: writes stay
+    /// rejected until an explicit new `begin_rebuild` re-adopts the fence.
+    Abandoned,
+}
+
+/// Receipt separating fence completion from deferred-authority cleanup.
+///
+/// `fence_open` reports the fence transition itself; the remaining counts and
+/// `drain_error` report the bounded-batch cleanup that runs after the fence
+/// opens. A drain error never re-closes the fence — retry cleanup by draining
+/// through the next accepted fence finish or reconfigure.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RebuildReceipt {
+    /// True when this finish committed the fence-open transition.
+    pub fence_open: bool,
+    /// Deferred pending-rollback authorities still queued after this call.
+    pub pending_rollbacks_remaining: usize,
+    /// Deferred committed-release authorities still queued after this call.
+    pub committed_releases_remaining: usize,
+    /// First error hit while draining deferred authorities, if any.
+    pub drain_error: Option<MemoryError>,
+}
+
+/// Non-Clone, epoch-bound authority over one rebuild fence.
+///
+/// Obtained from [`LiveProcessMemoryBroker::begin_rebuild`]. Dropping it
+/// without [`Self::finish`] abandons the fence closed (observable via
+/// [`LiveProcessMemoryBroker::rebuild_fence_status`]) instead of silently
+/// reopening writes; recovery is an explicit new `begin_rebuild`.
+pub struct RebuildFence {
+    broker: LiveProcessMemoryBroker,
+    epoch: u64,
+    finished: bool,
+}
+
+impl RebuildFence {
+    /// Commit the fence open and drain deferred authorities in bounded
+    /// batches. Fence completion and the cleanup outcome are reported
+    /// separately in the returned receipt.
+    pub fn finish(mut self) -> MemoryResult<RebuildReceipt> {
+        self.finished = true;
+        self.broker.finish_rebuild_epoch(self.epoch)
+    }
+
+    /// The epoch this permit authorizes.
+    #[must_use]
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+}
+
+impl Drop for RebuildFence {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.broker.abandon_rebuild_epoch(self.epoch);
+        }
+    }
+}
+
+impl std::fmt::Debug for RebuildFence {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RebuildFence")
+            .field("epoch", &self.epoch)
+            .field("finished", &self.finished)
+            .finish_non_exhaustive()
+    }
+}
+
 impl LiveProcessMemoryBroker {
     /// Build a live broker from a validated effective report. The residency
     /// policy is re-validated here so a broker can never come up on an invalid
@@ -506,6 +590,8 @@ impl LiveProcessMemoryBroker {
                 ticket_owners: BTreeMap::new(),
                 deferred_committed_releases: VecDeque::new(),
                 deferred_pending_rollbacks: VecDeque::new(),
+                rebuild_epoch: 0,
+                rebuild_abandoned: false,
                 reclaimer,
                 reclaim_stats: ReclaimRuntimeStats::default(),
             })),
@@ -710,6 +796,20 @@ impl LiveProcessMemoryBroker {
         bytes: u64,
     ) -> Result<ReservationTicket, RechargeError> {
         use crate::application::scheduler::ResourceGroupScheduler;
+
+        // Same reentry bound as a reentrant reserve: a recharge is a
+        // synchronous release+reserve+commit swap, so a callback running for
+        // this broker must not grow or shrink charges reentrantly. The old
+        // charge is untouched (OldChargePreserved).
+        let broker_identity = Arc::as_ptr(&self.inner) as usize;
+        if BrokerCallbackScope::is_active(BrokerCallbackKind::Reclaimer, broker_identity) {
+            return Err(RechargeError {
+                error: MemoryError::operation_in_progress(
+                    "reentrant recharge from this broker's memory reclaimer",
+                ),
+                recovery: RechargeRecoveryV1::OldChargePreserved,
+            });
+        }
 
         let mut core = self.lock().map_err(|error| RechargeError {
             error,
@@ -1512,6 +1612,14 @@ impl LiveProcessMemoryBroker {
     /// rebuild failure leaves every lease unchanged. An empty batch is a
     /// successful no-op.
     pub fn release_managed_many(&self, charges: &mut [ManagedCharge]) -> MemoryResult<()> {
+        // Advisory event payload only: a saturating sum so preflight failures
+        // keep reporting the batch's byte magnitude. The authoritative
+        // checked sum below still runs after the active-lease scan and can
+        // never mask an inactive lease as zero.
+        let advisory_bytes = charges
+            .iter()
+            .map(|charge| charge.bytes().unwrap_or(0))
+            .fold(0u64, u64::saturating_add);
         // Preflight with no ticket vector: an invalid batch is rejected before
         // an O(batch length) allocation. A batch larger than the live-ticket
         // cap can never be a valid active batch of this broker.
@@ -1521,7 +1629,7 @@ impl LiveProcessMemoryBroker {
                 charges.len(),
                 crate::domain::management_limits::MAX_LIVE_TICKETS_PER_BROKER
             )));
-            self.emit_result(MemoryOperation::Release, None, &result);
+            self.emit_result(MemoryOperation::Release, Some(advisory_bytes), &result);
             return result;
         }
         for charge in charges.iter() {
@@ -1529,14 +1637,14 @@ impl LiveProcessMemoryBroker {
                 let result = Err(MemoryError::InvalidState(
                     "managed charge batch contains a foreign broker lease".to_string(),
                 ));
-                self.emit_result(MemoryOperation::Release, None, &result);
+                self.emit_result(MemoryOperation::Release, Some(advisory_bytes), &result);
                 return result;
             }
             if charge.charge.is_none() {
                 let result = Err(MemoryError::InvalidState(
                     "managed charge batch contains an already released lease".to_string(),
                 ));
-                self.emit_result(MemoryOperation::Release, None, &result);
+                self.emit_result(MemoryOperation::Release, Some(advisory_bytes), &result);
                 return result;
             }
         }
@@ -1581,42 +1689,154 @@ impl LiveProcessMemoryBroker {
         Ok(core.scheduler.admits(group_name, bytes))
     }
 
-    /// Enter rebuild mode: subsequent live writes are rejected until
-    /// [`Self::finish_rebuild`].
-    pub fn begin_rebuild(&self) -> MemoryResult<()> {
+    /// Enter rebuild mode and mint the sole authority that may finish it.
+    ///
+    /// The returned [`RebuildFence`] is intentionally not `Clone` and is
+    /// bound to this broker's current rebuild epoch:
+    ///
+    /// - a second `begin_rebuild` while a live fence is held is rejected
+    ///   (one coordinator owns one fence);
+    /// - a fence left behind by a dropped permit is **abandoned**: writes
+    ///   stay rejected and the state is observable via
+    ///   [`Self::rebuild_fence_status`]; an explicit new `begin_rebuild`
+    ///   re-adopts it under a fresh epoch (deterministic recovery that
+    ///   never silently reopens writes);
+    /// - `RebuildFence::finish` verifies the epoch, so a stale or foreign
+    ///   permit cannot open another coordinator's fence.
+    pub fn begin_rebuild(&self) -> MemoryResult<RebuildFence> {
         let mut core = self.lock()?;
-        core.ledger.begin_rebuild();
-        Ok(())
+        if core.ledger.rebuild_in_progress() {
+            if !core.rebuild_abandoned {
+                return Err(MemoryError::InvalidState(
+                    "rebuild already in progress: a second live coordinator cannot open over \
+                     the active fence"
+                        .to_string(),
+                ));
+            }
+            // Explicit recovery: re-adopt the abandoned fence under a new
+            // epoch. Deferred authorities stay queued and exact.
+            core.rebuild_abandoned = false;
+        } else {
+            core.ledger.begin_rebuild();
+        }
+        core.rebuild_epoch = core
+            .rebuild_epoch
+            .checked_add(1)
+            .ok_or_else(|| MemoryError::InvalidState("rebuild epoch exhausted u64".to_string()))?;
+        let epoch = core.rebuild_epoch;
+        drop(core);
+        Ok(RebuildFence { broker: self.clone(), epoch, finished: false })
     }
 
-    pub fn finish_rebuild(&self) -> MemoryResult<()> {
+    /// Observable rebuild fence state: no fence, one live fence, or a fence
+    /// abandoned by a dropped permit (writes still rejected).
+    pub fn rebuild_fence_status(&self) -> MemoryResult<RebuildFenceStatus> {
+        let core = self.lock()?;
+        Ok(if !core.ledger.rebuild_in_progress() {
+            RebuildFenceStatus::Unfenced
+        } else if core.rebuild_abandoned {
+            RebuildFenceStatus::Abandoned
+        } else {
+            RebuildFenceStatus::Active
+        })
+    }
+
+    /// Epoch-bound fence completion used by [`RebuildFence::finish`].
+    fn finish_rebuild_epoch(&self, epoch: u64) -> MemoryResult<RebuildReceipt> {
         {
             let mut core = self.lock()?;
+            if !core.ledger.rebuild_in_progress() {
+                return Err(MemoryError::InvalidState(
+                    "no rebuild fence is active to finish".to_string(),
+                ));
+            }
+            if core.rebuild_epoch != epoch {
+                return Err(MemoryError::InvalidState(format!(
+                    "stale or foreign rebuild fence: permit epoch {epoch}, active epoch {}",
+                    core.rebuild_epoch
+                )));
+            }
             core.ledger.finish_rebuild();
+            core.rebuild_abandoned = false;
         }
-        // The existing contract opens admission before deferred committed
-        // releases are applied. Keep that ordering, but release the lock between
-        // bounded batches so a large (yet ticket-bounded) backlog cannot create
-        // one unbounded critical section. Charges remain conservatively counted
-        // until their own atomic batch succeeds.
+        // The fence is open. Drain deferred authorities in bounded batches,
+        // reporting the cleanup outcome separately from the fence transition.
+        let (pending, committed, drain_error) = self.drain_deferred_queues();
+        Ok(RebuildReceipt {
+            fence_open: true,
+            pending_rollbacks_remaining: pending,
+            committed_releases_remaining: committed,
+            drain_error,
+        })
+    }
+
+    /// Mark a dropped (unfinished) fence abandoned if it still owns the
+    /// current epoch; a stale permit must not abandon a newer coordinator's
+    /// fence.
+    fn abandon_rebuild_epoch(&self, epoch: u64) {
+        let mut core = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        if core.ledger.rebuild_in_progress() && core.rebuild_epoch == epoch {
+            core.rebuild_abandoned = true;
+        }
+    }
+
+    /// Bounded-batch drain of the deferred queues. Returns the remaining
+    /// queue depths and the first drain error, if any. A drain interrupted
+    /// by another coordinator's fence reports a distinct typed error instead
+    /// of blaming this caller's own release.
+    fn drain_deferred_queues(&self) -> (usize, usize, Option<MemoryError>) {
+        let mut drain_error: Option<MemoryError> = None;
         loop {
-            let mut core = self.lock()?;
+            let mut core = match self.lock() {
+                Ok(core) => core,
+                Err(error) => return (usize::MAX, usize::MAX, Some(error)),
+            };
+            if drain_error.is_none() && core.ledger.rebuild_in_progress() {
+                // Another coordinator re-entered a fence between our batches.
+                // The queues are preserved; report it distinctly instead of
+                // failing a release with a misleading "live release rejected".
+                drain_error = Some(MemoryError::InvalidState(
+                    "rebuild fence re-entered by another coordinator; deferred authorities \
+                     remain queued"
+                        .to_string(),
+                ));
+            }
             if core.deferred_pending_rollbacks.is_empty()
                 && core.deferred_committed_releases.is_empty()
             {
-                return Ok(());
+                return (
+                    core.deferred_pending_rollbacks.len(),
+                    core.deferred_committed_releases.len(),
+                    drain_error,
+                );
             }
             let queued_before =
                 core.deferred_pending_rollbacks.len() + core.deferred_committed_releases.len();
             let pending_resolved = Self::drain_deferred_pending_rollbacks_batch(&mut core);
-            let committed_released = Self::drain_deferred_committed_releases_batch(&mut core)?;
+            let committed_released = match Self::drain_deferred_committed_releases_batch(&mut core)
+            {
+                Ok(released) => released,
+                Err(error) => {
+                    drain_error = Some(error);
+                    return (
+                        core.deferred_pending_rollbacks.len(),
+                        core.deferred_committed_releases.len(),
+                        drain_error,
+                    );
+                }
+            };
             let queued_after =
                 core.deferred_pending_rollbacks.len() + core.deferred_committed_releases.len();
             if queued_after >= queued_before && pending_resolved == 0 && committed_released == 0 {
-                return Err(MemoryError::InvalidState(format!(
-                    "rebuild cleanup made no progress; {} deferred ticket authorities remain",
-                    queued_after
+                drain_error = Some(MemoryError::InvalidState(format!(
+                    "rebuild cleanup made no progress; {queued_after} deferred ticket \
+                     authorities remain",
                 )));
+                return (
+                    core.deferred_pending_rollbacks.len(),
+                    core.deferred_committed_releases.len(),
+                    drain_error,
+                );
             }
         }
     }
@@ -1718,6 +1938,17 @@ impl LiveProcessMemoryBroker {
             let live_tickets = live_ticket_owners.get(owner).copied().unwrap_or(0);
             if owner_used == 0 && live_tickets == 0 {
                 continue;
+            }
+            // Removing an owner's quota would silently uncap a live owner,
+            // exactly like dropping a live class from the policy; deny it
+            // symmetric with the class-drop rule.
+            if core.ledger.policy().owner_quotas.contains_key(owner)
+                && !new_policy.owner_quotas.contains_key(owner)
+            {
+                return Err(MemoryError::InvalidState(format!(
+                    "live reconfig denied: owner {owner} holds {live_tickets} live ticket(s) \
+                     ({owner_used} live bytes); removing its quota would silently uncap it"
+                )));
             }
             let current_group = current_owner_groups.get(owner);
             let next_group = new_policy.owner_groups.get(owner);
@@ -2123,14 +2354,14 @@ mod tests {
                 100_000,
             )
             .expect("reserve pending");
-        b.begin_rebuild().expect("begin rebuild");
+        let fence1 = b.begin_rebuild().expect("begin rebuild");
 
         drop(pending);
 
         let snapshot = b.ledger_snapshot().expect("snapshot");
         assert!(snapshot.rebuild_in_progress);
         assert_eq!(snapshot.total_owner_bytes(), 0);
-        b.finish_rebuild().expect("finish rebuild");
+        fence1.finish().expect("finish rebuild");
     }
 
     #[test]
@@ -2145,11 +2376,11 @@ mod tests {
                 100_000,
             )
             .expect("reserve pending");
-        b.begin_rebuild().expect("begin rebuild");
+        let fence2 = b.begin_rebuild().expect("begin rebuild");
 
         assert!(matches!(pending.commit(), Err(MemoryError::InvalidState(_))));
         assert_eq!(b.ledger_snapshot().expect("snapshot").total_owner_bytes(), 0);
-        b.finish_rebuild().expect("finish rebuild");
+        fence2.finish().expect("finish rebuild");
     }
 
     #[test]
@@ -2201,7 +2432,7 @@ mod tests {
         let b = broker();
         let count = crate::domain::management_limits::MAX_DEFERRED_TICKET_DRAIN_BATCH * 2 + 17;
         let charges: Vec<_> = (0..count).map(|_| managed_charge(&b, 0)).collect();
-        b.begin_rebuild().expect("begin rebuild");
+        let fence3 = b.begin_rebuild().expect("begin rebuild");
         drop(charges);
         assert_eq!(b.inner.lock().expect("core").deferred_committed_releases.len(), count);
 
@@ -2219,8 +2450,12 @@ mod tests {
                 core.deferred_committed_releases.len(),
                 count - crate::domain::management_limits::MAX_DEFERRED_TICKET_DRAIN_BATCH
             );
+            // Restore the closed fence so the owning permit can finish it.
+            core.ledger.begin_rebuild();
         }
-        b.finish_rebuild().expect("finish remaining batches");
+        let receipt = fence3.finish().expect("finish remaining batches");
+        assert!(receipt.fence_open);
+        assert!(receipt.drain_error.is_none());
         let snapshot = b.ledger_snapshot().expect("snapshot");
         assert_eq!(snapshot.live_ticket_count, 0);
         assert_eq!(snapshot.total_owner_bytes(), 0);
@@ -2246,7 +2481,7 @@ mod tests {
     fn managed_charge_drop_during_rebuild_defers_until_finish() {
         let b = broker();
         let charge = managed_charge(&b, 100_000);
-        b.begin_rebuild().expect("begin rebuild");
+        let fence4 = b.begin_rebuild().expect("begin rebuild");
 
         drop(charge);
 
@@ -2254,7 +2489,7 @@ mod tests {
         assert!(fenced.rebuild_in_progress);
         assert_eq!(fenced.total_owner_bytes(), 100_000, "deferred release stays conservative");
 
-        b.finish_rebuild().expect("finish drains deferred charge");
+        fence4.finish().expect("finish drains deferred charge");
         let drained = b.ledger_snapshot().expect("drained snapshot");
         assert!(!drained.rebuild_in_progress);
         assert_eq!(drained.total_owner_bytes(), 0);
@@ -2265,7 +2500,7 @@ mod tests {
         let b = broker();
         let mut charge = managed_charge(&b, 100_000);
         let id = charge.id();
-        b.begin_rebuild().expect("begin rebuild");
+        let fence5 = b.begin_rebuild().expect("begin rebuild");
 
         let error = charge.release().expect_err("release is fenced during rebuild");
         assert!(matches!(error, MemoryError::InvalidState(_)));
@@ -2273,7 +2508,7 @@ mod tests {
         assert_eq!(charge.id(), id);
         assert_eq!(b.ledger_snapshot().expect("still charged").total_owner_bytes(), 100_000);
 
-        b.finish_rebuild().expect("finish rebuild");
+        fence5.finish().expect("finish rebuild");
         charge.release().expect("retry exact release");
         assert!(!charge.is_active());
         assert_eq!(b.ledger_snapshot().expect("released").total_owner_bytes(), 0);
@@ -2284,14 +2519,14 @@ mod tests {
         let b = broker();
         let mut charges = [managed_charge(&b, 100_000), managed_charge(&b, 120_000)];
         let ids = [charges[0].id(), charges[1].id()];
-        b.begin_rebuild().expect("begin rebuild");
+        let fence6 = b.begin_rebuild().expect("begin rebuild");
 
         b.release_managed_many(&mut charges).expect_err("batch release is fenced");
         assert!(charges.iter().all(ManagedCharge::is_active));
         assert_eq!([charges[0].id(), charges[1].id()], ids);
         assert_eq!(b.ledger_snapshot().expect("unchanged").total_owner_bytes(), 220_000);
 
-        b.finish_rebuild().expect("finish rebuild");
+        fence6.finish().expect("finish rebuild");
         b.release_managed_many(&mut charges).expect("atomic retry");
         assert!(charges.iter().all(|charge| !charge.is_active()));
         assert_eq!(b.ledger_snapshot().expect("released").total_owner_bytes(), 0);
@@ -2447,7 +2682,7 @@ mod tests {
             let b = broker();
             let mut batch = [managed_charge(&b, 40), metadata_charge(&b, 60)];
             let ids = [batch[0].id(), batch[1].id()];
-            b.begin_rebuild().expect("begin rebuild");
+            let fence7 = b.begin_rebuild().expect("begin rebuild");
             assert!(matches!(
                 b.release_managed_many(&mut batch),
                 Err(MemoryError::InvalidState(_))
@@ -2458,7 +2693,7 @@ mod tests {
             assert_eq!(fenced.total_owner_bytes(), 100);
             assert_eq!(fenced.live_ticket_count, 2);
 
-            b.finish_rebuild().expect("finish rebuild");
+            fence7.finish().expect("finish rebuild");
             b.release_managed_many(&mut batch).expect("retry after fence");
             let drained = b.ledger_snapshot().expect("drained");
             assert_eq!(drained.total_owner_bytes(), 0);
@@ -2843,7 +3078,7 @@ mod tests {
                 10_000,
             )
             .expect("reserve before rebuild");
-        b.begin_rebuild().expect("begin rebuild");
+        let fence8 = b.begin_rebuild().expect("begin rebuild");
 
         let r = b.reserve(
             MemoryClass::ArtifactCache,
@@ -2863,7 +3098,7 @@ mod tests {
         );
 
         // positive pair: after finishing rebuild, writes resume.
-        b.finish_rebuild().expect("finish rebuild");
+        fence8.finish().expect("finish rebuild");
         assert!(b.commit(&t).is_ok(), "commit resumes after rebuild");
     }
 
@@ -3296,7 +3531,8 @@ mod tests {
         assert_eq!(b.classify_pressure().expect("classify"), PressureState::Soft);
 
         // Raise the global limit to 4M (and class caps to fit). Now 800k / 4M =
-        // 20% -> Normal. Caps only rise so the reconfig is legal.
+        // 20% -> Normal. Caps only rise so the reconfig is legal; owner:a's
+        // quota is carried forward because a live owner must stay capped.
         let bigger = ResidencyPolicy::new(4_000_000)
             .with_class_budget(
                 MemoryClass::ArtifactCache,
@@ -3305,6 +3541,10 @@ mod tests {
             .with_class_budget(
                 MemoryClass::EvidenceCache,
                 class_budget(0, 1_000_000, 2_000_000, false),
+            )
+            .with_owner_quota(
+                "owner:a",
+                OwnerQuota { soft_cap_bytes: 300_000, hard_cap_bytes: 500_000 },
             );
         b.try_live_reconfigure(bigger).expect("raising the global limit is legal");
 
@@ -3410,14 +3650,15 @@ mod tests {
         }
     }
 
-    // scenario C: rebuild re-entrancy. begin_rebuild twice then finish once must
-    // yield coherent state: after two begins the ledger is rebuilding and writes
-    // are rejected; a single finish clears it and writes resume. A finish when
-    // NOT rebuilding is a no-op (returns Ok, leaves the flag false) -- pinned to
-    // the actual ledger behavior.
+    // scenario C (new fence contract): the fence is a single-owner authority.
+    // A second live begin is rejected; the owning permit finishes exactly
+    // once (a second finish has no permit to consume); a dropped permit
+    // abandons the fence closed and observably, and an explicit re-begin
+    // recovers it. Supersedes the old boolean idempotence contract.
     #[test]
-    fn rebuild_is_reentrant_double_begin_single_finish_then_idle_finish_is_noop() {
+    fn rebuild_fence_is_single_owner_finishes_once_and_recovers_after_abandon() {
         let b = broker();
+        let other = b.clone();
         let t = b
             .reserve(
                 MemoryClass::ArtifactCache,
@@ -3428,32 +3669,326 @@ mod tests {
             )
             .expect("reserve before rebuild");
 
-        // Two begins: idempotent, still a single logical rebuild in progress.
-        b.begin_rebuild().expect("first begin");
-        b.begin_rebuild().expect("second begin is idempotent");
+        let fence = b.begin_rebuild().expect("first coordinator opens the fence");
+        assert_eq!(
+            other.rebuild_fence_status().expect("status"),
+            crate::api::control::RebuildFenceStatus::Active
+        );
         assert!(
-            b.ledger_snapshot().expect("snap").rebuild_in_progress,
-            "after two begins the ledger is rebuilding"
+            matches!(other.begin_rebuild(), Err(MemoryError::InvalidState(_))),
+            "a second live coordinator must not open over the first fence"
         );
         assert!(
             matches!(b.commit(&t), Err(MemoryError::InvalidState(_))),
-            "writes rejected while rebuilding (after double-begin)"
+            "writes rejected while the fence is closed"
         );
 
-        // A SINGLE finish clears the (single) rebuild -- begin is not a counter.
-        b.finish_rebuild().expect("finish");
+        let receipt = fence.finish().expect("owning coordinator finishes");
+        assert!(receipt.fence_open);
+        assert_eq!(receipt.pending_rollbacks_remaining, 0);
+        assert_eq!(receipt.committed_releases_remaining, 0);
+        assert!(receipt.drain_error.is_none());
         assert!(
             !b.ledger_snapshot().expect("snap").rebuild_in_progress,
-            "one finish clears the rebuild flag set by two begins"
+            "the owning finish reopens writes"
         );
-        assert!(b.commit(&t).is_ok(), "writes resume after the single finish");
+        assert!(b.commit(&t).is_ok(), "writes resume after the finish");
 
-        // Finishing again while NOT rebuilding is a no-op: Ok, flag stays false.
-        b.finish_rebuild().expect("idle finish is a no-op, not an error");
-        assert!(
-            !b.ledger_snapshot().expect("snap").rebuild_in_progress,
-            "idle finish leaves the flag false"
+        // Abandonment: a dropped unfinished permit leaves the fence closed
+        // and observably abandoned; writes stay rejected; an explicit
+        // re-begin recovers it and finishes cleanly.
+        let abandoned = b.begin_rebuild().expect("open a fence to abandon");
+        drop(abandoned);
+        assert_eq!(
+            b.rebuild_fence_status().expect("status"),
+            crate::api::control::RebuildFenceStatus::Abandoned
         );
+        assert!(
+            matches!(
+                b.reserve(
+                    MemoryClass::ArtifactCache,
+                    "owner:a".to_string(),
+                    MemoryContextKind::Request,
+                    ChargeKind::RetainedPayload,
+                    1,
+                ),
+                Err(MemoryError::InvalidState(_))
+            ),
+            "an abandoned fence still rejects writes"
+        );
+        let recovered = b.begin_rebuild().expect("explicit re-adoption recovers the fence");
+        let receipt = recovered.finish().expect("recovered fence finishes");
+        assert!(receipt.fence_open);
+        assert!(!b.ledger_snapshot().expect("snap").rebuild_in_progress);
+    }
+
+    // scenario C (authority hardening): the rebuild fence must have ONE owner.
+    // A second broker clone must not be able to begin over a live fence, and
+    // the tokenless finish path is structurally gone: no public API lets a
+    // clone open another coordinator's fence.
+    #[test]
+    fn rebuild_fence_rejects_foreign_clone_finish_and_second_live_begin() {
+        let b = broker();
+        let other = b.clone();
+        let fence = b.begin_rebuild().expect("first coordinator opens the fence");
+
+        assert!(
+            matches!(other.begin_rebuild(), Err(MemoryError::InvalidState(_))),
+            "a second live coordinator must not open over the first fence"
+        );
+        assert_eq!(
+            other.rebuild_fence_status().expect("status"),
+            crate::api::control::RebuildFenceStatus::Active,
+            "the rejected foreign begin leaves the fence closed and owned"
+        );
+        assert!(
+            b.ledger_snapshot().expect("snap").rebuild_in_progress,
+            "the rejected foreign calls must leave the fence closed"
+        );
+        fence.finish().expect("owning coordinator finishes");
+        assert!(!b.ledger_snapshot().expect("snap").rebuild_in_progress);
+    }
+
+    // scenario C (fence gates the slow path): a capacity breach detected
+    // before the rebuild fence must NOT run the host reclaim callback or be
+    // reported as a terminal Capacity denial while the fence is active. The
+    // fence is a non-capacity refusal no callback can cure, so it wins the
+    // preflight chain.
+    #[test]
+    fn rebuild_fence_gates_reclaim_slow_path_before_capacity_breaches() {
+        use crate::ports::reclaim::ReclaimOutcome;
+
+        struct CountingReclaimer {
+            requests: std::sync::Mutex<Vec<ReclaimRequest>>,
+        }
+
+        impl MemoryReclaimer for CountingReclaimer {
+            fn reclaim(&self, request: &ReclaimRequest) -> MemoryResult<ReclaimOutcome> {
+                self.requests.lock().expect("requests").push(request.clone());
+                Ok(ReclaimOutcome { reclaimed_bytes: 0 })
+            }
+        }
+
+        let group = ResourceGroup {
+            reserved_bytes: 0,
+            soft_cap_bytes: 900,
+            hard_cap_bytes: 900,
+            burst_percent: 0,
+            reclaim_priority: ReclaimPriority::Normal,
+            admission_weight: 1,
+        };
+        let residency = ResidencyPolicy::new(1_000_000)
+            .with_class_budget(
+                MemoryClass::ArtifactCache,
+                class_budget(0, 1_000_000, 1_000_000, false),
+            )
+            .with_resource_group("g", group)
+            .with_owner_group("owner:g", "g");
+        let reclaimer = Arc::new(CountingReclaimer { requests: std::sync::Mutex::new(Vec::new()) });
+        let b = LiveProcessMemoryBroker::from_report_with_reclaimer(
+            report_with(residency),
+            Some(reclaimer.clone() as Arc<dyn MemoryReclaimer>),
+        )
+        .expect("broker");
+
+        let filling = managed_charge_owner(&b, "owner:g", 900).expect("fill the group exactly");
+        let fence12 = b.begin_rebuild().expect("begin rebuild");
+
+        // The group is full AND the fence is closed: the fence must win, so
+        // no host callback fires and the denial is a typed rebuild refusal.
+        let denied = b.reserve_managed_charge(
+            MemoryClass::ArtifactCache,
+            "owner:g".to_string(),
+            MemoryContextKind::Request,
+            ChargeKind::RetainedPayload,
+            10,
+        );
+        assert!(
+            matches!(denied, Err(MemoryError::InvalidState(_))),
+            "a closed rebuild fence must surface as InvalidState, got {denied:?}"
+        );
+        assert!(
+            reclaimer.requests.lock().expect("requests").is_empty(),
+            "no reclaim callback may run while the fence is closed"
+        );
+        let stats = b.reclaim_runtime_stats().expect("stats");
+        assert_eq!(stats.attempts, 0, "no reclaim attempt during the fence");
+        assert!(
+            stats.blocked_denials >= 1,
+            "the fence denial is blocked (recoverable), not terminal"
+        );
+
+        fence12.finish().expect("finish rebuild");
+        // After the fence opens, the same group breach takes the normal slow
+        // path with exactly one bounded callback.
+        let slow = b.reserve_managed_charge(
+            MemoryClass::ArtifactCache,
+            "owner:g".to_string(),
+            MemoryContextKind::Request,
+            ChargeKind::RetainedPayload,
+            10,
+        );
+        assert!(
+            matches!(slow, Err(MemoryError::Capacity(_))),
+            "post-fence group breach is an ordinary Capacity denial, got {slow:?}"
+        );
+        assert_eq!(reclaimer.requests.lock().expect("requests").len(), 1);
+        drop(filling);
+        sep23_assert_fully_drained(&b);
+    }
+
+    // Live reconfigure must not silently uncap an owner: removing an owner's
+    // quota while that owner holds live bytes or tickets is denied, exactly
+    // like dropping a live class from the policy.
+    #[test]
+    fn live_reconfig_denies_removing_a_quota_while_the_owner_holds_authority() {
+        let quota_policy = ResidencyPolicy::new(1_000_000)
+            .with_class_budget(
+                MemoryClass::ArtifactCache,
+                class_budget(0, 1_000_000, 1_000_000, false),
+            )
+            .with_owner_quota(
+                "owner:q",
+                crate::domain::policy::OwnerQuota { soft_cap_bytes: 5_000, hard_cap_bytes: 5_000 },
+            );
+        let b = LiveProcessMemoryBroker::from_report(report_with(quota_policy.clone()))
+            .expect("broker");
+        let live =
+            managed_charge_owner(&b, "owner:q", 800).expect("owner holds live bytes under quota");
+
+        // Removing the quota would silently uncap a live owner.
+        let mut uncap = quota_policy.clone();
+        uncap.owner_quotas.remove("owner:q");
+        let denied = b.try_live_reconfigure(uncap);
+        assert!(
+            matches!(denied, Err(MemoryError::InvalidState(_))),
+            "quota removal under live authority must be denied, got {denied:?}"
+        );
+        assert_eq!(
+            b.ledger_snapshot().expect("unchanged").total_owner_bytes(),
+            800,
+            "the denied reconfigure leaves the ledger untouched"
+        );
+
+        // Retaining (even lowering within live usage) or raising the quota
+        // stays a legal reconfiguration.
+        let mut narrowed = quota_policy;
+        narrowed.owner_quotas.insert(
+            "owner:q".to_string(),
+            crate::domain::policy::OwnerQuota { soft_cap_bytes: 800, hard_cap_bytes: 1_000 },
+        );
+        b.try_live_reconfigure(narrowed).expect("retained quota reconfigures legally");
+
+        drop(live);
+        sep23_assert_fully_drained(&b);
+    }
+
+    /// [`managed_charge`](self::managed_charge) with a caller-selected owner.
+    fn managed_charge_owner(
+        broker: &LiveProcessMemoryBroker,
+        owner: &str,
+        bytes: u64,
+    ) -> MemoryResult<ManagedCharge> {
+        broker.reserve_managed_charge(
+            MemoryClass::ArtifactCache,
+            owner.to_string(),
+            MemoryContextKind::Request,
+            ChargeKind::RetainedPayload,
+            bytes,
+        )
+    }
+
+    // The port contract bounds reentrant mutation from this broker's own
+    // reclaimer callback: a synchronous reserve fails with
+    // OperationInProgress. A reentrant recharge is the same synchronous
+    // release+reserve+commit swap and must be bounded identically.
+    #[test]
+    fn reentrant_recharge_from_reclaimer_callback_is_bounded_and_typed() {
+        use crate::ports::reclaim::ReclaimOutcome;
+        use std::sync::OnceLock;
+
+        type ChargeHolder = Arc<std::sync::Mutex<Option<ManagedCharge>>>;
+
+        struct RechargingReclaimer {
+            charge: OnceLock<ChargeHolder>,
+            outcomes: std::sync::Mutex<Vec<Result<(), ManagedChargeRechargeError>>>,
+        }
+
+        impl MemoryReclaimer for RechargingReclaimer {
+            fn reclaim(&self, _request: &ReclaimRequest) -> MemoryResult<ReclaimOutcome> {
+                let holder = self.charge.get().expect("charge registered before use");
+                if let Some(charge) = holder.lock().expect("charge").as_mut() {
+                    // Same-size swap: admissible on its own, so only the
+                    // reentry bound can reject it.
+                    let bytes = charge.bytes().expect("live charge reports bytes");
+                    let outcome = charge.recharge(
+                        MemoryClass::ArtifactCache,
+                        "owner:g".to_string(),
+                        MemoryContextKind::Request,
+                        ChargeKind::RetainedPayload,
+                        bytes,
+                    );
+                    self.outcomes.lock().expect("outcomes").push(outcome);
+                }
+                Ok(ReclaimOutcome { reclaimed_bytes: 0 })
+            }
+        }
+
+        let group = ResourceGroup {
+            reserved_bytes: 0,
+            soft_cap_bytes: 900,
+            hard_cap_bytes: 900,
+            burst_percent: 0,
+            reclaim_priority: ReclaimPriority::Normal,
+            admission_weight: 1,
+        };
+        let residency = ResidencyPolicy::new(1_000_000)
+            .with_class_budget(
+                MemoryClass::ArtifactCache,
+                class_budget(0, 1_000_000, 1_000_000, false),
+            )
+            .with_resource_group("g", group)
+            .with_owner_group("owner:g", "g");
+        let reclaimer = Arc::new(RechargingReclaimer {
+            charge: OnceLock::new(),
+            outcomes: std::sync::Mutex::new(Vec::new()),
+        });
+        let b = LiveProcessMemoryBroker::from_report_with_reclaimer(
+            report_with(residency),
+            Some(reclaimer.clone() as Arc<dyn MemoryReclaimer>),
+        )
+        .expect("broker");
+
+        let holder: ChargeHolder = Arc::new(std::sync::Mutex::new(Some(
+            managed_charge_owner(&b, "owner:g", 900).expect("fill the group"),
+        )));
+        assert!(reclaimer.charge.set(Arc::clone(&holder)).is_ok());
+
+        // The full group triggers the callback; the nested recharge must be
+        // rejected by the reentry bound with the charge byte-identical.
+        let denied = managed_charge_owner(&b, "owner:g", 10);
+        assert!(
+            matches!(denied, Err(MemoryError::Capacity(_))),
+            "outer admission stays an ordinary Capacity denial, got {denied:?}"
+        );
+        let outcomes = reclaimer.outcomes.lock().expect("outcomes");
+        assert_eq!(outcomes.len(), 1, "exactly one callback with one nested recharge");
+        assert!(
+            matches!(
+                &outcomes[0],
+                Err(ManagedChargeRechargeError { error: MemoryError::OperationInProgress(_), .. })
+            ),
+            "reentrant recharge must be typed OperationInProgress, got {:?}",
+            outcomes[0]
+        );
+        drop(outcomes);
+        {
+            let mut guard = holder.lock().expect("charge");
+            let charge = guard.as_mut().expect("charge preserved");
+            assert_eq!(charge.bytes(), Some(900), "the bounded recharge never mutated the lease");
+        }
+        drop(holder.lock().expect("charge").take());
+        sep23_assert_fully_drained(&b);
     }
 
     // scenario C (IMPL): the ProcessMemoryBroker::effective_report trait impl
@@ -3823,14 +4358,14 @@ mod tests {
             .scratch()
             .reserve_scratch_scope(&context, ScratchRequest::new("temporary", 100))
             .expect("fill capacity");
-        b.begin_rebuild().expect("begin rebuild");
+        let fence13 = b.begin_rebuild().expect("begin rebuild");
 
         drop(reservation);
 
         let snapshot = b.ledger_snapshot().expect("snapshot");
         assert!(snapshot.rebuild_in_progress);
         assert_eq!(snapshot.total_owner_bytes(), 0);
-        b.finish_rebuild().expect("finish rebuild");
+        fence13.finish().expect("finish rebuild");
     }
 
     #[test]
@@ -4157,7 +4692,7 @@ mod tests {
     #[test]
     fn reserve_committed_during_rebuild_is_fail_closed_no_strand() {
         let b = broker();
-        b.begin_rebuild().expect("begin rebuild");
+        let _fence14 = b.begin_rebuild().expect("begin rebuild");
         let before = b.ledger_snapshot().expect("snap").total_owner_bytes();
         let denied = b.reserve_committed(
             MemoryClass::ArtifactCache,
@@ -4331,7 +4866,7 @@ mod tests {
                 100_000,
             )
             .expect("charge old");
-        b.begin_rebuild().expect("begin rebuild");
+        let fence15 = b.begin_rebuild().expect("begin rebuild");
         let err = b
             .recharge(
                 &old,
@@ -4350,7 +4885,7 @@ mod tests {
             "rebuild recharge strands nothing and leaves the old charge intact"
         );
         // After rebuild the ORIGINAL ticket is still valid.
-        b.finish_rebuild().expect("finish");
+        fence15.finish().expect("finish");
         b.release(&old).expect("original ticket still valid after rebuild");
         assert_eq!(b.ledger_snapshot().expect("snap").total_owner_bytes(), 0);
     }
@@ -4629,6 +5164,9 @@ mod tests {
             )
             .expect("reserve before poison");
         let report_before = <LiveProcessMemoryBroker as ProcessMemoryBroker>::effective_report(&b);
+        // Acquire the fence BEFORE poisoning so its finish exercises the
+        // poisoned-lock path (a fence cannot be minted after the poison).
+        let pre_fence = b.begin_rebuild().expect("fence acquired before poison");
         poison_broker_lock(&b);
 
         assert!(matches!(
@@ -4644,7 +5182,10 @@ mod tests {
         assert!(matches!(b.commit(&ticket), Err(MemoryError::Poisoned(_))));
         assert!(matches!(b.release(&ticket), Err(MemoryError::Poisoned(_))));
         assert!(matches!(b.begin_rebuild(), Err(MemoryError::Poisoned(_))));
-        assert!(matches!(b.finish_rebuild(), Err(MemoryError::Poisoned(_))));
+        assert!(
+            matches!(pre_fence.finish(), Err(MemoryError::Poisoned(_))),
+            "finishing a fence over a poisoned broker lock fails closed"
+        );
         assert!(matches!(
             b.try_live_reconfigure(ResidencyPolicy::new(2_000_000)),
             Err(MemoryError::Poisoned(_))
@@ -6070,11 +6611,11 @@ mod tests {
     fn sep23_fup007_zero_byte_committed_rebuild_fence_drop_drains_on_finish() {
         let b = sep23_grouped_broker();
         let charge = sep23_zero_committed(&b, "owner:g");
-        b.begin_rebuild().expect("begin rebuild");
+        let fence16 = b.begin_rebuild().expect("begin rebuild");
         drop(charge);
         // Under the fence the exact ticket is deferred, still charged.
         assert_eq!(b.ledger_snapshot().expect("fenced").live_ticket_count, 1);
-        b.finish_rebuild().expect("finish drains the deferred zero-byte release");
+        fence16.finish().expect("finish drains the deferred zero-byte release");
         sep23_assert_fully_drained(&b);
     }
 
@@ -6574,7 +7115,7 @@ mod tests {
         assert_eq!(b.reclaim_runtime_stats().expect("stats").blocked_denials, 1);
         assert!(reclaimer.requests.lock().expect("requests").is_empty());
 
-        b.begin_rebuild().expect("begin rebuild");
+        let fence17 = b.begin_rebuild().expect("begin rebuild");
         let fenced = b.reserve(
             MemoryClass::ArtifactCache,
             "owner:plain".to_string(),
@@ -6588,7 +7129,7 @@ mod tests {
         );
         assert_eq!(b.reclaim_runtime_stats().expect("stats").blocked_denials, 2);
         assert!(reclaimer.requests.lock().expect("requests").is_empty());
-        b.finish_rebuild().expect("finish rebuild");
+        fence17.finish().expect("finish rebuild");
         sep23_assert_fully_drained(&b);
     }
 
@@ -7095,12 +7636,13 @@ mod tests {
             assert_eq!(core.deferred_pending_rollbacks.len(), 1, "drain preserves failures");
             assert_eq!(core.deferred_pending_rollbacks.front().unwrap().id(), foreign_id);
         }
-        b.begin_rebuild().expect("begin rebuild");
-        assert!(b.finish_rebuild().is_err(), "stuck cleanup is surfaced");
+        let fence18 = b.begin_rebuild().expect("begin rebuild");
+        let receipt = fence18.finish().expect("the fence opens even when cleanup is stuck");
+        assert!(receipt.drain_error.is_some(), "stuck cleanup is surfaced as a drain error");
         assert_eq!(
             b.inner.lock().expect("core").deferred_pending_rollbacks.len(),
             1,
-            "finish_rebuild keeps the failing ticket queued"
+            "the finish receipt keeps the failing ticket queued"
         );
         assert_eq!(b.ledger_snapshot().expect("snapshot"), pristine, "drain mutates nothing");
         assert_eq!(b.ledger_snapshot().expect("snapshot").live_ticket_count, 0);
@@ -7135,9 +7677,9 @@ mod tests {
         let foreign = sep23_audit_seed_deferred_foreign_ticket();
         let foreign_id = foreign.id();
         b.inner.lock().expect("core").deferred_committed_releases.push_back(foreign);
-        b.begin_rebuild().expect("begin rebuild");
-        let drained = b.finish_rebuild();
-        assert!(drained.is_err(), "a still-failing batch drain surfaces its error");
+        let fence19 = b.begin_rebuild().expect("begin rebuild");
+        let drained = fence19.finish().expect("the fence opens before the failing batch");
+        assert!(drained.drain_error.is_some(), "a still-failing batch drain surfaces its error");
         let core = b.inner.lock().expect("core");
         assert_eq!(core.deferred_committed_releases.len(), 1, "whole batch restored");
         assert_eq!(core.deferred_committed_releases.front().unwrap().id(), foreign_id);
@@ -7648,7 +8190,7 @@ mod tests {
             for step in 0..500u32 {
                 if step % 100 == 99 {
                     // Rebuild-fence agreement inside the evolving state.
-                    broker.begin_rebuild().expect("begin rebuild");
+                    let fence20 = broker.begin_rebuild().expect("begin rebuild");
                     let class = CLASSES[rng.below(5) as usize].clone();
                     let owner = OWNERS[rng.below(3) as usize].to_string();
                     let core = broker.inner.lock().expect("core");
@@ -7684,7 +8226,7 @@ mod tests {
                         )),
                         "shape {shape} step {step}: fenced attempt matches"
                     );
-                    broker.finish_rebuild().expect("finish rebuild");
+                    fence20.finish().expect("finish rebuild");
                     continue;
                 }
                 let class = CLASSES[rng.below(5) as usize].clone();

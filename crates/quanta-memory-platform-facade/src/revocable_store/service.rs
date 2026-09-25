@@ -4176,7 +4176,7 @@ mod tests {
         let store = store_with_broker(&broker);
         store.insert_checked("a".into(), vec![0; 4]).expect("a");
         store.insert_checked("b".into(), vec![0; 6]).expect("b");
-        broker.begin_rebuild().expect("begin rebuild");
+        let rebuild_fence1 = broker.begin_rebuild().expect("begin rebuild");
 
         assert!(matches!(store.close(), Err(MemoryError::InvalidState(_))));
         assert_eq!(store.stats().expect("restored stats").item_count, 2);
@@ -4184,7 +4184,7 @@ mod tests {
         assert_eq!(store.committed_bytes().expect("restored bytes"), expected);
         assert_eq!(broker.ledger_snapshot().expect("ledger").total_owner_bytes(), expected);
 
-        broker.finish_rebuild().expect("finish rebuild");
+        rebuild_fence1.finish().expect("finish rebuild");
         assert_eq!(store.reclaim_one().expect("fifo").expect("entry").0, "a");
         store.close().expect("retry close");
         assert_eq!(broker.ledger_snapshot().expect("ledger").total_owner_bytes(), 0);
@@ -4197,13 +4197,13 @@ mod tests {
         for (key, bytes) in [("a", 4), ("b", 4), ("c", 4)] {
             store.insert_checked(key.into(), vec![0; bytes]).expect("insert");
         }
-        broker.begin_rebuild().expect("begin rebuild");
+        let rebuild_fence2 = broker.begin_rebuild().expect("begin rebuild");
         assert!(matches!(store.reclaim_until(5), Err(MemoryError::InvalidState(_))));
         assert_eq!(store.stats().expect("stats").item_count, 3);
         let expected = 3 * expected_entry_cost("a", 4);
         assert_eq!(store.committed_bytes().expect("bytes"), expected);
         assert_eq!(broker.ledger_snapshot().expect("ledger").total_owner_bytes(), expected);
-        broker.finish_rebuild().expect("finish rebuild");
+        rebuild_fence2.finish().expect("finish rebuild");
         assert_eq!(store.reclaim_one().expect("fifo").expect("entry").0, "a");
     }
 
@@ -4213,13 +4213,13 @@ mod tests {
         let store = store_with_broker(&broker);
         store.insert_checked("a".into(), vec![0; 4]).expect("a");
         store.insert_checked("b".into(), vec![0; 6]).expect("b");
-        broker.begin_rebuild().expect("begin rebuild");
+        let rebuild_fence3 = broker.begin_rebuild().expect("begin rebuild");
         assert!(matches!(store.reclaim_one(), Err(MemoryError::InvalidState(_))));
         assert_eq!(store.stats().expect("stats").item_count, 2);
         let expected = expected_entry_cost("a", 4) + expected_entry_cost("b", 6);
         assert_eq!(store.committed_bytes().expect("bytes"), expected);
         assert_eq!(broker.ledger_snapshot().expect("ledger").total_owner_bytes(), expected);
-        broker.finish_rebuild().expect("finish rebuild");
+        rebuild_fence3.finish().expect("finish rebuild");
     }
 
     #[test]
@@ -4229,13 +4229,13 @@ mod tests {
         for key in ["a", "b", "c"] {
             store.insert_checked(key.into(), vec![0; 4]).expect("insert");
         }
-        broker.begin_rebuild().expect("begin rebuild");
+        let rebuild_fence4 = broker.begin_rebuild().expect("begin rebuild");
         assert!(matches!(store.reclaim_until(5), Err(MemoryError::InvalidState(_))));
         assert_eq!(store.stats().expect("stats").item_count, 3);
         let expected = 3 * expected_entry_cost("a", 4);
         assert_eq!(store.committed_bytes().expect("bytes"), expected);
         assert_eq!(broker.ledger_snapshot().expect("ledger").total_owner_bytes(), expected);
-        broker.finish_rebuild().expect("finish rebuild");
+        rebuild_fence4.finish().expect("finish rebuild");
     }
 
     #[test]
@@ -4257,13 +4257,13 @@ mod tests {
         let broker = live_broker(1_000_000);
         let store = store_with_broker(&broker);
         store.insert_checked("live".into(), vec![0; 9]).expect("insert");
-        broker.begin_rebuild().expect("begin rebuild");
+        let rebuild_fence5 = broker.begin_rebuild().expect("begin rebuild");
         drop(store);
         assert_eq!(
             broker.ledger_snapshot().expect("conservative ledger").total_owner_bytes(),
             expected_entry_cost("live", 9)
         );
-        broker.finish_rebuild().expect("finish and drain");
+        rebuild_fence5.finish().expect("finish and drain");
         assert_eq!(broker.ledger_snapshot().expect("ledger").total_owner_bytes(), 0);
     }
 

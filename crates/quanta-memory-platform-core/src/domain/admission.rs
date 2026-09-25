@@ -667,11 +667,19 @@ pub(crate) fn check_execution_scratch(
     Ok(())
 }
 
-/// Evaluate the full admission chain once, in exact attempt order:
-/// group admission, non-headroom floor, execution scratch, rebuild fence,
-/// live-ticket count, ledger postimage, ticket ID space.
+/// Evaluate the full admission chain once, in exact attempt order: rebuild
+/// fence, group admission, non-headroom floor, execution scratch, live-ticket
+/// count, ledger postimage, ticket ID space.
+///
+/// The fence is checked first because it is a non-capacity refusal no reclaim
+/// callback can cure: letting a capacity breach win would run the host
+/// callback mid-fence and misreport the fence denial as a terminal Capacity
+/// denial.
 fn evaluate_chain(inputs: &PreflightInputs) -> Result<(), AdmissionFailure> {
     let request = &inputs.request;
+    if inputs.rebuild_in_progress {
+        return Err(AdmissionFailure::Block(AdmissionBlock::RebuildInProgress));
+    }
     if let Some(group) = inputs.owner_group {
         // The chain needs the structured breach on denial, so it materializes
         // here; pure boolean probes (`admits`) skip `into_breach` instead.
@@ -723,9 +731,6 @@ fn evaluate_chain(inputs: &PreflightInputs) -> Result<(), AdmissionFailure> {
         request.kind,
         request.bytes,
     )?;
-    if inputs.rebuild_in_progress {
-        return Err(AdmissionFailure::Block(AdmissionBlock::RebuildInProgress));
-    }
     if inputs.live_ticket_limit_reached {
         let limit = crate::domain::management_limits::MAX_LIVE_TICKETS_PER_BROKER as u64;
         return Err(AdmissionFailure::Breach(LimitBreach::new(

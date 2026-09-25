@@ -80,11 +80,15 @@ impl MemoryPlatformBuilder {
         Self::default()
     }
 
+    /// Replaces any previously set manifest (last call wins).
+    #[must_use]
     pub fn with_manifest(mut self, manifest: MemoryBudgetManifest) -> Self {
         self.inner = self.inner.with_manifest(manifest);
         self
     }
 
+    /// Select a preset manifest; replaces any previously set manifest.
+    #[must_use]
     pub fn with_preset(mut self, preset: MemoryPreset) -> Self {
         self.inner = self.inner.with_preset(preset);
         self
@@ -527,6 +531,10 @@ impl<Stage, Commit, Published> PublishPipelineBuilder<Stage, Commit, Published> 
         Published: From<Stage>,
     {
         let binding = self.binding.ok_or_else(missing_binding)?;
+        #[allow(
+            deprecated,
+            reason = "legacy convenience kept until the transition trait is removed"
+        )]
         Ok(SimplePublishPipeline::new(binding))
     }
 }

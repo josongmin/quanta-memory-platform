@@ -1,9 +1,60 @@
 # Changelog
 
+## Unreleased - 2026-09-26 (round 1 hardening)
+
+- Compound hostile caller containment (P0): a caller type pairing a
+  panicking trait (Hash/Eq/Ord/Clone/ByteSized/CanonicalKey) with a
+  panicking Drop can no longer turn a store mutation unwind into a process
+  abort. New `InFlight` guard (lifecycle.rs); retained-map insert/remove now
+  probe with borrowed keys and insert via precomputed hashes; transcript
+  append, prepared publication, and payload publication guard their in-flight
+  caller values. The two std-BTreeMap insertion points for new transcript
+  sessions/message evidence are a documented residual. Child-process
+  regressions: `compound_hostile_{remove,insert}_panic_cannot_abort_process`,
+  `compound_hostile_session_ord_panic_cannot_abort_append`.
+- Rebuild fence gates the admission slow path (P2): the fence check now runs
+  first in the admission chain, so a capacity breach during a fence can no
+  longer run the host reclaim callback or be misreported as a terminal
+  Capacity denial. Regression: `rebuild_fence_gates_reclaim_slow_path_before_capacity_breaches`.
+- Rebuild fence is permit-owned (ENG-03, source-breaking): see MIGRATION.md —
+  `RebuildFence`/`RebuildReceipt`/`RebuildFenceStatus`, second-begin
+  rejection, observable abandoned fences with explicit re-adoption, and a
+  drain receipt that distinguishes fence completion from deferred cleanup
+  (including a distinct error for a fence re-entered by another coordinator).
+- Payload-store digest randomization (P2): canonical/reference digests use a
+  per-store `RandomState` instead of fixed-key `DefaultHasher`, so
+  attacker-chosen keys cannot be ground into one index bucket.
+  Regression: `canonical_digests_are_randomized_per_store_seed`.
+- Policy-map cardinality caps (ENG-05 validation half, fail-closed):
+  resource groups ≤ 256, owner-group mappings ≤ 4,096, owner quotas ≤ 4,096;
+  shared burst pool ≤ global hard limit; zero admission weight with positive
+  burst demand rejected. Regression:
+  `validate_rejects_policy_map_cardinality_above_the_caps` and companions.
+- Provenance authority (P2): build-time override layers claiming
+  `OverrideSource::RuntimeReconfigure` are rejected — that provenance is
+  minted only by an accepted live policy replacement.
+- Reentrant recharge bounded (P3): `recharge` from this broker's own
+  reclaimer callback now fails with `OperationInProgress` like a reentrant
+  reserve. Regression: `reentrant_recharge_from_reclaimer_callback_is_bounded_and_typed`.
+- Live reconfigure cannot silently uncap an owner (P3): removing an owner's
+  quota while the owner holds live bytes or tickets is denied, symmetric
+  with the live-class rule. Regression:
+  `live_reconfig_denies_removing_a_quota_while_the_owner_holds_authority`.
+- Ledger snapshot totals document their panics on forged snapshots (P3) with
+  a `#[should_panic]` oracle; `release_managed_many` preflight failures keep
+  reporting the batch's advisory byte magnitude in events.
+- Legacy `SimplePublishPipeline` constructors and `published_count` are
+  `#[deprecated]` in favor of the prepared-publication service.
+- CI contract test hardened: extraction-subshell nesting is asserted for the
+  example commands (dedented fixtures must fail) and the dispatch-only
+  GitHub workflow's mirrored example commands are gated `--locked`.
+
 ## Unreleased - 2026-09-26
 
-- Store read boundary (ENG-01): every facade public read now runs through
-  one owned `StoreLifecycle::with_read_state` boundary (lifecycle preflight,
+- Store read boundary (ENG-01): every public read of the four
+  caller-trait-bearing facade stores (payload, retained map, transcript,
+  prepared publication) now runs through one owned
+  `StoreLifecycle::with_read_state` boundary (lifecycle preflight,
   nonblocking state lock, unwind containment), so a caller-trait panic in a
   read such as transcript `session_bytes` can no longer poison an intact
   store. Regression: `session_bytes_ord_panic_preserves_store_and_ledger`.

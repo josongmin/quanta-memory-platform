@@ -496,8 +496,9 @@ where
 
     let fence = InvariantAssertion::new(ContractFamily::RebuildWriteFence, "rebuild_fences_writes");
     let begin = target.do_begin_rebuild();
-    verdicts.push(fence.assert_that(begin.is_ok(), format!("begin_rebuild={begin:?}")));
-    if begin.is_ok() {
+    let begin_ok = begin.is_ok();
+    verdicts.push(fence.assert_that(begin_ok, format!("begin_rebuild_ok={begin_ok}")));
+    if let Ok(rebuild_permit) = begin {
         let before_denied = target.view();
         let during = target.do_reserve(0, owner_a, ChargeAxis::RetainedPayload, 1);
         verdicts.push(fence.assert_that(
@@ -518,7 +519,7 @@ where
                 "denied reserve during rebuild mutated accounting: before={before_denied:?} after={after_denied:?}"
             ),
         ));
-        let finish = target.do_finish_rebuild();
+        let finish = target.do_finish_rebuild(rebuild_permit);
         verdicts.push(fence.assert_that(finish.is_ok(), format!("finish_rebuild={finish:?}")));
         let after = target.do_reserve(0, owner_a, ChargeAxis::RetainedPayload, 1);
         let after_ok = after.is_ok();
@@ -692,13 +693,17 @@ pub fn run_facade_store_suite(kit: &MemoryTestKit) -> Vec<AssertionVerdict> {
 /// private accounting or implementation state.
 #[cfg(feature = "fixtures")]
 pub trait StoreLifecycleConformanceTarget {
+    /// Permit coupling the rebuild window's open and close (production:
+    /// the non-Clone epoch fence; fixtures: `()`).
+    type RebuildFence;
+
     fn populate(&mut self) -> Result<(), String>;
     fn retained_bytes(&self) -> Result<u64, String>;
     fn ledger_bytes(&self) -> Result<u64, String>;
     fn close(&mut self) -> Result<(), String>;
     fn post_close_mutation_is_typed_closed(&mut self) -> bool;
-    fn begin_rebuild(&mut self) -> Result<(), String>;
-    fn finish_rebuild(&mut self) -> Result<(), String>;
+    fn begin_rebuild(&mut self) -> Result<Self::RebuildFence, String>;
+    fn finish_rebuild(&mut self, fence: Self::RebuildFence) -> Result<(), String>;
     fn drop_store(&mut self);
 }
 
@@ -736,10 +741,10 @@ where
         let mut target = factory()?;
         target.populate()?;
         let before = (target.retained_bytes()?, target.ledger_bytes()?);
-        target.begin_rebuild()?;
+        let rebuild_permit = target.begin_rebuild()?;
         let denied = target.close().is_err();
         let during = (target.retained_bytes()?, target.ledger_bytes()?);
-        target.finish_rebuild()?;
+        target.finish_rebuild(rebuild_permit)?;
         target.close()?;
         let after = (target.retained_bytes()?, target.ledger_bytes()?);
         Ok::<_, String>((before, denied, during, after))
@@ -766,10 +771,10 @@ where
         let mut target = factory()?;
         target.populate()?;
         let before = (target.retained_bytes()?, target.ledger_bytes()?);
-        target.begin_rebuild()?;
+        let rebuild_permit = target.begin_rebuild()?;
         target.drop_store();
         let during = target.ledger_bytes()?;
-        target.finish_rebuild()?;
+        target.finish_rebuild(rebuild_permit)?;
         Ok::<_, String>((before, during, target.ledger_bytes()?))
     })();
     verdicts.push(assertion("rebuild_drop_defers_until_finish").assert_that(
@@ -846,6 +851,8 @@ impl FacadeLifecycleTarget {
 
 #[cfg(feature = "fixtures")]
 impl StoreLifecycleConformanceTarget for FacadeLifecycleTarget {
+    type RebuildFence = quanta_memory_platform_core::RebuildFence;
+
     fn populate(&mut self) -> Result<(), String> {
         match self.store()? {
             LifecycleStore::Payload(store) => {
@@ -966,12 +973,12 @@ impl StoreLifecycleConformanceTarget for FacadeLifecycleTarget {
         }
     }
 
-    fn begin_rebuild(&mut self) -> Result<(), String> {
+    fn begin_rebuild(&mut self) -> Result<Self::RebuildFence, String> {
         self.platform.broker().begin_rebuild().map_err(|error| error.to_string())
     }
 
-    fn finish_rebuild(&mut self) -> Result<(), String> {
-        self.platform.broker().finish_rebuild().map_err(|error| error.to_string())
+    fn finish_rebuild(&mut self, fence: Self::RebuildFence) -> Result<(), String> {
+        fence.finish().map(|_| ()).map_err(|error| error.to_string())
     }
 
     fn drop_store(&mut self) {
@@ -1422,12 +1429,15 @@ mod tests {
             }
         }
 
-        fn do_begin_rebuild(&mut self) -> Result<(), String> {
+        type RebuildFence =
+            <crate::fake::FakeProcessBroker as BrokerConformanceTarget>::RebuildFence;
+
+        fn do_begin_rebuild(&mut self) -> Result<Self::RebuildFence, String> {
             BrokerConformanceTarget::do_begin_rebuild(&mut self.inner)
         }
 
-        fn do_finish_rebuild(&mut self) -> Result<(), String> {
-            BrokerConformanceTarget::do_finish_rebuild(&mut self.inner)
+        fn do_finish_rebuild(&mut self, fence: Self::RebuildFence) -> Result<(), String> {
+            BrokerConformanceTarget::do_finish_rebuild(&mut self.inner, fence)
         }
 
         fn view(&self) -> Result<AccountingView, String> {
@@ -1725,6 +1735,7 @@ mod tests {
         let owners = ["owner:conformance-a", "owner:conformance-b"];
         let mut model = IndependentAccountingModel::grouped();
         let mut tickets: Vec<ModelTicket<T::Ticket>> = Vec::new();
+        let mut model_fence: Option<T::RebuildFence> = None;
 
         for (step, operation) in operations.iter().enumerate() {
             match *operation {
@@ -1780,14 +1791,18 @@ mod tests {
                     }
                 }
                 ModelOperation::BeginRebuild if !model.rebuild_in_progress => {
-                    target
-                        .do_begin_rebuild()
-                        .unwrap_or_else(|error| panic!("step {step}: begin failed: {error}"));
+                    model_fence = Some(
+                        target
+                            .do_begin_rebuild()
+                            .unwrap_or_else(|error| panic!("step {step}: begin failed: {error}")),
+                    );
                     model.rebuild_in_progress = true;
                 }
                 ModelOperation::FinishRebuild if model.rebuild_in_progress => {
+                    let fence =
+                        model_fence.take().expect("model tracks the rebuild fence with its window");
                     target
-                        .do_finish_rebuild()
+                        .do_finish_rebuild(fence)
                         .unwrap_or_else(|error| panic!("step {step}: finish failed: {error}"));
                     model.rebuild_in_progress = false;
                 }
@@ -1808,7 +1823,8 @@ mod tests {
         }
 
         if model.rebuild_in_progress {
-            target.do_finish_rebuild().expect("final rebuild close");
+            let fence = model_fence.take().expect("model tracks the fence with its window");
+            target.do_finish_rebuild(fence).expect("final rebuild close");
             model.rebuild_in_progress = false;
         }
         for ticket in &mut tickets {
@@ -2727,6 +2743,7 @@ mod tests {
 
     impl BrokerConformanceTarget for MutateOnDenyTarget {
         type Ticket = u64;
+        type RebuildFence = ();
 
         fn do_reserve(
             &mut self,
@@ -2765,7 +2782,7 @@ mod tests {
             Ok(())
         }
 
-        fn do_finish_rebuild(&mut self) -> Result<(), String> {
+        fn do_finish_rebuild(&mut self, _fence: Self::RebuildFence) -> Result<(), String> {
             self.rebuild = false;
             Ok(())
         }
@@ -2864,6 +2881,7 @@ mod tests {
 
     impl BrokerConformanceTarget for ObserveMutatesTarget {
         type Ticket = ();
+        type RebuildFence = ();
 
         fn do_reserve(
             &mut self,
@@ -2885,11 +2903,11 @@ mod tests {
             Ok(())
         }
 
-        fn do_begin_rebuild(&mut self) -> Result<(), String> {
+        fn do_begin_rebuild(&mut self) -> Result<Self::RebuildFence, String> {
             Ok(())
         }
 
-        fn do_finish_rebuild(&mut self) -> Result<(), String> {
+        fn do_finish_rebuild(&mut self, _fence: Self::RebuildFence) -> Result<(), String> {
             Ok(())
         }
 

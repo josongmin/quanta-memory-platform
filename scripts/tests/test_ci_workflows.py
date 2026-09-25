@@ -100,6 +100,28 @@ def circleci_extraction_gate_errors(command_block: list[str]) -> list[str]:
         "clean-status assertion",
         errors,
     )
+    # Subshell membership: the subshell body (its `cd` and both example
+    # commands) shares one indentation level strictly deeper than the step
+    # body. Dedenting an example to the body level structurally removes it
+    # from the extraction subshell even though presence and order still hold.
+    def indent_of(line: str) -> int:
+        return len(line) - len(line.lstrip())
+
+    extraction_line = next(
+        (l for l in command_block if l.strip() == EXTRACTION_COMMAND), None
+    )
+    cd_line = next((l for l in command_block if l.strip() == EXTRACT_CD_COMMAND), None)
+    if extraction_line is None or cd_line is None or hello is None or report is None:
+        errors.append("cannot verify subshell nesting without extraction/cd/example lines")
+    else:
+        body_indent = indent_of(extraction_line)
+        if indent_of(cd_line) <= body_indent:
+            errors.append("the subshell cd must be indented deeper than the step body")
+        for label, position in (("hello_world", hello), ("effective_budget_report", report)):
+            if indent_of(command_block[position]) <= body_indent:
+                errors.append(
+                    f"{label} example must be indented deeper than the step body to stay inside the extraction subshell"
+                )
     for example in (hello, report):
         if example is not None:
             position = stripped[example]
@@ -173,6 +195,27 @@ class CircleCiExtractionGateTest(unittest.TestCase):
         errors = circleci_extraction_gate_errors(negative)
         self.assertTrue(any("duplicate extraction command" in error for error in errors))
 
+    def test_dedented_examples_leave_the_subshell_and_are_rejected(self) -> None:
+        block = extract_step_command_block(CIRCLECI_CONFIG.read_text(encoding="utf-8"), STEP_NAME)
+        cd_index = next(
+            index for index, line in enumerate(block) if line.strip() == EXTRACT_CD_COMMAND
+        )
+        hello_index = next(
+            index for index, line in enumerate(block) if line.strip() == EXAMPLE_HELLO
+        )
+        report_index = next(
+            index for index, line in enumerate(block) if line.strip() == EXAMPLE_REPORT
+        )
+        negative = list(block)
+        # Dedent both examples to the step-body level: structurally outside
+        # the extraction subshell even though presence and order still hold.
+        body_indent = len(block[cd_index]) - len(block[cd_index].lstrip()) - 2
+        negative[hello_index] = " " * body_indent + EXAMPLE_HELLO
+        negative[report_index] = " " * body_indent + EXAMPLE_REPORT
+        assert cd_index < hello_index, "fixture sanity: cd precedes examples"
+        errors = circleci_extraction_gate_errors(negative)
+        self.assertTrue(any("subshell" in error for error in errors), errors)
+
     def test_swapped_example_order_is_rejected(self) -> None:
         block = extract_step_command_block(CIRCLECI_CONFIG.read_text(encoding="utf-8"), STEP_NAME)
         negative = [line for line in block if line.strip() not in (EXAMPLE_HELLO, EXAMPLE_REPORT)]
@@ -187,6 +230,28 @@ class CircleCiExtractionGateTest(unittest.TestCase):
         ]
         errors = circleci_extraction_gate_errors(negative)
         self.assertTrue(any("command order" in error for error in errors))
+
+
+class GitHubWorkflowExamplesTest(unittest.TestCase):
+    """Mirror the CircleCI example gate for the manual GitHub workflow.
+
+    The dispatch-only workflow runs the same two public examples inside its
+    own extraction step; drift there must not be invisible to the contract.
+    """
+
+    def _example_lines(self) -> list[str]:
+        text = GITHUB_WORKFLOW.read_text(encoding="utf-8")
+        return [line.strip() for line in text.splitlines() if line.strip().startswith("cargo run")]
+
+    def test_both_examples_run_locked_in_the_workflow(self) -> None:
+        lines = self._example_lines()
+        self.assertIn(EXAMPLE_HELLO, lines)
+        self.assertIn(EXAMPLE_REPORT, lines)
+        for line in lines:
+            self.assertTrue(
+                line.startswith("cargo run --locked"),
+                f"workflow example must be --locked: {line}",
+            )
 
 
 class GitHubWorkflowDispatchOnlyTest(unittest.TestCase):

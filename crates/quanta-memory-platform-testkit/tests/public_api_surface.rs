@@ -62,6 +62,7 @@ struct DummyTarget;
 #[cfg(feature = "conformance")]
 impl BrokerConformanceTarget for DummyTarget {
     type Ticket = ();
+    type RebuildFence = ();
 
     fn do_reserve(
         &mut self,
@@ -81,11 +82,11 @@ impl BrokerConformanceTarget for DummyTarget {
         Ok(())
     }
 
-    fn do_begin_rebuild(&mut self) -> Result<(), String> {
+    fn do_begin_rebuild(&mut self) -> Result<Self::RebuildFence, String> {
         Ok(())
     }
 
-    fn do_finish_rebuild(&mut self) -> Result<(), String> {
+    fn do_finish_rebuild(&mut self, _fence: Self::RebuildFence) -> Result<(), String> {
         Ok(())
     }
 
