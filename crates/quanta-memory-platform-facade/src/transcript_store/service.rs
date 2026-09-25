@@ -1,3 +1,4 @@
+use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet};
 use std::marker::PhantomData;
 use std::sync::{Mutex, MutexGuard, PoisonError};
@@ -876,6 +877,14 @@ where
         // acquiring a charge or mutating any store-owned state.
         let row_message_id = message_id.get().clone();
         let evidence_message_id = message_id.get().clone();
+        // The evidence-map key is cloned BEFORE any charge or publication:
+        // the last caller Clone that runs while the guards hold both the key
+        // and the body. The publication below resolves the keyed slot with
+        // this clone BEFORE publishing the row or evidence, so a panic in
+        // the slot resolution (caller Ord on the owned key — the documented
+        // std residual) leaves nothing published; every step after it until
+        // the counter commit is caller-trait-free.
+        let evidence_key = message_id.get().clone();
 
         let active_charge = self
             .accounting
@@ -957,13 +966,21 @@ where
                         "transcript message-id index changed during append publication".to_string(),
                     )));
                 }
+                // Resolve the message-evidence slot FIRST: the only caller
+                // trait between the guard releases and the counter commit is
+                // the owned-key Ord descent here, before anything is
+                // published. VacantEntry::insert below is trait-free.
+                let Entry::Vacant(message_slot) = session.message_evidence.entry(evidence_key)
+                else {
+                    return Err(TranscriptAppendErrorV1::Storage(MemoryError::InvalidState(
+                        "transcript message-id index changed during append publication".to_string(),
+                    )));
+                };
                 session.rows.insert(sequence, row.take().expect("planned row"));
                 session
                     .sequence_evidence
                     .insert(sequence, sequence_evidence.take().expect("planned sequence evidence"));
-                session
-                    .message_evidence
-                    .insert(message_id.get().clone(), MessageEvidence { sequence, body_digest });
+                message_slot.insert(MessageEvidence { sequence, body_digest });
                 session.version = next_version;
                 session.retained_bytes = next_session_bytes;
             } else {
@@ -975,13 +992,21 @@ where
                     retained_bytes: next_session_bytes,
                     ..SessionState::default()
                 };
+                // Same discipline as the existing-session branch: resolve
+                // the evidence slot before any caller value moves into the
+                // session (on a fresh session the map is empty, so the
+                // descent is trivially trait-free).
+                let Entry::Vacant(message_slot) = session.message_evidence.entry(evidence_key)
+                else {
+                    return Err(TranscriptAppendErrorV1::Storage(MemoryError::InvalidState(
+                        "transcript message-id index changed during append publication".to_string(),
+                    )));
+                };
                 session.rows.insert(sequence, row.take().expect("planned row"));
                 session
                     .sequence_evidence
                     .insert(sequence, sequence_evidence.take().expect("planned sequence evidence"));
-                session
-                    .message_evidence
-                    .insert(message_id.get().clone(), MessageEvidence { sequence, body_digest });
+                message_slot.insert(MessageEvidence { sequence, body_digest });
                 session.version = next_version;
                 state.sessions.insert(session_id.get().clone(), session);
             }
@@ -2473,8 +2498,8 @@ mod tests {
             );
             let before_retry = comparisons.calls.load(AtomicOrdering::SeqCst);
             // Three MessageId comparisons follow on the retry (preflight
-            // probe, borrowed publication probe, keyed insert); arm past all
-            // of them so the disarmed retry completes.
+            // probes and the publication slot resolution); arm past all of
+            // them so the disarmed retry completes.
             comparisons.arm_after(4);
             assert_eq!(
                 store
@@ -2492,7 +2517,7 @@ mod tests {
             assert_eq!(
                 comparisons.calls.load(AtomicOrdering::SeqCst),
                 before_retry + 3,
-                "append compares MessageId once in preflight, once in the                  borrowed publication probe, and once in the final keyed insert"
+                "append compares MessageId during preflight and the publication slot resolution"
             );
             comparisons.disarm();
             let expected = cost("s", &[("m0", "one", true), ("m1", "four", true)]);
@@ -2502,6 +2527,77 @@ mod tests {
                 expected
             );
             store.close().expect("close after callback panic");
+            assert_eq!(broker.ledger_snapshot().expect("drained").total_owner_bytes(), 0);
+        }
+
+        // P0 regression oracle (round-2 audit): a caller-trait panic in the
+        // FINAL message-evidence keyed step of publication must leave the
+        // store atomically intact — close still works, counters reconcile,
+        // and the rolled-back append retries as a clean Applied. The trap is
+        // armed at the last MessageId comparison of the append under the
+        // current publication shape (preflight probe, publication probe,
+        // keyed insert descent).
+        #[test]
+        fn message_id_keyed_insert_panic_rolls_back_publication_completely() {
+            let broker = broker(1_000_000);
+            let store = callback_store(&broker);
+            let clones = CallbackTrap::new();
+            let comparisons = CallbackTrap::new();
+            store
+                .append(TranscriptAppendRequestV1::new(
+                    TranscriptAppendIdentityV1::new(
+                        "s".to_string(),
+                        0,
+                        callback_id("m0", &clones, &comparisons),
+                    ),
+                    "one".to_string(),
+                ))
+                .expect("seed row");
+            comparisons.arm_after(3);
+            let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = store.append(TranscriptAppendRequestV1::new(
+                    TranscriptAppendIdentityV1::new(
+                        "s".to_string(),
+                        1,
+                        callback_id("m1", &clones, &comparisons),
+                    ),
+                    "four".to_string(),
+                ));
+            }));
+            assert!(panicked.is_err(), "trap must fire inside publication");
+            comparisons.disarm();
+
+            // Atomicity: the seed-only image must hold and the store must
+            // remain fully closable (no half-published row/evidence).
+            assert_seed_only_after_append_panic(&store, &broker);
+            assert_eq!(
+                store.load(&"s".to_string()).expect("readable").len(),
+                1,
+                "no phantom row may survive the publication panic"
+            );
+
+            // The rolled-back append must retry cleanly, not be swallowed as
+            // a replay and not double-publish the message id.
+            assert_eq!(
+                store
+                    .append(TranscriptAppendRequestV1::new(
+                        TranscriptAppendIdentityV1::new(
+                            "s".to_string(),
+                            1,
+                            callback_id("m1", &clones, &comparisons),
+                        ),
+                        "four".to_string(),
+                    ))
+                    .expect("clean retry after rollback"),
+                TranscriptAppendDispositionV1::Applied
+            );
+            let expected = cost("s", &[("m0", "one", true), ("m1", "four", true)]);
+            assert_eq!(store.retained_bytes().expect("committed bytes"), expected);
+            assert_eq!(
+                broker.ledger_snapshot().expect("committed ledger").total_owner_bytes(),
+                expected
+            );
+            store.close().expect("close must reconcile after the panic");
             assert_eq!(broker.ledger_snapshot().expect("drained").total_owner_bytes(), 0);
         }
 

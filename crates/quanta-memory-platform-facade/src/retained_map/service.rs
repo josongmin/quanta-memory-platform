@@ -352,9 +352,11 @@ where
                 return Err(error);
             }
         };
-        // Borrowed-key probe with a precomputed hash; the insertion itself
-        // runs no caller trait, so no owned caller value is ever in flight
-        // during caller code.
+        // Borrowed-key probe with a precomputed hash; the insertion runs no
+        // caller Eq and needs no owned caller value. A capacity-growth
+        // rehash may still invoke caller Hash on STORED keys inside the
+        // insertion — containment there comes from the in-flight guard and
+        // the plan's Drop restore, not from trait-freedom.
         let hash = state.entries.hasher().hash_one(key_in_flight.get());
         let RawEntryMut::Vacant(vacant) =
             state.entries.raw_entry_mut().from_key_hashed_nocheck(hash, key_in_flight.get())
@@ -484,8 +486,10 @@ where
                 let next =
                     Self::committed_bytes_after_replace_v1(*committed_bytes, 0, reserved_bytes)?;
                 let charge = self.charge_new_entry_v1(reserved_bytes)?;
-                // Insertion with the precomputed hash runs no caller trait,
-                // so the owned key is never in flight during caller code.
+                // Insertion with the precomputed hash runs no caller Eq; a
+                // growth rehash may still hash STORED keys (contained by the
+                // guard and plan restore). The owned key is never in flight
+                // during caller Eq.
                 vacant.insert_hashed_nocheck(
                     hash,
                     key_in_flight.take(),

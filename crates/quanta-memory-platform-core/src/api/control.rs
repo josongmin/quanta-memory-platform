@@ -481,10 +481,14 @@ pub enum RebuildFenceStatus {
 
 /// Receipt separating fence completion from deferred-authority cleanup.
 ///
-/// `fence_open` reports the fence transition itself; the remaining counts and
-/// `drain_error` report the bounded-batch cleanup that runs after the fence
-/// opens. A drain error never re-closes the fence — retry cleanup by draining
-/// through the next accepted fence finish or reconfigure.
+/// `fence_open` reports the fence transition itself; the remaining counts
+/// and `drain_error` report the bounded-batch cleanup that runs after the
+/// fence opens. A drain error never re-closes the fence — retry cleanup
+/// through the next accepted fence finish (an accepted live reconfigure
+/// retries only deferred pending rollbacks, not deferred committed
+/// releases). On a broker-lock failure the remaining counts are reported
+/// as `usize::MAX` sentinels alongside the typed `drain_error`; treat any
+/// `usize::MAX` count as "unknown", never as a literal depth.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RebuildReceipt {
     /// True when this finish committed the fence-open transition.
@@ -1659,7 +1663,7 @@ impl LiveProcessMemoryBroker {
             Ok(bytes) => bytes,
             Err(error) => {
                 let result = Err(error);
-                self.emit_result(MemoryOperation::Release, None, &result);
+                self.emit_result(MemoryOperation::Release, Some(advisory_bytes), &result);
                 return result;
             }
         };
@@ -1716,14 +1720,15 @@ impl LiveProcessMemoryBroker {
             // Explicit recovery: re-adopt the abandoned fence under a new
             // epoch. Deferred authorities stay queued and exact.
             core.rebuild_abandoned = false;
-        } else {
-            core.ledger.begin_rebuild();
         }
-        core.rebuild_epoch = core
+        // Resolve every fallible step BEFORE mutating the ledger fence: an
+        // exhausted epoch must not strand a fence with no permit.
+        let epoch = core
             .rebuild_epoch
             .checked_add(1)
             .ok_or_else(|| MemoryError::InvalidState("rebuild epoch exhausted u64".to_string()))?;
-        let epoch = core.rebuild_epoch;
+        core.ledger.begin_rebuild();
+        core.rebuild_epoch = epoch;
         drop(core);
         Ok(RebuildFence { broker: self.clone(), epoch, finished: false })
     }
