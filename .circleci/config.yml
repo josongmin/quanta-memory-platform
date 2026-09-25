@@ -1,0 +1,48 @@
+version: 2.1
+
+jobs:
+  full-extraction:
+    machine:
+      image: ubuntu-2404:2026.05.1
+    resource_class: large
+    steps:
+      - checkout
+      - run:
+          name: Install pinned verification tools
+          command: |
+            set -euo pipefail
+            sudo apt-get update
+            sudo apt-get install -y shellcheck python3-venv
+            if ! command -v rustup >/dev/null 2>&1; then
+              curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs |
+                sh -s -- -y --profile minimal --default-toolchain none
+            fi
+            . "$HOME/.cargo/env"
+            rustup toolchain install 1.92.0 --profile minimal --component clippy --component rustfmt
+            python3 -m venv /tmp/qmp-semgrep-venv
+            /tmp/qmp-semgrep-venv/bin/pip install semgrep==1.157.0
+            cargo install cargo-deny --version 0.19.7 --locked
+            printf 'export PATH="%s:/tmp/qmp-semgrep-venv/bin:$PATH"\n' "$HOME/.cargo/bin" >> "$BASH_ENV"
+      - run:
+          name: Verify tool versions
+          command: |
+            set -euo pipefail
+            rustc --version
+            cargo-deny --version
+            semgrep --version
+            shellcheck --version
+      - run:
+          name: Verify actual standalone extraction and full workspace gate
+          no_output_timeout: 20m
+          command: |
+            set -euo pipefail
+            echo "Source SHA: $CIRCLE_SHA1"
+            qmp_extract_dir="$(mktemp -d /tmp/qmp-circleci-extraction.XXXXXX)"
+            scripts/extract-to-standalone-repo.sh "$qmp_extract_dir"
+            test -z "$(git -C "$qmp_extract_dir" status --porcelain)"
+
+workflows:
+  main-verification:
+    jobs:
+      - full-extraction:
+          filters: pipeline.git.branch == "main"
