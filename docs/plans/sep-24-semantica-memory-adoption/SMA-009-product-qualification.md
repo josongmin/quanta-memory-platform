@@ -128,6 +128,35 @@ baseline product runtime 구성 중 `RUNTIME.QUERY_ARGS_SOURCE_CLOSURE_MISMATCH`
 수정 중인 dirty 상태이므로, 이 결과는 최종 main verdict가 아니다. 수정 후
 고정 소스 worker process 재실행과 성공 receipt가 필요하다.
 
+2026-09-25 후속 판정: 전용 Semantica 브랜치
+`codex/shadow-budget-closure`의 `dac08123e51`에는 제품 source authority가
+코드 source member와 `pyproject.toml` 같은 workspace input을 별도로 고정하고,
+SemanticModule 하위 질의에는 발급된 workspace union을 전달하며,
+no-runtime-persist 질의에는 같은 실행의 pre-digest artifact를 재사용하는
+수정이 커밋·푸시됐다. 해당 수정으로 worker 통합 테스트
+`worker_process_canary_owns_timer_runtime_v1`는 컴파일 후 실제 프로세스를
+실행했고, 기존 `QueryId(82)` closure mismatch를 통과했다. 그러나 baseline
+`PTA_PRECISE`가 `LOWERING_CAPABILITY_BOUNDARY` /
+`pta_external_boundary_occurrence_missing_or_ambiguous_external_edge`를 반환해
+`dual_run` 단계에서 여전히 RED였다. 이는 제품 PASS나 main 통합 증거가 아니다.
+외부 경계 packet과 call-graph edge의 caller/callsite/origin/callee 일치 조건을
+독립 진단하고, 소스 또는 fixture의 결함을 수정한 뒤 같은 process E2E를
+최종 고정 소스에서 GREEN으로 만들어야 G8을 닫을 수 있다. 브랜치의
+owner-local 신규 테스트는 아직 실행되지 않았다. RED 브랜치를 main으로
+병합하거나 예전 composer GREEN을 최종 qualification으로 재사용하지 않는다.
+임시 계수 진단을 넣은 같은 worker 테스트의 재실행에서는
+`sql_canary.product_sql_execute` → `sqlite3.connect` packet 행에 대해
+해당 caller edge 0개였고, 그래프 전체에서도 같은 callsite ID 또는 origin의
+edge가 각각 0개였다. 이는 PTA의 이름 비교만 느슨하게 해서 해결할 문제가
+아니라 call-graph packet/edge 생성·전달의 불일치다. 임시 진단 코드는
+출하 브랜치에 남기지 않았다.
+추가 계수 진단에서 해당 call graph는 edge 2개·function 6개였고
+`direct_call_target_not_found_in_canonical_interproc_authority` 및
+`call_graph_trace_diff_unavailable` partial reason을 보유했다. budget
+exhaustion 증거는 없었다. `sqlite3.connect`의 canonical direct-call target
+해결 또는 제품 fixture의 source/import authority를 먼저 교정하고,
+partial graph를 promotable baseline으로 취급하지 않는지 재검증해야 한다.
+
 ## 최소 proof matrix
 
 | Gate | 재사용할 경계 | 통과 조건 |
