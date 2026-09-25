@@ -37,6 +37,7 @@ graph = sorted(
 print(hashlib.sha256(json.dumps(graph, sort_keys=True, separators=(",", ":")).encode()).hexdigest())
 ')"
 dependency_lock_sha256="$(shasum -a 256 Cargo.lock | awk '{print $1}')"
+benchmark_source_sha256="$(shasum -a 256 crates/quanta-memory-platform-facade/benches/scaling.rs | awk '{print $1}')"
 
 if [[ -n "${QMP_SCALING_ARTIFACT:-}" ]]; then
   result_file="$QMP_SCALING_ARTIFACT"
@@ -60,11 +61,11 @@ echo "run-scaling-bench: raw artifact: $result_file" >&2
 cargo bench --locked -p quanta-memory-platform-facade "${cargo_features[@]}" --bench scaling --no-run >/dev/null
 
 run_id="$(python3 -c 'import uuid; print(uuid.uuid4())')"
-python3 - "$source_sha" "$source_tree" "$rustc_version" "$cargo_version" "$machine" "$feature_graph_sha256" "$dependency_lock_sha256" "$feature_set" "$run_id" "$@" <<'PY' | tee "$result_file"
+python3 - "$source_sha" "$source_tree" "$rustc_version" "$cargo_version" "$machine" "$feature_graph_sha256" "$dependency_lock_sha256" "$benchmark_source_sha256" "$feature_set" "$run_id" "$@" <<'PY' | tee "$result_file"
 import json
 import os
 import sys
-sha, tree, rustc, cargo, machine, feature_graph, lock_digest, feature_set, run_id, *bench_args = sys.argv[1:]
+sha, tree, rustc, cargo, machine, feature_graph, lock_digest, benchmark_source, feature_set, run_id, *bench_args = sys.argv[1:]
 logical_cpus = os.cpu_count()
 if not logical_cpus:
     raise SystemExit("run-scaling-bench: logical CPU count is unavailable")
@@ -78,6 +79,7 @@ print(json.dumps({
     "feature_set": feature_set,
     "feature_graph_sha256": feature_graph,
     "dependency_lock_sha256": lock_digest,
+    "benchmark_source_sha256": benchmark_source,
     "package": "quanta-memory-platform-facade",
     "bench_target": "scaling",
     "benchmark_args": bench_args,

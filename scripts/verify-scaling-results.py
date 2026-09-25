@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
 import statistics
 import sys
 from collections import defaultdict
@@ -38,6 +39,7 @@ COMPAT_FIELDS = (
     "rustc", "cargo", "machine", "feature_set", "feature_graph_sha256",
     "dependency_lock_sha256", "package", "bench_target",
 )
+BENCHMARK_SOURCE_FIELD = "benchmark_source_sha256"
 
 
 class ValidationError(RuntimeError):
@@ -206,6 +208,12 @@ def run_metadata(records: list[dict[str, object]]) -> tuple[dict[str, object], B
     for field in ("source_sha", "source_tree", *COMPAT_FIELDS):
         if not isinstance(run.get(field), str) or not run[field]:
             raise ValidationError(f"run metadata field {field!r} is missing")
+    benchmark_source = run.get(BENCHMARK_SOURCE_FIELD)
+    if benchmark_source is not None and (
+        not isinstance(benchmark_source, str)
+        or re.fullmatch(r"[0-9a-f]{64}", benchmark_source) is None
+    ):
+        raise ValidationError(f"run metadata field {BENCHMARK_SOURCE_FIELD!r} is invalid")
     for field in ("source_sha", "source_tree"):
         if end.get(field) != run[field]:
             raise ValidationError(f"source changed during benchmark: {field}")
@@ -379,6 +387,11 @@ def validate(
         for field in COMPAT_FIELDS:
             if baseline_run[field] != run[field]:
                 raise ValidationError(f"baseline incompatible {field}: {baseline_run[field]!r} != {run[field]!r}")
+        if (
+            not run.get(BENCHMARK_SOURCE_FIELD)
+            or baseline_run.get(BENCHMARK_SOURCE_FIELD) != run[BENCHMARK_SOURCE_FIELD]
+        ):
+            raise ValidationError(f"baseline incompatible {BENCHMARK_SOURCE_FIELD}")
         baseline_samples, baseline_groups = validate_samples(
             baseline_records, spec, max_p99_ns, require_outcome_latencies=False,
         )
@@ -438,6 +451,8 @@ def release_run(
         raise ValidationError("release comparison requires the canonical full matrix")
     if not isinstance(run.get("run_id"), str) or not run["run_id"]:
         raise ValidationError("release run identity is missing")
+    if not run.get(BENCHMARK_SOURCE_FIELD):
+        raise ValidationError(f"release {BENCHMARK_SOURCE_FIELD} is missing")
     if "bench_exit_code" not in records[-1]:
         raise ValidationError("release bench exit status is missing")
     if (
@@ -506,10 +521,10 @@ def validate_release(
         for run, run_spec, _ in runs:
             if run_spec != spec:
                 raise ValidationError(f"{label} benchmark matrix differs")
-            for field in ("source_sha", "source_tree", "benchmark_args", *COMPAT_FIELDS, "logical_cpus"):
+            for field in ("source_sha", "source_tree", "benchmark_args", BENCHMARK_SOURCE_FIELD, *COMPAT_FIELDS, "logical_cpus"):
                 if run[field] != reference[field]:
                     raise ValidationError(f"{label} runs disagree on {field}")
-    for field in (*COMPAT_FIELDS, "logical_cpus"):
+    for field in (BENCHMARK_SOURCE_FIELD, *COMPAT_FIELDS, "logical_cpus"):
         if baseline_ref[field] != candidate_ref[field]:
             raise ValidationError(f"release baseline incompatible {field}")
     if (
