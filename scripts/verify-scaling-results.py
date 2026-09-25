@@ -136,12 +136,18 @@ def parse_benchmark_args(arguments: object) -> BenchmarkSpec:
     threads = (1, 8, 32) if profile == "in-memory-pressure" else (1, 2, 8, 32)
     if smoke:
         threads = (1, 8) if profile == "in-memory-pressure" else (1, 2)
-    return BenchmarkSpec(
+    spec = BenchmarkSpec(
         sizes_override or sizes,
         threads_override or threads,
         repetitions_override or repetitions,
         profile,
     )
+    if profile == "in-memory-pressure" and any(
+        entries < 2 * worker_count
+        for entries in spec.sizes for worker_count in spec.threads if worker_count > 1
+    ):
+        raise ValidationError("contended pressure requires at least two admission attempts per worker")
+    return spec
 
 
 def load_jsonl(path: Path) -> list[dict[str, object]]:
@@ -345,13 +351,17 @@ def validate_samples(
                     raise ValidationError(f"{key}: invalid/over-limit {phase} latency distribution {values}")
         if sample.get("operation") == PRESSURE_RECLAIM_OPERATION:
             reclaimed = integer(sample, "reclaimed_operations")
-            if not 0 < reclaimed <= denied:
+            if not 0 < reclaimed <= denied or reclaimed > succeeded + 2:
                 raise ValidationError(f"{key}: reclaimed operation count is invalid")
         elif "reclaimed_operations" in sample:
             raise ValidationError(f"{key}: reclaimed operation count is unexpected")
         derived_throughput = round(timed * 1_000_000_000 / integer(sample, "elapsed_ns"))
         if abs(throughput - derived_throughput) > max(1, derived_throughput // 1_000):
             raise ValidationError(f"{key}: throughput does not match timed operations / elapsed time")
+        successful_throughput = integer(sample, "successful_throughput_ops_per_sec")
+        derived_successful_throughput = round(succeeded * 1_000_000_000 / integer(sample, "elapsed_ns"))
+        if successful_throughput <= 0 or abs(successful_throughput - derived_successful_throughput) > max(1, derived_successful_throughput // 1_000):
+            raise ValidationError(f"{key}: successful throughput does not match admitted operations / elapsed time")
         semantic_peak = integer(sample, "semantic_peak_bytes")
         if sample.get("operation") == PRESSURE_OUTCOME_OPERATION:
             if semantic_peak != 1:
@@ -449,14 +459,18 @@ def validate(
         p99_allowed = max_p99_regression_percent / 100.0
         for key, current in grouped.items():
             baseline = baseline_groups[key]
-            current_throughput = statistics.median(integer(sample, "throughput_ops_per_sec") for sample in current)
-            baseline_throughput = statistics.median(integer(sample, "throughput_ops_per_sec") for sample in baseline)
             baseline_elapsed = statistics.median(integer(sample, "elapsed_ns") for sample in baseline)
-            if (
-                baseline_elapsed >= baseline_min_elapsed_ns
-                and current_throughput < baseline_throughput * (1.0 - throughput_allowed)
+            for field, label in (
+                ("throughput_ops_per_sec", "throughput"),
+                ("successful_throughput_ops_per_sec", "successful throughput"),
             ):
-                raise ValidationError(f"{key}: throughput regressed beyond {max_throughput_regression_percent}%")
+                current_throughput = statistics.median(integer(sample, field) for sample in current)
+                baseline_throughput = statistics.median(integer(sample, field) for sample in baseline)
+                if (
+                    baseline_elapsed >= baseline_min_elapsed_ns
+                    and current_throughput < baseline_throughput * (1.0 - throughput_allowed)
+                ):
+                    raise ValidationError(f"{key}: {label} regressed beyond {max_throughput_regression_percent}%")
             for field, label in (
                 ("p99_ns", "p99"),
                 ("admitted_p99_ns", "admitted p99"),
@@ -538,6 +552,9 @@ def run_cell_metrics(
         # median. Cross-process noise remains a separate INCONCLUSIVE gate.
         cell = {
             "throughput": min(integer(row, "throughput_ops_per_sec") for row in samples),
+            "successful_throughput": min(
+                integer(row, "successful_throughput_ops_per_sec") for row in samples
+            ),
             "p99": max(integer(row, "p99_ns") for row in samples),
             "busy_per_operation": max(
                 integer(row, "busy_retries") / integer(row, "timed_operations") for row in samples
@@ -599,7 +616,7 @@ def validate_release(
                     continue  # Absolute Busy ceiling is checked below.
                 values = [run[key][field] for run in runs]
                 center = statistics.median(values)
-                floor = policy.p99_noise_floor_ns if field != "throughput" else 1
+                floor = 1 if field in {"throughput", "successful_throughput"} else policy.p99_noise_floor_ns
                 if max(values) - min(values) > noise_limit * max(center, floor):
                     raise InconclusiveError(f"{label} {key} {field} varies beyond run-noise limit")
 
@@ -616,6 +633,8 @@ def validate_release(
         }
         if candidate["throughput"] < baseline["throughput"] * (1.0 - throughput_limit):
             raise ValidationError(f"{key}: release throughput regressed")
+        if candidate["successful_throughput"] < baseline["successful_throughput"] * (1.0 - throughput_limit):
+            raise ValidationError(f"{key}: release successful throughput regressed")
         for field in ("p99", "admitted_p99_ns", "denied_p99_ns", "fill_p99_ns", "reclaim_p99_ns"):
             if field not in baseline:
                 continue

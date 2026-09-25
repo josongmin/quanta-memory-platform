@@ -264,6 +264,14 @@ fn options() -> Options {
     assert!(options.sizes.iter().all(|entries| *entries > 0), "entries must be > 0");
     assert!(options.threads.iter().all(|threads| *threads > 0), "threads must be > 0");
     assert!(options.repetitions >= 3, "at least three repetitions are required");
+    if options.profile == BenchProfile::InMemoryPressure {
+        for threads in options.threads.iter().copied().filter(|threads| *threads > 1) {
+            assert!(
+                options.sizes.iter().all(|entries| *entries >= threads.saturating_mul(2)),
+                "contended pressure requires at least two admission attempts per worker"
+            );
+        }
+    }
     options
 }
 
@@ -364,6 +372,8 @@ fn emit(
     let elapsed_ns = elapsed.as_nanos();
     let timed_operations = operations.timed();
     let throughput = (timed_operations as f64 / elapsed.as_secs_f64()).round() as u64;
+    let successful_throughput =
+        (operations.successful as f64 / elapsed.as_secs_f64()).round() as u64;
     let outcome_latency_fields = operations.outcome_latencies.map_or_else(String::new, |(admitted, denied)| {
         format!(
             ",\"admitted_p50_ns\":{},\"admitted_p95_ns\":{},\"admitted_p99_ns\":{},\"denied_p50_ns\":{},\"denied_p95_ns\":{},\"denied_p99_ns\":{}",
@@ -390,6 +400,7 @@ fn emit(
             "\"successful_operations\":{successful_operations},",
             "\"denied_operations\":{denied_operations},",
             "\"elapsed_ns\":{elapsed_ns},\"throughput_ops_per_sec\":{throughput},",
+            "\"successful_throughput_ops_per_sec\":{successful_throughput},",
             "\"p50_ns\":{p50},\"p95_ns\":{p95},\"p99_ns\":{p99},",
             "\"semantic_peak_bytes\":{semantic_peak_bytes},",
             "\"semantic_after_close_bytes\":{semantic_after_close_bytes},",
@@ -410,6 +421,7 @@ fn emit(
         denied_operations = operations.denied,
         elapsed_ns = elapsed_ns,
         throughput = throughput,
+        successful_throughput = successful_throughput,
         p50 = latency.p50,
         p95 = latency.p95,
         p99 = latency.p99,

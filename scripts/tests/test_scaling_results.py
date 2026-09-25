@@ -48,6 +48,7 @@ def sample(
         "repetition": repetition,
         "elapsed_ns": entries,
         "throughput_ops_per_sec": round(timed * 1_000_000_000 / entries),
+        "successful_throughput_ops_per_sec": round(successful * 1_000_000_000 / entries),
         "timed_operations": timed,
         "successful_operations": successful,
         "denied_operations": timed - successful,
@@ -87,6 +88,14 @@ def sample(
             "reclaimed_operations": entries // 4,
         })
     return result
+
+
+def set_elapsed(row: dict[str, object], elapsed_ns: int) -> None:
+    row["elapsed_ns"] = elapsed_ns
+    row["throughput_ops_per_sec"] = round(int(row["timed_operations"]) * 1_000_000_000 / elapsed_ns)
+    row["successful_throughput_ops_per_sec"] = round(
+        int(row["successful_operations"]) * 1_000_000_000 / elapsed_ns
+    )
 
 
 def valid_records(
@@ -323,10 +332,7 @@ class ScalingResultTests(unittest.TestCase):
         for records in candidates:
             for row in records:
                 if row.get("operation") == "payload_unique_fill" and row.get("entries") == 1_000:
-                    row["elapsed_ns"] *= 2
-                    row["throughput_ops_per_sec"] = round(
-                        int(row["timed_operations"]) * 1_000_000_000 / int(row["elapsed_ns"])
-                    )
+                    set_elapsed(row, int(row["elapsed_ns"]) * 2)
         with self.assertRaisesRegex(MODULE.ValidationError, "release throughput regressed"):
             MODULE.validate_release(candidates, baselines, RELEASE_POLICY)
         candidates, baselines = release_receipts()
@@ -362,10 +368,7 @@ class ScalingResultTests(unittest.TestCase):
                 row for row in records if row.get("operation") == "payload_unique_fill"
                 and row.get("entries") == 1_000 and row.get("repetition") == repetition
             )
-            row["elapsed_ns"] *= 2
-            row["throughput_ops_per_sec"] = round(
-                int(row["timed_operations"]) * 1_000_000_000 / int(row["elapsed_ns"])
-            )
+            set_elapsed(row, int(row["elapsed_ns"]) * 2)
         with self.assertRaisesRegex(MODULE.ValidationError, "release throughput regressed"):
             MODULE.validate_release(candidates, baselines, RELEASE_POLICY)
 
@@ -394,10 +397,7 @@ class ScalingResultTests(unittest.TestCase):
         candidates, baselines = release_receipts()
         for row in candidates[0]:
             if row.get("operation") == "payload_unique_fill" and row.get("entries") == 1_000:
-                row["elapsed_ns"] *= 2
-                row["throughput_ops_per_sec"] = round(
-                    int(row["timed_operations"]) * 1_000_000_000 / int(row["elapsed_ns"])
-                )
+                set_elapsed(row, int(row["elapsed_ns"]) * 2)
         with self.assertRaisesRegex(MODULE.InconclusiveError, "varies beyond run-noise"):
             MODULE.validate_release(candidates, baselines, RELEASE_POLICY)
         candidates, baselines = release_receipts()
@@ -467,6 +467,16 @@ class ScalingResultTests(unittest.TestCase):
         ):
             with self.subTest(args=args), self.assertRaises(MODULE.ValidationError):
                 MODULE.parse_benchmark_args(args)
+
+    def test_contended_pressure_requires_two_attempts_per_worker(self) -> None:
+        with self.assertRaisesRegex(MODULE.ValidationError, "at least two admission attempts"):
+            MODULE.parse_benchmark_args([
+                "--profile=in-memory-pressure", "--sizes=15", "--threads=1,8",
+            ])
+        spec = MODULE.parse_benchmark_args([
+            "--profile=in-memory-pressure", "--sizes=16", "--threads=1,8",
+        ])
+        self.assertEqual(spec.sizes, (16,))
 
     def test_pressure_profile_is_independent_and_fail_closed(self) -> None:
         args = ["--smoke", "--profile=in-memory-pressure"]
@@ -547,6 +557,20 @@ class ScalingResultTests(unittest.TestCase):
         with self.assertRaisesRegex(MODULE.ValidationError, "release reclaim_p99_ns regressed"):
             MODULE.validate_release(candidates, baselines, RELEASE_POLICY)
 
+    def test_release_rejects_denial_as_speed_even_if_total_throughput_is_stable(self) -> None:
+        candidates, baselines = release_receipts(["--profile=in-memory-pressure"])
+        for records in candidates:
+            for row in records:
+                if row.get("operation") == "contended_pressure_reclaim":
+                    row["successful_operations"] = row["entries"] // 10
+                    row["denied_operations"] = row["entries"] - row["successful_operations"]
+                    row["reclaimed_operations"] = row["successful_operations"]
+                    row["successful_throughput_ops_per_sec"] = round(
+                        int(row["successful_operations"]) * 1_000_000_000 / int(row["elapsed_ns"])
+                    )
+        with self.assertRaisesRegex(MODULE.ValidationError, "release successful throughput regressed"):
+            MODULE.validate_release(candidates, baselines, RELEASE_POLICY)
+
     def test_default_metadata_with_smoke_only_rows_is_rejected(self) -> None:
         records = valid_records([], (1_000,), (1, 2), 3)
         with self.assertRaisesRegex(MODULE.ValidationError, "matrix is incomplete"):
@@ -595,10 +619,7 @@ class ScalingResultTests(unittest.TestCase):
         records = valid_records()
         for record in records:
             if record.get("operation") == "revocable_fill_and_drain" and record.get("entries") == 10_000:
-                record["elapsed_ns"] = 100_000
-                record["throughput_ops_per_sec"] = round(
-                    int(record["timed_operations"]) * 1_000_000_000 / 100_000
-                )
+                set_elapsed(record, 100_000)
         self.assertEqual(MODULE.validate(records), 220)
 
     def test_accounting_and_operation_counts_are_rejected(self) -> None:
@@ -607,6 +628,7 @@ class ScalingResultTests(unittest.TestCase):
             ("semantic_after_close_bytes", 1, "did not drain"),
             ("timed_operations", 0, "counts disagree"),
             ("busy_retries", -1, "busy retry"),
+            ("successful_throughput_ops_per_sec", 0, "successful throughput"),
         ):
             with self.subTest(field=field):
                 records = valid_records(["--smoke"])
@@ -824,16 +846,10 @@ class ScalingResultTests(unittest.TestCase):
         current = valid_records(["--smoke"])
         for record in baseline + current:
             if record.get("schema") == MODULE.SAMPLE_SCHEMA:
-                record["elapsed_ns"] = 20_000_000
-                record["throughput_ops_per_sec"] = round(
-                    int(record["timed_operations"]) * 1_000_000_000 / 20_000_000
-                )
+                set_elapsed(record, 20_000_000)
         for record in current:
             if record.get("schema") == MODULE.SAMPLE_SCHEMA:
-                record["elapsed_ns"] = 2_000_000_000
-                record["throughput_ops_per_sec"] = round(
-                    int(record["timed_operations"]) * 1_000_000_000 / 2_000_000_000
-                )
+                set_elapsed(record, 2_000_000_000)
         with self.assertRaisesRegex(MODULE.ValidationError, "throughput regressed"):
             MODULE.validate(current, baseline)
         current = valid_records(["--smoke"])
