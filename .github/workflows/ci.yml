@@ -37,10 +37,16 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y shellcheck
+          if ! command -v rustup >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs |
+              sh -s -- -y --profile minimal --default-toolchain none
+          fi
+          . "$HOME/.cargo/env"
           rustup toolchain install 1.92.0 --profile minimal --component clippy --component rustfmt
           python3 -m venv "$RUNNER_TEMP/qmp-semgrep"
           "$RUNNER_TEMP/qmp-semgrep/bin/pip" install semgrep==1.157.0
           cargo install cargo-deny --version 0.19.7 --locked
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
           echo "$RUNNER_TEMP/qmp-semgrep/bin" >> "$GITHUB_PATH"
       - name: Verify pinned tools
         run: |
