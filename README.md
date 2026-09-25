@@ -129,10 +129,10 @@ The scaling results are same-host signals, not portable latency guarantees.
 Push CI verifies a real clean standalone extraction, its full workspace rail,
 and both public examples on the extracted source. The separate, manually run
 CircleCI benchmark collects three independent full `in-memory-pressure`
-process receipts at one pinned commit and retains each raw JSONL artifact.
-Passing those receipts establishes only the profile's absolute/structural
-guards; release regression or SLO claims still require an approved policy and
-compatible baseline receipts as described in
+process receipts and one 220-row standard scaling receipt at one pinned commit,
+retaining each raw JSONL artifact. Passing those receipts establishes only the
+profiles' absolute/structural guards; release regression or SLO claims still
+require an approved policy and compatible baseline receipts as described in
 [verification scenarios](docs/verification-scenarios.md).
 Extraction and host adoption are separate operations; see
 [EXTRACTION.md](EXTRACTION.md).
