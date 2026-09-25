@@ -141,8 +141,16 @@ def load_jsonl(path: Path) -> list[dict[str, object]]:
         raw = raw.strip()
         if not raw.startswith("{"):
             continue  # cargo's human-readable lines are not benchmark records
+
+        def unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+            result: dict[str, object] = {}
+            for key, value in pairs:
+                if key in result:
+                    raise ValidationError(f"line {line_number}: duplicate JSON key {key!r}")
+                result[key] = value
+            return result
         try:
-            value = json.loads(raw)
+            value = json.loads(raw, object_pairs_hook=unique_object)
         except json.JSONDecodeError as error:
             raise ValidationError(f"line {line_number}: invalid JSON: {error}") from error
         if not isinstance(value, dict):

@@ -79,8 +79,10 @@ Correctness is managed as **tests**; benchmarks answer a different question
   `INCONCLUSIVE`; recurrence across processes can fail the regression limit.
   The verifier rejects mixed source/toolchain/feature/machine runs, missing or
   reused run IDs, a baseline with the candidate's source tree, incomplete rows,
-  an absent/nonzero benchmark exit status, accounting drift, and threshold
-  violations.
+  duplicate JSON object keys (including nested keys), an absent/nonzero
+  benchmark exit status, accounting drift, and threshold violations. Duplicate
+  keys are rejected before metric validation so different JSON parsers cannot
+  disagree on a receipt's SHA, exit status, or measured value.
   Recorded per-CPU host load or cross-process timing spread above policy yields
   exit 2 (`INCONCLUSIVE`), never GREEN. Exit 1 is invalid evidence or a
   measured regression; exit 0 covers only the selected local performance

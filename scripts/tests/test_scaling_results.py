@@ -4,6 +4,7 @@ import copy
 import contextlib
 import io
 import importlib.util
+import json
 import sys
 import unittest.mock
 import tempfile
@@ -692,6 +693,30 @@ class ScalingResultTests(unittest.TestCase):
                 MODULE.load_jsonl(path)
             path.write_bytes(b"\xff\n")
             with self.assertRaisesRegex(MODULE.ValidationError, "invalid UTF-8"):
+                MODULE.load_jsonl(path)
+
+    def test_duplicate_json_keys_cannot_rewrite_release_evidence(self) -> None:
+        records = valid_records(["--smoke"])
+        lines = [json.dumps(record, separators=(",", ":")) for record in records]
+        conflicts = (
+            (0, '"source_sha":"' + "a" * 40 + '"',
+             '"source_sha":"' + "0" * 40 + '","source_sha":"' + "a" * 40 + '"'),
+            (1, '"successful_operations":1000',
+             '"successful_operations":0,"successful_operations":1000'),
+            (-1, '"bench_exit_code":0', '"bench_exit_code":1,"bench_exit_code":0'),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "result.jsonl"
+            for index, old, new in conflicts:
+                with self.subTest(index=index):
+                    conflicted = lines.copy()
+                    self.assertIn(old, conflicted[index])
+                    conflicted[index] = conflicted[index].replace(old, new, 1)
+                    path.write_text("\n".join(conflicted) + "\n", encoding="utf-8")
+                    with self.assertRaisesRegex(MODULE.ValidationError, "duplicate JSON key"):
+                        MODULE.validate(MODULE.load_jsonl(path))
+            path.write_text('{"schema":"sample","detail":{"bytes":0,"bytes":1}}\n', encoding="utf-8")
+            with self.assertRaisesRegex(MODULE.ValidationError, "duplicate JSON key"):
                 MODULE.load_jsonl(path)
 
 
