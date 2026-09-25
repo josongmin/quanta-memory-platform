@@ -425,9 +425,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         scenarios.join("\n")
     );
     fs::write(artifact_root.join("receipt.txt"), &receipt)?;
-    if let Err(error) = run_result {
-        return Err(error);
-    }
+    run_result?;
     println!(
         "L2_RESULT attempts=2 passed=2 source_head={source_head} source_digest={source_digest} effective_uid={effective_uid} architecture={architecture} kernel={kernel} filesystem={fs_type} strace={strace_version} receipt={}",
         artifact_root.join("receipt.txt").display()
