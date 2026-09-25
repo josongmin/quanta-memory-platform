@@ -752,3 +752,33 @@ mapping. The BuildKit builder also returned and is running. The filesystem and
 device-mapper experiments therefore leave no remaining VM kernel residue.
 Only physical L3 remains an external hardware qualification, not an automated
 runner/code defect.
+
+### Final cleanup-failure RCA (2026-09-25)
+
+An adversarial read-only-artifact test found a cleanup gap: the DM runner's
+`EXIT` trap inherited `set -e`, so a failed artifact hash/stat could abort the
+trap before deleting its runner-owned temporary directory. The trap now turns
+off fail-fast mode locally, records evidence-write/cleanup failures in its
+exit status, and continues the unmount, mapping removal, loop detach, and
+temporary-directory removal attempts. The read-only artifact injection
+returned non-zero as expected and independently verified zero `qmpd*`
+mappings, loop devices, and test mounts after exit. Since the requested
+evidence destination is read-only, no runner can write a receipt there; the
+original error remains visible rather than being replaced by a cleanup panic.
+
+After this last code change, HEAD remained
+`f9a7e624b4f978f692ea2e1cc6c3e2b21b798d8c` (`origin/main`), executable digest
+`665812812e219bb385885ccbdba1168481a0f6cf10d0d6d0189d25085517a328`. Exact
+HEAD receipts:
+
+- syscall EIO 2/2:
+  `/tmp/qmp-durability-final-20260925/syscall-f9a7/receipt.txt`;
+- disposable ext4 device-mapper EIO 1/1:
+  `/tmp/qmp-durability-final-20260925/dm-final-f9a7/receipt.txt`.
+
+The Linux-only Clippy rail for `spill_redb_durability_l2` passed after
+installing the Clippy component in the ephemeral Rust 1.92 container. The
+full `python3 tools/pm/pm.py sync && scripts/check-workspace.sh` rail also
+passed after the cleanup change. The only unclosed item remains physical L3:
+this environment has no production-equivalent DUT or independent power
+controller.

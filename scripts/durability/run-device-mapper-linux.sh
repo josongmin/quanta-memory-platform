@@ -52,6 +52,10 @@ mounted=false
 cleanup() {
   local status=$?
   trap - EXIT
+  # Cleanup must continue when evidence cannot be persisted (for example, a
+  # caller supplied a read-only artifact mount). Do not let the script's
+  # fail-fast mode skip device detach or the runner-owned temp-directory drop.
+  set +e
   if [[ "${mapping_created}" == true && -n "${loop_device}" ]] && dmsetup info "${dm_name}" >/dev/null 2>&1; then
     dmsetup suspend --noflush "${dm_name}" >/dev/null 2>&1 || true
     dmsetup reload "${dm_name}" --table "0 ${sectors} linear ${loop_device} 0" >/dev/null 2>&1 || true
@@ -67,20 +71,29 @@ cleanup() {
     losetup -d "${loop_device}" || status=1
   fi
   if [[ -n "${artifact_root}" && -f "${image}" ]]; then
-    mkdir -p "${artifact_root}" || status=1
-    cp --sparse=always "${image}" "${artifact_root}/device-mapper-backing.img" || status=1
-    local image_hash
-    image_hash="$(sha256sum "${artifact_root}/device-mapper-backing.img" | awk '{print $1}')"
-    if [[ -f "${artifact_root}/receipt.txt" ]]; then
-      printf 'device_mapper_image_sha256=%s\ndevice_mapper_image_bytes=%s\n' \
-        "${image_hash}" "$(stat -c '%s' "${artifact_root}/device-mapper-backing.img")" \
-        >>"${artifact_root}/receipt.txt"
+    if mkdir -p "${artifact_root}" && \
+      cp --sparse=always "${image}" "${artifact_root}/device-mapper-backing.img"; then
+      local image_hash image_bytes
+      image_hash="$(sha256sum "${artifact_root}/device-mapper-backing.img" | awk '{print $1}')"
+      image_bytes="$(stat -c '%s' "${artifact_root}/device-mapper-backing.img")"
+      if [[ -n "${image_hash}" && -n "${image_bytes}" ]]; then
+        if [[ -f "${artifact_root}/receipt.txt" ]]; then
+          printf 'device_mapper_image_sha256=%s\ndevice_mapper_image_bytes=%s\n' \
+            "${image_hash}" "${image_bytes}" >>"${artifact_root}/receipt.txt" || status=1
+        else
+          printf 'level=L2\nrunner_receipt=unavailable\nrunner_exit_status=%s\ndevice_mapper_image_sha256=%s\ndevice_mapper_image_bytes=%s\n' \
+            "${status}" "${image_hash}" "${image_bytes}" >"${artifact_root}/receipt.txt" || status=1
+        fi
+      else
+        echo "error: copied DM backing image could not be hashed/stat'ed" >&2
+        status=1
+      fi
     else
-      printf 'level=L2\nrunner_receipt=unavailable\nrunner_exit_status=%s\n' \
-        "${status}" >"${artifact_root}/receipt.txt"
+      echo "error: could not preserve DM backing image under ${artifact_root}" >&2
+      status=1
     fi
   fi
-  rm -rf -- "${vm_root}"
+  rm -rf -- "${vm_root}" || status=1
   exit "${status}"
 }
 trap cleanup EXIT
