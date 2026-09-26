@@ -1,4 +1,4 @@
-//! Finalize-kill child helper for the DURABILITY-001 L1 rail.
+//! Finalize-kill child helper for the durability L1 rail.
 //!
 //! This is test tooling, not a consumer demo:
 //! `tests/spill_redb_finalize_kill.rs` spawns this binary, waits for its

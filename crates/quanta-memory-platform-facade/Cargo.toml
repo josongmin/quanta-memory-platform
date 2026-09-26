@@ -32,7 +32,7 @@ spill = []
 # Existing opt-in backing. `spill-redb` is outside the current product plan
 # and is not production-qualified; enabling it is not a release claim.
 spill-redb = ["spill", "dep:redb"]
-# Test-only finalize kill hooks (DURABILITY-001 L1). This is crash-rail
+# Test-only finalize-kill L1 hooks. This is crash-rail
 # instrumentation, not a production capability: it stays absent from `default`,
 # `full`, and `full-backings`, and default builds compile the existing finalize
 # path with zero added code. `--all-features` still proves the surface.

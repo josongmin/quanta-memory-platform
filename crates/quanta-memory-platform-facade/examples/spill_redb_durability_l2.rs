@@ -1,4 +1,4 @@
-//! Opt-in Linux syscall-failure rail for Redb finalize (DURABILITY-001 L2).
+//! Opt-in Linux syscall-failure L2 rail for Redb finalize.
 //!
 //! This harness injects `EIO` into the first `pwrite64` or `fdatasync` after
 //! the finalize transaction is fully staged and immediately before

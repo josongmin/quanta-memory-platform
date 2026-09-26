@@ -315,7 +315,7 @@ pub struct RedbSpillBacking {
     faults: RedbFaults,
 }
 
-/// Test-only finalize kill hooks (DURABILITY-001 L1). This module exists only
+/// Test-only finalize-kill L1 hooks. This module exists only
 /// under the non-default `durability-test-hooks` feature, which is crash-rail
 /// instrumentation — never a production callback, environment kill switch, or
 /// always-present global. Default builds compile `finalize_restore` with zero

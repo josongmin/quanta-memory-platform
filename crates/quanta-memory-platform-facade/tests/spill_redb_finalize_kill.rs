@@ -1,5 +1,4 @@
-//! Real finalize instruction-point kill rail for the durable spill tier
-//! (DURABILITY-001 L1).
+//! Real finalize instruction-point kill L1 rail for the durable spill tier.
 //!
 //! Boundary proved here: the child process is ended with
 //! [`std::process::Child::kill`] — `SIGKILL` on Unix, which runs no
