@@ -46,6 +46,10 @@ def named_step(text: str, name: str) -> list[str]:
         raise AssertionError(f"expected one {name!r} step, got {len(matches)}")
     start = matches[0]
     indent = len(lines[start]) - len(lines[start].lstrip())
+    if lines[start].strip().startswith("name:"):
+        previous = next((line for line in reversed(lines[:start]) if line.strip() and not line.lstrip().startswith("#")), "")
+        if previous.strip() != "- run:" or len(previous) - len(previous.lstrip()) != indent - 4:
+            raise AssertionError("extraction name must be the first property of its run step")
     end = len(lines)
     for i in range(start + 1, len(lines)):
         line = lines[i]
@@ -60,11 +64,28 @@ def named_step(text: str, name: str) -> list[str]:
 
 def executable_step_errors(text: str, name: str, body_key: str) -> list[str]:
     try:
-        step = named_step(job_block(text, "full-extraction"), name)
+        job = job_block(text, "full-extraction")
+        step = named_step(job, name)
     except AssertionError as error:
         return [str(error)]
     stripped = [line.strip() for line in step if line.strip()]
     errors: list[str] = []
+    job_keys = {"machine", "resource_class", "steps"} if body_key == "command" else {
+        "if", "runs-on", "timeout-minutes", "steps",
+    }
+    root_keys = {"version", "jobs", "workflows"} if body_key == "command" else {
+        "name", "on", "permissions", "jobs",
+    }
+    # Reject inherited defaults/environment and YAML merge keys too. Quoted
+    # keys cannot evade a blacklist because the owned envelopes are explicit.
+    for container, indent, allowed_keys in ((job, 4, job_keys), (text, 0, root_keys)):
+        for line in container.splitlines():
+            if not line.strip() or line.lstrip().startswith("#"):
+                continue
+            if len(line) - len(line.lstrip()) == indent:
+                key = line.strip().split(":", 1)[0]
+                if key not in allowed_keys:
+                    errors.append(f"extraction execution envelope has unapproved property: {key}")
     expected_indent = 10 if body_key == "command" else 6
     actual_indent = len(step[0]) - len(step[0].lstrip())
     if actual_indent != expected_indent:
@@ -73,6 +94,17 @@ def executable_step_errors(text: str, name: str, body_key: str) -> list[str]:
         errors.append("extraction step is disabled")
     if any(line.startswith(("when:", "continue-on-error:")) for line in stripped):
         errors.append("extraction step has conditional or ignored failure")
+    # Only the owned execution envelope may surround the command. A custom
+    # shell such as /bin/true can accept the script filename without running
+    # it; background execution can report success before the gate finishes.
+    property_indent = expected_indent if body_key == "command" else expected_indent + 2
+    allowed = {"name", body_key} | ({"no_output_timeout"} if body_key == "command" else set())
+    for line in step[1:]:
+        level = len(line) - len(line.lstrip())
+        if level == property_indent and line.strip():
+            key = line.strip().split(":", 1)[0]
+            if key not in allowed:
+                errors.append(f"extraction step has unapproved execution property: {key}")
     if f"{body_key}: |" not in stripped:
         errors.append("extraction step has no executable command block")
     else:
@@ -237,6 +269,37 @@ class CiEntryPointContracts(unittest.TestCase):
         )
         moved = circle.replace(direct, "").replace("workflows:\n", unused_job + "\nworkflows:\n")
         self.assertTrue(executable_step_errors(moved, STEP_NAME, "command"))
+
+    def test_extraction_execution_envelope_cannot_skip_the_command(self) -> None:
+        circle = CIRCLECI_CONFIG.read_text(encoding="utf-8")
+        quoted_environment = circle.replace(
+            "  full-extraction:\n", '  full-extraction:\n    "environment": {BASH_ENV: /tmp/skip}\n',
+        )
+        self.assertTrue(executable_step_errors(quoted_environment, STEP_NAME, "command"))
+        for property_line in ("shell: /bin/true", "background: true", "environment: {BASH_ENV: /tmp/skip}"):
+            mutated = circle.replace(
+                f"          name: {STEP_NAME}\n", f"          name: {STEP_NAME}\n          {property_line}\n",
+            )
+            with self.subTest(property_line=property_line):
+                self.assertTrue(executable_step_errors(mutated, STEP_NAME, "command"))
+        before_name = circle.replace(
+            f"          name: {STEP_NAME}\n", f"          shell: /bin/true\n          name: {STEP_NAME}\n",
+        )
+        self.assertTrue(executable_step_errors(before_name, STEP_NAME, "command"))
+        self.assertTrue(executable_step_errors(
+            circle.replace("  full-extraction:\n", "  full-extraction:\n    environment: {BASH_ENV: /tmp/skip}\n"),
+            STEP_NAME, "command",
+        ))
+        github = GITHUB_WORKFLOW.read_text(encoding="utf-8")
+        self.assertTrue(executable_step_errors(
+            github.replace("jobs:\n", "defaults:\n  run:\n    shell: true {0}\njobs:\n"), STEP_NAME, "run",
+        ))
+        for property_line in ("shell: true {0}", "working-directory: /tmp/stale", "env: {BASH_ENV: /tmp/skip}"):
+            mutated = github.replace(
+                f"      - name: {STEP_NAME}\n", f"      - name: {STEP_NAME}\n        {property_line}\n",
+            )
+            with self.subTest(property_line=property_line):
+                self.assertTrue(executable_step_errors(mutated, STEP_NAME, "run"))
 
     def test_benchmark_artifact_steps_cannot_disappear(self) -> None:
         text = BENCHMARK_CONFIG.read_text(encoding="utf-8")
