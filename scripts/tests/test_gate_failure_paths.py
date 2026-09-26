@@ -19,6 +19,14 @@ def executable(path: Path, contents: str) -> None:
     path.chmod(0o755)
 
 
+def command_env(path: str) -> dict[str, str]:
+    env = {**os.environ, "PATH": path}
+    # CircleCI sources BASH_ENV in every child Bash process and prepends its
+    # tool paths again, which would bypass the command wrappers in these tests.
+    env.pop("BASH_ENV", None)
+    return env
+
+
 class GateFailurePathsTests(unittest.TestCase):
     def test_extracted_checkout_status_error_cannot_report_success(self) -> None:
         with tempfile.TemporaryDirectory(prefix="qmp-extract-git-failure-") as directory:
@@ -37,7 +45,7 @@ class GateFailurePathsTests(unittest.TestCase):
             result = subprocess.run(
                 ["bash", str(scripts / "verify-extracted-examples.sh")],
                 cwd=root,
-                env={**os.environ, "PATH": f"{binary}:{os.environ['PATH']}"},
+                env=command_env(f"{binary}:{os.environ['PATH']}"),
                 capture_output=True,
                 text=True,
                 check=False,
@@ -62,7 +70,7 @@ class GateFailurePathsTests(unittest.TestCase):
             result = subprocess.run(
                 [str(binary / "bash"), str(scripts / "verify-feature-matrix.sh")],
                 cwd=root,
-                env={**os.environ, "PATH": str(binary)},
+                env=command_env(str(binary)),
                 capture_output=True,
                 text=True,
                 check=False,
@@ -90,7 +98,7 @@ class GateFailurePathsTests(unittest.TestCase):
                 "#!/bin/sh\nprintf 'scripts/check-workspace.sh\\000'\nexit 42\n",
             )
             executable(binary / "shellcheck", "#!/bin/sh\nexit 0\n")
-            env = {**os.environ, "PATH": f"{binary}:{os.environ['PATH']}"}
+            env = command_env(f"{binary}:{os.environ['PATH']}")
             result = subprocess.run(
                 ["bash", str(scripts / "check-workspace.sh")],
                 cwd=root,
@@ -141,12 +149,8 @@ class GateFailurePathsTests(unittest.TestCase):
                 "  *) exit 38 ;;\n"
                 "esac\n",
             )
-            env = {
-                **os.environ,
-                "PATH": f"{binary}:{os.environ['PATH']}",
-                "QMP_MATRIX_METADATA": str(metadata),
-                "QMP_MATRIX_LOG": str(log),
-            }
+            env = command_env(f"{binary}:{os.environ['PATH']}")
+            env.update(QMP_MATRIX_METADATA=str(metadata), QMP_MATRIX_LOG=str(log))
             result = subprocess.run(
                 ["bash", str(scripts / "verify-feature-matrix.sh")],
                 cwd=root,

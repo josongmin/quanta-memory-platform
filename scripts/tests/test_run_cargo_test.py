@@ -71,6 +71,9 @@ class CargoTestOutputTest(unittest.TestCase):
             fake_python.chmod(0o755)
             capture = temporary / "calls.txt"
             environment = dict(os.environ)
+            # CircleCI's BASH_ENV prepends its tool paths in child Bash shells,
+            # overriding this test's intentionally first PATH entry.
+            environment.pop("BASH_ENV", None)
             environment["PATH"] = f"{temporary}:{environment['PATH']}"
             environment["QMP_TEST_CAPTURE"] = str(capture)
             for arguments, expected_count in ((["--in-memory"], 8), ([], 10)):
