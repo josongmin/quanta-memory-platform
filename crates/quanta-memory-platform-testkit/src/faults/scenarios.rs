@@ -7,11 +7,12 @@
 //! folds into an assertion.
 
 use quanta_memory_platform_core::{
-    ChargeKind, MemoryClass, MemoryPreset, MemoryResult, RetainedEnvelope, StoreBindingHandle,
+    ChargeKind, LedgerSnapshot, LiveProcessMemoryBroker, MemoryClass, MemoryPreset, MemoryResult,
+    RetainedEnvelope, StoreBindingHandle, StoreStats, UsageBreakdown,
 };
 use quanta_memory_platform_facade::{
-    InMemorySpillTarget, MemoryPlatformBuilder, PayloadStore, RoutedSpillController,
-    SpillController,
+    Budgeted, InMemorySpillTarget, MemoryPlatformBuilder, PayloadStore, RoutedSpillController,
+    SimplePayloadStore, SpillController,
 };
 
 use crate::fake::FakeProcessBroker;
@@ -81,6 +82,101 @@ pub fn drive_reclaim_returns_zero() -> FaultOutcome {
     }
 }
 
+/// The reference lookup (`pin_count`) proves the actual pinned entry is present;
+/// store statistics and the full ledger snapshot separately prove its accounting.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PinnedPayloadObservation {
+    pin_count: u64,
+    stats: StoreStats,
+    charged_bytes: u64,
+    ledger: LedgerSnapshot,
+}
+
+fn kind_totals<'a>(mut usage: impl Iterator<Item = &'a UsageBreakdown>) -> Option<(u64, u64, u64)> {
+    usage.try_fold((0u64, 0u64, 0u64), |(payload, metadata, scratch), usage| {
+        Some((
+            payload.checked_add(usage.retained_payload_bytes)?,
+            metadata.checked_add(usage.retained_metadata_bytes)?,
+            scratch.checked_add(usage.live_scratch_bytes)?,
+        ))
+    })
+}
+
+impl PinnedPayloadObservation {
+    fn proves_live_accounting(&self) -> bool {
+        let class = kind_totals(self.ledger.class_usage.values());
+        let owner = kind_totals(self.ledger.owner_usage.values());
+        let context = kind_totals(self.ledger.context_usage.values());
+        self.ledger.live_ticket_count > 0
+            && !self.ledger.rebuild_in_progress
+            && self.ledger.checked_total_class_bytes() == Ok(self.charged_bytes)
+            && self.ledger.checked_total_owner_bytes() == Ok(self.charged_bytes)
+            && self.ledger.checked_total_context_bytes() == Ok(self.charged_bytes)
+            && class.is_some()
+            && class == owner
+            && owner == context
+    }
+}
+
+trait PinnedPayloadProbe {
+    type Reference;
+
+    fn observe(&self, payload_ref: &Self::Reference) -> MemoryResult<PinnedPayloadObservation>;
+    fn delete_if_unpinned(&self, payload_ref: &Self::Reference) -> MemoryResult<()>;
+}
+
+struct LivePinnedPayloadProbe<'a> {
+    store: &'a SimplePayloadStore<String, Vec<u8>, Budgeted>,
+    broker: &'a LiveProcessMemoryBroker,
+}
+
+impl PinnedPayloadProbe for LivePinnedPayloadProbe<'_> {
+    type Reference = String;
+    fn observe(&self, payload_ref: &String) -> MemoryResult<PinnedPayloadObservation> {
+        Ok(PinnedPayloadObservation {
+            pin_count: self.store.pin_count(payload_ref)?,
+            stats: self.store.stats()?,
+            charged_bytes: self.store.charged_bytes()?,
+            ledger: self.broker.ledger_snapshot()?,
+        })
+    }
+
+    fn delete_if_unpinned(&self, payload_ref: &String) -> MemoryResult<()> {
+        self.store.delete_if_unpinned(payload_ref)
+    }
+}
+
+/// Both the live driver and the broken targets execute this one classifier.
+/// An unreadable observation or a missing reference cannot count as containment.
+fn classify_pinned_delete<P: PinnedPayloadProbe>(
+    probe: &P,
+    payload_ref: &P::Reference,
+) -> FaultOutcome {
+    let before = probe.observe(payload_ref);
+    let delete = probe.delete_if_unpinned(payload_ref);
+    let after = probe.observe(payload_ref);
+    match (before, delete, after) {
+        (Ok(before), Err(error), Ok(after))
+            if before.pin_count > 0
+                && before.stats.item_count > 0
+                && before.charged_bytes > 0
+                && before.stats.estimated_bytes == before.charged_bytes
+                && before.proves_live_accounting()
+                && before == after => FaultOutcome::Contained {
+                    evidence: format!(
+                        "pinned delete rejected ({error}); reference and bytes survived at {} (pins={} items={})",
+                        after.charged_bytes, after.pin_count, after.stats.item_count,
+                    ),
+                },
+        (before, Err(error), after) => FaultOutcome::Escaped {
+            evidence: format!("delete rejected ({error}) but pinned payload proof was {before:?}->{after:?}"),
+        },
+        (_, Ok(()), _) => FaultOutcome::Escaped {
+            evidence: "pinned payload was deleted (pin discipline violated)".to_string(),
+        },
+    }
+}
+
 /// NEGATIVE PATH 2: pin invalidation race — a delete attempted while the payload
 /// is pinned must be rejected (the pinned payload must survive). Contained means
 /// the delete failed closed AND the bytes/entry survived.
@@ -107,20 +203,10 @@ pub fn drive_pin_invalidation_failure() -> FaultOutcome {
     if store.pin(published.payload_ref()).is_err() {
         return FaultOutcome::Escaped { evidence: "pin of fresh payload failed".to_string() };
     }
-    let charged_before = store.charged_bytes().unwrap_or(0);
-    let delete = store.delete_if_unpinned(published.payload_ref());
-    let charged_after = store.charged_bytes().unwrap_or(0);
-    match delete {
-        Err(e) if charged_after == charged_before && charged_after > 0 => FaultOutcome::Contained {
-            evidence: format!("pinned delete rejected ({e}); bytes survived at {charged_after}"),
-        },
-        Err(e) => FaultOutcome::Escaped {
-            evidence: format!("delete rejected ({e}) but bytes drifted to {charged_after}"),
-        },
-        Ok(()) => FaultOutcome::Escaped {
-            evidence: "pinned payload was deleted (pin discipline violated)".to_string(),
-        },
-    }
+    classify_pinned_delete(
+        &LivePinnedPayloadProbe { store: &store, broker: platform.broker() },
+        published.payload_ref(),
+    )
 }
 
 /// NEGATIVE PATH 3: rebuild race — a write that arrives while the rebuild window
@@ -216,6 +302,110 @@ mod tests {
         assert!(outcome.contained(), "pinned delete must be contained: {}", outcome.evidence());
         // Evidence proves the bytes survived the rejected delete.
         assert!(outcome.evidence().contains("bytes survived"));
+    }
+
+    #[test]
+    fn pinned_delete_classifier_rejects_reference_loss_and_accounting_lies() {
+        use quanta_memory_platform_core::{MemoryContextKind, MemoryError, UsageBreakdown};
+        use std::cell::Cell;
+
+        #[derive(Clone, Copy, Debug)]
+        enum BrokenPin {
+            MissingReference,
+            LostEntry,
+            StoreDebitDrift,
+            ClassKindDrift,
+            TicketAuthorityDrift,
+            UnreadableProof,
+            ReportsSuccess,
+            InvalidInitialProof,
+        }
+        struct BrokenPinProbe {
+            fault: BrokenPin,
+            deleted: Cell<bool>,
+            before: PinnedPayloadObservation,
+        }
+        impl PinnedPayloadProbe for BrokenPinProbe {
+            type Reference = String;
+
+            fn observe(&self, _payload_ref: &String) -> MemoryResult<PinnedPayloadObservation> {
+                let mut proof = self.before.clone();
+                if matches!(self.fault, BrokenPin::InvalidInitialProof) {
+                    let usage = proof
+                        .ledger
+                        .class_usage
+                        .get_mut(&MemoryClass::ArtifactCache)
+                        .expect("fixture class");
+                    usage.retained_payload_bytes = 0;
+                    usage.retained_metadata_bytes = 103;
+                }
+                if self.deleted.get() {
+                    match self.fault {
+                        // The debit and item count deliberately still claim survival.
+                        BrokenPin::MissingReference => proof.pin_count = 0,
+                        BrokenPin::LostEntry => {
+                            proof.pin_count = 0;
+                            proof.stats.item_count = 0;
+                        }
+                        BrokenPin::StoreDebitDrift => proof.charged_bytes += 1,
+                        BrokenPin::ClassKindDrift => {
+                            let usage = proof
+                                .ledger
+                                .class_usage
+                                .get_mut(&MemoryClass::ArtifactCache)
+                                .expect("fixture class");
+                            usage.retained_payload_bytes = 0;
+                            usage.retained_metadata_bytes = 103;
+                        }
+                        BrokenPin::TicketAuthorityDrift => proof.ledger.live_ticket_count = 0,
+                        BrokenPin::UnreadableProof => {
+                            return Err(MemoryError::report("pin proof unreadable"))
+                        }
+                        BrokenPin::ReportsSuccess | BrokenPin::InvalidInitialProof => {}
+                    }
+                }
+                Ok(proof)
+            }
+            fn delete_if_unpinned(&self, _payload_ref: &String) -> MemoryResult<()> {
+                self.deleted.set(true);
+                match self.fault {
+                    BrokenPin::ReportsSuccess => Ok(()),
+                    _ => Err(MemoryError::InvalidState("delete rejected: still pinned".into())),
+                }
+            }
+        }
+        let usage = UsageBreakdown { retained_payload_bytes: 103, ..UsageBreakdown::default() };
+        let before = PinnedPayloadObservation {
+            pin_count: 1,
+            stats: StoreStats { item_count: 1, estimated_bytes: 103 },
+            charged_bytes: 103,
+            ledger: LedgerSnapshot {
+                class_usage: [(MemoryClass::ArtifactCache, usage)].into(),
+                owner_usage: [("fault:owner".into(), usage)].into(),
+                context_usage: [(MemoryContextKind::Request, usage)].into(),
+                live_ticket_count: 1,
+                rebuild_in_progress: false,
+            },
+        };
+        for fault in [
+            BrokenPin::MissingReference,
+            BrokenPin::LostEntry,
+            BrokenPin::StoreDebitDrift,
+            BrokenPin::ClassKindDrift,
+            BrokenPin::TicketAuthorityDrift,
+            BrokenPin::UnreadableProof,
+            BrokenPin::ReportsSuccess,
+            BrokenPin::InvalidInitialProof,
+        ] {
+            let probe = BrokenPinProbe { fault, deleted: Cell::new(false), before: before.clone() };
+            let outcome = classify_pinned_delete(&probe, &"payload-0".into());
+            assert!(
+                matches!(outcome, FaultOutcome::Escaped { .. }),
+                "{fault:?} must escape containment through the live classifier: {outcome:?}"
+            );
+        }
+        // Positive pole runs exactly the same classifier through the real adapter.
+        assert!(drive_pin_invalidation_failure().contained());
     }
 
     #[test]

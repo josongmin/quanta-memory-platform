@@ -920,8 +920,9 @@ mod tests {
     // each axis must fit the global band, but they are not summed together.
     #[test]
     fn resource_group_reserved_has_an_independent_global_floor() {
-        let residency =
-            ResidencyPolicy::new(10_000).with_headroom_bytes(1_000).with_resource_group(
+        let residency = ResidencyPolicy::new(10_000)
+            .with_headroom_bytes(1_000)
+            .with_resource_group(
                 "group:a",
                 ResourceGroup {
                     reserved_bytes: 5_000,
@@ -930,6 +931,16 @@ mod tests {
                     burst_percent: 10,
                     reclaim_priority: ReclaimPriority::Normal,
                     admission_weight: 1,
+                },
+            )
+            .with_class_budget(
+                MemoryClass::ArtifactCache,
+                MemoryClassBudget {
+                    reserved_bytes: 5_000,
+                    soft_cap_bytes: 6_000,
+                    hard_cap_bytes: 7_000,
+                    borrow_from_shared_pool: false,
+                    reclaim_priority: ReclaimPriority::Normal,
                 },
             );
         assert!(validate_residency(&residency).is_ok());

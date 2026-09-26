@@ -3459,6 +3459,30 @@ mod tests {
         b.commit(&t2).expect("commit");
         // 800k / 1_000_000 = 80% -> Soft (>=75) but < hard (90).
         assert_eq!(b.classify_pressure().expect("classify"), PressureState::Soft);
+        let before = b.ledger_snapshot().expect("semantic snapshot before telemetry");
+        for resident_bytes in [0, 999_999] {
+            let advisory = b
+                .observe_allocator(&AllocatorSnapshot {
+                    resident_bytes: Some(resident_bytes),
+                    ..AllocatorSnapshot::default()
+                })
+                .expect("observe contradictory allocator usage");
+            assert!(advisory.mismatch);
+            assert_eq!(advisory.semantic_bytes, 800_000);
+            assert_eq!(
+                crate::PressureController::current_pressure(
+                    b.lock().expect("pressure after advisory observation").controller.as_ref()
+                ),
+                PressureState::Soft,
+                "advisory observation must not change cached pressure before reclassification"
+            );
+            assert_eq!(
+                b.classify_pressure().expect("classify after telemetry"),
+                PressureState::Soft,
+                "allocator telemetry must neither downgrade nor escalate semantic pressure"
+            );
+            assert_eq!(b.ledger_snapshot().expect("snapshot after telemetry"), before);
+        }
     }
 
     // === Scenario group C: control-plane extras ===========================
@@ -7331,7 +7355,7 @@ mod tests {
             policy: &policy,
             usage: UsageView {
                 class_usage: &empty_classes,
-                owner_usage: &empty_owners,
+                owner_usage: (&empty_owners).into(),
                 context_usage: &empty_contexts,
                 total_usage: &empty_total,
             },

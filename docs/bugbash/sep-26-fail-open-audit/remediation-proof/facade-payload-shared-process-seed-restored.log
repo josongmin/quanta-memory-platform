@@ -1,0 +1,9 @@
+   Compiling quanta-memory-platform-facade v0.2.0 (/private/tmp/qmp-sep26-candidate-aych53eb/crates/quanta-memory-platform-facade)
+    Finished `test` profile [unoptimized] target(s) in 26.63s
+     Running unittests src/lib.rs (/tmp/qmp-sep26-candidate-y2s09ws1/target/debug/deps/quanta_memory_platform_facade-608c73b79af53532)
+
+running 1 test
+test payload_store::service::tests::canonical_digests_are_randomized_per_store_seed ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 363 filtered out; finished in 0.00s
+

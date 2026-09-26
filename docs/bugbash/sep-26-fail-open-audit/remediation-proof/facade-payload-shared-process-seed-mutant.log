@@ -1,0 +1,22 @@
+   Compiling quanta-memory-platform-core v0.2.0 (/private/tmp/qmp-sep26-candidate-aych53eb/crates/quanta-memory-platform-core)
+   Compiling quanta-memory-platform-facade v0.2.0 (/private/tmp/qmp-sep26-candidate-aych53eb/crates/quanta-memory-platform-facade)
+    Finished `test` profile [unoptimized] target(s) in 19.75s
+     Running unittests src/lib.rs (/tmp/qmp-sep26-candidate-y2s09ws1/target/debug/deps/quanta_memory_platform_facade-608c73b79af53532)
+
+running 1 test
+
+thread 'payload_store::service::tests::canonical_digests_are_randomized_per_store_seed' (3671977) panicked at crates/quanta-memory-platform-facade/src/payload_store/service.rs:890:9:
+assertion `left != right` failed: per-store random seeds must not reproduce a grindable fixed-key digest
+  left: 4178529197423965114
+ right: 4178529197423965114
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test payload_store::service::tests::canonical_digests_are_randomized_per_store_seed ... FAILED
+
+failures:
+
+failures:
+    payload_store::service::tests::canonical_digests_are_randomized_per_store_seed
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 363 filtered out; finished in 0.01s
+
+error: test failed, to rerun pass `-p quanta-memory-platform-facade --lib`

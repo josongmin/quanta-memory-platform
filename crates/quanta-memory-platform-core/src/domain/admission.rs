@@ -102,7 +102,7 @@ pub(crate) enum AdmissionVerdict {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct UsageView<'a> {
     pub class_usage: &'a BTreeMap<MemoryClass, UsageBreakdown>,
-    pub owner_usage: &'a BTreeMap<OwnerKey, UsageBreakdown>,
+    pub owner_usage: crate::domain::ledger::OwnerUsageRead<'a>,
     pub context_usage: &'a BTreeMap<MemoryContextKind, UsageBreakdown>,
     pub total_usage: &'a UsageBreakdown,
 }
@@ -404,6 +404,17 @@ pub(crate) fn check_ledger_postimage(
     Ok(())
 }
 
+#[cfg(test)]
+std::thread_local! {
+    // Thread-local instrumentation isolates concurrently executing unit tests.
+    static FAIR_SHARE_PRECOMPUTE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn fair_share_precompute_calls() -> usize {
+    FAIR_SHARE_PRECOMPUTE_CALLS.with(std::cell::Cell::get)
+}
+
 /// Precompute Hamilton's largest-remainder allocation. Every group receives
 /// the floor of its exact weighted share, then leftover bytes are assigned
 /// by descending fractional remainder with the stable group name as the
@@ -417,6 +428,8 @@ pub(crate) fn precompute_fair_burst_shares(
     groups: &BTreeMap<String, ResourceGroup>,
     shared_burst_pool_bytes: u64,
 ) -> BTreeMap<String, u64> {
+    #[cfg(test)]
+    FAIR_SHARE_PRECOMPUTE_CALLS.with(|calls| calls.set(calls.get() + 1));
     let total: u128 = groups.values().map(|group| u128::from(group.admission_weight)).sum();
     if total == 0 {
         return groups.keys().map(|name| (name.clone(), 0)).collect();
@@ -770,7 +783,7 @@ pub(crate) fn preflight(inputs: &PreflightInputs) -> AdmissionVerdict {
             let zero = PreflightInputs {
                 usage: UsageView {
                     class_usage: &empty_classes,
-                    owner_usage: &empty_owners,
+                    owner_usage: (&empty_owners).into(),
                     context_usage: &empty_contexts,
                     total_usage: &empty_usage,
                 },
@@ -845,7 +858,7 @@ mod tests {
         let empty_contexts = BTreeMap::new();
         let usage = UsageView {
             class_usage: &empty_classes,
-            owner_usage: &empty_owners,
+            owner_usage: (&empty_owners).into(),
             context_usage: &empty_contexts,
             total_usage: &total,
         };

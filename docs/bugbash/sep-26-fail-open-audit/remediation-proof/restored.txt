@@ -1,0 +1,1 @@
+All source hashes match the frozen candidate. Every selector baseline/restored GREEN and mutant RED.

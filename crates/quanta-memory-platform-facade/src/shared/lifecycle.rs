@@ -337,6 +337,7 @@ impl Drop for ClosePermit<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::SingleTestCommand;
 
     struct PanicOnPayloadDrop;
 
@@ -380,6 +381,7 @@ mod tests {
             .arg("shared::lifecycle::tests::hostile_panic_payload_drop_cannot_abort_outer_unwind")
             .arg("--nocapture")
             .env(CHILD, "1")
+            .require_one_test()
             .output()
             .expect("run isolated destructor-panic child");
         assert!(

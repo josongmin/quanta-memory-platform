@@ -1,0 +1,21 @@
+   Compiling quanta-memory-platform-core v0.2.0 (/private/tmp/qmp-sep26-candidate-aych53eb/crates/quanta-memory-platform-core)
+    Finished `test` profile [unoptimized] target(s) in 9.30s
+     Running unittests src/lib.rs (/tmp/qmp-sep26-candidate-y2s09ws1/target/debug/deps/quanta_memory_platform_core-37b056fcda520d3a)
+
+running 1 test
+
+thread 'domain::ledger::tests::single_release_preflight_is_bounded_independent_of_owner_cardinality' (3727843) panicked at crates/quanta-memory-platform-core/src/domain/ledger.rs:1811:9:
+assertion `left == right` failed: one release probes exactly one class/kind, owner/kind and context/kind slot
+  left: 35
+ right: 3
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test domain::ledger::tests::single_release_preflight_is_bounded_independent_of_owner_cardinality ... FAILED
+
+failures:
+
+failures:
+    domain::ledger::tests::single_release_preflight_is_bounded_independent_of_owner_cardinality
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 273 filtered out; finished in 0.02s
+
+error: test failed, to rerun pass `-p quanta-memory-platform-core --lib`

@@ -499,6 +499,7 @@ fn remove_index_slot(index: &mut HashMap<u64, Vec<usize>>, digest: u64, slot: us
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::SingleTestCommand;
     use std::cell::{Cell, RefCell};
     use std::hash::Hasher;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -881,15 +882,17 @@ mod tests {
         // Fixed-key hashing would let an attacker grind canonical keys into
         // one index bucket offline; per-store random seeds must not reproduce
         // a deterministic digest (collision probability 2^-64).
-        let a = RandomState::new();
-        let b = RandomState::new();
+        let (_, store_a) = store();
+        let (_, store_b) = store();
+        let a = &store_a.digest_seed;
+        let b = &store_b.digest_seed;
         let key = b"adversarial-canonical-key".as_slice();
         assert_ne!(
-            canonical_digest(&a, key),
-            canonical_digest(&b, key),
+            canonical_digest(a, key),
+            canonical_digest(b, key),
             "per-store random seeds must not reproduce a grindable fixed-key digest"
         );
-        assert_eq!(canonical_digest(&a, key), canonical_digest(&a, key));
+        assert_eq!(canonical_digest(a, key), canonical_digest(a, key));
     }
 
     #[test]
@@ -1527,6 +1530,7 @@ mod tests {
                 std::process::Command::new(std::env::current_exe().expect("test binary"))
                     .arg("delete_drop_reentry_is_bounded_and_peer_publication_retains_exact_charge")
                     .env(CHILD, "1")
+                    .require_one_test()
                     .spawn()
                     .expect("spawn bounded reentry test");
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
@@ -1686,6 +1690,7 @@ mod tests {
             .arg("delete_contains_two_panicking_client_destructors_after_exact_refund")
             .arg("--nocapture")
             .env(CHILD, "1")
+            .require_one_test()
             .output()
             .expect("spawn child");
         assert!(

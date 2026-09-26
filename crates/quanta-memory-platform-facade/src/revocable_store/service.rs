@@ -1428,6 +1428,7 @@ mod tests {
         InProcessSpillTarget, NoopSpillController, RoutedSpillController, SpillController,
         SpillInventory, SpillReceipt, SpillTarget,
     };
+    use crate::test_support::SingleTestCommand;
     #[cfg(feature = "spill")]
     use quanta_memory_platform_core::MemoryOutcome;
     use quanta_memory_platform_core::{
@@ -1595,6 +1596,7 @@ mod tests {
             .arg("--exact")
             .arg("revocable_store::service::tests::compound_measurement_and_drop_panic_does_not_abort_insert")
             .env(CHILD, "1")
+            .require_one_test()
             .output()
             .expect("isolated measurement child");
         assert!(

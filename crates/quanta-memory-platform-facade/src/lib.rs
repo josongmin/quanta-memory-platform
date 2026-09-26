@@ -43,6 +43,18 @@
 pub mod presets;
 pub mod shared;
 
+#[cfg(all(
+    test,
+    any(
+        feature = "payload_store",
+        feature = "retained_map",
+        feature = "revocable_store",
+        feature = "transcript",
+        feature = "publish_pipeline"
+    )
+))]
+mod test_support;
+
 #[cfg(feature = "payload_store")]
 pub mod payload_store;
 #[cfg(feature = "publish_pipeline")]

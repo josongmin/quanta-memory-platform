@@ -589,7 +589,7 @@ The retaining prepared-publication service is separately charged.
 ## K. Numeric / safety 🔢 — ✅
 
 - ✅ ledger numeric edges — see group A (checked aggregate folds, u64 add/sub, i64-cast regression guard).
-- ✅ controller numeric coverage — `tiny_non_zero_limit_saturates_percent_without_wrapping` and the existing zero-limit / ladder tests cover tiny-limit and `u64::MAX` semantic usage edges without wrap.
+- ✅ controller numeric coverage — `extreme_limits_classify_percent_without_wrapping_or_saturating_product` and the existing zero-limit / ladder tests cover tiny limits, MAX-limit/MAX-usage and large-limit 80% ratios without wrapping or premature saturation.
 - ✅ scheduler numeric coverage — `huge_pool_and_weights_compute_a_non_wrapping_fair_share` and `repeated_exact_usage_release_round_trip_never_wraps` cover huge-pool/huge-weight share math and repeated exact usage/release round-trips.
 
 ## L. Telemetry adapters — ✅ (`core/src/adapters/*`, `core/src/ports/telemetry.rs`)

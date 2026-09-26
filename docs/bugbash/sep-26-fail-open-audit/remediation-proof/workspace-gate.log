@@ -1,0 +1,1198 @@
+[check-workspace] fmt --check
+[check-workspace] shellcheck
+[check-workspace] resolved workspace graph
+[check-workspace] workspace policy
+workspace policy: OK
+[check-workspace] host dependency cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+[check-workspace] regression-guards (parallel with Python contract tests)
+[check-workspace] Python contract tests
+....................................................................................................
+----------------------------------------------------------------------
+Ran 100 tests in 19.864s
+
+OK
+----------------------------------------------------------------------
+Ran 18 tests in 0.394s
+
+OK
+PASS: omitted semgrep config rejected
+PASS: missing lockfile source rejected
+PASS: missing semgrep config rejected
+PASS: missing semgrep binary rejected
+PASS: zero-target semgrep scan rejected
+PASS: consolidated Semgrep fixtures exercised all 6 rules and clean cases
+PASS: feature-list parser failure stops feature matrix
+PASS: lockfile drift rejected
+extraction-contracts: OK
+[regression-guards] semgrep tools/semgrep/qmp-regressions.yml
+               
+               
+┌─────────────┐
+│ Scan Status │
+└─────────────┘
+  Scanning 76 files tracked by git with 6 Code rules:
+  Scanning 76 files with 6 rust rules.
+                
+                
+┌──────────────┐
+│ Scan Summary │
+└──────────────┘
+✅ Scan completed successfully.
+ • Findings: 0 (0 blocking)
+ • Rules run: 6
+ • Targets scanned: 76
+ • Parsed lines: ~100.0%
+ • Scan skipped: 
+   ◦ Not matching --include patterns: 85
+   ◦ Files matching .semgrepignore patterns: 20
+ • Scan was limited to files tracked by git
+ • For a detailed list of skipped files and lines, run semgrep with the --verbose flag
+Ran 6 rules on 76 files: 0 findings.
+[regression-guards] scanned 76 Rust files, including all 68 production files
+[regression-guards] semgrep: clean
+[check-workspace] feature-matrix
+feature-matrix: per-crate feature-slice build sweep (fail-closed)
+==> [quanta-memory-platform-core] checking: default features
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.22s
+==> [quanta-memory-platform-core] checking: --no-default-features
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.11s
+==> [quanta-memory-platform-core] checking: feature 'live_control' alone
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.07s
+==> [quanta-memory-platform-core] checking: feature 'pressure' alone
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.11s
+==> [quanta-memory-platform-core] checking: feature 'scheduler' alone
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.06s
+==> [quanta-memory-platform-core] checking: feature 'telemetry' alone
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.39s
+==> [quanta-memory-platform-core] checking: feature 'unbudgeted_pin' alone
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.11s
+==> [quanta-memory-platform-core] checking: --no-default-features --features full
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.15s
+==> [quanta-memory-platform-facade] checking: default features
+    Blocking waiting for file lock on package cache
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.71s
+==> [quanta-memory-platform-facade] checking: --no-default-features
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.33s
+==> [quanta-memory-platform-facade] checking: feature 'core-live-accounting' alone
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.15s
+==> [quanta-memory-platform-facade] checking: feature 'durability-l2' alone
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.25s
+==> [quanta-memory-platform-facade] checking: feature 'durability-test-hooks' alone
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.15s
+==> [quanta-memory-platform-facade] checking: feature 'full-backings' alone
+    Blocking waiting for file lock on package cache
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.39s
+==> [quanta-memory-platform-facade] checking: feature 'payload_store' alone
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.07s
+==> [quanta-memory-platform-facade] checking: feature 'publish_pipeline' alone
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.22s
+==> [quanta-memory-platform-facade] checking: feature 'retained_map' alone
+    Blocking waiting for file lock on package cache
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.21s
+==> [quanta-memory-platform-facade] checking: feature 'revocable_store' alone
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.22s
+==> [quanta-memory-platform-facade] checking: feature 'spill' alone
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.13s
+==> [quanta-memory-platform-facade] checking: feature 'spill-redb' alone
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.11s
+==> [quanta-memory-platform-facade] checking: feature 'transcript' alone
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.14s
+==> [quanta-memory-platform-facade] checking: feature 'unbudgeted-stores' alone
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.21s
+==> [quanta-memory-platform-facade] checking: --no-default-features --features full
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.13s
+==> [quanta-memory-platform-testkit] checking: default features
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.59s
+==> [quanta-memory-platform-testkit] checking: --no-default-features
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.18s
+==> [quanta-memory-platform-testkit] checking: feature 'alloc_tracking' alone
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.39s
+==> [quanta-memory-platform-testkit] checking: feature 'conformance' alone
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.34s
+==> [quanta-memory-platform-testkit] checking: feature 'doctor' alone
+    Blocking waiting for file lock on package cache
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.76s
+==> [quanta-memory-platform-testkit] checking: feature 'faults' alone
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.99s
+==> [quanta-memory-platform-testkit] checking: feature 'fixtures' alone
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.37s
+==> [quanta-memory-platform-testkit] checking: feature 'loom' alone
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.93s
+==> [quanta-memory-platform-testkit] checking: --no-default-features --features full
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.27s
+    Blocking waiting for file lock on package cache
+==> [workspace] checking: --workspace --all-features
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.88s
+feature-matrix: OK (all feature combinations compiled warning-free)
+[check-workspace] cargo test --workspace --all-features
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.92s
+     Running unittests src/lib.rs (target/debug/deps/quanta_memory_platform_core-7353ddf27ab29a8b)
+
+running 274 tests
+test adapters::hdrhistogram::tests::out_of_range_record_is_rejected_and_does_not_mutate_count ... ok
+test adapters::pin::tests::duplicate_pin_does_not_over_count_dependent ... ok
+test adapters::hdrhistogram::tests::record_is_monotonic_and_lossless_in_count ... ok
+test adapters::pin::tests::invalidation_outcome_reports_exact_dependents ... ok
+test adapters::metrics::tests::emitter_surface_is_emit_only_and_takes_shared_ref ... ok
+test adapters::hdrhistogram::tests::records_deterministic_set_and_reads_back_count_and_percentiles ... ok
+test api::builder::tests::build_without_manifest_returns_build_error ... ok
+test adapters::pin::tests::pin_invalidate_round_trip_tracks_dependent_count ... ok
+test adapters::pin::tests::distinct_dependents_each_increment_count ... ok
+test adapters::hdrhistogram::tests::invalid_bounds_return_error_not_panic ... ok
+test adapters::metrics::tests::emitter_holds_no_accounting_state ... ok
+test api::control::tests::broker_is_send_and_sync ... ok
+test api::builder::tests::build_with_soft_above_hard_returns_config_error ... ok
+test api::builder::tests::report_only_builder_applies_override_layers ... ok
+test api::control::tests::bounded_events_execute_outside_lock_and_cover_major_broker_outcomes ... ok
+test api::control::tests::accepted_reconfigure_rebuilds_controller_to_new_global_limit ... ok
+test api::control::tests::competing_rebuild_fence_preserves_deferred_authority_and_original_error ... ok
+test api::builder::tests::builder_reclaimer_reaches_build_live_broker ... ok
+test api::control::tests::accepted_reconfigure_updates_revision_source_and_matches_headroom_predicate ... ok
+test api::builder::tests::build_with_invalid_residency_returns_config_error ... ok
+test api::builder::tests::builder_rejects_manifest_missing_mandatory_class ... ok
+test api::builder::tests::build_with_valid_residency_succeeds_and_reports_that_residency ... ok
+test api::control::tests::begin_rebuild_epoch_exhaustion_leaves_fence_state_untouched ... ok
+test api::control::tests::accepted_reconfigure_preserves_scheduler_group_usage ... ok
+test api::control::tests::allocator_advisory_mismatch_does_not_mutate_accounting ... ok
+test api::control::tests::broker_clones_share_one_ledger ... ok
+test api::control::tests::failed_pending_commit_during_rebuild_rolls_back_capacity ... ok
+test api::control::tests::concurrent_reclaimer_reentry_does_not_start_a_callback_storm ... ok
+test api::control::tests::denied_recharge_on_grouped_owner_preserves_group_usage ... ok
+test api::control::tests::denied_recharge_preserves_the_old_axis_not_the_new_one ... ok
+test api::control::tests::dropping_pending_reservation_during_rebuild_does_not_strand_capacity ... ok
+test api::control::tests::dropping_pending_reservation_rolls_back_all_axes ... ok
+test api::control::tests::denied_reconfigure_leaves_scheduler_controller_and_report_unchanged ... ok
+test api::control::tests::dropping_runtime_scratch_during_rebuild_returns_capacity ... ok
+test api::control::tests::execution_scratch_budget_accepts_exact_cap_and_denies_one_more ... ok
+test api::control::tests::execution_scratch_budget_caps_live_scratch_and_spares_other_kinds ... ok
+test adapters::pin::tests::poisoned_lock_is_fail_closed_not_panicking ... ok
+test api::control::tests::identity_reconfigure_succeeds_during_legal_group_burst ... ok
+test api::control::tests::event_sink_observation_reentry_delivers_outer_event_once ... ok
+test api::control::tests::forged_snapshot_has_fallible_totals_without_panicking ... ok
+test api::control::tests::group_reserved_floor_is_unavailable_to_peer_group ... ok
+test api::control::tests::grouped_headroom_preserves_protected_floor_across_reconfigure_and_release ... ok
+test api::control::tests::hard_cap_denial_reclaims_outside_lock_remeasures_and_retries_once ... ok
+test api::control::tests::identity_reconfigure_succeeds_during_legal_class_borrow ... ok
+test api::control::tests::live_reconfig_class_hard_cap_below_class_usage_denied ... ok
+test api::control::tests::live_reconfig_denies_removing_a_quota_while_the_owner_holds_authority ... ok
+test api::control::tests::live_reconfig_dropping_a_class_with_live_usage_is_denied ... ok
+test api::control::tests::live_reconfig_shrink_below_usage_denied_and_noop ... ok
+test api::control::tests::managed_charge_batch_failure_retains_every_lease ... ok
+test api::control::tests::live_reconfig_owner_quota_below_owner_usage_is_denied ... ok
+test api::control::tests::live_reconfig_raise_caps_accepted_and_preserves_usage ... ok
+test api::control::tests::live_reconfig_raising_headroom_over_non_headroom_usage_is_denied ... ok
+test api::control::tests::live_runtime_scratch_charge_appears_in_ledger_snapshot ... ok
+test api::control::tests::managed_charge_drop_recovers_poisoned_lock_for_exact_release ... ok
+test api::control::tests::managed_charge_recharge_denial_restores_old_authority ... ok
+test api::control::tests::live_runtime_scratch_over_cap_is_denied_without_mutation ... ok
+test api::control::tests::managed_charge_explicit_release_failure_retains_authority ... ok
+test api::control::tests::managed_charge_drop_during_rebuild_defers_until_finish ... ok
+test api::control::tests::managed_charge_batch_rejects_foreign_broker_before_mutation ... ok
+test api::control::tests::live_reconfig_lowering_group_cap_below_live_group_usage_is_denied ... ok
+test api::control::tests::managed_charge_drop_on_healthy_broker_releases_exact_capacity ... ok
+test api::control::tests::independent_outer_reserves_share_one_in_flight_reclaimer ... ok
+test api::control::tests::overlong_owner_is_denied_before_reclaim_or_accounting ... ok
+test api::control::tests::owner_and_group_soft_caps_each_trigger_the_same_reclaim_lane ... ok
+test api::control::tests::owner_without_group_mapping_is_not_gated_by_admission ... ok
+test api::control::tests::pending_drop_restores_resource_group_capacity ... ok
+test api::control::tests::owned_charge_sequence_matches_exact_reference_model ... ok
+test api::control::tests::poisoned_broker_fails_closed_and_trait_report_stays_truthful ... ok
+test api::control::tests::poisoned_pending_commit_retains_ticket_until_drop_rollback ... ok
+test api::control::tests::pressure_classifies_from_semantic_usage ... ok
+test api::control::tests::rebuild_fence_rejects_foreign_clone_finish_and_second_live_begin ... ok
+test api::control::tests::pressure_thresholds_are_inclusive_at_exact_boundary_fractions ... ok
+test api::control::tests::held_reclaim_remeasures_concurrent_policy_and_slot_changes ... ok
+test api::control::tests::poisoned_runtime_scratch_explicit_release_preserves_then_drop_recovers_authority ... ok
+test api::control::tests::rebuild_fence_gates_reclaim_slow_path_before_capacity_breaches ... ok
+test api::control::tests::rebuild_fence_is_single_owner_finishes_once_and_recovers_after_abandon ... ok
+test api::control::tests::rebuild_in_progress_rejects_reserve_commit_release ... ok
+test api::control::tests::recharge_cannot_consume_peer_group_reserved_floor ... ok
+test api::control::tests::recharge_denied_preserves_original_old_ticket ... ok
+test api::control::tests::recharge_denied_by_scratch_budget_preserves_old_scratch_charge ... ok
+test api::control::tests::recharge_does_not_transiently_double_count_group_admission ... ok
+test api::control::tests::concurrent_reserve_and_reconfigure_preserve_group_cap_truth ... ok
+test api::control::tests::recharge_swaps_committed_charge_atomically ... ok
+test api::control::tests::reclaim_priority_orders_victims_deterministically ... ok
+test api::control::tests::reentrant_recharge_from_reclaimer_callback_is_bounded_and_typed ... ok
+test api::control::tests::recharge_during_rebuild_leaves_old_intact ... ok
+test api::control::tests::reconfigure_missing_class_denial_preserves_policy_scheduler_and_usage ... ok
+test api::control::tests::reconfigure_rejects_policy_missing_drained_mandatory_class ... ok
+test api::control::tests::reclaimer_release_then_panic_uses_remeasured_ledger_not_callback_result ... ok
+test api::control::tests::reclaimer_panic_payloads_are_retired_once_and_admission_remeasures ... ok
+test api::control::tests::release_returns_bytes_and_preserves_invariants ... ok
+test api::control::tests::remapping_live_owner_group_is_denied_fail_closed ... ok
+test api::control::tests::replace_denial_returns_original_live_charge ... ok
+test api::control::tests::reserve_commit_keeps_class_owner_and_partition_balanced ... ok
+test api::control::tests::reserve_committed_charges_exactly_once ... ok
+test api::control::tests::reserve_committed_during_rebuild_is_fail_closed_no_strand ... ok
+test api::control::tests::reserve_denied_class_hard_cap_no_borrow ... ok
+test api::control::tests::reserve_denied_owner_hard_cap_leaves_ledger_untouched ... ok
+test api::control::tests::reserve_gated_by_resource_group_admission_fail_closed ... ok
+test api::control::tests::runtime_scratch_and_direct_broker_charge_share_one_limit ... ok
+test api::control::tests::scratch_recharge_cap_overflow_preserves_original_ticket ... ok
+test api::control::tests::reserve_borrow_beyond_shared_pool_denied ... ok
+test api::control::tests::runtime_scratch_rejects_foreign_runtime_context_without_mutation ... ok
+test api::control::tests::runtime_scratch_release_restores_resource_group_capacity ... ok
+test api::control::tests::scratch_peak_denial_release_and_drop_keep_authority_exact ... ok
+test api::control::tests::same_broker_reclaimer_reserve_reentry_is_bounded_and_typed ... ok
+test api::control::tests::sep23_audit_failing_committed_drain_restores_whole_batch ... ok
+test api::control::tests::sep23_audit_failing_pending_drain_preserves_ticket_for_retry ... ok
+test api::control::tests::sep23_audit_forged_reclaimed_bytes_are_recorded_but_never_trusted ... ok
+test api::control::tests::sep23_audit_group_denial_runs_single_hard_regardless_of_soft_crossing ... ok
+test api::control::tests::scratch_reserve_cap_overflow_is_denied_without_mutation ... ok
+test api::control::tests::sep23_audit_max_scale_plus_one_byte_denies_clean_without_callback ... ok
+test api::control::tests::sep23_audit_wrong_victim_release_does_not_admit ... ok
+test api::control::tests::sep23_audit_zero_byte_reserve_fires_no_callback_even_over_soft ... ok
+test api::control::tests::sep23_audit_panicking_reclaimer_is_contained_and_broker_survives ... ok
+test api::control::tests::sep23_fup003_blocked_matrix_never_fires_callback ... ok
+test api::control::tests::sep23_fup003_borrowing_class_hard_is_not_terminal_until_pool_exhausted ... ok
+test api::control::tests::sep23_fup003_hard_remeasure_still_denied_is_terminal_without_second_callback ... ok
+test api::control::tests::sep23_fup003_predicted_failure_skips_soft_and_runs_single_hard ... ok
+test api::control::tests::sep23_fup003_terminal_matrix_never_fires_callback ... ok
+test api::control::tests::sep23_fup003_ticket_exhaustion_blocks_without_callback ... ok
+test api::control::tests::sep23_fup005_denied_reconfigure_preserves_provenance_byte_for_byte ... ok
+test api::control::tests::sep23_fup006_accepted_reconfigure_inside_callback_remeasures_under_new_policy ... ok
+test api::control::tests::sep23_fup006_denied_reconfigure_inside_callback_preserves_receipt_and_admits ... ok
+test api::control::tests::sep23_fup007_denied_reconfigure_preserves_policy_revision_scheduler_ledger ... ok
+test api::control::tests::sep23_fup007_mixed_zero_and_nonzero_partial_termination ... ok
+test api::control::tests::sep23_fup007_zero_byte_committed_blocks_group_removal_until_explicit_release ... ok
+test api::control::tests::sep23_fup007_zero_byte_committed_drop_after_denied_reconfigure_releases ... ok
+test api::control::tests::sep23_fup007_scope_matrix_remap_cap_ungrouped_terminated ... ok
+test api::control::tests::sep23_fup007_zero_byte_committed_rebuild_fence_drop_drains_on_finish ... ok
+test api::control::tests::sep23_fup007_zero_byte_pending_blocks_removal_explicit_rollback_unblocks ... ok
+test api::control::tests::sep23_fup007_zero_byte_pending_drop_rolls_back_without_stranding ... ok
+test api::control::tests::terminal_preflight_preserves_the_live_first_breach_when_zero_axis_differs ... ok
+test api::control::tests::soft_cap_crossing_triggers_reclaim_without_immediate_hard_deny ... ok
+test api::control::tests::trait_effective_report_matches_inherent_and_is_not_fabricated ... ok
+test api::control::tests::telemetry_panic_cannot_change_or_abort_accounting ... ok
+test api::control::tests::sink_panic_payloads_are_retired_once_and_callback_is_quarantined ... ok
+test application::controller::tests::allocator_snapshot_observation_does_not_change_pressure ... ok
+test application::controller::tests::classification_is_deterministic_across_the_ladder ... ok
+test application::controller::tests::extreme_limits_classify_percent_without_wrapping_or_saturating_product ... ok
+test application::controller::tests::first_priority_owner_does_not_self_reclaim_below_fatal ... ok
+test application::controller::tests::ladder_gets_more_aggressive_with_pressure ... ok
+test application::controller::tests::ladder_transitions_up_then_down_through_every_rung ... ok
+test api::control::tests::concurrent_reserves_never_exceed_global_limit_no_toctou ... ok
+test application::controller::tests::reclaim_returns_zero_under_fatal_pressure_without_spill ... ok
+test application::controller::tests::zero_limit_is_normal_when_empty_and_fatal_when_used ... ok
+test application::controller::tests::reclaim_uses_spillable_under_fatal_pressure ... ok
+test application::controller::tests::thresholds_new_accepts_monotonic_and_default_is_valid ... ok
+test application::controller::tests::thresholds_new_rejects_inverted_or_out_of_range ... ok
+test application::controller::tests::update_caches_current_pressure ... ok
+test application::controller::tests::update_from_semantic_is_idempotent ... ok
+test application::scheduler::tests::burst_percent_changes_admission_outcome ... ok
+test application::scheduler::tests::headroom_usage_never_consumes_a_non_headroom_group_floor ... ok
+test application::scheduler::tests::prospective_floor_aggregate_matches_committed_growth_and_release ... ok
+test application::scheduler::tests::empty_scheduler_has_zero_share_and_denies_all ... ok
+test application::scheduler::tests::huge_pool_and_weights_compute_a_non_wrapping_fair_share ... ok
+test application::scheduler::tests::release_returns_burst_capacity ... ok
+test application::scheduler::tests::noisy_group_cannot_borrow_beyond_weighted_share ... ok
+test application::scheduler::tests::repeated_exact_usage_release_round_trip_never_wraps ... ok
+test application::scheduler::tests::unknown_group_denied_even_with_pool_available ... ok
+test domain::admission::tests::unknown_group_denies_terminally_with_legacy_message ... ok
+test application::scheduler::tests::unknown_group_is_denied_fail_closed ... ok
+test application::scheduler::tests::usage_release_round_trip_readmits_burst ... ok
+test application::scheduler::tests::weighted_share_distributes_remainder_work_conservingly ... ok
+test application::scheduler::tests::within_hard_cap_is_always_admitted ... ok
+test domain::admission::tests::deficit_saturates_for_unrepresentable_postimages ... ok
+test domain::admission::tests::unrepresentable_global_aggregate_blocks_without_panic ... ok
+test domain::config::tests::empty_layer_is_skipped_in_provenance ... ok
+test domain::config::tests::higher_precedence_layer_wins_and_is_recorded_in_provenance ... ok
+test domain::config::tests::removing_top_layer_changes_effective_value ... ok
+test domain::config::tests::reserved_floor_checked_add_overflow_is_config_error ... ok
+test domain::config::tests::resource_group_reserved_has_an_independent_global_floor ... ok
+test api::control::tests::soft_and_hard_reclaim_plans_share_one_callback_in_both_arrival_orders ... ok
+test domain::config::tests::runtime_reconfigure_layers_are_rejected_at_build_time ... ok
+test domain::config::tests::validate_accepts_owner_group_mapping_to_declared_group ... ok
+test domain::config::tests::validate_accepts_resource_group_burst_percent_boundaries ... ok
+test domain::config::tests::validate_accepts_resource_group_reserved_equal_to_soft_cap ... ok
+test domain::config::tests::validate_accepts_well_formed_policy ... ok
+test domain::config::tests::validate_accepts_well_formed_resource_group ... ok
+test domain::config::tests::validate_rejects_class_hard_cap_above_global ... ok
+test domain::config::tests::validate_rejects_global_below_reserved_plus_headroom_floor ... ok
+test domain::config::tests::validate_rejects_group_reserved_plus_headroom_above_global ... ok
+test domain::config::tests::validate_rejects_overlong_owner_and_resource_group_identifiers ... ok
+test domain::config::tests::validate_rejects_missing_each_mandatory_class ... ok
+test domain::config::tests::validate_rejects_owner_group_mapping_to_unknown_group ... ok
+test domain::config::tests::validate_rejects_owner_hard_cap_above_global ... ok
+test domain::config::tests::validate_rejects_reserved_above_soft ... ok
+test domain::config::tests::validate_rejects_resource_group_hard_above_global ... ok
+test domain::config::tests::validate_rejects_resource_group_burst_percent_over_100 ... ok
+test domain::config::tests::validate_rejects_resource_group_soft_above_hard ... ok
+test domain::config::tests::validate_rejects_zero_admission_weight_with_burst_demand ... ok
+test domain::config::tests::validate_rejects_resource_group_reserved_above_soft ... ok
+test domain::ledger::tests::aggregate_usage_tracks_charge_kinds_and_headroom ... ok
+test domain::config::tests::validate_rejects_shared_burst_pool_above_global_hard_limit ... ok
+test domain::ledger::tests::batch_release_preflights_every_charge_kind_before_first_ticket_mutates ... ok
+test domain::ledger::tests::borrow_over_class_cap_is_bounded_by_shared_burst_pool ... ok
+test domain::config::tests::validated_policy_materializes_no_implicit_class_holes ... ok
+test domain::ledger::tests::context_axis_balances_with_owner_after_mixed_sequence ... ok
+test api::control::tests::sep23_fup003_preflight_attempt_agreement_randomized ... ok
+test domain::ledger::tests::borrow_false_still_denies_over_cap_regardless_of_pool ... ok
+test domain::ledger::tests::commit_after_release_is_rejected ... ok
+test domain::ledger::tests::double_release_of_a_cloned_ticket_is_rejected_and_does_not_corrupt ... ok
+test domain::ledger::tests::deterministic_fuzz_preserves_invariants_and_returns_to_zero ... ok
+test domain::ledger::tests::empty_release_batch_is_a_noop_even_during_rebuild ... ok
+test domain::ledger::tests::exact_boundary_ticket_survives_first_release ... ok
+test domain::ledger::tests::global_ceiling_reserves_headroom_for_non_headroom_classes ... ok
+test domain::ledger::tests::headroom_usage_does_not_consume_protected_non_headroom_band_twice ... ok
+test domain::ledger::tests::forged_snapshot_total_owner_bytes_panics_as_documented - should panic ... ok
+test domain::config::tests::validate_rejects_policy_map_cardinality_above_the_caps ... ok
+test domain::ledger::tests::mixed_kind_release_preserves_charge_kind_partition ... ok
+test domain::ledger::tests::owner_hard_cap_still_enforced ... ok
+test domain::ledger::tests::owner_probe_meter_observes_keyed_reads_and_every_scanned_key ... ok
+test domain::ledger::tests::overflow_denial_preserves_exact_live_ticket_accounting ... ok
+test domain::ledger::tests::owner_key_byte_limit_is_exact_and_denial_is_fail_closed ... ok
+test domain::ledger::tests::reserve_above_i64_max_does_not_wrap_to_negative_delta ... ok
+test domain::ledger::tests::reserve_denied_when_global_hard_limit_would_be_exceeded ... ok
+test domain::ledger::tests::reserve_for_unconfigured_class_is_denied_without_mutation ... ok
+test domain::ledger::tests::second_commit_of_same_reservation_is_rejected ... ok
+test domain::ledger::tests::reserved_floor_protects_class_from_peer_consumption ... ok
+test domain::ledger::tests::sep23_audit_admitted_recharge_moves_kind_vectors_exactly ... ok
+test domain::ledger::tests::sep23_fup004_class_kind_swap_preserving_totals_is_rejected ... ok
+test domain::ledger::tests::sep23_audit_batch_release_moves_kind_vectors_exactly ... ok
+test domain::ledger::tests::sep23_fup004_context_kind_swap_preserving_totals_is_rejected ... ok
+test domain::ledger::tests::sep23_fup004_honest_mixed_kind_snapshot_validates ... ok
+test domain::ledger::tests::sep23_fup004_owner_kind_swap_preserving_totals_is_rejected ... ok
+test domain::ledger::tests::snapshot_validation_rejects_unrepresentable_axis_instead_of_saturating_it ... ok
+test domain::ledger::tests::ticket_from_one_ledger_cannot_release_on_another ... ok
+test domain::ledger::tests::shared_burst_pool_is_shared_across_borrowing_classes ... ok
+test domain::ledger::tests::single_release_preflight_is_bounded_independent_of_owner_cardinality ... ok
+test domain::ledger::tests::ticket_id_exhaustion_fails_without_reuse ... ok
+test domain::ledger::tests::unrepresentable_sum_is_denied_without_mutating_any_axis ... ok
+test domain::ledger::tests::ticket_ids_are_monotonic_and_unique_across_many_reserves ... ok
+test domain::ledger::tests::zero_byte_reserve_commits_and_releases_coherently ... ok
+test domain::policy::execution_budget_tests::check_helpers_admit_within_cap_and_reject_over_cap ... ok
+test domain::policy::execution_budget_tests::unlimited_budget_admits_everything ... ok
+test domain::policy::tests::borrow_flag_with_zero_shared_pool_is_valid_and_preserved ... ok
+test domain::policy::tests::default_residency_global_one_does_not_underflow_and_validates ... ok
+test domain::policy::tests::default_residency_small_globals_all_validate ... ok
+test domain::policy::tests::for_preset_headroom_class_owns_exactly_the_reserved_band ... ok
+test domain::policy::tests::for_preset_class_caps_isolate_below_global ... ok
+test domain::policy::tests::for_preset_no_single_class_cap_plus_headroom_exceeds_global ... ok
+test domain::policy::tests::for_preset_is_structurally_valid ... ok
+test domain::policy::tests::for_preset_populates_every_mandatory_class ... ok
+test domain::policy::tests::for_preset_scales_caps_with_global_limit ... ok
+test domain::policy::tests::validate_accepts_headroom_equal_to_global ... ok
+test domain::policy::tests::for_preset_weighted_split_never_over_allocates_distributable ... ok
+test domain::policy::tests::validate_rejects_constructed_headroom_above_global ... ok
+test ports::scratch::tests::double_release_is_rejected_not_silent ... ok
+test ports::scratch::tests::failed_release_preserves_authority_for_retry ... ok
+test ports::scratch::tests::grow_after_release_is_rejected_and_fail_closed ... ok
+test ports::scratch::tests::grow_to_observed_updates_within_reserved_ceiling ... ok
+test ports::scratch::tests::grow_beyond_reserved_is_fail_closed_capacity_error ... ok
+test ports::scratch::tests::lifecycle_reserve_grow_release_succeeds_in_order ... ok
+test ports::scratch::tests::reservation_maps_to_live_scratch_charge_kind ... ok
+test ports::scratch::tests::scratch_peak_never_decreases_on_smaller_observation ... ok
+test ports::scratch::tests::successful_release_prevents_drop_from_releasing_twice ... ok
+test ports::telemetry::tests::advisory_agreement_has_no_mismatch ... ok
+test ports::telemetry::tests::allocator_telemetry_trait_surface_is_observation_only ... ok
+test ports::telemetry::tests::compare_reports_signed_drift_and_mismatch_boundary ... ok
+test ports::telemetry::tests::compare_semantic_bytes_is_ssot_not_allocator ... ok
+test ports::telemetry::tests::missing_allocator_data_is_not_treated_as_mismatch ... ok
+test ports::telemetry::tests::operational_labels_are_closed_bounded_sets ... ok
+test ports::telemetry::tests::static_telemetry_returns_its_snapshot_verbatim ... ok
+test ports::telemetry::tests::trait_path_absent_allocator_data_never_contradicts_ssot ... ok
+test api::control::tests::deferred_committed_cleanup_is_batched_and_drains_large_backlog ... ok
+test api::control::tests::concurrent_recharge_and_observe_never_expose_torn_axes ... ok
+test domain::ledger::tests::zero_byte_tickets_obey_independent_live_ticket_cap_fail_closed ... ok
+test application::scheduler::tests::admission_reuses_policy_static_fair_share_table_at_high_group_cardinality ... ok
+test domain::ledger::tests::committed_replacement_at_live_ticket_cap_is_a_net_zero_authority_swap ... ok
+test api::control::tests::managed_batch_invalid_lease_rejects_before_ticket_collection ... ok
+test api::control::tests::sep23_fup005_ten_thousand_reconfigures_keep_provenance_bounded ... ok
+test api::control::tests::live_ticket_count_cap_can_recover_when_host_releases_zero_byte_charge ... ok
+test api::control::tests::managed_recharge_at_live_ticket_cap_keeps_broker_authority_maps_exact ... ok
+test api::control::tests::live_ticket_count_cap_runs_one_reclaim_then_remeasures ... ok
+
+test result: ok. 274 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.59s
+
+     Running tests/policy_contracts.rs (target/debug/deps/policy_contracts-25e1c09ddab0b792)
+
+running 15 tests
+test execution_budget_default_matches_runtime_budget_truth ... ok
+test memory_class_taxonomy_keeps_mandatory_and_future_classes_split ... ok
+test memory_error_has_typed_config_and_report_variants ... ok
+test residency_policy_tracks_class_quota_and_resource_group_vocabulary ... ok
+test builder_emits_effective_budget_report_with_override_provenance ... ok
+test live_control_contracts::non_borrowing_class_cannot_use_burst_pool_at_public_surface ... ok
+test live_control_contracts::preset_broker_global_limit_is_consistent_with_enforcement ... ok
+test every_preset_and_custom_validated_policy_is_total_over_mandatory_classes ... ok
+test live_control_contracts::dropping_pending_public_authority_rolls_reservation_back ... ok
+test live_control_contracts::headroom_band_is_reserved_for_headroom_class_at_public_surface ... ok
+test live_control_contracts::managed_charge_double_release_is_rejected_without_counter_drift ... ok
+test live_control_contracts::zero_shared_pool_cannot_extend_borrowing_class_hard_cap ... ok
+test live_control_contracts::shared_burst_pool_bounds_borrowing_through_public_broker ... ok
+test live_control_contracts::global_hard_limit_denies_reserve_through_public_broker_and_is_fail_closed ... ok
+test live_control_contracts::preset_class_caps_bite_at_public_reserve_surface ... ok
+
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/public_api_surface.rs (target/debug/deps/public_api_surface-3062e8f0e3336869)
+
+running 8 tests
+test charge_kind_has_exactly_three_partitions ... ok
+test memory_preset_has_exactly_the_four_documented_variants ... ok
+test builder_without_manifest_fails_closed_with_build_variant ... ok
+test memory_error_has_exactly_the_nine_documented_variants ... ok
+test memory_class_taxonomy_is_stable ... ok
+test pressure_thresholds_construct_and_getters_reach_the_external_path ... ok
+test report_only_builder_returns_data_without_runtime_authority ... ok
+test builder_first_surface_produces_a_broker_from_a_preset ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/quanta_memory_platform_facade-3c636e33c5b2d798)
+
+running 364 tests
+test payload_store::service::tests::canonical_digests_are_randomized_per_store_seed ... ok
+test payload_store::service::tests::counter_overflow_is_rejected_without_accounting_or_entry_mutation ... ok
+test payload_store::service::tests::cost_component_sum_overflow_denies_without_publishing_or_charging ... ok
+test payload_store::service::tests::drop_during_rebuild_defers_then_finish_drains_capacity ... ok
+test payload_store::service::tests::double_close_is_idempotent_without_double_refund ... ok
+test payload_store::service::tests::close_refunds_every_live_entry_exactly_once ... ok
+test payload_store::service::tests::composite_entry_charges_one_payload_bucket ... ok
+test payload_store::service::tests::counter_reads_show_open_busy_and_closed_images ... ok
+test payload_store::service::tests::explicit_unbudgeted_store_is_a_distinct_non_ledger_mode ... ok
+test payload_store::service::tests::concurrent_mutation_and_close_has_one_typed_linearized_outcome ... ok
+test payload_store::service::tests::close_refund_failure_preserves_entries_and_charge_ownership ... ok
+test payload_store::service::tests::distinct_payloads_each_charge_once ... ok
+test payload_store::service::tests::mutation_after_close_is_typed_closed ... ok
+test payload_store::service::tests::over_cap_put_is_fail_closed_and_does_not_consume_ref ... ok
+test payload_store::service::tests::missing_delete_and_unpin_without_pin_are_invalid_state ... ok
+test payload_store::service::tests::dedup_hit_preserves_first_context_and_stores_no_second_entry ... ok
+test payload_store::service::tests::duplicate_canonical_callback_reentry_under_lock_is_typed_busy_and_charges_once ... ok
+test payload_store::service::tests::canonical_put_deduplicates_and_charges_once ... ok
+test payload_store::service::tests::metadata_equality_reentry_under_read_lock_is_typed_busy_and_preserves_charge ... ok
+test payload_store::service::tests::delete_unpinned_releases_bytes_exactly_once ... ok
+test payload_store::service::tests::pin_is_metadata_only_and_pinned_delete_is_rejected ... ok
+test payload_store::service::tests::non_injective_public_reference_conversion_is_rejected_before_charge ... ok
+test payload_store::service::tests::put_and_delete_during_rebuild_are_fail_closed_then_resume ... ok
+test publish_pipeline::prepared_publication::tests::accounting::broker_capacity_denial_leaves_no_local_or_ledger_state ... ok
+test payload_store::service::tests::measurement_panic_precedes_accounting_and_does_not_poison_state ... ok
+test payload_store::service::tests::payload_delete_reuses_vacant_slots_without_stale_index_alias ... ok
+test payload_store::service::tests::reference_clone_panic_before_publication_keeps_public_store_available ... ok
+test payload_store::service::tests::transient_canonical_key_is_not_charged_but_retained_identity_is ... ok
+test publish_pipeline::prepared_publication::tests::accounting::large_identity_with_zero_payload_is_denied_before_retention ... ok
+test publish_pipeline::prepared_publication::tests::aborted_root_reference_fails_closed_without_collecting_other_entries ... ok
+test publish_pipeline::prepared_publication::tests::accounting::checked_overflow_and_underflow_reject_before_broker_or_index_mutation ... ok
+test publish_pipeline::prepared_publication::tests::accounting::close_refunds_all_entries_and_is_terminal_and_idempotent ... ok
+test publish_pipeline::prepared_publication::tests::accounting::failed_orphan_gc_preserves_every_payload_index_and_charge ... ok
+test publish_pipeline::prepared_publication::tests::accounting::drop_refunds_live_entries_and_rebuild_drop_defers_exact_release ... ok
+test publish_pipeline::prepared_publication::tests::abort_releases_exact_payload_and_is_retry_safe ... ok
+test publish_pipeline::prepared_publication::tests::accounting::failed_abort_keeps_payload_index_and_charge_coherent ... ok
+test publish_pipeline::prepared_publication::tests::accounting::failed_close_keeps_exact_payloads_tokens_and_charges_for_retry ... ok
+test payload_store::service::tests::poisoned_stats_is_error_not_empty ... ok
+test publish_pipeline::prepared_publication::tests::accounting::mutation_gate_returns_typed_busy_and_exposes_no_partial_plan ... ok
+test publish_pipeline::prepared_publication::tests::accounting::orphan_gc_rejects_corrupt_active_lease_cost_without_partial_refund ... ok
+test publish_pipeline::prepared_publication::tests::accounting::prepared_component_sum_overflow_is_fail_closed_before_reservation ... ok
+test publish_pipeline::prepared_publication::tests::accounting::prepare_measurement_reentry_is_typed_busy_and_replay_skips_measurement ... ok
+test publish_pipeline::prepared_publication::tests::accounting::resolve_clone_reentry_under_read_lock_is_typed_busy_and_preserves_charge ... ok
+test publish_pipeline::prepared_publication::tests::accounting::prepared_identity_index_and_tombstone_keep_exact_independent_cost ... ok
+test publish_pipeline::prepared_publication::tests::accounting::replay_charges_once_and_abort_preserves_identity_evidence_once ... ok
+test publish_pipeline::prepared_publication::tests::prepare_capacity_failure_leaves_all_state_unchanged ... ok
+test publish_pipeline::prepared_publication::tests::orphan_gc_with_unknown_root_reference_is_batch_atomic ... ok
+test publish_pipeline::prepared_publication::tests::identical_prepare_replays_same_token_without_second_charge ... ok
+test publish_pipeline::prepared_publication::tests::identity_payload_drift_is_typed_conflict ... ok
+test publish_pipeline::prepared_publication::tests::prepared_payload_is_only_reachable_by_exact_token ... ok
+test publish_pipeline::prepared_publication::tests::root_referenced_token_is_never_enumerated_or_collected_as_an_orphan ... ok
+test publish_pipeline::prepared_publication::tests::tombstone_limits_bound_n_cycle_churn_and_fail_closed_at_saturation ... ok
+test publish_pipeline::prepared_publication::tests::concurrent_conflicting_prepare_has_one_winner ... ok
+test publish_pipeline::service::tests::default_commit_transition_applies_identity_with_no_missing_step ... ok
+test publish_pipeline::service::tests::default_pipeline_runs_stage_then_commit_each_exactly_once_no_rollback ... ok
+test publish_pipeline::service::tests::failed_commit_never_publishes_and_never_increments_count ... ok
+test publish_pipeline::service::tests::identity_pipeline_stages_then_commits_published ... ok
+test publish_pipeline::service::tests::published_count_only_reflects_committed_not_staged ... ok
+test retained_map::service::tests::arbitrary_remove_preserves_remaining_newest_first_sweep_order ... ok
+test retained_map::service::tests::byte_targeted_sweep_reclaims_full_cost_of_newest_entry ... ok
+test retained_map::service::tests::charged::aggregate_cost_overflow_is_denied_before_new_entry_or_ledger_charge ... ok
+test retained_map::service::tests::byte_targeted_sweep_of_empty_values_reclaims_key_and_index_cost ... ok
+test publish_pipeline::prepared_publication::tests::accounting::orphan_roots_bound_and_fail_closed ... ok
+test retained_map::service::tests::charged::atomic_insert_if_absent_never_recharges_or_overwrites_an_existing_entry_v1 ... ok
+test retained_map::service::tests::charged::charged_insert_routes_bytes_through_the_ledger ... ok
+test retained_map::service::tests::charged::charged_full_eviction_leaves_no_entry_key_ticket_or_accounting_residue_v1 ... ok
+test publish_pipeline::prepared_publication::tests::concurrent_identical_prepare_has_one_applied_winner ... ok
+test retained_map::service::tests::charged::charged_insert_over_cap_is_denied_and_fails_closed ... ok
+test retained_map::service::tests::charged::charged_overwrite_denial_leaves_existing_entry_unchanged ... ok
+test retained_map::service::tests::charged::charged_overwrite_during_rebuild_is_fail_closed_and_leaves_entry_intact ... ok
+test retained_map::service::tests::charged::charged_remove_rejects_a_ticketless_entry_without_mutating_state ... ok
+test retained_map::service::tests::charged::charged_remove_during_rebuild_is_fail_closed ... ok
+test retained_map::service::tests::charged::charged_sweep_during_rebuild_is_fail_closed ... ok
+test retained_map::service::tests::charged::charged_sweep_refunds_reclaimed_bytes_to_the_ledger ... ok
+test retained_map::service::tests::charged::charged_sweep_rejects_a_ticketless_candidate_without_partial_refund_or_eviction ... ok
+
+running 1 test
+test retained_map::service::tests::charged::counter_reads_show_open_busy_and_closed_images ... ok
+test retained_map::service::tests::charged::denied_atomic_insert_if_absent_publishes_neither_payload_nor_charge_v1 ... ok
+test retained_map::service::tests::charged::empty_value_with_huge_retained_key_is_denied_without_ledger_or_map_mutation ... ok
+test retained_map::service::tests::charged::entry_remains_refundable_after_a_denied_overwrite ... ok
+test retained_map::service::tests::charged::overwrite_preserves_retained_original_key_cost_and_exact_ledger ... ok
+test retained_map::service::tests::charged::rebuild_denied_recharge_preserves_charged_preimage_v1 ... ok
+test payload_store::service::tests::delete_drop_reentry_is_bounded_and_peer_publication_retains_exact_charge ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 363 filtered out; finished in 0.00s
+
+test payload_store::service::tests::delete_contains_two_panicking_client_destructors_after_exact_refund ... ok
+test payload_store::service::tests::delete_drop_reentry_is_bounded_and_peer_publication_retains_exact_charge ... ok
+test retained_map::service::tests::charged::remove_contains_panicking_key_and_returns_value_after_exact_refund ... ok
+test retained_map::service::tests::charged::sweep_never_hashes_client_key_after_refund ... ok
+test retained_map::service::tests::charged::uncharged_store_is_explicit_non_budgeted_mode ... ok
+test payload_store::service::tests::payload_lookup_probe_count_is_n_independent ... ok
+test retained_map::service::tests::committed_byte_overflow_rejects_before_payload_or_accounting_mutation_v1 ... ok
+test retained_map::service::tests::charged::sweep_multiple_panicking_destructors_does_not_abort_process ... ok
+test retained_map::service::tests::compound_hostile_remove_panic_cannot_abort_process ... ok
+test retained_map::service::tests::charged::close_contains_client_destructor_panic_and_keeps_terminal_image ... ok
+test publish_pipeline::prepared_publication::tests::accounting::resolve_clone_panic_preserves_readability_and_charge ... ok
+test publish_pipeline::prepared_publication::tests::accounting::prepare_measurement_panic_preserves_readability_and_allows_retry ... ok
+test retained_map::service::tests::charged::panic_in_sweep_value_drop_is_contained_after_exact_refund ... ok
+test retained_map::service::tests::charged::key_measurement_panic_precedes_accounting_and_preserves_state ... ok
+test retained_map::service::tests::entries_lists_pairs_in_same_sorted_order_as_keys ... ok
+test retained_map::service::tests::equal_hash_key_duplicate_overwrites_and_does_not_double_count ... ok
+test retained_map::service::tests::get_missing_key_is_none ... ok
+test publish_pipeline::prepared_publication::tests::accounting::poisoned_store_reports_error_but_drop_still_releases_every_charge ... ok
+test retained_map::service::tests::insert_commits_envelope_bytes ... ok
+test retained_map::service::tests::charged::panic_in_old_value_drop_cannot_split_committed_bytes_from_ledger ... ok
+test retained_map::service::tests::keys_after_remove_drops_the_removed_key ... ok
+test retained_map::service::tests::keys_lists_inserted_keys_in_deterministic_sorted_order ... ok
+test retained_map::service::tests::keys_on_empty_store_is_empty ... ok
+test retained_map::service::tests::measured_any_handle_round_trips_and_accounts_caller_size ... ok
+test retained_map::service::tests::overwrite_preserves_original_insertion_position_for_newest_first_sweep ... ok
+test retained_map::service::tests::checked_reads_propagate_client_clone_panics_without_poisoning_owner_mutex_v1 ... ok
+test retained_map::service::tests::concurrent_insert_if_absent_has_one_creator_and_never_overwrites_v1 ... ok
+test retained_map::service::tests::put_get_remove_get_none_round_trip_corrects_bytes ... ok
+test retained_map::service::tests::read_hash_callback_reentry_is_typed_busy_and_preserves_exact_postimage ... ok
+test retained_map::service::tests::reinsert_same_key_recharges_to_new_size_not_doubled ... ok
+test retained_map::service::tests::remove_releases_committed_bytes ... ok
+test retained_map::service::tests::sweep_hash_callback_reentry_is_typed_busy_before_refund ... ok
+test retained_map::service::tests::sweep_reclaims_at_least_target_bytes_and_releases_them ... ok
+test retained_map::service::tests::typed_value_round_trips_and_accounts_its_own_byte_size ... ok
+test revocable_store::cost::tests::revocable_entry_cost_has_one_checked_formula ... ok
+test retained_map::service::tests::uncharged_retained_map_bytes_are_not_reflected_in_a_broker_ledger_snapshot ... ok
+test revocable_store::durable_codec::tests::literal_v1_record_decodes_without_using_the_current_encoder ... ok
+test revocable_store::durable_codec::tests::malformed_or_forged_lengths_never_reach_allocation ... ok
+test retained_map::service::tests::charged::drop_during_unwind_contains_two_client_destructor_panics_and_releases_all ... ok
+test revocable_store::durable_codec::tests::versioned_codec_round_trip_and_exact_cost ... ok
+test retained_map::service::tests::charged::sweep_hash_panic_before_refund_preserves_charged_preimage ... ok
+test retained_map::service::tests::hash_unwind_during_detached_mutation_restores_owned_state_and_charge ... ok
+test payload_store::service::tests::reference_eq_panic_before_mutation_keeps_public_store_available ... ok
+test revocable_store::service::tests::ambiguous_durable_delete_fences_source_until_absence_is_reconciled ... ok
+test revocable_store::service::tests::close_refunds_every_live_entry_exactly_once_and_stays_closed ... ok
+test revocable_store::service::tests::bounded_codec_keeps_output_charged_until_durable_commit_returns ... ok
+test publish_pipeline::prepared_publication::tests::accounting::multiple_panicking_client_drops_during_outer_unwind_drain_exact_charges ... ok
+test revocable_store::service::tests::close_release_failure_preserves_entries_fifo_and_ledger_authority ... ok
+test revocable_store::service::tests::closed_source_rejects_restored_handle_without_losing_its_charge ... ok
+test revocable_store::service::tests::constructed_budgeted_store_exposes_its_single_broker_authority ... ok
+test revocable_store::service::tests::cost_component_sum_overflow_is_fail_closed_before_charge ... ok
+test revocable_store::service::tests::counter_overflow_is_rejected_before_broker_charge_or_mutation ... ok
+test revocable_store::service::tests::concurrent_insert_and_close_have_one_linearized_outcome ... ok
+test revocable_store::service::tests::drop_during_rebuild_defers_exact_release_until_finish ... ok
+test revocable_store::service::tests::drop_without_explicit_close_releases_capacity ... ok
+
+running 1 test
+test retained_map::service::tests::overwrite_drop_reentry_is_bounded_and_other_store_sees_exact_ledger ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 363 filtered out; finished in 0.00s
+
+test retained_map::service::tests::overwrite_drop_reentry_is_bounded_and_other_store_sees_exact_ledger ... ok
+test revocable_store::service::tests::drop_during_outer_unwind_contains_two_client_panics_and_refunds_all_charges ... ok
+test revocable_store::service::tests::durable_spill_releases_source_only_after_commit ... ok
+test revocable_store::service::tests::empty_reclaim_leaves_state_byte_for_byte_unchanged ... ok
+test revocable_store::service::tests::failed_destination_write_preserves_source_entry_and_charge ... ok
+test revocable_store::service::tests::failed_durable_delete_rolls_back_provisional_source_charge ... ok
+test revocable_store::service::tests::failed_durable_write_and_encoder_error_restore_source_fifo_and_charge ... ok
+test revocable_store::service::tests::foreign_store_cannot_adopt_spill_charge ... ok
+test revocable_store::service::tests::insert_charges_and_reclaim_refunds_the_ledger ... ok
+test revocable_store::service::tests::insert_over_cap_is_denied_and_fails_closed ... ok
+test revocable_store::service::tests::insert_tracks_reclaimable_bytes ... ok
+test revocable_store::service::tests::large_key_with_zero_value_is_charged_and_denied_without_state_change ... ok
+test revocable_store::service::tests::many_spills_share_large_binding_identity_without_unbilled_clones ... ok
+test payload_store::service::tests::drop_during_outer_unwind_contains_two_client_panics_and_refunds_all_charges ... ok
+test revocable_store::service::tests::noop_spill_does_not_discard_source ... ok
+test revocable_store::service::tests::panicking_durable_commit_fences_source_until_exact_record_resolution ... ok
+test revocable_store::service::tests::panicking_durable_encoder_restores_source_before_unwind ... ok
+test revocable_store::service::tests::panicking_finalize_fences_published_source_until_reconciliation ... ok
+test retained_map::service::tests::first_and_last_key_point_operations_share_one_n_independent_probe_bound_v1 ... ok
+test revocable_store::service::tests::compound_measurement_and_drop_panic_does_not_abort_insert ... ok
+test retained_map::service::tests::compound_hostile_insert_panic_cannot_abort_process ... ok
+test retained_map::service::tests::partial_entry_read_clone_and_drop_panics_cannot_abort ... ok
+test revocable_store::service::tests::poisoned_stats_is_error_not_empty_and_drop_still_releases ... ok
+test revocable_store::service::tests::reclaim_batch_failure_preserves_every_entry_and_charge ... ok
+test revocable_store::service::tests::reclaim_eviction_order_is_deterministic_fifo_at_capacity_boundary ... ok
+test revocable_store::service::tests::reclaim_one_during_rebuild_is_fail_closed ... ok
+test revocable_store::service::tests::reclaim_one_is_fifo_and_releases_its_bytes ... ok
+test revocable_store::service::tests::reclaim_one_on_empty_returns_none ... ok
+test revocable_store::service::tests::reclaim_to_in_memory_tier_keeps_bytes_charged ... ok
+test revocable_store::service::tests::reclaim_until_charges_and_evicts_zero_payload_keys ... ok
+test revocable_store::service::tests::reclaim_until_during_rebuild_is_fail_closed ... ok
+test revocable_store::service::tests::reclaim_until_frees_at_least_target_and_reports_reclaimed_bytes ... ok
+test revocable_store::service::tests::reclaim_until_of_zero_payload_entries_reclaims_their_key_and_index_cost ... ok
+test revocable_store::service::tests::reclaim_until_on_empty_store_reports_zero ... ok
+test revocable_store::service::tests::panicking_prepare_after_persisted_claim_has_explicit_recovery_path ... ok
+test revocable_store::service::tests::reentrant_read_and_close_under_state_lock_return_typed_busy ... ok
+test revocable_store::service::tests::revoke_makes_entry_unretrievable_and_decrements_accounting ... ok
+test revocable_store::service::tests::same_store_reclaimer_returns_busy_without_losing_fifo ... ok
+test retained_map::service::tests::concurrent_checked_read_observes_only_complete_old_or_new_payloads_v1 ... ok
+test publish_pipeline::prepared_publication::tests::unbudgeted_admission_never_exceeds_a_complete_gc_root_set ... ok
+test revocable_store::service::tests::bounded_codec_rejects_malformed_durable_record_without_publication ... ok
+test revocable_store::service::tests::durable_redb_round_trip_transfers_charge_exactly_once ... ok
+test revocable_store::service::tests::bounded_codec_spill_preflights_backend_and_broker_before_allocating ... ok
+test revocable_store::service::tests::oversized_encoded_record_preserves_charged_source_and_no_durable_payload ... ok
+test revocable_store::service::tests::denied_durable_restore_leaves_redb_record_authoritative ... ok
+test revocable_store::service::tests::source_close_does_not_refund_live_in_process_tier ... ok
+test revocable_store::service::tests::sparse_reclaim_partition_and_rollback_preserve_large_fifo ... ok
+test revocable_store::service::tests::spill_and_close_emit_bounded_facade_events ... ok
+test revocable_store::service::tests::unbudgeted_store_is_a_distinct_explicit_product_type ... ok
+test shared::builder::tests::builder_first_happy_path_builds_a_usable_payload_store ... ok
+test shared::builder::tests::default_build_composes_charged_stores_without_manual_glue ... ok
+test shared::builder::tests::default_build_platform_sink_is_the_same_ledger_as_the_broker ... ok
+test shared::builder::tests::memory_platform_builder_builds_broker_from_preset ... ok
+test shared::builder::tests::payload_builder_without_binding_fails_with_build_error ... ok
+test shared::builder::tests::publish_pipeline_builder_without_binding_fails_with_build_error ... ok
+test shared::builder::tests::retained_map_platform_builder_routes_bytes_through_the_ledger ... ok
+test shared::builder::tests::revocable_builder_without_binding_fails_with_build_error ... ok
+test shared::builder::tests::revocable_platform_builder_routes_bytes_through_the_ledger ... ok
+test shared::builder::tests::transcript_builder_without_binding_fails_with_build_error ... ok
+test shared::builder::tests::transcript_platform_builder_routes_bytes_through_the_ledger ... ok
+test shared::lifecycle::tests::client_callback_reentry_on_held_container_lock_is_typed_busy ... ok
+test shared::lifecycle::tests::close_excludes_mutations_and_other_close_attempts ... ok
+test shared::lifecycle::tests::committed_close_stays_closed_and_double_close_is_idempotent ... ok
+test shared::lifecycle::tests::drop_transition_is_terminal_and_reports_cleanup_once ... ok
+test shared::lifecycle::tests::failed_close_reopens_for_mutation_and_retry ... ok
+test revocable_store::service::tests::panicking_restore_measurement_aborts_prepared_claim_and_retries_clean ... ok
+test shared::lifecycle::tests::reentry_returns_typed_busy_without_blocking ... ok
+test shared::measure::tests::arc_byte_size_delegates_to_inner ... ok
+test shared::measure::tests::cloning_measured_arc_shares_the_allocation_not_a_deep_copy ... ok
+test shared::measure::tests::cloning_measured_value_preserves_size_and_value_context ... ok
+test shared::measure::tests::measured_arc_any_handle_charges_caller_size ... ok
+test shared::measure::tests::measured_value_charges_caller_supplied_size_not_inner_len ... ok
+test shared::measure::tests::measured_value_into_inner_returns_wrapped_value ... ok
+test shared::measure::tests::measured_value_zero_size_is_charged_verbatim ... ok
+test shared::measure::tests::retained_cost_v1_rejects_component_and_cross_component_overflow ... ok
+test shared::measure::tests::retained_cost_v1_sums_each_component_exactly_once ... ok
+test shared::lifecycle::tests::hostile_panic_payload_drop_cannot_abort_outer_unwind ... ok
+test revocable_store::service::tests::durable_redb_committed_restore_recovers_after_process_restart ... ok
+test revocable_store::service::tests::durable_redb_prepared_restore_recovers_after_process_restart ... ok
+test spill::backings::redb::tests::capped_file_backend_rejects_extension_before_file_mutation ... ok
+test revocable_store::service::tests::sep23_audit_panicking_decode_aborts_prepared_claim_and_retries_clean ... ok
+test revocable_store::service::tests::panicking_recovery_measurement_preserves_committed_claim_for_retry ... ok
+test revocable_store::service::tests::bounded_codec_cold_reopen_restore_denial_and_retry_keep_one_authority ... ok
+test revocable_store::service::tests::bounded_codec_committed_recovery_retries_after_capacity_denial ... ok
+test revocable_store::service::tests::sep23_fup001_uncertain_commit_keeps_source_fenced_and_blocks_wrong_retire ... ok
+test revocable_store::service::tests::redb_file_cap_denial_keeps_store_source_charged_until_exact_resolution ... ok
+test spill::backings::redb::tests::create_on_an_invalid_path_is_a_neutral_memory_error ... ok
+test revocable_store::service::tests::sep23_fup002_decode_failure_and_denied_admission_preserve_durable ... ok
+test revocable_store::service::tests::sep23_fup002_commit_ack_loss_same_claimant_publishes_on_retry ... ok
+test spill::backings::redb::tests::ambiguous_finalize_probe_uses_own_record_proof_with_foreign_claim_live ... ok
+test spill::backings::redb::tests::accept_at_exhausted_keyspace_fails_closed_without_overwriting ... ok
+test revocable_store::service::tests::panicking_restore_commit_fences_resident_until_redb_reconciliation ... ok
+test revocable_store::service::tests::sep23_audit_panicking_decode_preserves_committed_recovery_until_retry ... ok
+test spill::backings::redb::tests::every_invalid_limit_relation_rejects_before_creating_database_file ... ok
+test spill::backings::redb::tests::concurrent_prepare_restore_issues_exactly_one_live_claim ... ok
+test revocable_store::service::tests::sep23_fup002_stolen_claim_reconcile_retires_provisional_copy ... ok
+test revocable_store::service::tests::sep23_fup002_concurrent_recovery_has_exactly_one_owner ... ok
+test spill::backings::redb::tests::concurrent_writers_at_record_cap_admit_exactly_one_transaction ... ok
+test spill::backings::redb::tests::concurrent_recovery_claims_are_generation_fenced_to_latest_owner ... ok
+test spill::backings::redb::tests::backend_identity_and_pending_claim_survive_cold_rename ... ok
+test spill::backings::redb::tests::committed_restore_payload_survives_reopen_until_resident_ack ... ok
+test spill::backings::redb::tests::generic_restore_is_non_destructive_and_requires_owned_two_phase_path ... ok
+test spill::backings::redb::tests::in_flight_restore_budget_denial_preserves_claim_and_releases_on_candidate_drop ... ok
+test spill::backings::redb::tests::drained_queue_never_reuses_sequence_or_accepts_stale_restore_token ... ok
+test spill::backings::redb::tests::concurrent_accepts_lose_no_handle_and_assign_distinct_keys ... ok
+test spill::backings::redb::tests::consistent_cold_copy_preserves_logical_lineage_identity ... ok
+test spill::backings::redb::tests::generic_write_is_non_mutating_and_returns_the_original_payload ... ok
+test spill::backings::redb::tests::durable_spill_target_round_trips_fifo_through_the_trait ... ok
+test spill::backings::redb::tests::injected_write_crash_points_converge_without_duplicate_records ... ok
+test spill::backings::redb::tests::injected_restore_and_finalize_ack_loss_preserve_recovery_authority ... ok
+test spill::backings::redb::tests::limits_reject_oversized_record_before_commit_without_consuming_reserved_id ... ok
+test spill::backings::redb::tests::lost_finalize_and_abort_acks_allow_a_new_claim_before_reconciliation ... ok
+test spill::backings::redb::tests::live_backing_excludes_second_open_and_drop_releases_persisted_file ... ok
+test spill::backings::redb::tests::partial_storage_full_during_finalize_reopens_present_or_finalized ... ok
+test spill::backings::redb::tests::partial_storage_full_write_reopens_to_whole_records_only ... ok
+test spill::backings::redb::tests::partial_storage_full_during_restore_commit_preserves_one_whole_copy ... ok
+test spill::backings::redb::tests::missing_schema_marker_on_v2_shaped_database_fails_without_restamping ... ok
+test spill::backings::redb::tests::missing_metadata_table_on_v2_shaped_database_fails_without_recreation ... ok
+test spill::backings::redb::tests::database_file_cap_denial_preserves_prior_durable_record_across_reopen ... ok
+test spill::backings::redb::tests::per_record_limit_is_checked_on_reopen_even_when_total_still_fits ... ok
+test spill::backings::redb::tests::retained_payload_cap_denies_next_record_without_changing_durable_authority ... ok
+test spill::backings::redb::tests::reopened_backing_resumes_sequence_and_restores_persisted_handles ... ok
+test spill::backings::redb::tests::persisted_restore_claim_blocks_duplicate_prepare_and_recovers_after_reopen ... ok
+test spill::backings::redb::tests::reopened_redb_reconciles_controller_count_from_persisted_inventory ... ok
+test spill::backings::redb::tests::reopening_above_database_file_cap_fails_without_erasing_payload ... ok
+test spill::backings::redb::tests::sep23_audit_finalize_proof_does_not_mask_reappeared_recovery_payload ... ok
+test spill::backings::redb::tests::sep23_audit_finalize_retry_succeeds_while_unrelated_claim_is_live ... ok
+test spill::backings::redb::tests::persisted_payload_usage_mismatch_fails_closed_without_erasing_record ... ok
+test spill::backings::redb::tests::sep23_fup001_out_of_order_commit_finalized_reinsert_rejected ... ok
+test spill::backings::redb::tests::retained_limits_count_recovery_and_refund_only_after_finalize ... ok
+test spill::backings::redb::tests::sep23_fup001_same_bytes_retry_keeps_inventory_stable ... ok
+test spill::service::tests::available_controller_succeeds_while_unavailable_controller_rejects ... ok
+test spill::service::tests::both_spill_targets_share_the_offline_restore_contract ... ok
+test spill::service::tests::concurrent_spills_keep_spilled_count_consistent_then_drain_to_zero ... ok
+test spill::service::tests::in_memory_target_accept_after_toggle_offline_is_rejected ... ok
+test spill::service::tests::in_memory_target_restore_after_offline_fails_closed_leaving_retained_state_unchanged ... ok
+test spill::service::tests::in_memory_target_restore_of_missing_handle_is_none_not_an_error ... ok
+test spill::service::tests::in_memory_target_write_then_restore_round_trips_the_payload ... ok
+test spill::service::tests::noop_controller_rejects_without_a_target_and_returns_handle ... ok
+test spill::service::tests::noop_controller_restore_is_none ... ok
+test spill::service::tests::noop_spill_rejects_and_returns_the_handle ... ok
+test spill::service::tests::poisoned_spill_inventory_returns_error_not_zero ... ok
+test spill::service::tests::retaining_target_offline_rejects_accept_but_state_unchanged ... ok
+test spill::service::tests::retaining_target_offline_restore_fails_closed_like_in_memory ... ok
+test spill::service::tests::retaining_target_round_trips_handles_fifo ... ok
+test spill::service::tests::routed_controller_spill_then_restore_balances_the_spilled_count ... ok
+test spill::service::tests::routed_spill_after_target_goes_offline_fails_closed_leaving_inventory_unchanged ... ok
+test spill::service::tests::routed_spill_rolls_back_the_count_when_accept_fails ... ok
+test spill::service::tests::routed_spill_to_available_target_succeeds_and_counts ... ok
+test spill::service::tests::spill_to_unavailable_target_fails_closed_and_does_not_count ... ok
+test spill::service::tests::unavailable_spill_returns_the_only_handle_without_dropping_it ... ok
+test test_support::tests::isolated_child_selection_rejects_multiple_tests ... ok
+test test_support::tests::isolated_child_selection_rejects_zero_tests ... ok
+test transcript_store::service::tests::accounting::active_row_and_session_evidence_own_separate_kind_buckets ... ok
+test transcript_store::service::tests::accounting::append_message_id_clone_and_order_reentry_is_typed_busy ... ok
+test transcript_store::service::tests::accounting::append_preflight_message_order_panic_keeps_public_store_available ... ok
+test transcript_store::service::tests::accounting::append_preflight_order_panic_keeps_public_store_available ... ok
+test transcript_store::service::tests::accounting::append_replay_canonical_key_panic_keeps_public_store_available ... ok
+test transcript_store::service::tests::accounting::checked_byte_and_version_overflow_denials_leave_ledger_and_indexes_intact ... ok
+test transcript_store::service::tests::accounting::close_refunds_all_sessions_exactly_once_and_exposes_terminal_empty_reads ... ok
+test spill::backings::redb::tests::sep23_fup002_stale_generation_rejected_after_claim_steal ... ok
+test spill::backings::redb::tests::sep23_fup002_finalize_proof_is_per_record_not_last_writer ... ok
+test transcript_store::service::tests::accounting::drop_during_rebuild_defers_exact_release_until_finish ... ok
+test transcript_store::service::tests::accounting::drop_releases_all_live_rows_even_after_storage_poison ... ok
+test transcript_store::service::tests::accounting::every_conflict_axis_preserves_rows_indexes_and_accounting ... ok
+test transcript_store::service::tests::accounting::exact_retry_charges_once_and_truncate_refunds_only_active_body ... ok
+test transcript_store::service::tests::accounting::failed_close_preserves_rows_versions_tombstones_and_all_lease_authority ... ok
+test transcript_store::service::tests::accounting::failed_multirow_retain_preserves_positions_tombstones_and_version ... ok
+test transcript_store::service::tests::accounting::message_id_keyed_insert_panic_rolls_back_publication_completely ... ok
+test transcript_store::service::tests::accounting::mutation_lane_rejects_reentry_and_reads_without_exposing_partial_images ... ok
+test transcript_store::service::tests::accounting::panicking_message_id_clone_at_each_publication_point_leaves_append_atomic ... ok
+test transcript_store::service::tests::accounting::panicking_message_id_clone_cannot_publish_an_empty_new_session ... ok
+test transcript_store::service::tests::accounting::panicking_message_id_order_at_publication_leaves_append_atomic ... ok
+test transcript_store::service::tests::accounting::panicking_new_session_order_after_charge_preserves_old_session_and_ledger ... ok
+test transcript_store::service::tests::accounting::panicking_session_order_before_detach_preserves_rows_and_ledger ... ok
+test transcript_store::service::tests::accounting::quota_denial_leaves_row_indexes_and_charge_unchanged ... ok
+test transcript_store::service::tests::accounting::racing_close_and_append_have_one_linearizable_terminal_image ... ok
+test transcript_store::service::tests::accounting::retain_retires_multiple_panicking_client_bodies_after_ledger_postimage ... ok
+test transcript_store::service::tests::accounting::retain_rollback_and_commit_do_not_compare_client_session_id_after_detach ... ok
+test transcript_store::service::tests::accounting::retention_saturation_denies_before_any_new_ledger_charge ... ok
+test transcript_store::service::tests::accounting::retention_saturation_emits_one_bounded_tombstone_event ... ok
+test transcript_store::service::tests::accounting::semantic_identity_component_overflow_denies_before_ledger_or_index_mutation ... ok
+test transcript_store::service::tests::accounting::session_bytes_ord_panic_preserves_store_and_ledger ... ok
+test transcript_store::service::tests::accounting::session_order_panic_before_mutation_keeps_public_transcript_available ... ok
+test transcript_store::service::tests::accounting::truncate_refund_failure_preserves_rows_indexes_and_accounting ... ok
+test transcript_store::service::tests::accounting::zero_body_large_identity_and_session_are_charged_until_evidence_retirement ... ok
+test transcript_store::service::tests::append_identity_is_partitioned_by_session ... ok
+test transcript_store::service::tests::append_truncate_cycles_cannot_grow_past_fail_closed_evidence_bound ... ok
+test transcript_store::service::tests::checked_load_reports_poisoned_storage_instead_of_empty_success ... ok
+test transcript_store::service::tests::client_message_clone_during_load_reenters_as_typed_busy_without_ledger_drift ... ok
+test transcript_store::service::tests::concurrent_conflicting_appends_have_one_applied_winner ... ok
+test transcript_store::service::tests::concurrent_identical_appends_have_one_applied_winner ... ok
+test transcript_store::service::tests::exact_request_retried_n_times_applies_once ... ok
+test transcript_store::service::tests::exact_retry_and_conflicts_remain_deterministic_at_saturation ... ok
+test spill::backings::redb::tests::sep23_fup001_reserved_hole_is_not_finalized_by_later_record ... ok
+test spill::backings::redb::tests::sep23_fup001_reserve_only_reopen_is_not_consumed ... ok
+test transcript_store::service::tests::ordered_load_sorts_by_caller_sequence_and_allows_declared_gaps ... ok
+test spill::backings::redb::tests::sep23_fup001_legacy_watermark_file_migrates_payload_and_fails_closed ... ok
+test spill::backings::redb::tests::incomplete_backend_identity_fails_closed_without_replacing_surviving_half ... ok
+test spill::backings::redb::tests::spill_receipt_inventory_includes_other_records_in_recovery_slot ... ok
+test transcript_store::service::tests::reentrant_load_stats_and_close_under_read_lock_are_typed_busy ... ok
+test transcript_store::service::tests::retention_reconfigure_below_live_evidence_is_rejected ... ok
+test transcript_store::service::tests::retention_stats_separate_active_evidence_and_session_costs ... ok
+test transcript_store::service::tests::reused_message_id_at_different_sequence_is_typed_conflict ... ok
+test transcript_store::service::tests::reused_sequence_with_different_message_id_is_typed_conflict ... ok
+test transcript_store::service::tests::same_identity_with_body_drift_is_payload_conflict ... ok
+test transcript_store::service::tests::selective_retain_preserves_sparse_rows_and_evicted_identity_tombstones ... ok
+test transcript_store::service::tests::selective_retain_rejects_invalid_selector_without_mutation ... ok
+test transcript_store::service::tests::tombstone_byte_limit_counts_large_message_ids ... ok
+test transcript_store::service::tests::truncate_retains_tombstone_so_late_retry_cannot_reappend ... ok
+test transcript_store::service::tests::truncate_to_zero_retains_all_identity_tombstones ... ok
+test transcript_store::service::tests::versioned_snapshot_retain_rejects_concurrent_append_without_dropping_rows ... ok
+test transcript_store::service::tests::zero_body_with_large_ids_and_session_retains_semantic_evidence_cost ... ok
+test spill::backings::redb::tests::staging_denial_after_staged_remove_rolls_back_durable_payload ... ok
+test spill::backings::redb::tests::sep23_fup002_backend_identity_stable_across_reopen ... ok
+test spill::backings::redb::tests::zero_byte_restore_candidates_are_bounded_by_buffer_count ... ok
+test spill::backings::redb::tests::tighter_reopen_rejects_existing_inventory_without_erasing_it ... ok
+test transcript_store::service::tests::accounting::compound_hostile_session_ord_panic_cannot_abort_append ... ok
+test transcript_store::service::tests::accounting::drop_contains_multiple_client_destructor_panics_during_outer_unwind ... ok
+test transcript_store::service::tests::new_session_clone_and_drop_panics_cannot_abort ... ok
+test transcript_store::service::tests::owned_session_key_order_and_drop_panics_cannot_abort ... ok
+test spill::backings::redb::tests::sep23_fup002_foreign_backend_claim_rejected_on_every_permission_change ... ok
+test transcript_store::service::tests::partial_append_identity_clone_and_drop_panics_cannot_abort ... ok
+test transcript_store::service::tests::partial_snapshot_clone_and_drop_panics_cannot_abort ... ok
+test transcript_store::service::tests::partial_load_clone_and_drop_panics_cannot_abort ... ok
+test spill::backings::redb::tests::schema_v2_payload_disposition_mismatch_fails_without_repair ... ok
+test spill::backings::redb::tests::unsupported_explicit_schema_versions_fail_closed_before_v2_initialization ... ok
+test spill::backings::redb::tests::schema_v2_missing_required_authority_fails_without_recreating_it ... ok
+
+test result: ok. 364 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 22.61s
+
+     Running tests/cross_store_hellgate.rs (target/debug/deps/cross_store_hellgate-9918c939d4efb21e)
+
+running 4 tests
+test other_store_reclaim_frees_admission_and_drains_every_ticket ... ok
+test store_scratch_and_zero_byte_authorities_survive_denied_remap_and_legal_raise ... ok
+test distinct_grouped_stores_compete_for_one_global_slot_and_handoff_after_release ... ok
+test mixed_store_kind_lifetimes_balance_every_axis ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/hellgate_e2e.rs (target/debug/deps/hellgate_e2e-ffa4a75c3792636f)
+
+running 18 tests
+test dropping_managed_charges_releases_each_exact_authority ... ok
+test class_cap_gates_store_bytes_fail_closed ... ok
+test e2e_spill_tier_round_trips_fifo_and_never_touches_the_ledger ... ok
+test failed_close_during_rebuild_preserves_store_and_retries_after_fence ... ok
+test release_many_during_rebuild_is_fail_closed ... ok
+test payload_e2e::charged_payload_over_cap_put_is_fail_closed ... ok
+test release_many_drains_a_batch_atomically ... ok
+test close_drains_all_charges_once_and_rejects_later_mutation ... ok
+test broker_recharge_denied_preserves_managed_authority ... ok
+test payload_e2e::charged_payload_dedup_pin_delete_flow_through_the_ledger ... ok
+test overwrite_recharge_admits_net_fitting_replacement ... ok
+test double_remove_does_not_double_refund_the_ledger ... ok
+test charged_store_bytes_flow_through_the_ledger_and_drain_to_zero ... ok
+test rebuild_fences_charged_store_writes_then_resumes ... ok
+test reconfigure_raise_preserves_charged_usage ... ok
+test store_drop_during_rebuild_defers_refund_until_finish ... ok
+test release_many_with_an_already_released_ticket_is_fail_closed ... ok
+test concurrent_charged_inserts_never_exceed_global_and_stay_consistent ... ok
+
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/public_api_surface.rs (target/debug/deps/public_api_surface-3f422cc4f54bde8b)
+
+running 20 tests
+test measured_value_round_trips_value_and_size ... ok
+test report_only_builder_without_config_fails_closed ... ok
+test noop_spill_controller_rejects_and_restores_nothing ... ok
+test memory_platform_builder_without_config_fails_closed ... ok
+test spill_controller_fails_closed_when_target_unavailable ... ok
+test portable_presets_cover_every_preset_with_full_class_taxonomy ... ok
+test report_only_builder_resolves_without_runtime_authority ... ok
+test payload_store_builder_yields_a_queryable_store ... ok
+test memory_platform_builder_builds_a_broker_from_a_preset ... ok
+test retained_map_builder_exposes_public_charged_path ... ok
+test spill_controller_round_trips_a_handle_via_restore ... ok
+test revocable_builder_exposes_public_charged_path ... ok
+test live_broker_bridge_is_present_only_with_core_live_accounting ... ok
+test explicit_unbudgeted_store_is_a_distinct_product_and_does_not_charge_the_platform ... ok
+test default_builder_and_report_only_share_override_resolution ... ok
+test default_builder_over_cap_store_mutation_is_denied ... ok
+test retained_map_atomic_insert_returns_occupied_value_without_overwrite ... ok
+test platform_builder_installs_reclaimer_before_live_construction ... ok
+test transcript_builder_exposes_public_charged_path ... ok
+test prepared_publication_builder_exposes_root_bound_resolution_contract ... ok
+
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/spill_redb_finalize_kill.rs (target/debug/deps/spill_redb_finalize_kill-6e8be1bc1b54de2e)
+
+running 3 tests
+test durability_l1_finalize_after_commit_kill_resolves_finalized_without_resurrection ... ok
+test durability_l1_finalize_before_commit_kill_recovers_present_and_drains_exactly_once ... ok
+test durability_l1_store_and_ledger_recover_across_finalize_kill ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.87s
+
+     Running tests/spill_redb_kill_reopen.rs (target/debug/deps/spill_redb_kill_reopen-a07b684fe3659341)
+
+running 4 tests
+test sep23_fup006_reserved_hole_stays_absent_across_sigkill ... ok
+test sep23_fup006_sigkill_during_write_stream_converges_without_duplicates_or_tears ... ok
+test durable_spill_store_charge_and_record_survive_process_boundary ... ok
+test sep23_fup006_sigkill_after_commit_reopens_with_stable_identity_and_exact_drain ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.17s
+
+     Running unittests src/lib.rs (target/debug/deps/quanta_memory_platform_testkit-c19efddda2b79a78)
+
+running 86 tests
+test alloc_tracking::tests::fresh_probe_reports_zero_signals ... ok
+test alloc_tracking::tests::tracker_callbacks_route_into_the_same_counters ... ok
+test alloc_tracking::tests::dealloc_exceeding_alloc_saturates_at_zero_not_nonsense ... ok
+test alloc_tracking::tests::recorded_signals_accumulate_and_net_live_is_correct ... ok
+test conformance::suites::tests::all_break_variants_are_distinct_non_honest_and_family_mapped ... ok
+test conformance::invariants::tests::family_attribution_is_preserved_through_both_assertion_constructors ... ok
+test conformance::invariants::tests::drift_evidence_sign_distinguishes_over_from_under_reporting ... ok
+test conformance::invariants::tests::equal_bytes_hold_unequal_violate_with_drift_evidence ... ok
+test alloc_tracking::tests::signals_feed_an_invariant_assertion ... ok
+test conformance::invariants::tests::every_family_has_a_unique_stable_label ... ok
+test conformance::invariants::tests::predicate_assertion_carries_supplied_evidence ... ok
+test conformance::suites::tests::prepared_publication_suite_rejects_duplicate_charging_fake ... ok
+test conformance::suites::tests::reentrant_sink_is_contained_outside_owner_lock ... ok
+test conformance::suites::tests::commit_then_release_returns_balance_to_zero_on_real_broker ... ok
+test conformance::suites::tests::commit_then_release_returns_balance_to_zero_on_honest_fake ... ok
+test conformance::suites::tests::cap_deny_agrees_between_honest_fake_and_real_broker ... ok
+test conformance::suites::tests::spill_routing_verdict_holds_for_honest_and_violates_for_a_dropping_target ... ok
+test conformance::suites::tests::owner_partition_break_localizes_to_owner_partition_not_balance ... ok
+test conformance::suites::tests::sep23_fup004_suite_rejects_context_confined_kind_swap ... ok
+test conformance::suites::tests::sep23_fup004_suite_rejects_class_confined_kind_swap ... ok
+test conformance::suites::tests::honest_fidelity_is_the_only_variant_the_suite_accepts ... ok
+test conformance::suites::tests::suite_rejects_black_hole_accounting ... ok
+test conformance::suites::tests::honest_fake_passes_the_strengthened_fail_closed_check ... ok
+test conformance::suites::tests::snapshot_error_is_failed_verdict_not_zero ... ok
+test conformance::suites::tests::sep23_fup004_suite_rejects_aggregate_preserving_bucket_swap ... ok
+test conformance::suites::tests::both_targets_still_pass_the_portable_suite_after_strengthening ... ok
+test conformance::suites::tests::sep23_fup004_mixed_kind_trace_agrees_on_every_axis_bucket ... ok
+test conformance::suites::tests::honest_fake_passes_every_accounting_invariant ... ok
+test conformance::suites::tests::suite_rejects_commit_swallowing_target ... ok
+test conformance::suites::tests::suite_rejects_every_accounting_fidelity_break_variant ... ok
+test conformance::suites::tests::suite_rejects_duplicate_commit_accepting_target ... ok
+test conformance::suites::tests::suite_rejects_fake_whose_class_diverges_from_owner ... ok
+test conformance::suites::tests::suite_rejects_release_swallowing_target ... ok
+test conformance::suites::tests::suite_rejects_stale_ticket_accepting_target ... ok
+test conformance::suites::tests::suite_rejects_target_that_mutates_accounting_on_a_denied_reserve ... ok
+test conformance::suites::tests::suite_rejects_target_that_mutates_on_allocator_observation ... ok
+test conformance::suites::tests::suite_rejects_fake_that_under_reports_owner_bytes ... ok
+test conformance::suites::tests::suite_rejects_transfer_double_owner ... ok
+test conformance::suites::tests::suite_rejects_wrong_charge_kind_axis ... ok
+test conformance::suites::tests::prepared_publication_suite_accepts_honest_service ... ok
+test conformance::suites::tests::suite_rejects_wrong_context_axis ... ok
+test conformance::suites::tests::prepared_suite_rejects_correct_replay_with_unbilled_identity ... ok
+test conformance::suites::tests::prepared_publication_suite_rejects_root_blind_gc_fake ... ok
+test conformance::suites::tests::transcript_append_suite_rejects_non_idempotent_fake ... ok
+test conformance::suites::tests::transcript_suite_rejects_correct_replay_with_unbilled_identity ... ok
+test conformance::tests::empty_assertion_list_is_failed_not_silently_passed ... ok
+test conformance::tests::broken_fake_yields_failed_verdict_localized_to_balance_family ... ok
+test conformance::suites::tests::transcript_append_suite_accepts_honest_service ... ok
+test conformance::suites::tests::transcript_suite_rejects_target_that_ignores_declared_horizon ... ok
+test fake::broker::tests::broken_under_report_corrupts_only_the_reported_snapshot ... ok
+test fake::broker::tests::honest_reserve_keeps_class_owner_balanced ... ok
+test fake::broker::tests::owner_hard_cap_denies_before_mutation ... ok
+test conformance::tests::honest_fake_yields_passed_verdict ... ok
+test fake::broker::tests::rebuild_window_rejects_writes_then_resumes ... ok
+test fake::broker::tests::reclaim_rebuild_and_incomplete_group_preflight_leave_all_authority_untouched ... ok
+test conformance::tests::real_core_broker_passes_the_same_portable_suite ... ok
+test fake::broker::tests::reclaim_preserves_ticket_provenance_kind_axes_and_group_refunds ... ok
+test conformance::tests::public_suite_rejects_every_break_variant_and_localizes_it ... ok
+test fake::broker::tests::reclaim_yield_zero_frees_nothing ... ok
+test fake::broker::tests::resource_group_cap_denies_aggregate_over_owners ... ok
+test fake::broker::tests::reclaim_terminates_full_tickets_and_preserves_partial_commit_authority ... ok
+test faults::scenarios::tests::pinned_delete_failure_is_contained_and_bytes_survive ... ok
+test faults::scenarios::tests::reclaim_returns_zero_is_contained ... ok
+test faults::scenarios::tests::rebuild_race_write_is_rejected ... ok
+test faults::scenarios::tests::pinned_delete_classifier_rejects_reference_loss_and_accounting_lies ... ok
+test faults::scenarios::tests::spill_failure_is_contained_without_counting ... ok
+test faults::scenarios::tests::spill_fault_classification_reports_escaped_for_a_lying_controller ... ok
+test faults::scenarios::tests::spill_fault_classification_reports_escaped_when_count_drifts ... ok
+test faults::scenarios::tests::spill_fault_classification_reports_escaped_when_count_is_unreadable ... ok
+test faults::tests::empty_harness_runs_nothing ... ok
+test fixtures::tests::fake_pressure_fixture_propagates_pressure_into_the_fake_broker ... ok
+test fixtures::tests::live_broker_materializes_from_fixture_manifest ... ok
+test fixtures::tests::conformance_verdict_localizes_to_contract_family_not_a_host_package ... ok
+test faults::tests::harness_covers_reclaim_pin_rebuild_and_spill ... ok
+test fixtures::tests::testkit_runs_conformance_against_its_fake_and_passes ... ok
+test self_tests::conformance_suite_accepts_an_honest_fake ... ok
+test self_tests::conformance_suite_rejects_a_fake_that_under_reports_usage ... ok
+test self_tests::conformance_suite_rejects_a_fake_with_divergent_class_totals ... ok
+test conformance::suites::tests::deterministic_trace_matches_independent_model ... ok
+test fixtures::tests::testkit_runs_facade_store_suite_against_live_broker_and_passes ... ok
+test loom_models::loom_ticket_transition_has_single_terminal_owner ... ok
+test loom_models::loom_spill_transfer_never_has_zero_or_double_owner ... ok
+test loom_models::loom_close_vs_mutation_never_mutates_after_close ... ok
+test loom_models::loom_reserve_vs_reconfigure_preserves_installed_cap ... ok
+test loom_models::loom_versioned_callback_compensation_is_exactly_once ... ok
+test conformance::suites::tests::property_trace_matches_independent_model ... ok
+
+test result: ok. 86 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.02s
+
+     Running tests/facade_conformance_bite.rs (target/debug/deps/facade_conformance_bite-3f429aad64b8eb35)
+
+running 4 tests
+test lifecycle_oracle_rejects_leaking_close_fake ... ok
+test lifecycle_oracle_rejects_state_losing_close_fake ... ok
+test lifecycle_oracle_rejects_double_refund_fake ... ok
+test honest_fake_and_all_five_real_stores_pass_lifecycle_oracle ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/public_api_surface.rs (target/debug/deps/public_api_surface-181de4798162c472)
+
+running 1 test
+test fixture_mode_exposes_the_facade_suite_end_to_end ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+   Doc-tests quanta_memory_platform_core
+
+running 16 tests
+test crates/quanta-memory-platform-core/src/application/controller.rs - application::controller::PressureThresholds (line 42) - compile fail ... ok
+test crates/quanta-memory-platform-core/src/lib.rs - (line 17) - compile fail ... ok
+test crates/quanta-memory-platform-core/src/lib.rs - (line 74) - compile fail ... ok
+test crates/quanta-memory-platform-core/src/lib.rs - (line 35) - compile fail ... ok
+test crates/quanta-memory-platform-core/src/api/control.rs - api::control::RebuildFence (line 536) - compile fail ... ok
+test crates/quanta-memory-platform-core/src/ports/scratch.rs - ports::scratch::ScratchReservation (line 31) - compile fail ... ok
+test crates/quanta-memory-platform-core/src/lib.rs - (line 39) - compile fail ... ok
+test crates/quanta-memory-platform-core/src/lib.rs - (line 43) - compile fail ... ok
+test crates/quanta-memory-platform-core/src/lib.rs - (line 54) - compile fail ... ok
+test crates/quanta-memory-platform-core/src/api/control.rs - api::control::ManagedCharge (line 367) - compile fail ... ok
+test crates/quanta-memory-platform-core/src/lib.rs - (line 31) - compile fail ... ok
+test crates/quanta-memory-platform-core/src/lib.rs - (line 27) - compile fail ... ok
+test crates/quanta-memory-platform-core/src/lib.rs - (line 11) - compile fail ... ok
+test crates/quanta-memory-platform-core/src/lib.rs - (line 50) - compile fail ... ok
+test crates/quanta-memory-platform-core/src/lib.rs - (line 58) - compile fail ... ok
+test crates/quanta-memory-platform-core/src/api/control.rs - api::control::RebuildReceipt (line 507) - compile fail ... ok
+
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.10s
+
+   Doc-tests quanta_memory_platform_facade
+
+running 28 tests
+test crates/quanta-memory-platform-facade/src/shared/accounting.rs - shared::accounting::Unbudgeted (line 82) - compile fail ... ok
+test crates/quanta-memory-platform-facade/src/publish_pipeline/prepared_publication.rs - publish_pipeline::prepared_publication::PreparedPublicationService (line 312) - compile fail ... ok
+test crates/quanta-memory-platform-facade/src/payload_store/service.rs - payload_store::service::SimplePayloadStore (line 89) - compile fail ... ok
+test crates/quanta-memory-platform-facade/src/publish_pipeline/mod.rs - publish_pipeline::PublishPipeline (line 25) - compile fail ... ok
+test crates/quanta-memory-platform-facade/src/revocable_store/service.rs - revocable_store::service::SimpleRevocableStore (line 136) - compile fail ... ok
+test crates/quanta-memory-platform-facade/src/retained_map/service.rs - retained_map::service::SimpleRetainedMapStore (line 107) - compile fail ... ok
+test crates/quanta-memory-platform-facade/src/lib.rs - (line 11) - compile fail ... ok
+test crates/quanta-memory-platform-facade/src/lib.rs - (line 24) - compile fail ... ok
+test crates/quanta-memory-platform-facade/src/retained_map/mod.rs - retained_map::RetainedMapStore (line 42) - compile fail ... ok
+test crates/quanta-memory-platform-facade/src/retained_map/service.rs - retained_map::service::SimpleRetainedMapStore (line 116) - compile fail ... ok
+test crates/quanta-memory-platform-facade/src/publish_pipeline/mod.rs - publish_pipeline::PublishPipeline (line 35) - compile fail ... ok
+test crates/quanta-memory-platform-facade/src/lib.rs - (line 34) - compile fail ... ok
+test crates/quanta-memory-platform-facade/src/lib.rs - (line 30) - compile fail ... ok
+test crates/quanta-memory-platform-facade/src/revocable_store/service.rs - revocable_store::service::SimpleRevocableStore (line 144) - compile fail ... ok
+test crates/quanta-memory-platform-facade/src/payload_store/service.rs - payload_store::service::SimplePayloadStore (line 94) - compile fail ... ok
+test crates/quanta-memory-platform-facade/src/publish_pipeline/prepared_publication.rs - publish_pipeline::prepared_publication::PreparedPublicationService (line 319) - compile fail ... ok
+test crates/quanta-memory-platform-facade/src/shared/builder.rs - shared::builder::PayloadStoreBuilder (line 255) - compile fail ... ok
+test crates/quanta-memory-platform-facade/src/spill/mod.rs - spill::DurableRestoreRecovery (line 360) - compile fail ... ok
+test crates/quanta-memory-platform-facade/src/spill/mod.rs - spill::DurableRestoreClaim (line 155) - compile fail ... ok
+test crates/quanta-memory-platform-facade/src/transcript_store/service.rs - transcript_store::service::SimpleSessionTranscriptStore (line 304) - compile fail ... ok
+test crates/quanta-memory-platform-facade/src/shared/builder.rs - shared::builder::RetainedMapStoreBuilder (line 358) - compile fail ... ok
+test crates/quanta-memory-platform-facade/src/transcript_store/service.rs - transcript_store::service::SimpleSessionTranscriptStore (line 290) - compile fail ... ok
+test crates/quanta-memory-platform-facade/src/spill/mod.rs - spill::InProcessSpillController (line 36) - compile fail ... ok
+test crates/quanta-memory-platform-facade/src/spill/mod.rs - spill::DurableSpillController (line 54) - compile fail ... ok
+test crates/quanta-memory-platform-facade/src/spill/mod.rs - spill::DurableRestoreClaim (line 163) - compile fail ... ok
+test crates/quanta-memory-platform-facade/src/spill/mod.rs - spill::DurableRestoreClaim (line 169) - compile fail ... ok
+test crates/quanta-memory-platform-facade/src/spill/mod.rs - spill::DurableRestoreCandidate (line 226) - compile fail ... ok
+test crates/quanta-memory-platform-facade/src/transcript_store/service.rs - transcript_store::service::SimpleSessionTranscriptStore (line 295) - compile fail ... ok
+
+test result: ok. 28 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.29s
+
+   Doc-tests quanta_memory_platform_testkit
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[check-workspace] advertised feature runtime capabilities
+[feature-capability] core-live-accounting: public_api_surface::live_broker_bridge_is_present_only_with_core_live_accounting
+    Blocking waiting for file lock on package cache
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.12s
+     Running tests/public_api_surface.rs (target/debug/deps/public_api_surface-cb1f452a25a74b1a)
+
+running 1 test
+test live_broker_bridge_is_present_only_with_core_live_accounting ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 8 filtered out; finished in 0.00s
+
+checked-cargo-test: selected=1 passed=1 failed=0 ignored=0 measured=0 result_lines=1
+[feature-capability] unbudgeted-stores,retained_map: public_api_surface::explicit_unbudgeted_store_is_a_distinct_product_and_does_not_charge_the_platform
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.30s
+     Running tests/public_api_surface.rs (target/debug/deps/public_api_surface-42be281f88492432)
+
+running 1 test
+test explicit_unbudgeted_store_is_a_distinct_product_and_does_not_charge_the_platform ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.00s
+
+checked-cargo-test: selected=1 passed=1 failed=0 ignored=0 measured=0 result_lines=1
+[feature-capability] payload_store: canonical_put_deduplicates_and_charges_once
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.02s
+     Running unittests src/lib.rs (target/debug/deps/quanta_memory_platform_facade-f2500bb8f29e5fcc)
+
+running 1 test
+test payload_store::service::tests::canonical_put_deduplicates_and_charges_once ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 49 filtered out; finished in 0.01s
+
+checked-cargo-test: selected=1 passed=1 failed=0 ignored=0 measured=0 result_lines=1
+[feature-capability] retained_map: put_get_remove_get_none_round_trip_corrects_bytes
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.05s
+     Running unittests src/lib.rs (target/debug/deps/quanta_memory_platform_facade-ad1b237b513276b0)
+
+running 1 test
+test retained_map::service::tests::put_get_remove_get_none_round_trip_corrects_bytes ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 75 filtered out; finished in 0.01s
+
+checked-cargo-test: selected=1 passed=1 failed=0 ignored=0 measured=0 result_lines=1
+[feature-capability] revocable_store: insert_tracks_reclaimable_bytes
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.02s
+     Running unittests src/lib.rs (target/debug/deps/quanta_memory_platform_facade-31b4a4d986289dd2)
+
+running 1 test
+test revocable_store::service::tests::insert_tracks_reclaimable_bytes ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 48 filtered out; finished in 0.01s
+
+checked-cargo-test: selected=1 passed=1 failed=0 ignored=0 measured=0 result_lines=1
+[feature-capability] transcript: exact_request_retried_n_times_applies_once
+    Blocking waiting for file lock on package cache
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.37s
+     Running unittests src/lib.rs (target/debug/deps/quanta_memory_platform_facade-89df7d1efa81c73d)
+
+running 1 test
+test transcript_store::service::tests::exact_request_retried_n_times_applies_once ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 77 filtered out; finished in 0.01s
+
+checked-cargo-test: selected=1 passed=1 failed=0 ignored=0 measured=0 result_lines=1
+[feature-capability] publish_pipeline: default_pipeline_runs_stage_then_commit_each_exactly_once_no_rollback
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.04s
+     Running unittests src/lib.rs (target/debug/deps/quanta_memory_platform_facade-0cb57a4066f4226e)
+
+running 1 test
+test publish_pipeline::service::tests::default_pipeline_runs_stage_then_commit_each_exactly_once_no_rollback ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 54 filtered out; finished in 0.00s
+
+checked-cargo-test: selected=1 passed=1 failed=0 ignored=0 measured=0 result_lines=1
+[feature-capability] spill: in_memory_target_write_then_restore_round_trips_the_payload
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.11s
+     Running unittests src/lib.rs (target/debug/deps/quanta_memory_platform_facade-78733ee0e5d53097)
+
+running 1 test
+test spill::service::tests::in_memory_target_write_then_restore_round_trips_the_payload ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 28 filtered out; finished in 0.00s
+
+checked-cargo-test: selected=1 passed=1 failed=0 ignored=0 measured=0 result_lines=1
+[feature-capability] revocable_store,spill-redb: durable_redb_round_trip_transfers_charge_exactly_once
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.06s
+     Running unittests src/lib.rs (target/debug/deps/quanta_memory_platform_facade-723ad84dc2d73211)
+
+running 1 test
+test revocable_store::service::tests::durable_redb_round_trip_transfers_charge_exactly_once ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 163 filtered out; finished in 1.00s
+
+checked-cargo-test: selected=1 passed=1 failed=0 ignored=0 measured=0 result_lines=1
+[feature-capability] full-backings: many_spills_share_large_binding_identity_without_unbilled_clones
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.06s
+     Running unittests src/lib.rs (target/debug/deps/quanta_memory_platform_facade-3975d1ca613ccd80)
+
+running 1 test
+test revocable_store::service::tests::many_spills_share_large_binding_identity_without_unbilled_clones ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 361 filtered out; finished in 0.03s
+
+checked-cargo-test: selected=1 passed=1 failed=0 ignored=0 measured=0 result_lines=1
+feature-capability: OK (10 advertised feature paths executed non-zero tests)
+[check-workspace] documented test selectors
+doc-test-selectors: OK (298 selectors resolve)
+[check-workspace] generated guidance
+pm lint OK: 9 target(s) up to date
+[check-workspace] cargo deny
+advisories ok, bans ok, licenses ok, sources ok
+check-workspace: clean (full repository gate)
