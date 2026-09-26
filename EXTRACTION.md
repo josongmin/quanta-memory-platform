@@ -19,8 +19,8 @@ dependency direction. Not prose: every step is a command or a verifiable gate.
   pinned `rust-toolchain.toml`, Python 3.9+, and installed ShellCheck,
   `cargo-deny`, and `semgrep`.
 - Output: a standalone git repo at `<dest>` that builds in isolation with its
-  own repo-local rails, plus a one-line manual rewire on the Semantica host
-  adapter manifest.
+  own repo-local rails. Semantica dependency rewiring is a separate, optional
+  consumer integration; it is not required to use the SDK.
 
 ## Step-by-step
 
@@ -74,7 +74,8 @@ dependency direction. Not prose: every step is a command or a verifiable gate.
    cargo metadata --locked --format-version 1 # no re-resolution
    ```
 
-4. Rewire the Semantica dependency contract (manual, coordinated change):
+4. Optional Semantica adoption only: rewire its dependency contract
+   (manual, coordinated change; skip for direct SDK use):
 
    Keep consumer manifests such as `quanta-memory-host/Cargo.toml` on
    `workspace = true`. Update the `quanta-memory-platform-core` and
@@ -87,7 +88,8 @@ dependency direction. Not prose: every step is a command or a verifiable gate.
    NOT add a dependency from this extracted repo back to Semantica or move
    dependency ownership into a consumer manifest.
 
-5. Host integration proof is separate from extraction. After the rewire, use
+5. If Semantica adoption was requested, host integration proof is separate
+   from extraction. After the rewire, use
    `cargo metadata` from both Semantica workspace roots to prove that Cargo
    resolves the intended identical QMP source. Then run the host's currently
    registered adoption suites from its suite registry. Do not treat an

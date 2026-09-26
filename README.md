@@ -12,8 +12,9 @@ accounting source of truth.
 ## Status and boundary
 
 This workspace is an internal, pre-1.0 library (`0.2.0`, `publish = false`).
-Repo-local checks establish library behavior only. Semantica host adoption,
-deployment, and activation require separate exact-source evidence.
+Consumers can use the public facade builder API directly; Semantica adoption
+is not required. Repo-local checks establish library behavior. Host-specific
+integration, deployment and activation are separate consumer work.
 
 Current product scope is in-memory accounting and reclaim. Redb-backed durable
 spill, its codec, and disk-recovery qualification are **excluded from the active

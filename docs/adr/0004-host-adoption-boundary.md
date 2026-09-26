@@ -1,7 +1,8 @@
 # ADR 0004: Host adoption without duplicate authority
 
 Status: Accepted integration direction; Semantica product qualification is
-tracked separately and is not asserted here.
+tracked separately and is not asserted here. Host adoption is optional for
+QMP SDK consumers and is excluded from the active 0.2 SDK work queue.
 
 ## Decision
 
@@ -33,5 +34,6 @@ receipt or prepared token can outlive the visible table row, so its lease
 must follow actual custody, not merely lookup visibility.
 
 The 0.3 builder/DSL in [RFC 0001](../rfcs/0001-sdk-interface-contract.md)
-remains proposed. Current Semantica verification obligations are kept in the
-[active product gate](../plans/sep-24-semantica-memory-adoption/SMA-009-product-qualification.md).
+is an accepted design target, not implemented or qualified. Conditional
+Semantica verification obligations are kept in the
+[host integration reference](../plans/sep-24-semantica-memory-adoption/SMA-009-product-qualification.md).
