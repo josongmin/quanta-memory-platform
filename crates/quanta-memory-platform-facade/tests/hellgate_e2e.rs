@@ -140,7 +140,7 @@ fn failed_close_during_rebuild_preserves_store_and_retries_after_fence() {
     assert_eq!(store.get_checked(&"kept".to_string()).expect("checked read"), Some(vec![0; 200]));
     assert_eq!(store.committed_bytes().expect("counter"), map_cost("kept", 200));
 
-    rebuild_fence_h1.finish().expect("end fence");
+    assert!(rebuild_fence_h1.finish().expect("end fence").drain_error.is_none());
     store.close().expect("retry close");
     assert_eq!(platform.broker().ledger_snapshot().expect("after close").total_owner_bytes(), 0);
 }
@@ -160,7 +160,7 @@ fn store_drop_during_rebuild_defers_refund_until_finish() {
         "rebuild must not silently zero the ledger"
     );
     assert_balanced(&fenced);
-    rebuild_fence_h2.finish().expect("drain deferred cleanup");
+    assert!(rebuild_fence_h2.finish().expect("drain deferred cleanup").drain_error.is_none());
     let drained = platform.broker().ledger_snapshot().expect("drained snapshot");
     assert_eq!(drained.total_owner_bytes(), 0);
     assert_balanced(&drained);
@@ -280,7 +280,7 @@ fn rebuild_fences_charged_store_writes_then_resumes() {
         map_cost("pre", 500)
     );
 
-    rebuild_fence_h2.finish().expect("finish rebuild");
+    assert!(rebuild_fence_h2.finish().expect("finish rebuild").drain_error.is_none());
     store.insert_checked("post".to_string(), vec![0u8; 300]).expect("writes resume after rebuild");
     assert_eq!(
         b.broker().ledger_snapshot().expect("snap").total_owner_bytes(),
@@ -527,7 +527,7 @@ fn release_many_during_rebuild_is_fail_closed() {
         "a rebuild-rejected batch strands nothing",
     );
     assert!(charges.iter().all(ManagedCharge::is_active));
-    rebuild_fence_h3.finish().expect("finish rebuild");
+    assert!(rebuild_fence_h3.finish().expect("finish rebuild").drain_error.is_none());
     b.broker().release_managed_many(&mut charges).expect("retry exact batch release");
     assert_eq!(b.broker().ledger_snapshot().expect("snap").total_owner_bytes(), 0);
 }

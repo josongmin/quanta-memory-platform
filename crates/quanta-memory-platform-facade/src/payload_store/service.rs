@@ -322,14 +322,28 @@ where
         // Client measurement callbacks run with no store state lock held. A
         // panic or reentry cannot poison the authoritative state or charge the
         // broker before the complete semantic cost is known.
-        let payload_ref = PayloadRef::from(payload_ref_text);
-        let payload_ref_digest = reference_digest(&self.digest_seed, &payload_ref);
+        let mut payload_ref = InFlight::new(PayloadRef::from(payload_ref_text));
+        let payload_ref_digest = reference_digest(&self.digest_seed, payload_ref.get());
+        // `From<String>` does not promise an injective conversion. The
+        // mutation permit keeps this check stable until publication; perform
+        // caller equality before charging or entering the publication lock.
+        let reference_exists = {
+            let state = self.lock()?;
+            invoke_client_read_while_locked(state, |state| {
+                find_reference_slot(state, payload_ref_digest, payload_ref.get()).is_some()
+            })
+        };
+        if reference_exists {
+            return Err(MemoryError::InvalidState(
+                "generated payload reference collides with a live entry".into(),
+            ));
+        }
         let index_bytes = semantic_cost_v1::DIGEST_BYTES
             .checked_mul(2)
             .ok_or_else(|| MemoryError::capacity("payload index cost exceeds u64"))?;
         let charged_bytes = RetainedCostV1 {
             payload_bytes: value.get().bytes.byte_size(),
-            key_identity_bytes: payload_ref.byte_size(),
+            key_identity_bytes: payload_ref.get().byte_size(),
             index_bytes,
             fixed_overhead_bytes: semantic_cost_v1::ENTRY_STATE_BYTES,
             ..RetainedCostV1::default()
@@ -344,7 +358,7 @@ where
         // PayloadRef::Clone is caller code. Prepare the stored identity before
         // charging or holding the publication lock so its panic cannot poison
         // the container or leave a provisional accounting lease behind.
-        let stored_payload_ref = payload_ref.clone();
+        let mut stored_payload_ref = InFlight::new(payload_ref.get().clone());
 
         let charge = self.accounting.charge(
             self.binding.class.clone(),
@@ -362,7 +376,7 @@ where
             }
         };
         let entry = PayloadEntry {
-            payload_ref: stored_payload_ref,
+            payload_ref: stored_payload_ref.take(),
             canonical_digest: digest,
             charged_bytes,
             pin_count: 0,
@@ -386,7 +400,7 @@ where
             .expect("live entry count cannot exceed allocated slots");
         state.next_ref = next_ref;
         state.charged_total = next_total;
-        Ok(PublishedPayload::new(payload_ref))
+        Ok(PublishedPayload::new(payload_ref.take()))
     }
 
     fn delete_if_unpinned(&self, payload_ref: &PayloadRef) -> Result<(), StoreDeleteError> {
@@ -1042,6 +1056,41 @@ mod tests {
         );
     }
 
+    #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+    struct ConstantRef;
+
+    impl From<String> for ConstantRef {
+        fn from(_: String) -> Self {
+            Self
+        }
+    }
+
+    impl ByteSized for ConstantRef {
+        fn byte_size(&self) -> u64 {
+            0
+        }
+    }
+
+    #[test]
+    fn non_injective_public_reference_conversion_is_rejected_before_charge() {
+        let broker = live_broker(1_000_000, 600_000);
+        let store = SimplePayloadStore::<ConstantRef, Vec<u8>, Budgeted>::new_budgeted(
+            binding(),
+            None,
+            broker.clone(),
+        );
+        let first = store.put_canonical(envelope(b"one")).expect("first identity");
+        let before_stats = store.stats().expect("before stats");
+        let before_ledger = broker.ledger_snapshot().expect("before ledger");
+        assert!(matches!(store.put_canonical(envelope(b"two")), Err(MemoryError::InvalidState(_))));
+        assert_eq!(store.stats().expect("unchanged stats"), before_stats);
+        assert_eq!(broker.ledger_snapshot().expect("unchanged ledger"), before_ledger);
+        store.pin(first.payload_ref()).expect("first remains addressable");
+        store.unpin(first.payload_ref()).expect("unpin first");
+        store.delete_if_unpinned(first.payload_ref()).expect("delete first");
+        assert_eq!(broker.ledger_snapshot().expect("drained").total_owner_bytes(), 0);
+    }
+
     #[test]
     fn delete_unpinned_releases_bytes_exactly_once() {
         let (broker, store) = store();
@@ -1248,7 +1297,7 @@ mod tests {
             retained_cost(80, 0)
         );
 
-        rebuild_fence1.finish().expect("finish rebuild");
+        assert!(rebuild_fence1.finish().expect("finish rebuild").drain_error.is_none());
         store.delete_if_unpinned(published.payload_ref()).expect("delete resumes");
         assert_eq!(broker.ledger_snapshot().expect("released").total_owner_bytes(), 0);
     }
@@ -1290,7 +1339,7 @@ mod tests {
             broker.ledger_snapshot().expect("preserved ledger").total_owner_bytes(),
             retained_cost(5, 0)
         );
-        rebuild_fence2.finish().expect("finish rebuild");
+        assert!(rebuild_fence2.finish().expect("finish rebuild").drain_error.is_none());
         store.close().expect("retry close");
         assert_eq!(broker.ledger_snapshot().expect("released").total_owner_bytes(), 0);
     }
@@ -1305,7 +1354,7 @@ mod tests {
             broker.ledger_snapshot().expect("deferred").total_owner_bytes(),
             retained_cost(5, 0)
         );
-        rebuild_fence3.finish().expect("finish drains");
+        assert!(rebuild_fence3.finish().expect("finish drains").drain_error.is_none());
         assert_eq!(broker.ledger_snapshot().expect("drained").total_owner_bytes(), 0);
     }
 

@@ -5,7 +5,7 @@
     feature = "revocable_store"
 ))]
 
-use std::sync::{Arc, Barrier, Mutex, OnceLock};
+use std::sync::{Arc, Barrier, Mutex, OnceLock, Weak};
 
 use quanta_memory_platform_core::{
     ChargeKind, ExecutionBudget, LedgerSnapshot, ManagedCharge, MemoryBudgetManifest, MemoryClass,
@@ -331,13 +331,18 @@ fn other_store_reclaim_frees_admission_and_drains_every_ticket() {
     const VICTIM_OWNER: &str = "owner:cross-revict";
 
     struct OtherStoreReclaimer {
-        victim: OnceLock<Arc<SimpleRevocableStore<String, Vec<u8>, Budgeted>>>,
+        victim: OnceLock<Weak<SimpleRevocableStore<String, Vec<u8>, Budgeted>>>,
         inner_results: Mutex<Vec<MemoryResult<SweepStats>>>,
     }
 
     impl MemoryReclaimer for OtherStoreReclaimer {
         fn reclaim(&self, request: &ReclaimRequest) -> MemoryResult<ReclaimOutcome> {
-            let victim = self.victim.get().expect("victim store registered before use");
+            let victim = self
+                .victim
+                .get()
+                .expect("victim store registered before use")
+                .upgrade()
+                .expect("victim remains live during callback");
             let swept = victim.reclaim_until(request.requested_bytes)?;
             self.inner_results.lock().expect("results").push(Ok(swept));
             // Advisory lie: report zero reclaimed bytes while the victim store
@@ -386,7 +391,7 @@ fn other_store_reclaim_frees_admission_and_drains_every_ticket() {
 
     let victim = Arc::new(revocable_store_for(&platform, VICTIM_OWNER));
     let admitting = revocable_store_for(&platform, REVOCABLE_OWNER);
-    assert!(reclaimer.victim.set(Arc::clone(&victim)).is_ok());
+    assert!(reclaimer.victim.set(Arc::downgrade(&victim)).is_ok());
 
     // Two FIFO victims fill the shared class budget.
     victim.insert_checked("v1".into(), vec![0; 4]).expect("first victim");
@@ -421,6 +426,9 @@ fn other_store_reclaim_frees_admission_and_drains_every_ticket() {
     victim.close().expect("close victim");
     admitting.close().expect("close admitting store");
     assert_drained(&platform.broker().ledger_snapshot().expect("final drain"));
+    let weak_victim = Arc::downgrade(&victim);
+    drop(victim);
+    assert!(weak_victim.upgrade().is_none(), "reclaimer must not pin a closed victim store");
 }
 
 /// One mixed-store lifecycle pins every charge-kind axis with independent

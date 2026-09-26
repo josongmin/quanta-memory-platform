@@ -451,6 +451,8 @@ struct RedbFaults {
     lose_write_commit_ack: AtomicBool,
     lose_restore_commit_ack: AtomicBool,
     lose_finalize_commit_ack: AtomicBool,
+    lose_abort_commit_ack: AtomicBool,
+    claim_after_lost_ack: AtomicBool,
 }
 
 impl RedbSpillBacking {
@@ -893,6 +895,18 @@ impl RedbSpillBacking {
         self.faults.lose_finalize_commit_ack.store(true, AtomicOrdering::SeqCst);
     }
 
+    #[cfg(test)]
+    fn inject_lost_finalize_ack_with_next_claim(&self) {
+        self.inject_lost_finalize_commit_ack();
+        self.faults.claim_after_lost_ack.store(true, AtomicOrdering::SeqCst);
+    }
+
+    #[cfg(test)]
+    fn inject_lost_abort_ack_with_next_claim(&self) {
+        self.faults.lose_abort_commit_ack.store(true, AtomicOrdering::SeqCst);
+        self.faults.claim_after_lost_ack.store(true, AtomicOrdering::SeqCst);
+    }
+
     /// Reject a claim minted for a different backend file. Numeric sequences
     /// collide across files, so the backend identity is always compared first.
     fn check_claim_backend(&self, claim: &DurableRestoreClaim) -> MemoryResult<()> {
@@ -933,6 +947,52 @@ impl RedbSpillBacking {
                 "durable restore generation without an active sequence".into(),
             )),
         }
+    }
+
+    /// A finalize ACK can be lost after another record acquires the global
+    /// claim. Only this record's atomic proof and payload removal establish
+    /// whether this claimant's finalize landed.
+    fn finalize_landed(&self, sequence: u64, generation: u64) -> MemoryResult<bool> {
+        let read = self.database.begin_read().map_err(|e| {
+            MemoryError::report(format!("redb finalize probe transaction failed: {e}"))
+        })?;
+        let proofs = read
+            .open_table(SPILL_FINALIZED_BY)
+            .map_err(|e| MemoryError::report(format!("redb finalize proof table failed: {e}")))?;
+        let recovery = read
+            .open_table(SPILL_RECOVERY)
+            .map_err(|e| MemoryError::report(format!("redb recovery table failed: {e}")))?;
+        let queue = read
+            .open_table(SPILL_QUEUE)
+            .map_err(|e| MemoryError::report(format!("redb spill table failed: {e}")))?;
+        let states = read.open_table(SPILL_RECORD_STATE).map_err(|e| {
+            MemoryError::report(format!("redb record disposition table failed: {e}"))
+        })?;
+        let proof = proofs
+            .get(sequence)
+            .map_err(|e| MemoryError::report(format!("redb finalize proof read failed: {e}")))?
+            .map(|value| value.value());
+        let recovery_present = recovery
+            .get(sequence)
+            .map_err(|e| MemoryError::report(format!("redb recovery read failed: {e}")))?
+            .is_some();
+        let queued = queue
+            .get(sequence)
+            .map_err(|e| MemoryError::report(format!("redb queued record read failed: {e}")))?
+            .is_some();
+        let disposition = states
+            .get(sequence)
+            .map_err(|e| MemoryError::report(format!("redb record disposition read failed: {e}")))?
+            .map(|value| RecordDisposition::decode(value.value()))
+            .transpose()?;
+        if proof.is_some()
+            && (recovery_present || queued || disposition != Some(RecordDisposition::Finalized))
+        {
+            return Err(MemoryError::InvalidState(format!(
+                "restore {sequence} has finalize proof inconsistent with retained bytes or disposition"
+            )));
+        }
+        Ok(proof == Some(generation))
     }
 
     /// Number of handles currently retained (restorable). For diagnostics/tests.
@@ -1798,13 +1858,16 @@ impl DurableRestoreTarget for RedbSpillBacking {
         match commit_error {
             None => Ok(()),
             Some(error) => {
-                // Non-mutating probe only: a claiming recovery here would mint
-                // a spurious generation and steal this finalizer's own claim.
-                match self.active_claim()? {
-                    None => Ok(()),
-                    Some(_) => Err(MemoryError::report(format!(
+                #[cfg(test)]
+                if self.faults.claim_after_lost_ack.swap(false, AtomicOrdering::SeqCst) {
+                    let _next = self.prepare_restore()?;
+                }
+                if self.finalize_landed(sequence, generation)? {
+                    Ok(())
+                } else {
+                    Err(MemoryError::report(format!(
                         "redb restore-finalize commit outcome remains unresolved: {error}"
-                    ))),
+                    )))
                 }
             }
         }
@@ -1880,21 +1943,42 @@ impl DurableRestoreTarget for RedbSpillBacking {
                 }
             }
         }
-        match txn.commit() {
-            Ok(()) => Ok(()),
-            Err(error) => match self.active_claim()? {
-                None => Ok(()),
-                Some((active, Some(active_gen)))
-                    if active == sequence && active_gen == generation =>
-                {
-                    Err(MemoryError::report(format!(
-                        "redb restore-abort commit outcome remains unresolved: {error}"
-                    )))
+        let commit_error = match txn.commit() {
+            Ok(()) => {
+                #[cfg(test)]
+                if self.faults.lose_abort_commit_ack.swap(false, AtomicOrdering::SeqCst) {
+                    Some("injected lost redb restore-abort acknowledgement".to_string())
+                } else {
+                    None
                 }
-                Some((active, active_gen)) => Err(MemoryError::InvalidState(format!(
-                    "restore-abort {sequence} observed foreign active claim ({active}, {active_gen:?})"
-                ))),
-            },
+                #[cfg(not(test))]
+                None
+            }
+            Err(error) => Some(error.to_string()),
+        };
+        match commit_error {
+            None => Ok(()),
+            Some(error) => {
+                #[cfg(test)]
+                if self.faults.claim_after_lost_ack.swap(false, AtomicOrdering::SeqCst) {
+                    let _next = self.prepare_restore()?;
+                }
+                match self.active_claim()? {
+                    None => Ok(()),
+                    Some((active, Some(active_gen)))
+                        if active == sequence && active_gen == generation =>
+                    {
+                        Err(MemoryError::report(format!(
+                            "redb restore-abort commit outcome remains unresolved: {error}"
+                        )))
+                    }
+                    // The write began with this exact live claim. A foreign claim
+                    // after the ambiguous commit means this one no longer holds
+                    // the global authority, regardless of whether the next claim
+                    // appeared before this read.
+                    Some(_) => Ok(()),
+                }
+            }
         }
     }
 
@@ -4085,6 +4169,61 @@ mod tests {
             DurableRecordResolution::Finalized,
             "record 0 stays exactly finalized"
         );
+    }
+
+    #[test]
+    fn ambiguous_finalize_probe_uses_own_record_proof_with_foreign_claim_live() {
+        let db = test_db();
+        let backing = RedbSpillBacking::create(&db.path).expect("open");
+        for payload in [b"first".as_slice(), b"second".as_slice()] {
+            let id = backing.reserve_record_id().expect("reserve");
+            let _receipt = backing.commit_spill(id, payload).expect("commit");
+        }
+        let first = backing.prepare_restore().expect("prepare first").expect("first");
+        backing.commit_restore(&first.claim).expect("commit first");
+        assert!(!backing
+            .finalize_landed(first.sequence, first.claim.generation())
+            .expect("preimage"));
+        backing.finalize_restore(&first.claim).expect("finalize first");
+        let second = backing.prepare_restore().expect("prepare second").expect("second");
+        assert_eq!(backing.active_restore(), Ok(Some(DurableRecordId::new(second.sequence))));
+        assert!(backing
+            .finalize_landed(first.sequence, first.claim.generation())
+            .expect("exact proof"));
+        assert!(!backing
+            .finalize_landed(first.sequence, second.claim.generation())
+            .expect("foreign generation"));
+        assert!(!backing
+            .finalize_landed(second.sequence, second.claim.generation())
+            .expect("unfinalized"));
+    }
+
+    #[test]
+    fn lost_finalize_and_abort_acks_allow_a_new_claim_before_reconciliation() {
+        let db = test_db();
+        let backing = RedbSpillBacking::create(&db.path).expect("open");
+        for payload in [b"first".as_slice(), b"second".as_slice()] {
+            let id = backing.reserve_record_id().expect("reserve");
+            let _receipt = backing.commit_spill(id, payload).expect("commit");
+        }
+        let first = backing.prepare_restore().expect("prepare first").expect("first");
+        backing.commit_restore(&first.claim).expect("commit first");
+        backing.inject_lost_finalize_ack_with_next_claim();
+        backing
+            .finalize_restore(&first.claim)
+            .expect("exact finalize proof survives foreign claim");
+        assert_eq!(backing.active_claim().expect("new claim").map(|claim| claim.0), Some(1));
+
+        let second = backing.recover_active_restore().expect("recover second").expect("second");
+        backing.inject_lost_abort_ack_with_next_claim();
+        backing.abort_restore(&second.candidate.claim).expect("own claim was released");
+        let next = backing.active_claim().expect("next claim").expect("active");
+        assert_eq!(next.0, 1);
+        assert_ne!(next.1, Some(second.candidate.claim.generation()));
+        assert!(matches!(
+            backing.abort_restore(&second.candidate.claim),
+            Err(MemoryError::InvalidState(_))
+        ));
     }
 
     #[test]
