@@ -1,9 +1,13 @@
 # SMA-009: Semantica product qualification
 
-Status: Open until an exact-source host receipt demonstrates every applicable
-gate below. The earlier integration of SMA-001/002/003 is implementation,
-not final product proof. This ticket lives in QMP for dependency and contract
-visibility; Semantica owns execution and its source-bound receipt.
+Status: Reference-only host integration ticket; excluded from the active QMP
+0.2 SDK queue. Execute only for an explicitly requested Semantica adoption.
+An exact-source host receipt must demonstrate every applicable gate below
+before claiming that host integration is qualified. The earlier integration
+of SMA-001/002/003 is implementation, not final product proof. This ticket
+lives in QMP for dependency and contract
+visibility; Semantica owns execution and its source-bound receipt. Direct SDK
+use, standalone extraction and QMP completion do not depend on this ticket.
 
 ## Freeze before execution
 
