@@ -709,13 +709,13 @@ where
         Key: Clone + Ord,
     {
         let mut keys = self.lifecycle.with_read_state(&self.state, |state| {
-            state.entries.keys().cloned().collect::<Vec<Key>>()
+            state.entries.keys().map(|key| InFlight::new(key.clone())).collect::<Vec<_>>()
         })?;
         // Deterministic, key-sorted order independent of insertion order. The
         // sort runs outside the store boundary so a caller `Ord` panic cannot
         // hold or poison the state mutex.
-        keys.sort();
-        Ok(keys)
+        keys.sort_by(|a, b| a.get().cmp(b.get()));
+        Ok(keys.iter_mut().map(InFlight::take).collect())
     }
 
     fn entries_checked(&self) -> Result<Vec<(Key, Value)>, MemoryError>
@@ -727,12 +727,16 @@ where
             state
                 .entries
                 .iter()
-                .map(|(key, entry)| (key.clone(), entry.value.clone()))
-                .collect::<Vec<(Key, Value)>>()
+                .map(|(key, entry)| {
+                    let key = InFlight::new(key.clone());
+                    let value = InFlight::new(entry.value.clone());
+                    (key, value)
+                })
+                .collect::<Vec<_>>()
         })?;
         // Same deterministic key order as `keys`, outside the boundary.
-        entries.sort_by(|a, b| a.0.cmp(&b.0));
-        Ok(entries)
+        entries.sort_by(|a, b| a.0.get().cmp(b.0.get()));
+        Ok(entries.iter_mut().map(|(key, value)| (key.take(), value.take())).collect())
     }
 
     fn close(&self) -> Result<(), MemoryError> {
@@ -1436,6 +1440,73 @@ mod tests {
         assert!(
             store.stats_checked().is_ok(),
             "entry-clone panic must release the read guard without poisoning the owner mutex"
+        );
+    }
+
+    #[test]
+    fn partial_entry_read_clone_and_drop_panics_cannot_abort() {
+        const CHILD: &str = "QMP_RETAINED_PARTIAL_READ_CHILD";
+        struct HostileReadValue {
+            calls: Arc<AtomicUsize>,
+            drop_panics: Arc<AtomicBool>,
+        }
+        impl Clone for HostileReadValue {
+            fn clone(&self) -> Self {
+                let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+                assert_ne!(call, 2, "second value clone trap");
+                Self { calls: Arc::clone(&self.calls), drop_panics: Arc::clone(&self.drop_panics) }
+            }
+        }
+        impl ByteSized for HostileReadValue {
+            fn byte_size(&self) -> u64 {
+                1
+            }
+        }
+        impl Drop for HostileReadValue {
+            fn drop(&mut self) {
+                assert!(!self.drop_panics.load(Ordering::SeqCst), "partial clone drop trap");
+            }
+        }
+        if std::env::var_os(CHILD).is_some() {
+            let binding = StoreBindingHandle::new(
+                MemoryClass::MemoResidency,
+                "owner:partial-read".into(),
+                None,
+            );
+            let store: UnbudgetedTestStore<String, HostileReadValue> =
+                SimpleRetainedMapStore::new_unbudgeted_fixture(binding);
+            let calls = Arc::new(AtomicUsize::new(0));
+            let drop_panics = Arc::new(AtomicBool::new(false));
+            for key in ["a", "b"] {
+                store
+                    .insert_checked(
+                        key.into(),
+                        HostileReadValue {
+                            calls: Arc::clone(&calls),
+                            drop_panics: Arc::clone(&drop_panics),
+                        },
+                    )
+                    .expect("seed");
+            }
+            drop_panics.store(true, Ordering::SeqCst);
+            let caught =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| store.entries_checked()));
+            assert!(caught.is_err(), "later Clone must panic");
+            drop_panics.store(false, Ordering::SeqCst);
+            assert_eq!(store.stats_checked().expect("read after unwind").item_count, 2);
+            store.close().expect("close after unwind");
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .arg("--exact")
+            .arg("retained_map::service::tests::partial_entry_read_clone_and_drop_panics_cannot_abort")
+            .env(CHILD, "1")
+            .output()
+            .expect("isolated partial-read child");
+        assert!(
+            output.status.success(),
+            "partial read must not abort: {}",
+            String::from_utf8_lossy(&output.stderr)
         );
     }
 
@@ -2648,7 +2719,7 @@ mod tests {
                 retained_cost("key", 30),
                 "store and ledger retain the same charge authority"
             );
-            rebuild_fence1.finish().expect("finish rebuild");
+            assert!(rebuild_fence1.finish().expect("finish rebuild").drain_error.is_none());
         }
 
         #[test]
@@ -2855,7 +2926,7 @@ mod tests {
             );
 
             // After rebuild the entry is still live: it overwrites and removes cleanly.
-            rebuild_fence2.finish().expect("finish");
+            assert!(rebuild_fence2.finish().expect("finish").drain_error.is_none());
             store.insert_checked("k".to_string(), vec![2u8; 20]).expect("overwrite resumes");
             assert_eq!(
                 broker.ledger_snapshot().expect("snap").total_owner_bytes(),
@@ -2988,7 +3059,7 @@ mod tests {
             // A failed refund_many must also leave internal insertion order intact.
             // Once the accounting gate reopens, the original newest entry is still
             // the first one reclaimed.
-            rebuild_fence4.finish().expect("finish rebuild");
+            assert!(rebuild_fence4.finish().expect("finish rebuild").drain_error.is_none());
             let swept = store
                 .sweep(SweepHint { target_bytes: retained_cost("c", 5) })
                 .expect("sweep after retry");

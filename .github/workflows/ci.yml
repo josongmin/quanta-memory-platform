@@ -26,7 +26,7 @@ jobs:
           printf 'Runner started for %s at %s\n' "$GITHUB_SHA" "$(date -u +%FT%TZ)"
 
   full-extraction:
-    if: github.event_name != 'workflow_dispatch' || inputs.verification == 'full'
+    if: github.event_name == 'workflow_dispatch' && inputs.verification == 'full'
     runs-on: ubuntu-24.04
     timeout-minutes: 180
     steps:
@@ -56,12 +56,5 @@ jobs:
           shellcheck --version
       - name: Verify actual standalone extraction and full workspace gate
         run: |
-          qmp_extract_dir="$(mktemp -d "$RUNNER_TEMP/qmp-extraction.XXXXXX")"
-          echo "Source SHA: $GITHUB_SHA"
-          scripts/extract-to-standalone-repo.sh "$qmp_extract_dir"
-          (
-            cd "$qmp_extract_dir"
-            cargo run --locked -p quanta-memory-platform-facade --example hello_world
-            cargo run --locked -p quanta-memory-platform-facade --example effective_budget_report
-          )
-          test -z "$(git -C "$qmp_extract_dir" status --porcelain)"
+          set -euo pipefail
+          scripts/verify-extracted-examples.sh

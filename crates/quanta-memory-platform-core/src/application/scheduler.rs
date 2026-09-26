@@ -11,7 +11,14 @@ use std::collections::BTreeMap;
 
 use crate::domain::admission;
 use crate::domain::errors::{MemoryError, MemoryResult};
+use crate::domain::policy::MemoryClass;
 use crate::domain::policy::ResourceGroup;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct GroupUsage {
+    total: u64,
+    non_headroom: u64,
+}
 
 /// Admission authority for resource groups.
 pub trait ResourceGroupScheduler {
@@ -36,7 +43,7 @@ pub trait ResourceGroupScheduler {
 #[derive(Clone, Debug, Default)]
 pub struct WeightedResourceGroupScheduler {
     groups: BTreeMap<String, ResourceGroup>,
-    usage: BTreeMap<String, u64>,
+    usage: BTreeMap<String, GroupUsage>,
     shared_burst_pool_bytes: u64,
     /// Hamilton allocation of the shared pool. Keeping this policy-static
     /// result avoids an O(group_count * log(group_count)) sort on every
@@ -94,38 +101,81 @@ impl WeightedResourceGroupScheduler {
 
     /// Record committed growth for a group so subsequent admission decisions see
     /// live usage. Returns the new usage total for that group.
-    pub fn record_usage(&mut self, group_name: &str, delta: u64) -> MemoryResult<u64> {
-        let before = self.current_usage(group_name);
-        let after = self.usage_after_growth(group_name, delta)?;
-        let unused_before = self.unused_floor_for(group_name, before);
-        let unused_after = self.unused_floor_for(group_name, after);
-        self.unused_reserved_floor_bytes = self
+    pub fn record_usage(
+        &mut self,
+        group_name: &str,
+        class: &MemoryClass,
+        delta: u64,
+    ) -> MemoryResult<u64> {
+        let before = self.usage.get(group_name).copied().unwrap_or_default();
+        let after_total = self.usage_after_growth(group_name, delta)?;
+        let after_non_headroom = if *class == MemoryClass::Headroom {
+            before.non_headroom
+        } else {
+            before.non_headroom.checked_add(delta).ok_or_else(|| {
+                MemoryError::capacity("resource-group non-headroom usage exceeds u64")
+            })?
+        };
+        let unused_before = self.unused_floor_for(group_name, before.non_headroom);
+        let unused_after = self.unused_floor_for(group_name, after_non_headroom);
+        let next_unused = self
             .unused_reserved_floor_bytes
             .checked_sub(u128::from(unused_before))
             .and_then(|total| total.checked_add(u128::from(unused_after)))
-            .expect("scheduler floor aggregate mirrors registered groups");
-        self.usage.insert(group_name.to_string(), after);
-        Ok(after)
+            .ok_or_else(|| {
+                MemoryError::InvalidState("scheduler floor aggregate is inconsistent".into())
+            })?;
+        self.unused_reserved_floor_bytes = next_unused;
+        self.usage.insert(
+            group_name.to_string(),
+            GroupUsage { total: after_total, non_headroom: after_non_headroom },
+        );
+        Ok(after_total)
     }
 
     /// Record a release for a group.
-    pub fn record_release(&mut self, group_name: &str, delta: u64) -> MemoryResult<u64> {
-        let before = self.current_usage(group_name);
-        let after = self.usage_after_release(group_name, delta)?;
-        let unused_before = self.unused_floor_for(group_name, before);
-        let unused_after = self.unused_floor_for(group_name, after);
-        self.unused_reserved_floor_bytes = self
+    pub fn record_release(
+        &mut self,
+        group_name: &str,
+        class: &MemoryClass,
+        delta: u64,
+    ) -> MemoryResult<u64> {
+        let before = self.usage.get(group_name).copied().unwrap_or_default();
+        let after_total = self.usage_after_release(group_name, delta)?;
+        let after_non_headroom = if *class == MemoryClass::Headroom {
+            before.non_headroom
+        } else {
+            before.non_headroom.checked_sub(delta).ok_or_else(|| {
+                MemoryError::InvalidState(
+                    "resource-group non-headroom release exceeds usage".into(),
+                )
+            })?
+        };
+        let unused_before = self.unused_floor_for(group_name, before.non_headroom);
+        let unused_after = self.unused_floor_for(group_name, after_non_headroom);
+        let next_unused = self
             .unused_reserved_floor_bytes
             .checked_sub(u128::from(unused_before))
             .and_then(|total| total.checked_add(u128::from(unused_after)))
-            .expect("scheduler floor aggregate mirrors registered groups");
-        self.usage.insert(group_name.to_string(), after);
-        Ok(after)
+            .ok_or_else(|| {
+                MemoryError::InvalidState("scheduler floor aggregate is inconsistent".into())
+            })?;
+        self.unused_reserved_floor_bytes = next_unused;
+        self.usage.insert(
+            group_name.to_string(),
+            GroupUsage { total: after_total, non_headroom: after_non_headroom },
+        );
+        Ok(after_total)
     }
 
     #[must_use]
     pub fn current_usage(&self, group_name: &str) -> u64 {
-        self.usage.get(group_name).copied().unwrap_or(0)
+        self.usage.get(group_name).map_or(0, |usage| usage.total)
+    }
+
+    #[must_use]
+    pub(crate) fn current_non_headroom_usage(&self, group_name: &str) -> u64 {
+        self.usage.get(group_name).map_or(0, |usage| usage.non_headroom)
     }
 
     /// Validate the complete resource-group reservation postimage against the
@@ -158,7 +208,7 @@ impl WeightedResourceGroupScheduler {
             &self.groups,
             self.unused_reserved_floor_bytes,
             group_name,
-            group_name.map_or(0, |name| self.current_usage(name)),
+            group_name.map_or(0, |name| self.current_non_headroom_usage(name)),
             delta,
             non_headroom_usage,
             non_headroom_band,
@@ -255,8 +305,14 @@ mod tests {
     fn unknown_group_is_denied_fail_closed() {
         let mut s = two_group_scheduler();
         assert!(!s.admits("ghost", 1), "unknown group must never be admitted");
-        assert!(matches!(s.record_usage("ghost", 0), Err(MemoryError::InvalidState(_))));
-        assert!(matches!(s.record_release("ghost", 0), Err(MemoryError::InvalidState(_))));
+        assert!(matches!(
+            s.record_usage("ghost", &MemoryClass::ArtifactCache, 0),
+            Err(MemoryError::InvalidState(_))
+        ));
+        assert!(matches!(
+            s.record_release("ghost", &MemoryClass::ArtifactCache, 0),
+            Err(MemoryError::InvalidState(_))
+        ));
         assert_eq!(s.usage.len(), 0, "unknown groups must not grow scheduler state");
     }
 
@@ -268,7 +324,10 @@ mod tests {
         // bg weight 1 => burst share = (400/4)*1 = 100.
 
         // fg fills its hard cap, then keeps trying to grow (noisy owner).
-        assert_eq!(s.record_usage("fg", 1_000).expect("record"), 1_000);
+        assert_eq!(
+            s.record_usage("fg", &MemoryClass::ArtifactCache, 1_000).expect("record"),
+            1_000
+        );
         // borrow up to 300 over hard cap is allowed.
         assert!(s.admits("fg", 300), "fg may borrow up to its 300 fair share");
         // but 301 over hard cap exceeds fg's share -> denied (no starvation of bg).
@@ -276,8 +335,11 @@ mod tests {
 
         // Even after fg already borrowed its full share, bg still gets its own
         // share -> bg is not starved by fg's noise.
-        assert_eq!(s.record_usage("fg", 300).expect("record"), 1_300); // fg consumed its share
-        assert_eq!(s.record_usage("bg", 1_000).expect("record"), 1_000); // bg at its hard cap
+        assert_eq!(s.record_usage("fg", &MemoryClass::ArtifactCache, 300).expect("record"), 1_300); // fg consumed its share
+        assert_eq!(
+            s.record_usage("bg", &MemoryClass::ArtifactCache, 1_000).expect("record"),
+            1_000
+        ); // bg at its hard cap
         assert!(s.admits("bg", 100), "bg keeps its own 100 fair share despite fg noise");
         assert!(!s.admits("bg", 101), "bg still bounded by its own share");
     }
@@ -285,9 +347,9 @@ mod tests {
     #[test]
     fn release_returns_burst_capacity() {
         let mut s = two_group_scheduler();
-        s.record_usage("fg", 1_300).expect("record"); // hard cap + full share
+        s.record_usage("fg", &MemoryClass::ArtifactCache, 1_300).expect("record"); // hard cap + full share
         assert!(!s.admits("fg", 1), "no more burst available");
-        s.record_release("fg", 300).expect("release"); // give back the borrowed share
+        s.record_release("fg", &MemoryClass::ArtifactCache, 300).expect("release"); // give back the borrowed share
         assert!(s.admits("fg", 200), "released capacity becomes admissible again");
     }
 
@@ -310,10 +372,46 @@ mod tests {
             Err(MemoryError::Capacity(_))
         ));
 
-        scheduler.record_usage("a", 100).expect("commit growth");
+        scheduler.record_usage("a", &MemoryClass::ArtifactCache, 100).expect("commit growth");
         scheduler.protected_floor_fits(800, 1_000).expect("committed aggregate matches preview");
-        scheduler.record_release("a", 100).expect("release growth");
+        scheduler.record_release("a", &MemoryClass::ArtifactCache, 100).expect("release growth");
         scheduler.protected_floor_fits(700, 1_000).expect("release restores reserved floor");
+    }
+
+    #[test]
+    fn headroom_usage_never_consumes_a_non_headroom_group_floor() {
+        let mut groups = BTreeMap::new();
+        let mut protected = group(200, 1);
+        protected.reserved_bytes = 100;
+        groups.insert("protected".to_string(), protected);
+        groups.insert("peer".to_string(), group(800, 1));
+        let mut scheduler = WeightedResourceGroupScheduler::new(groups, 0);
+
+        scheduler.record_usage("protected", &MemoryClass::Headroom, 100).expect("headroom");
+        assert_eq!(scheduler.current_usage("protected"), 100);
+        assert_eq!(scheduler.current_non_headroom_usage("protected"), 0);
+        assert_eq!(scheduler.unused_reserved_floor_bytes(), 100);
+        assert!(matches!(
+            scheduler.protected_floor_fits_after_growth(Some("peer"), 800, 800, 800),
+            Err(MemoryError::Capacity(_))
+        ));
+        scheduler
+            .protected_floor_fits_after_growth(Some("peer"), 700, 700, 800)
+            .expect("peer may consume only the unprotected band");
+        scheduler.record_usage("peer", &MemoryClass::ArtifactCache, 700).expect("peer");
+        scheduler
+            .protected_floor_fits_after_growth(Some("protected"), 100, 800, 800)
+            .expect("owner may consume its own floor");
+        scheduler.record_usage("protected", &MemoryClass::ArtifactCache, 100).expect("floor");
+        assert_eq!(scheduler.unused_reserved_floor_bytes(), 0);
+        scheduler
+            .record_release("protected", &MemoryClass::Headroom, 100)
+            .expect("headroom release");
+        assert_eq!(scheduler.unused_reserved_floor_bytes(), 0);
+        scheduler
+            .record_release("protected", &MemoryClass::ArtifactCache, 100)
+            .expect("floor release");
+        assert_eq!(scheduler.unused_reserved_floor_bytes(), 100);
     }
 
     // scenario D-local: an empty scheduler (no groups) has total_weight == 0.
@@ -379,15 +477,24 @@ mod tests {
         let mut s = two_group_scheduler(); // fg share 300 over hard cap 1_000
         assert_eq!(s.current_usage("fg"), 0);
         // Consume hard cap + full burst share.
-        assert_eq!(s.record_usage("fg", 1_300).expect("record"), 1_300);
+        assert_eq!(
+            s.record_usage("fg", &MemoryClass::ArtifactCache, 1_300).expect("record"),
+            1_300
+        );
         assert!(!s.admits("fg", 1), "fully bursted: no further admission");
         // Release the full burst; usage returns to exactly the hard cap.
-        assert_eq!(s.record_release("fg", 300).expect("release"), 1_000);
+        assert_eq!(
+            s.record_release("fg", &MemoryClass::ArtifactCache, 300).expect("release"),
+            1_000
+        );
         assert_eq!(s.current_usage("fg"), 1_000, "round-trip restores exact prior usage");
         // The freed burst is admissible again.
         assert!(s.admits("fg", 300), "released burst capacity is re-admitted");
         let before = s.current_usage("fg");
-        assert!(matches!(s.record_release("fg", u64::MAX), Err(MemoryError::InvalidState(_))));
+        assert!(matches!(
+            s.record_release("fg", &MemoryClass::ArtifactCache, u64::MAX),
+            Err(MemoryError::InvalidState(_))
+        ));
         assert_eq!(s.current_usage("fg"), before, "over-release must not mutate usage");
     }
 
@@ -420,7 +527,9 @@ mod tests {
         assert_eq!(scheduler.fair_burst_shares.values().copied().sum::<u64>(), 10_000);
 
         let allocation = scheduler.fair_burst_shares.clone();
-        scheduler.record_usage("group-05000", 1_000).expect("record hard-cap usage");
+        scheduler
+            .record_usage("group-05000", &MemoryClass::ArtifactCache, 1_000)
+            .expect("record hard-cap usage");
         for _ in 0..1_000 {
             assert!(scheduler.admits("group-05000", 1));
             assert!(!scheduler.admits("group-05000", 2));
@@ -435,12 +544,21 @@ mod tests {
     fn repeated_exact_usage_release_round_trip_never_wraps() {
         let mut s = two_group_scheduler();
         for _ in 0..8 {
-            assert_eq!(s.record_usage("fg", u64::MAX).expect("first charge"), u64::MAX);
+            assert_eq!(
+                s.record_usage("fg", &MemoryClass::ArtifactCache, u64::MAX).expect("first charge"),
+                u64::MAX
+            );
             assert_eq!(s.current_usage("fg"), u64::MAX);
-            assert!(matches!(s.record_usage("fg", 1), Err(MemoryError::Capacity(_))));
+            assert!(matches!(
+                s.record_usage("fg", &MemoryClass::ArtifactCache, 1),
+                Err(MemoryError::Capacity(_))
+            ));
             assert_eq!(s.current_usage("fg"), u64::MAX, "overflow must not alter usage");
             assert!(!s.admits("fg", 1), "admission must deny unrepresentable sum");
-            assert_eq!(s.record_release("fg", u64::MAX).expect("release"), 0);
+            assert_eq!(
+                s.record_release("fg", &MemoryClass::ArtifactCache, u64::MAX).expect("release"),
+                0
+            );
             assert_eq!(s.current_usage("fg"), 0);
         }
     }

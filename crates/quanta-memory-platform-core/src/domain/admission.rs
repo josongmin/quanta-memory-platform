@@ -127,6 +127,7 @@ pub(crate) struct PreflightInputs<'a> {
     pub execution_scratch_max: Option<usize>,
     pub fair_burst_shares: &'a BTreeMap<String, u64>,
     pub group_current_usage: u64,
+    pub group_current_non_headroom_usage: u64,
     pub unused_group_floors: u128,
     pub owner_group: Option<&'a str>,
     pub request: AdmissionRequest<'a>,
@@ -566,7 +567,7 @@ pub(crate) fn check_group_floor(
     groups: &BTreeMap<String, ResourceGroup>,
     unused_floors: u128,
     group: Option<&str>,
-    group_current_usage: u64,
+    group_current_non_headroom_usage: u64,
     delta: u64,
     non_headroom_after: u64,
     non_headroom_band: u64,
@@ -579,7 +580,7 @@ pub(crate) fn check_group_floor(
                 )),
             )));
         };
-        let after = group_current_usage.checked_add(delta).ok_or_else(|| {
+        let after = group_current_non_headroom_usage.checked_add(delta).ok_or_else(|| {
             AdmissionFailure::Breach(LimitBreach::new(
                 LimitAxis::Group { group: group_name.to_string() },
                 u64::MAX,
@@ -587,7 +588,7 @@ pub(crate) fn check_group_floor(
                 MemoryError::capacity("resource-group usage exceeds u64"),
             ))
         })?;
-        let unused_before = budget.reserved_bytes.saturating_sub(group_current_usage);
+        let unused_before = budget.reserved_bytes.saturating_sub(group_current_non_headroom_usage);
         let unused_after = budget.reserved_bytes.saturating_sub(after);
         unused_floors
             .checked_sub(u128::from(unused_before))
@@ -668,8 +669,8 @@ pub(crate) fn check_execution_scratch(
 }
 
 /// Evaluate the full admission chain once, in exact attempt order: rebuild
-/// fence, group admission, non-headroom floor, execution scratch, live-ticket
-/// count, ledger postimage, ticket ID space.
+/// fence, ticket ID space, group admission, non-headroom floor, execution
+/// scratch, live-ticket count, ledger postimage.
 ///
 /// The fence is checked first because it is a non-capacity refusal no reclaim
 /// callback can cure: letting a capacity breach win would run the host
@@ -679,6 +680,10 @@ fn evaluate_chain(inputs: &PreflightInputs) -> Result<(), AdmissionFailure> {
     let request = &inputs.request;
     if inputs.rebuild_in_progress {
         return Err(AdmissionFailure::Block(AdmissionBlock::RebuildInProgress));
+    }
+    // No amount of reclaim can create a new monotonic ticket identifier.
+    if inputs.ticket_id_space_exhausted {
+        return Err(AdmissionFailure::Block(AdmissionBlock::TicketIdSpaceExhausted));
     }
     if let Some(group) = inputs.owner_group {
         // The chain needs the structured breach on denial, so it materializes
@@ -719,7 +724,7 @@ fn evaluate_chain(inputs: &PreflightInputs) -> Result<(), AdmissionFailure> {
             &inputs.policy.resource_groups,
             inputs.unused_group_floors,
             inputs.owner_group,
-            inputs.group_current_usage,
+            inputs.group_current_non_headroom_usage,
             request.bytes,
             non_headroom_after,
             band,
@@ -741,9 +746,6 @@ fn evaluate_chain(inputs: &PreflightInputs) -> Result<(), AdmissionFailure> {
         )));
     }
     check_ledger_postimage(inputs.policy, &inputs.usage, request)?;
-    if inputs.ticket_id_space_exhausted {
-        return Err(AdmissionFailure::Block(AdmissionBlock::TicketIdSpaceExhausted));
-    }
     Ok(())
 }
 
@@ -775,6 +777,7 @@ pub(crate) fn preflight(inputs: &PreflightInputs) -> AdmissionVerdict {
                 non_headroom_bytes: 0,
                 live_scratch_bytes: 0,
                 group_current_usage: 0,
+                group_current_non_headroom_usage: 0,
                 unused_group_floors: zero_floors,
                 rebuild_in_progress: false,
                 ticket_id_space_exhausted: false,
@@ -787,8 +790,12 @@ pub(crate) fn preflight(inputs: &PreflightInputs) -> AdmissionVerdict {
                 // overflow, unknown classes short-circuit live first), but
                 // fail closed without a callback if it ever happens.
                 Err(AdmissionFailure::Block(reason)) => AdmissionVerdict::Blocked { reason },
-                Err(AdmissionFailure::Breach(zero_breach)) => {
-                    AdmissionVerdict::TerminalDenial { breach: zero_breach }
+                Err(AdmissionFailure::Breach(_)) => {
+                    // The zero-state probe decides terminality, not which live
+                    // admission check failed first. Preserve the attempt's
+                    // exact diagnostic even when the zero-state limiting axis
+                    // differs from the live one.
+                    AdmissionVerdict::TerminalDenial { breach: live_breach }
                 }
             }
         }

@@ -7,7 +7,10 @@ or exact-source qualification receipt.
 Its [structural remediation plan](bugbash-sep-26-engine/STRUCTURAL-REMEDIATION-PLAN.md)
 maps all 13 findings to owner-level repairs, explicit contracts, conditional SDK
 work, and measurement gates at `438b869`; four public-API diagnostic reproductions
-are recorded separately. Implementation remains planned.
+are recorded separately. STR-01–05/07 were implemented after that plan; the
+plan's `PLANNED` wording is historical, not the current implementation state.
+The post-`f5e20c5` hardening and remaining proof boundary are tracked in
+[the Sep-26 follow-up](bugbash-sep-26-engine/POST-RR-HARDENING.md).
 The [file-by-file runbook](bugbash-sep-26-engine/IMPLEMENTATION-RUNBOOK.md)
 gives future workers concrete edit and test instructions.
 

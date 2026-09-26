@@ -590,6 +590,15 @@ where
             return Err(PreparedPublicationErrorV1::TokenCollision { token });
         }
 
+        // Every live prepared entry can be a GC root. Never admit a state
+        // whose complete root set cannot be supplied to the bounded GC API,
+        // including when unbudgeted accounting has no byte ceiling.
+        if state.entries.len() >= MAX_REFERENCED_ROOT_TOKENS {
+            return Err(PreparedPublicationErrorV1::Storage(MemoryError::capacity(format!(
+                "prepared publication live entry count reached the GC root limit of {MAX_REFERENCED_ROOT_TOKENS}"
+            ))));
+        }
+
         let persistent_bytes = persistent_cost(request.identity.as_bytes().len())?;
         // Only fresh tokens need measurement. Catch a client panic, release
         // the state guard, then resume unwinding so the intact state is not
@@ -1056,6 +1065,32 @@ mod tests {
             PreparedPublicationIdentityV1::new(identity.as_bytes().to_vec()).expect("identity"),
             payload.to_vec(),
         )
+    }
+
+    #[test]
+    fn unbudgeted_admission_never_exceeds_a_complete_gc_root_set() {
+        let service = service(None);
+        let mut roots = Vec::with_capacity(MAX_REFERENCED_ROOT_TOKENS);
+        for index in 0..MAX_REFERENCED_ROOT_TOKENS {
+            let identity = format!("root-{index}");
+            roots.push(
+                service
+                    .prepare(request(&identity, b""))
+                    .expect("within root bound")
+                    .token()
+                    .clone(),
+            );
+        }
+        assert!(service.orphan_tokens(&roots).expect("complete roots").is_empty());
+        let before = service.stats().expect("at-cap stats");
+        assert!(matches!(
+            service.prepare(request("one-too-many", b"")),
+            Err(PreparedPublicationErrorV1::Storage(MemoryError::Capacity(_)))
+        ));
+        assert_eq!(service.stats().expect("denial unchanged"), before);
+        roots.pop();
+        assert_eq!(service.gc_orphans(&roots).expect("free one slot"), 1);
+        service.prepare(request("replacement", b"")).expect("freed slot admits");
     }
 
     // Independent V1 oracle: identity-index key + two token copies + two
@@ -1628,7 +1663,7 @@ mod tests {
                 (ACTIVE_PAYLOAD_BUCKET, PERSISTENT_METADATA_BUCKET, 0, LIVE_TOTAL, 2)
             );
             assert_eq!(service.resolve(receipt.token()).expect("data intact"), Vec::new());
-            rebuild_fence1.finish().expect("finish rebuild");
+            assert!(rebuild_fence1.finish().expect("finish rebuild").drain_error.is_none());
 
             // Orphan GC refunds only the active payload component of the collected
             // entry; its identity evidence stays behind as a metadata tombstone.
@@ -1990,7 +2025,7 @@ mod tests {
                 live_cost("id", b"payload")
             );
 
-            rebuild_fence2.finish().expect("finish rebuild");
+            assert!(rebuild_fence2.finish().expect("finish rebuild").drain_error.is_none());
             assert_eq!(service.abort(receipt.token()).expect("abort"), AbortDispositionV1::Aborted);
         }
 
@@ -2032,7 +2067,7 @@ mod tests {
                 live_cost("id-1", b"one") + live_cost("id-2", b"two")
             );
 
-            rebuild_fence3.finish().expect("finish rebuild");
+            assert!(rebuild_fence3.finish().expect("finish rebuild").drain_error.is_none());
             assert_eq!(service.gc_orphans(&[]).expect("retry GC"), 2);
             assert_eq!(
                 broker.ledger_snapshot().expect("snapshot").total_owner_bytes(),
@@ -2100,7 +2135,7 @@ mod tests {
                 live_cost("id-1", b"one") + live_cost("id-2", b"two")
             );
 
-            rebuild_fence4.finish().expect("finish rebuild");
+            assert!(rebuild_fence4.finish().expect("finish rebuild").drain_error.is_none());
             service.close().expect("retry close");
             assert_eq!(broker.ledger_snapshot().expect("refunded").total_owner_bytes(), 0);
         }
@@ -2136,7 +2171,7 @@ mod tests {
                 broker.ledger_snapshot().expect("deferred").total_owner_bytes(),
                 live_cost("id-3", b"three")
             );
-            rebuild_fence5.finish().expect("drain deferred");
+            assert!(rebuild_fence5.finish().expect("drain deferred").drain_error.is_none());
             assert_eq!(broker.ledger_snapshot().expect("drained").total_owner_bytes(), 0);
         }
 

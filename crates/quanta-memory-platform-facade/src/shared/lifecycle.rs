@@ -42,6 +42,7 @@ pub(crate) fn retire_client_value<T>(value: T) {
 #[cfg(any(
     feature = "payload_store",
     feature = "retained_map",
+    feature = "revocable_store",
     feature = "transcript",
     feature = "publish_pipeline"
 ))]
@@ -50,6 +51,7 @@ pub(crate) struct InFlight<T>(Option<T>);
 #[cfg(any(
     feature = "payload_store",
     feature = "retained_map",
+    feature = "revocable_store",
     feature = "transcript",
     feature = "publish_pipeline"
 ))]
@@ -73,6 +75,7 @@ impl<T> InFlight<T> {
 #[cfg(any(
     feature = "payload_store",
     feature = "retained_map",
+    feature = "revocable_store",
     feature = "transcript",
     feature = "publish_pipeline"
 ))]

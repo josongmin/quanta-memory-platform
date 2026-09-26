@@ -662,6 +662,12 @@ impl AccountingLedger {
             ));
         }
 
+        // Identifier exhaustion is permanent for this ledger. Check it before
+        // byte caps so an impossible request cannot provoke host reclaim.
+        let id = self.next_ticket_id.ok_or_else(|| {
+            MemoryError::InvalidState("reservation ticket id space exhausted".to_string())
+        })?;
+
         // This authority bound is independent of byte budgets: admitting a
         // zero-byte ticket still grows ticket state and per-ticket bookkeeping.
         if self.live_ticket_limit_reached() {
@@ -697,9 +703,6 @@ impl AccountingLedger {
         crate::domain::admission::check_ledger_postimage(self.policy(), &usage, &request)
             .map_err(|failure| failure.into_error())?;
         // --- all checks passed: mutate ---
-        let id = self.next_ticket_id.ok_or_else(|| {
-            MemoryError::InvalidState("reservation ticket id space exhausted".to_string())
-        })?;
         self.next_ticket_id = id.checked_add(1);
         self.ticket_states.insert(id, TicketState::Pending);
 
@@ -1377,6 +1380,11 @@ mod tests {
         let exhausted = reserve(&mut ledger, MemoryClass::ArtifactCache, "o", 1);
 
         assert!(matches!(exhausted, Err(MemoryError::InvalidState(_))));
+        assert_eq!(
+            reserve(&mut ledger, MemoryClass::ArtifactCache, "o", 1_000_001),
+            Err(MemoryError::InvalidState("reservation ticket id space exhausted".into())),
+            "an impossible capacity request cannot mask permanent ID exhaustion"
+        );
         assert_eq!(ledger.snapshot(), before, "exhaustion must not mutate or reuse an id");
     }
 

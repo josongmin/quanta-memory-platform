@@ -1357,7 +1357,9 @@ fn scheduler_admission_group_cardinality(
     }
     let target = format!("group-{:08}", entries / 2);
     let mut scheduler = WeightedResourceGroupScheduler::new(groups, entries as u64);
-    scheduler.record_usage(&target, 1_000).expect("record target hard-cap usage");
+    scheduler
+        .record_usage(&target, &MemoryClass::ArtifactCache, 1_000)
+        .expect("record target hard-cap usage");
     let mut latencies = Vec::with_capacity(entries.checked_mul(2).expect("operation count"));
 
     // Phase 2: open the epoch immediately before the admission loop and

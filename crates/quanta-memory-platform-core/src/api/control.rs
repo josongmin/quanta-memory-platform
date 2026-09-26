@@ -144,16 +144,10 @@ struct BrokerCore {
     scheduler: WeightedResourceGroupScheduler,
     controller: Arc<LadderPressureController>,
     report: EffectiveMemoryBudgetReport,
-    /// Resource group each live ticket was admitted under, captured at reserve
-    /// time so `release` returns capacity to the ISSUING group even after a live
-    /// reconfigure remaps owners (reserve/release stay symmetric).
-    ticket_groups: BTreeMap<u64, String>,
-    /// Issuing owner of each live ticket (pending or committed), including
-    /// zero-byte tickets that hold no positive usage entry. Live reconfigure
-    /// must not remap/remove an owner mapping while any ticket — zero-byte or
-    /// not — still draws release authority from it (FUP-007: zero usage is not
-    /// the absence of authority). Entries mirror `ticket_groups` lifetimes.
-    ticket_owners: BTreeMap<u64, OwnerKey>,
+    /// One issuing-scope record per live ticket, including zero-byte tickets.
+    /// This is the joint owner/class/group axis needed to rebuild the derived
+    /// scheduler without guessing class attribution from marginal snapshots.
+    ticket_attribution: BTreeMap<u64, TicketAttribution>,
     /// Committed charges whose last owning lease was dropped while the rebuild
     /// fence was closed. They remain charged until `finish_rebuild` opens the
     /// fence and releases bounded atomic batches. This queue is a subset of live
@@ -176,6 +170,25 @@ struct BrokerCore {
     rebuild_abandoned: bool,
     reclaimer: Option<Arc<dyn MemoryReclaimer>>,
     reclaim_stats: ReclaimRuntimeStats,
+}
+
+#[derive(Clone, Debug)]
+struct TicketAttribution {
+    owner: OwnerKey,
+    class: MemoryClass,
+    group: Option<String>,
+    bytes: u64,
+}
+
+impl TicketAttribution {
+    fn new(ticket: &ReservationTicket, group: Option<String>) -> Self {
+        Self {
+            owner: ticket.owner().clone(),
+            class: ticket.class().clone(),
+            group,
+            bytes: ticket.bytes(),
+        }
+    }
 }
 
 /// An owned pending reservation. This type is intentionally not `Clone`.
@@ -489,7 +502,18 @@ pub enum RebuildFenceStatus {
 /// releases). On a broker-lock failure the remaining counts are reported
 /// as `usize::MAX` sentinels alongside the typed `drain_error`; treat any
 /// `usize::MAX` count as "unknown", never as a literal depth.
+///
+/// A caller compiling with warnings denied cannot silently discard cleanup:
+/// ```compile_fail
+/// #![deny(unused_must_use)]
+/// use quanta_memory_platform_core::{MemoryResult, RebuildFence};
+/// fn bad(fence: RebuildFence) -> MemoryResult<()> {
+///     fence.finish()?;
+///     Ok(())
+/// }
+/// ```
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[must_use = "inspect fence completion and deferred cleanup outcome"]
 pub struct RebuildReceipt {
     /// True when this finish committed the fence-open transition.
     pub fence_open: bool,
@@ -507,6 +531,17 @@ pub struct RebuildReceipt {
 /// without [`Self::finish`] abandons the fence closed (observable via
 /// [`LiveProcessMemoryBroker::rebuild_fence_status`]) instead of silently
 /// reopening writes; recovery is an explicit new `begin_rebuild`.
+///
+/// A caller compiling with warnings denied cannot discard the permit:
+/// ```compile_fail
+/// #![deny(unused_must_use)]
+/// use quanta_memory_platform_core::{LiveProcessMemoryBroker, MemoryResult};
+/// fn bad(broker: &LiveProcessMemoryBroker) -> MemoryResult<()> {
+///     broker.begin_rebuild()?;
+///     Ok(())
+/// }
+/// ```
+#[must_use = "finish or explicitly recover this rebuild fence"]
 pub struct RebuildFence {
     broker: LiveProcessMemoryBroker,
     epoch: u64,
@@ -590,8 +625,7 @@ impl LiveProcessMemoryBroker {
                 scheduler,
                 controller,
                 report,
-                ticket_groups: BTreeMap::new(),
-                ticket_owners: BTreeMap::new(),
+                ticket_attribution: BTreeMap::new(),
                 deferred_committed_releases: VecDeque::new(),
                 deferred_pending_rollbacks: VecDeque::new(),
                 rebuild_epoch: 0,
@@ -823,13 +857,16 @@ impl LiveProcessMemoryBroker {
         // Validate resource-group admission against the replacement postimage,
         // not against a transient double charge. A cloned candidate gives us an
         // infallible scheduler commit after the ledger replacement succeeds.
-        let old_group = core.ticket_groups.get(&old.id()).cloned();
+        let old_attribution = Self::attribution_for(&core, old).map_err(|error| RechargeError {
+            error,
+            recovery: RechargeRecoveryV1::OldChargePreserved,
+        })?;
+        let old_group = old_attribution.group;
         let new_group = core.ledger.policy().owner_groups.get(&owner).cloned();
         let mut next_scheduler = core.scheduler.clone();
         if let Some(group) = &old_group {
-            next_scheduler.record_release(group, old.bytes()).map_err(|error| RechargeError {
-                error,
-                recovery: RechargeRecoveryV1::OldChargePreserved,
+            next_scheduler.record_release(group, old.class(), old.bytes()).map_err(|error| {
+                RechargeError { error, recovery: RechargeRecoveryV1::OldChargePreserved }
             })?;
         }
         if let Some(group) = &new_group {
@@ -841,7 +878,7 @@ impl LiveProcessMemoryBroker {
                     recovery: RechargeRecoveryV1::OldChargePreserved,
                 });
             }
-            next_scheduler.record_usage(group, bytes).map_err(|error| RechargeError {
+            next_scheduler.record_usage(group, &class, bytes).map_err(|error| RechargeError {
                 error,
                 recovery: RechargeRecoveryV1::OldChargePreserved,
             })?;
@@ -923,12 +960,9 @@ impl LiveProcessMemoryBroker {
                 |error| RechargeError { error, recovery: RechargeRecoveryV1::OldChargePreserved },
             )?;
         core.scheduler = next_scheduler;
-        core.ticket_groups.remove(&old.id());
-        core.ticket_owners.remove(&old.id());
-        core.ticket_owners.insert(replacement.id(), replacement.owner().clone());
-        if let Some(group) = new_group {
-            core.ticket_groups.insert(replacement.id(), group);
-        }
+        core.ticket_attribution.remove(&old.id());
+        core.ticket_attribution
+            .insert(replacement.id(), TicketAttribution::new(&replacement, new_group));
         Ok(replacement)
     }
 
@@ -1176,6 +1210,8 @@ impl LiveProcessMemoryBroker {
             execution_scratch_max: core.report.execution.max_execution_scratch_bytes,
             fair_burst_shares: core.scheduler.fair_burst_shares(),
             group_current_usage: owner_group.map_or(0, |group| core.scheduler.current_usage(group)),
+            group_current_non_headroom_usage: owner_group
+                .map_or(0, |group| core.scheduler.current_non_headroom_usage(group)),
             unused_group_floors: core.scheduler.unused_reserved_floor_bytes(),
             owner_group,
             request: AdmissionRequest { class, owner, context, kind, bytes },
@@ -1312,15 +1348,33 @@ impl LiveProcessMemoryBroker {
     /// Release on an already-held lock guard (ledger release + group bookkeeping).
     /// Scheduler state is preflighted and transactionally restored if the
     /// ledger rejects the ticket, avoiding a full scheduler clone.
+    fn attribution_for(
+        core: &BrokerCore,
+        ticket: &ReservationTicket,
+    ) -> MemoryResult<TicketAttribution> {
+        let attribution = core.ticket_attribution.get(&ticket.id()).ok_or_else(|| {
+            MemoryError::InvalidState("live ticket has no issuing-scope attribution".into())
+        })?;
+        if attribution.owner != *ticket.owner()
+            || attribution.class != *ticket.class()
+            || attribution.bytes != ticket.bytes()
+        {
+            return Err(MemoryError::InvalidState(
+                "live ticket issuing-scope attribution disagrees with authority".into(),
+            ));
+        }
+        Ok(attribution.clone())
+    }
+
     fn release_on(core: &mut BrokerCore, ticket: &ReservationTicket) -> MemoryResult<()> {
-        let group = core.ticket_groups.get(&ticket.id()).cloned();
-        if let Some(group) = &group {
+        let attribution = Self::attribution_for(core, ticket)?;
+        if let Some(group) = &attribution.group {
             core.scheduler.usage_after_release(group, ticket.bytes())?;
-            core.scheduler.record_release(group, ticket.bytes())?;
+            core.scheduler.record_release(group, ticket.class(), ticket.bytes())?;
         }
         if let Err(error) = core.ledger.release(ticket) {
-            if let Some(group) = &group {
-                core.scheduler.record_usage(group, ticket.bytes()).map_err(|rollback| {
+            if let Some(group) = &attribution.group {
+                core.scheduler.record_usage(group, ticket.class(), ticket.bytes()).map_err(|rollback| {
                     MemoryError::InvalidState(format!(
                         "ledger release failed ({error}); scheduler rollback also failed ({rollback})"
                     ))
@@ -1328,20 +1382,19 @@ impl LiveProcessMemoryBroker {
             }
             return Err(error);
         }
-        core.ticket_groups.remove(&ticket.id());
-        core.ticket_owners.remove(&ticket.id());
+        core.ticket_attribution.remove(&ticket.id());
         Ok(())
     }
 
     fn rollback_pending_on(core: &mut BrokerCore, ticket: &ReservationTicket) -> MemoryResult<()> {
-        let group = core.ticket_groups.get(&ticket.id()).cloned();
-        if let Some(group) = &group {
+        let attribution = Self::attribution_for(core, ticket)?;
+        if let Some(group) = &attribution.group {
             core.scheduler.usage_after_release(group, ticket.bytes())?;
-            core.scheduler.record_release(group, ticket.bytes())?;
+            core.scheduler.record_release(group, ticket.class(), ticket.bytes())?;
         }
         if let Err(error) = core.ledger.rollback_pending(ticket) {
-            if let Some(group) = &group {
-                core.scheduler.record_usage(group, ticket.bytes()).map_err(|rollback| {
+            if let Some(group) = &attribution.group {
+                core.scheduler.record_usage(group, ticket.class(), ticket.bytes()).map_err(|rollback| {
                     MemoryError::InvalidState(format!(
                         "ledger pending rollback failed ({error}); scheduler rollback also failed ({rollback})"
                     ))
@@ -1349,8 +1402,7 @@ impl LiveProcessMemoryBroker {
             }
             return Err(error);
         }
-        core.ticket_groups.remove(&ticket.id());
-        core.ticket_owners.remove(&ticket.id());
+        core.ticket_attribution.remove(&ticket.id());
         Ok(())
     }
 
@@ -1454,43 +1506,20 @@ impl LiveProcessMemoryBroker {
     }
 
     fn release_many_on(core: &mut BrokerCore, tickets: &[ReservationTicket]) -> MemoryResult<()> {
-        let mut group_refunds = BTreeMap::<String, u64>::new();
+        // Validate and stage both scheduler axes before touching the ledger.
+        // A batch may mix Headroom and non-Headroom tickets in one group, so a
+        // scalar group refund would erase the protected-floor distinction.
+        let mut next_scheduler = core.scheduler.clone();
         for ticket in tickets {
-            if let Some(group) = core.ticket_groups.get(&ticket.id()) {
-                let refund = group_refunds.entry(group.clone()).or_default();
-                *refund = refund.checked_add(ticket.bytes()).ok_or_else(|| {
-                    MemoryError::InvalidState("resource-group batch release exceeds u64".into())
-                })?;
+            let attribution = Self::attribution_for(core, ticket)?;
+            if let Some(group) = &attribution.group {
+                next_scheduler.record_release(group, ticket.class(), ticket.bytes())?;
             }
         }
-        for (group, refund) in &group_refunds {
-            core.scheduler.usage_after_release(group, *refund)?;
-        }
-        let mut applied: Vec<(String, u64)> = Vec::with_capacity(group_refunds.len());
-        for (group, refund) in &group_refunds {
-            if let Err(error) = core.scheduler.record_release(group, *refund) {
-                for (applied_group, applied_refund) in applied {
-                    core.scheduler
-                        .record_usage(&applied_group, applied_refund)
-                        .expect("preflighted scheduler batch rollback");
-                }
-                return Err(error);
-            }
-            applied.push((group.clone(), *refund));
-        }
-        if let Err(error) = core.ledger.release_batch(tickets) {
-            for (group, refund) in applied {
-                core.scheduler.record_usage(&group, refund).map_err(|rollback| {
-                    MemoryError::InvalidState(format!(
-                        "ledger batch release failed ({error}); scheduler rollback also failed ({rollback})"
-                    ))
-                })?;
-            }
-            return Err(error);
-        }
+        core.ledger.release_batch(tickets)?;
+        core.scheduler = next_scheduler;
         for ticket in tickets {
-            core.ticket_groups.remove(&ticket.id());
-            core.ticket_owners.remove(&ticket.id());
+            core.ticket_attribution.remove(&ticket.id());
         }
         Ok(())
     }
@@ -1515,6 +1544,12 @@ impl LiveProcessMemoryBroker {
                 "owner identifier is {owner_key_bytes} bytes; maximum is {}",
                 crate::domain::management_limits::MAX_OWNER_KEY_BYTES
             )));
+        }
+
+        if core.ledger.ticket_id_space_exhausted() {
+            return Err(MemoryError::InvalidState(
+                "reservation ticket id space exhausted".to_string(),
+            ));
         }
 
         // D: resource-group admission. An owner mapped to a group must pass the
@@ -1572,10 +1607,8 @@ impl LiveProcessMemoryBroker {
         // The issuing owner is recorded for every ticket — including zero-byte
         // tickets with no positive usage entry — so live reconfigure can guard
         // the ticket's release scope (FUP-007).
-        core.ticket_owners.insert(ticket.id(), ticket.owner().clone());
-        if let Some(group) = group {
-            if let Err(error) = core.scheduler.record_usage(&group, bytes) {
-                core.ticket_owners.remove(&ticket.id());
+        if let Some(group_name) = &group {
+            if let Err(error) = core.scheduler.record_usage(group_name, ticket.class(), bytes) {
                 core.ledger.rollback_pending(&ticket).map_err(|rollback| {
                     MemoryError::InvalidState(format!(
                         "scheduler commit failed ({error}); ledger rollback also failed ({rollback})"
@@ -1583,8 +1616,8 @@ impl LiveProcessMemoryBroker {
                 })?;
                 return Err(error);
             }
-            core.ticket_groups.insert(ticket.id(), group);
         }
+        core.ticket_attribution.insert(ticket.id(), TicketAttribution::new(&ticket, group));
         Ok(ticket)
     }
 
@@ -1805,6 +1838,11 @@ impl LiveProcessMemoryBroker {
                      remain queued"
                         .to_string(),
                 ));
+                return (
+                    core.deferred_pending_rollbacks.len(),
+                    core.deferred_committed_releases.len(),
+                    drain_error,
+                );
             }
             if core.deferred_pending_rollbacks.is_empty()
                 && core.deferred_committed_releases.is_empty()
@@ -1929,8 +1967,8 @@ impl LiveProcessMemoryBroker {
         // is O(live tickets) on the slow control path only; reserve/release hot
         // paths do not scan.
         let mut live_ticket_owners: BTreeMap<&OwnerKey, usize> = BTreeMap::new();
-        for owner in core.ticket_owners.values() {
-            *live_ticket_owners.entry(owner).or_insert(0) += 1;
+        for attribution in core.ticket_attribution.values() {
+            *live_ticket_owners.entry(&attribution.owner).or_insert(0) += 1;
         }
         let current_owner_groups = &core.ledger.policy().owner_groups;
         for owner in snapshot
@@ -1973,10 +2011,10 @@ impl LiveProcessMemoryBroker {
         // changes for live owners are already rejected, so summing live owner usage
         // by the new mapping reflects the true live load per group.
         let mut live_group_usage: BTreeMap<&String, u64> = BTreeMap::new();
-        for (owner, usage) in &snapshot.owner_usage {
-            if let Some(group) = new_policy.owner_groups.get(owner) {
+        for attribution in core.ticket_attribution.values() {
+            if let Some(group) = new_policy.owner_groups.get(&attribution.owner) {
                 let slot = live_group_usage.entry(group).or_insert(0);
-                *slot = slot.checked_add(usage.total()).ok_or_else(|| {
+                *slot = slot.checked_add(attribution.bytes).ok_or_else(|| {
                     MemoryError::InvalidState("live resource-group usage exceeds u64".into())
                 })?;
             }
@@ -1993,7 +2031,15 @@ impl LiveProcessMemoryBroker {
                      hard/burst policy"
                 )));
             }
-            candidate_scheduler.record_usage(group, *used)?;
+        }
+        // The marginal owner/class snapshots cannot reconstruct which class
+        // consumed a given group's bytes. Replay the exact live ticket joint
+        // axis, preserving Headroom's participation in group caps but not in
+        // non-headroom reserved-floor consumption.
+        for attribution in core.ticket_attribution.values() {
+            if let Some(group) = new_policy.owner_groups.get(&attribution.owner) {
+                candidate_scheduler.record_usage(group, &attribution.class, attribution.bytes)?;
+            }
         }
         candidate_scheduler
             .protected_floor_fits(non_headroom_used, new_non_headroom_ceiling)
@@ -2001,7 +2047,7 @@ impl LiveProcessMemoryBroker {
 
         // Accepted: install the new policy by rebuilding the ledger's view while
         // preserving usage counters.
-        core.install_policy(validated, OverrideSource::RuntimeReconfigure)?;
+        core.install_policy(validated, OverrideSource::RuntimeReconfigure, candidate_scheduler)?;
         // A restored group scope may unblock preserved pending authority.
         Self::drain_deferred_pending_rollbacks_batch(&mut core);
         Ok(())
@@ -2077,6 +2123,7 @@ impl BrokerCore {
         &mut self,
         validated: ValidatedResidencyPolicy,
         source: OverrideSource,
+        scheduler: WeightedResourceGroupScheduler,
     ) -> MemoryResult<()> {
         // Snapshot live usage BEFORE the swap so the rebuilt scheduler can be
         // re-seeded from it (a fresh scheduler starts at zero usage, which would
@@ -2090,16 +2137,6 @@ impl BrokerCore {
             .checked_add(1)
             .ok_or_else(|| MemoryError::InvalidState("policy revision exhausted".into()))?;
         let new_policy = validated.as_policy().clone();
-        let mut scheduler = WeightedResourceGroupScheduler::new(
-            new_policy.resource_groups.clone(),
-            new_policy.shared_burst_pool_bytes,
-        );
-        for (owner, group) in &new_policy.owner_groups {
-            let used = snapshot.owner_usage.get(owner).map_or(0, |u| u.total());
-            if used > 0 {
-                scheduler.record_usage(group, used)?;
-            }
-        }
         self.ledger.swap_policy(validated);
         self.scheduler = scheduler;
         let controller = LadderPressureController::new(
@@ -2366,7 +2403,7 @@ mod tests {
         let snapshot = b.ledger_snapshot().expect("snapshot");
         assert!(snapshot.rebuild_in_progress);
         assert_eq!(snapshot.total_owner_bytes(), 0);
-        fence1.finish().expect("finish rebuild");
+        assert!(fence1.finish().expect("finish rebuild").drain_error.is_none());
     }
 
     #[test]
@@ -2385,7 +2422,7 @@ mod tests {
 
         assert!(matches!(pending.commit(), Err(MemoryError::InvalidState(_))));
         assert_eq!(b.ledger_snapshot().expect("snapshot").total_owner_bytes(), 0);
-        fence2.finish().expect("finish rebuild");
+        assert!(fence2.finish().expect("finish rebuild").drain_error.is_none());
     }
 
     #[test]
@@ -2494,7 +2531,7 @@ mod tests {
         assert!(fenced.rebuild_in_progress);
         assert_eq!(fenced.total_owner_bytes(), 100_000, "deferred release stays conservative");
 
-        fence4.finish().expect("finish drains deferred charge");
+        assert!(fence4.finish().expect("finish drains deferred charge").drain_error.is_none());
         let drained = b.ledger_snapshot().expect("drained snapshot");
         assert!(!drained.rebuild_in_progress);
         assert_eq!(drained.total_owner_bytes(), 0);
@@ -2513,7 +2550,7 @@ mod tests {
         assert_eq!(charge.id(), id);
         assert_eq!(b.ledger_snapshot().expect("still charged").total_owner_bytes(), 100_000);
 
-        fence5.finish().expect("finish rebuild");
+        assert!(fence5.finish().expect("finish rebuild").drain_error.is_none());
         charge.release().expect("retry exact release");
         assert!(!charge.is_active());
         assert_eq!(b.ledger_snapshot().expect("released").total_owner_bytes(), 0);
@@ -2531,7 +2568,7 @@ mod tests {
         assert_eq!([charges[0].id(), charges[1].id()], ids);
         assert_eq!(b.ledger_snapshot().expect("unchanged").total_owner_bytes(), 220_000);
 
-        fence6.finish().expect("finish rebuild");
+        assert!(fence6.finish().expect("finish rebuild").drain_error.is_none());
         b.release_managed_many(&mut charges).expect("atomic retry");
         assert!(charges.iter().all(|charge| !charge.is_active()));
         assert_eq!(b.ledger_snapshot().expect("released").total_owner_bytes(), 0);
@@ -2698,7 +2735,7 @@ mod tests {
             assert_eq!(fenced.total_owner_bytes(), 100);
             assert_eq!(fenced.live_ticket_count, 2);
 
-            fence7.finish().expect("finish rebuild");
+            assert!(fence7.finish().expect("finish rebuild").drain_error.is_none());
             b.release_managed_many(&mut batch).expect("retry after fence");
             let drained = b.ledger_snapshot().expect("drained");
             assert_eq!(drained.total_owner_bytes(), 0);
@@ -3103,7 +3140,7 @@ mod tests {
         );
 
         // positive pair: after finishing rebuild, writes resume.
-        fence8.finish().expect("finish rebuild");
+        assert!(fence8.finish().expect("finish rebuild").drain_error.is_none());
         assert!(b.commit(&t).is_ok(), "commit resumes after rebuild");
     }
 
@@ -3781,7 +3818,7 @@ mod tests {
             b.ledger_snapshot().expect("snap").rebuild_in_progress,
             "the rejected foreign calls must leave the fence closed"
         );
-        fence.finish().expect("owning coordinator finishes");
+        assert!(fence.finish().expect("owning coordinator finishes").drain_error.is_none());
         assert!(!b.ledger_snapshot().expect("snap").rebuild_in_progress);
     }
 
@@ -3854,7 +3891,7 @@ mod tests {
             "the fence denial is blocked (recoverable), not terminal"
         );
 
-        fence12.finish().expect("finish rebuild");
+        assert!(fence12.finish().expect("finish rebuild").drain_error.is_none());
         // After the fence opens, the same group breach takes the normal slow
         // path with exactly one bounded callback.
         let slow = b.reserve_managed_charge(
@@ -4401,7 +4438,7 @@ mod tests {
         let snapshot = b.ledger_snapshot().expect("snapshot");
         assert!(snapshot.rebuild_in_progress);
         assert_eq!(snapshot.total_owner_bytes(), 0);
-        fence13.finish().expect("finish rebuild");
+        assert!(fence13.finish().expect("finish rebuild").drain_error.is_none());
     }
 
     #[test]
@@ -4921,7 +4958,7 @@ mod tests {
             "rebuild recharge strands nothing and leaves the old charge intact"
         );
         // After rebuild the ORIGINAL ticket is still valid.
-        fence15.finish().expect("finish");
+        assert!(fence15.finish().expect("finish").drain_error.is_none());
         b.release(&old).expect("original ticket still valid after rebuild");
         assert_eq!(b.ledger_snapshot().expect("snap").total_owner_bytes(), 0);
     }
@@ -5180,8 +5217,7 @@ mod tests {
         assert!(snapshot.class_owner_balanced());
         assert!(snapshot.owner_partition_balanced());
         assert!(snapshot.context_owner_balanced());
-        assert!(core.ticket_groups.is_empty());
-        assert!(core.ticket_owners.is_empty());
+        assert!(core.ticket_attribution.is_empty());
         assert!(core.deferred_pending_rollbacks.is_empty());
     }
 
@@ -6401,6 +6437,107 @@ mod tests {
     }
 
     #[test]
+    fn grouped_headroom_preserves_protected_floor_across_reconfigure_and_release() {
+        let protected = ResourceGroup {
+            reserved_bytes: 100,
+            soft_cap_bytes: 200,
+            hard_cap_bytes: 200,
+            burst_percent: 0,
+            reclaim_priority: ReclaimPriority::Normal,
+            admission_weight: 1,
+        };
+        let peer = ResourceGroup {
+            reserved_bytes: 0,
+            soft_cap_bytes: 800,
+            hard_cap_bytes: 800,
+            burst_percent: 0,
+            reclaim_priority: ReclaimPriority::Normal,
+            admission_weight: 1,
+        };
+        let mut policy = ResidencyPolicy::new(1_000)
+            .with_headroom_bytes(200)
+            .with_class_budget(MemoryClass::Headroom, class_budget(0, 200, 200, false))
+            .with_class_budget(MemoryClass::ArtifactCache, class_budget(0, 800, 800, false))
+            .with_resource_group("protected", protected)
+            .with_resource_group("peer", peer)
+            .with_owner_group("protected-owner", "protected")
+            .with_owner_group("peer-owner", "peer");
+        let report = report_with(policy.clone());
+        policy = report.residency.clone();
+        let broker = LiveProcessMemoryBroker::from_report(report).expect("broker");
+        let headroom = broker
+            .reserve(
+                MemoryClass::Headroom,
+                "protected-owner".into(),
+                MemoryContextKind::Request,
+                ChargeKind::LiveScratch,
+                100,
+            )
+            .expect("headroom");
+        assert!(matches!(
+            broker.reserve(
+                MemoryClass::ArtifactCache,
+                "peer-owner".into(),
+                MemoryContextKind::Request,
+                ChargeKind::RetainedPayload,
+                800
+            ),
+            Err(MemoryError::Capacity(_))
+        ));
+        let peer = broker
+            .reserve(
+                MemoryClass::ArtifactCache,
+                "peer-owner".into(),
+                MemoryContextKind::Request,
+                ChargeKind::RetainedPayload,
+                700,
+            )
+            .expect("unprotected band");
+        broker.try_live_reconfigure(policy).expect("identity reconfigure");
+        assert!(matches!(
+            broker.reserve(
+                MemoryClass::ArtifactCache,
+                "peer-owner".into(),
+                MemoryContextKind::Request,
+                ChargeKind::RetainedPayload,
+                1
+            ),
+            Err(MemoryError::Capacity(_))
+        ));
+        let floor = broker
+            .reserve(
+                MemoryClass::ArtifactCache,
+                "protected-owner".into(),
+                MemoryContextKind::Request,
+                ChargeKind::RetainedPayload,
+                100,
+            )
+            .expect("own protected floor");
+        {
+            let mut core = broker.inner.lock().expect("core");
+            LiveProcessMemoryBroker::release_many_on(&mut core, &[headroom, floor])
+                .expect("mixed-class batch release");
+        }
+        assert!(
+            matches!(
+                broker.reserve(
+                    MemoryClass::ArtifactCache,
+                    "peer-owner".into(),
+                    MemoryContextKind::Request,
+                    ChargeKind::RetainedPayload,
+                    1
+                ),
+                Err(MemoryError::Capacity(_))
+            ),
+            "mixed batch release must restore the protected group's floor"
+        );
+        broker.release(&peer).expect("peer release");
+        let snapshot = broker.ledger_snapshot().expect("snapshot");
+        snapshot.validate_exact().expect("all axes balance");
+        assert_eq!(snapshot.live_ticket_count, 0);
+    }
+
+    #[test]
     fn accepted_reconfigure_updates_revision_source_and_matches_headroom_predicate() {
         let mut policy = ResidencyPolicy::new(1_000).with_headroom_bytes(200);
         policy.classes.insert(MemoryClass::Headroom, class_budget(0, 200, 200, false));
@@ -6600,8 +6737,7 @@ mod tests {
         assert_eq!(snapshot.total_context_bytes(), 0);
         assert_eq!(snapshot.live_ticket_count, 0, "no live ticket remains");
         let core = broker.inner.lock().expect("broker lock");
-        assert!(core.ticket_groups.is_empty(), "no issuing-group refs remain");
-        assert!(core.ticket_owners.is_empty(), "no issuing-owner refs remain");
+        assert!(core.ticket_attribution.is_empty(), "no issuing-scope refs remain");
         assert!(core.deferred_committed_releases.is_empty(), "no deferred committed backlog");
         assert!(core.deferred_pending_rollbacks.is_empty(), "no deferred pending backlog");
     }
@@ -6651,7 +6787,11 @@ mod tests {
         drop(charge);
         // Under the fence the exact ticket is deferred, still charged.
         assert_eq!(b.ledger_snapshot().expect("fenced").live_ticket_count, 1);
-        fence16.finish().expect("finish drains the deferred zero-byte release");
+        assert!(fence16
+            .finish()
+            .expect("finish drains the deferred zero-byte release")
+            .drain_error
+            .is_none());
         sep23_assert_fully_drained(&b);
     }
 
@@ -7165,7 +7305,7 @@ mod tests {
         );
         assert_eq!(b.reclaim_runtime_stats().expect("stats").blocked_denials, 2);
         assert!(reclaimer.requests.lock().expect("requests").is_empty());
-        fence17.finish().expect("finish rebuild");
+        assert!(fence17.finish().expect("finish rebuild").drain_error.is_none());
         sep23_assert_fully_drained(&b);
     }
 
@@ -7200,6 +7340,7 @@ mod tests {
             execution_scratch_max: None,
             fair_burst_shares: &empty_shares,
             group_current_usage: 0,
+            group_current_non_headroom_usage: 0,
             unused_group_floors: 0,
             owner_group: None,
             request: AdmissionRequest {
@@ -7216,6 +7357,15 @@ mod tests {
         assert_eq!(
             crate::domain::admission::preflight(&inputs),
             AdmissionVerdict::Blocked { reason: AdmissionBlock::TicketIdSpaceExhausted }
+        );
+        let impossible = PreflightInputs {
+            request: AdmissionRequest { bytes: 1_000_001, ..inputs.request },
+            ..inputs
+        };
+        assert_eq!(
+            crate::domain::admission::preflight(&impossible),
+            AdmissionVerdict::Blocked { reason: AdmissionBlock::TicketIdSpaceExhausted },
+            "permanent identifier exhaustion must win over a reclaimable byte breach"
         );
         assert_eq!(
             AdmissionBlock::TicketIdSpaceExhausted.into_error(),
@@ -7732,6 +7882,43 @@ mod tests {
     }
 
     #[test]
+    fn competing_rebuild_fence_preserves_deferred_authority_and_original_error() {
+        let broker = broker();
+        let ticket = broker
+            .reserve(
+                MemoryClass::ArtifactCache,
+                "owner:deferred".into(),
+                MemoryContextKind::Request,
+                ChargeKind::RetainedPayload,
+                17,
+            )
+            .expect("reserve");
+        broker.commit(&ticket).expect("commit");
+        broker.inner.lock().expect("core").deferred_committed_releases.push_back(ticket.clone());
+        let fence = broker.begin_rebuild().expect("competing fence");
+        let (pending, committed, error) = broker.drain_deferred_queues();
+        assert_eq!((pending, committed), (0, 1));
+        assert!(
+            matches!(error, Some(MemoryError::InvalidState(message)) if message.contains("re-entered"))
+        );
+        assert_eq!(broker.ledger_snapshot().expect("snapshot").total_owner_bytes(), 17);
+        assert_eq!(
+            broker
+                .inner
+                .lock()
+                .expect("core")
+                .deferred_committed_releases
+                .front()
+                .expect("preserved")
+                .id(),
+            ticket.id()
+        );
+        let receipt = fence.finish().expect("finish competing fence");
+        assert!(receipt.drain_error.is_none(), "authority drains when the fence opens");
+        assert_eq!(broker.ledger_snapshot().expect("drained").live_ticket_count, 0);
+    }
+
+    #[test]
     fn sep23_fup006_denied_reconfigure_inside_callback_preserves_receipt_and_admits() {
         let reclaimer = Arc::new(RecordingReclaimer::default());
         let broker = LiveProcessMemoryBroker::from_report_with_reclaimer(
@@ -8122,6 +8309,83 @@ mod tests {
         sep23_assert_fully_drained(&broker);
     }
 
+    #[test]
+    fn terminal_preflight_preserves_the_live_first_breach_when_zero_axis_differs() {
+        let policy = ResidencyPolicy::new(100)
+            .with_class_budget(MemoryClass::MemoResidency, class_budget(0, 10, 10, false))
+            .with_resource_group(
+                "g",
+                ResourceGroup {
+                    reserved_bytes: 0,
+                    soft_cap_bytes: 10,
+                    hard_cap_bytes: 10,
+                    burst_percent: 0,
+                    reclaim_priority: ReclaimPriority::Normal,
+                    admission_weight: 1,
+                },
+            )
+            .with_owner_group("owner:x", "g");
+        let mut report = report_with(policy);
+        // The shared test fixture widens constructor-zero class caps; restore
+        // this case's intentional zero cap to keep the oracle independent.
+        report
+            .residency
+            .classes
+            .insert(MemoryClass::ArtifactCache, MemoryClassBudget::zero(ReclaimPriority::Normal));
+        let broker = LiveProcessMemoryBroker::from_report(report)
+            .expect("zero ArtifactCache and ten-byte group form a valid policy");
+        let seed = broker
+            .reserve_managed_charge(
+                MemoryClass::MemoResidency,
+                "owner:x".into(),
+                MemoryContextKind::Request,
+                ChargeKind::RetainedMetadata,
+                10,
+            )
+            .expect("fill group with a different class");
+        let before = broker.ledger_snapshot().expect("before denial");
+        let (preflight_error, attempt_error) = {
+            let mut core = broker.lock().expect("broker lock");
+            let verdict = LiveProcessMemoryBroker::admission_preflight(
+                &core,
+                &MemoryClass::ArtifactCache,
+                &"owner:x".into(),
+                MemoryContextKind::Request,
+                ChargeKind::RetainedPayload,
+                1,
+            );
+            let AdmissionVerdict::TerminalDenial { breach } = verdict else {
+                panic!("a zero-cap class is terminal: {verdict:?}");
+            };
+            let attempt_error = LiveProcessMemoryBroker::reserve_on(
+                &mut core,
+                MemoryClass::ArtifactCache,
+                "owner:x".into(),
+                MemoryContextKind::Request,
+                ChargeKind::RetainedPayload,
+                1,
+            )
+            .expect_err("group-first attempt denies");
+            (breach.into_error(), attempt_error)
+        };
+        let public_error = broker
+            .reserve_managed_charge(
+                MemoryClass::ArtifactCache,
+                "owner:x".into(),
+                MemoryContextKind::Request,
+                ChargeKind::RetainedPayload,
+                1,
+            )
+            .expect_err("public denial");
+        assert_eq!(preflight_error, attempt_error);
+        assert_eq!(public_error, attempt_error);
+        assert!(
+            matches!(public_error, MemoryError::Capacity(message) if message.contains("resource group g"))
+        );
+        assert_eq!(broker.ledger_snapshot().expect("denial is fail-closed"), before);
+        drop(seed);
+    }
+
     // --- Randomized preflight/attempt agreement (FUP-003) --------------------
     //
     // The admission module promises this test: the preflight verdict and the
@@ -8262,7 +8526,7 @@ mod tests {
                         )),
                         "shape {shape} step {step}: fenced attempt matches"
                     );
-                    fence20.finish().expect("finish rebuild");
+                    assert!(fence20.finish().expect("finish rebuild").drain_error.is_none());
                     continue;
                 }
                 let class = CLASSES[rng.below(5) as usize].clone();
@@ -8320,9 +8584,11 @@ mod tests {
                                  vs {expected:?}"
                             ),
                         }
-                        // Terminality proof: the same request denies
-                        // identically on a fresh broker, so no callback on
-                        // live state could have helped.
+                        // Terminality proof: the same request denies on a
+                        // fresh broker, so no callback on live state could
+                        // have helped. Its first limiting axis may differ
+                        // from the live first breach and need not have an
+                        // identical diagnostic.
                         if terminal_spot_checks < 20 {
                             terminal_spot_checks += 1;
                             let fresh =
@@ -8337,10 +8603,9 @@ mod tests {
                                     bytes,
                                 )
                                 .map(|_| ());
-                            assert_eq!(
-                                fresh_result,
-                                Err(expected),
-                                "shape {shape} step {step}: terminal denial reproduces at zero usage"
+                            assert!(
+                                matches!(fresh_result, Err(MemoryError::Capacity(_))),
+                                "shape {shape} step {step}: terminal denial reproduces at zero usage: {fresh_result:?}"
                             );
                         }
                     }

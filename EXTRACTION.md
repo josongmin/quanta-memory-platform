@@ -103,8 +103,10 @@ dependency direction. Not prose: every step is a command or a verifiable gate.
 - All Cargo resolution is locked; missing ShellCheck, Semgrep, or cargo-deny
   fails closed.
 - Qualification runs the fresh actual extraction command directly from a clean,
-  frozen source checkout. This repository intentionally has no GitHub Actions
-  workflow; a nonexistent remote job is not an acceptance dependency.
+  frozen source checkout. CircleCI's main-branch job and the dispatch-only
+  GitHub workflow call the same `scripts/verify-extracted-examples.sh`; both
+  run the public examples against the extracted checkout. A checked-in CI
+  configuration is not evidence that a hosted job passed at a given SHA.
 
 Host adapter compilation and Semantica static guards are host-adoption proof,
 not evidence that this repo-local extraction rail passed.

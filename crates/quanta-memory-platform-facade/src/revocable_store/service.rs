@@ -15,7 +15,7 @@ use crate::revocable_store::RevocableStore;
 #[cfg(feature = "unbudgeted-stores")]
 use crate::shared::accounting::Unbudgeted;
 use crate::shared::accounting::{Budgeted, StoreAccounting};
-use crate::shared::lifecycle::{retire_client_value, BeginClose, StoreLifecycle};
+use crate::shared::lifecycle::{retire_client_value, BeginClose, InFlight, StoreLifecycle};
 use crate::shared::measure::ByteSized;
 #[cfg(feature = "spill")]
 use crate::spill::{
@@ -1265,7 +1265,9 @@ where
 
     fn insert_checked(&self, key: Key, value: Value) -> Result<(), StoreWriteError> {
         let _mutation = self.lifecycle.begin_mutation()?;
-        let charged_bytes = revocable_entry_cost(&key, &value)?;
+        let mut key = InFlight::new(key);
+        let mut value = InFlight::new(value);
+        let charged_bytes = revocable_entry_cost(key.get(), value.get())?;
         let next_committed =
             self.lock_state()?.committed_bytes.checked_add(charged_bytes).ok_or_else(|| {
                 MemoryError::capacity("revocable committed byte accounting overflow")
@@ -1281,8 +1283,8 @@ where
 
         let mut state = self.lock_state()?;
         state.entries.push_back(RevocableEntry {
-            key,
-            value,
+            key: key.take(),
+            value: value.take(),
             charged_bytes,
             charge,
             #[cfg(feature = "spill")]
@@ -1355,14 +1357,21 @@ fn extract_entries<Key, Value>(
     entries: &mut VecDeque<RevocableEntry<Key, Value>>,
     indices: &[usize],
 ) -> Vec<(usize, RevocableEntry<Key, Value>)> {
-    let mut plan = indices
-        .iter()
-        .rev()
-        .map(|index| {
-            (*index, entries.remove(*index).expect("selected revocable index must remain present"))
-        })
-        .collect::<Vec<_>>();
-    plan.reverse();
+    if indices.is_empty() {
+        return Vec::new();
+    }
+    let mut plan = Vec::with_capacity(indices.len());
+    let mut selected = indices.iter().copied().peekable();
+    let original = std::mem::take(entries);
+    for (index, entry) in original.into_iter().enumerate() {
+        if selected.peek() == Some(&index) {
+            selected.next();
+            plan.push((index, entry));
+        } else {
+            entries.push_back(entry);
+        }
+    }
+    assert!(selected.next().is_none(), "selected revocable index must remain present");
     plan
 }
 
@@ -1370,9 +1379,20 @@ fn restore_entries<Key, Value>(
     entries: &mut VecDeque<RevocableEntry<Key, Value>>,
     plan: Vec<(usize, RevocableEntry<Key, Value>)>,
 ) {
-    for (index, entry) in plan {
-        entries.insert(index, entry);
+    let mut retained = std::mem::take(entries);
+    let total = retained.len() + plan.len();
+    let mut selected = plan.into_iter().peekable();
+    for index in 0..total {
+        if selected.peek().is_some_and(|(selected_index, _)| *selected_index == index) {
+            entries.push_back(selected.next().expect("selected entry").1);
+        } else {
+            entries.push_back(retained.pop_front().expect("retained revocable entry"));
+        }
     }
+    assert!(
+        selected.next().is_none() && retained.is_empty(),
+        "revocable rollback must restore every entry"
+    );
 }
 
 fn take_charges<Key, Value>(
@@ -1415,13 +1435,45 @@ mod tests {
         MemoryEventSink, MemoryPreset, ProcessMemoryBrokerBuilder, ReclaimPriority,
         ResidencyPolicy,
     };
-    #[cfg(feature = "spill")]
-    use std::sync::atomic::AtomicBool;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Barrier;
     use std::thread;
 
     type Store = SimpleRevocableStore<String, Vec<u8>, Budgeted>;
+
+    #[test]
+    fn sparse_reclaim_partition_and_rollback_preserve_large_fifo() {
+        let count = 16_384usize;
+        // The first shape is the ordinary oldest-half reclaim. The second
+        // exercises sparse selection, which is also accepted by the partition
+        // helpers used for exact rollback.
+        for selected in
+            [(0..count / 2).collect::<Vec<_>>(), (0..count).step_by(2).collect::<Vec<_>>()]
+        {
+            let mut entries = (0..count)
+                .map(|key| RevocableEntry {
+                    key,
+                    value: (),
+                    charged_bytes: 1,
+                    charge: None,
+                    #[cfg(feature = "spill")]
+                    restore_claim: None,
+                })
+                .collect::<VecDeque<_>>();
+            let plan = extract_entries(&mut entries, &selected);
+            assert_eq!(plan.len(), count / 2);
+            let mut selected_flags = vec![false; count];
+            for &index in &selected {
+                selected_flags[index] = true;
+            }
+            assert!(entries
+                .iter()
+                .map(|entry| entry.key)
+                .eq((0..count).filter(|index| !selected_flags[*index])));
+            restore_entries(&mut entries, plan);
+            assert!(entries.iter().map(|entry| entry.key).eq(0..count));
+        }
+    }
 
     #[derive(Default)]
     struct RecordingEvents(Mutex<Vec<MemoryEvent>>);
@@ -1497,6 +1549,59 @@ mod tests {
             self.drops.fetch_add(1, Ordering::SeqCst);
             panic!("client revocable destructor panic");
         }
+    }
+
+    #[test]
+    fn compound_measurement_and_drop_panic_does_not_abort_insert() {
+        const CHILD: &str = "QMP_REVOCABLE_MEASURE_DROP_CHILD";
+        struct HostileValue {
+            measure: Arc<AtomicBool>,
+            drop: Arc<AtomicBool>,
+        }
+        impl ByteSized for HostileValue {
+            fn byte_size(&self) -> u64 {
+                assert!(!self.measure.load(Ordering::SeqCst), "measurement trap");
+                1
+            }
+        }
+        impl Drop for HostileValue {
+            fn drop(&mut self) {
+                assert!(!self.drop.load(Ordering::SeqCst), "drop trap");
+            }
+        }
+        if std::env::var_os(CHILD).is_some() {
+            let broker = live_broker(1_000);
+            let store = SimpleRevocableStore::<String, HostileValue, Budgeted>::new_budgeted(
+                binding(),
+                broker.clone(),
+            );
+            let measure = Arc::new(AtomicBool::new(true));
+            let drop = Arc::new(AtomicBool::new(true));
+            let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                store.insert_checked(
+                    "x".into(),
+                    HostileValue { measure: Arc::clone(&measure), drop: Arc::clone(&drop) },
+                )
+            }));
+            assert!(caught.is_err());
+            measure.store(false, Ordering::SeqCst);
+            drop.store(false, Ordering::SeqCst);
+            assert_eq!(store.stats().expect("usable after panic").item_count, 0);
+            assert_eq!(broker.ledger_snapshot().expect("uncharged").live_ticket_count, 0);
+            store.close().expect("close after panic");
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .arg("--exact")
+            .arg("revocable_store::service::tests::compound_measurement_and_drop_panic_does_not_abort_insert")
+            .env(CHILD, "1")
+            .output()
+            .expect("isolated measurement child");
+        assert!(
+            output.status.success(),
+            "measurement+Drop must not abort: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]
@@ -4184,7 +4289,7 @@ mod tests {
         assert_eq!(store.committed_bytes().expect("restored bytes"), expected);
         assert_eq!(broker.ledger_snapshot().expect("ledger").total_owner_bytes(), expected);
 
-        rebuild_fence1.finish().expect("finish rebuild");
+        assert!(rebuild_fence1.finish().expect("finish rebuild").drain_error.is_none());
         assert_eq!(store.reclaim_one().expect("fifo").expect("entry").0, "a");
         store.close().expect("retry close");
         assert_eq!(broker.ledger_snapshot().expect("ledger").total_owner_bytes(), 0);
@@ -4203,7 +4308,7 @@ mod tests {
         let expected = 3 * expected_entry_cost("a", 4);
         assert_eq!(store.committed_bytes().expect("bytes"), expected);
         assert_eq!(broker.ledger_snapshot().expect("ledger").total_owner_bytes(), expected);
-        rebuild_fence2.finish().expect("finish rebuild");
+        assert!(rebuild_fence2.finish().expect("finish rebuild").drain_error.is_none());
         assert_eq!(store.reclaim_one().expect("fifo").expect("entry").0, "a");
     }
 
@@ -4219,7 +4324,7 @@ mod tests {
         let expected = expected_entry_cost("a", 4) + expected_entry_cost("b", 6);
         assert_eq!(store.committed_bytes().expect("bytes"), expected);
         assert_eq!(broker.ledger_snapshot().expect("ledger").total_owner_bytes(), expected);
-        rebuild_fence3.finish().expect("finish rebuild");
+        assert!(rebuild_fence3.finish().expect("finish rebuild").drain_error.is_none());
     }
 
     #[test]
@@ -4235,7 +4340,7 @@ mod tests {
         let expected = 3 * expected_entry_cost("a", 4);
         assert_eq!(store.committed_bytes().expect("bytes"), expected);
         assert_eq!(broker.ledger_snapshot().expect("ledger").total_owner_bytes(), expected);
-        rebuild_fence4.finish().expect("finish rebuild");
+        assert!(rebuild_fence4.finish().expect("finish rebuild").drain_error.is_none());
     }
 
     #[test]
@@ -4263,7 +4368,7 @@ mod tests {
             broker.ledger_snapshot().expect("conservative ledger").total_owner_bytes(),
             expected_entry_cost("live", 9)
         );
-        rebuild_fence5.finish().expect("finish and drain");
+        assert!(rebuild_fence5.finish().expect("finish and drain").drain_error.is_none());
         assert_eq!(broker.ledger_snapshot().expect("ledger").total_owner_bytes(), 0);
     }
 
