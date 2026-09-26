@@ -515,6 +515,13 @@ class ScalingResultTests(unittest.TestCase):
                     self.assertIn("release limits require --release", output.getvalue())
                     load.assert_not_called()
 
+    def test_abbreviated_policy_options_cannot_bypass_mode_checks(self) -> None:
+        with unittest.mock.patch(
+            "sys.argv", ["verify-scaling-results.py", "--release", "--input", "missing.jsonl", "--max-p99=1"],
+        ), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as raised:
+            MODULE.main()
+        self.assertEqual(raised.exception.code, 2)
+
     def test_release_cli_does_not_default_unapproved_limits(self) -> None:
         output = io.StringIO()
         with unittest.mock.patch("sys.argv", ["verify-scaling-results.py", "--release", "--input", "missing.jsonl"]):

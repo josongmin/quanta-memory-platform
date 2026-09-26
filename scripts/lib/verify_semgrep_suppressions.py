@@ -10,7 +10,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 RULES = ROOT / "tools/semgrep/qmp-regressions.yml"
-SUPPRESSION = re.compile(r"\bnosem(?:grep)?\b", re.IGNORECASE)
+SUPPRESSION = re.compile(r"\bnosem(?:grep)?", re.IGNORECASE)
 REASON = re.compile(r":\s*(qmp-[a-z0-9-]+)\s+--\s+reason:\s*(\S.*)$")
 
 

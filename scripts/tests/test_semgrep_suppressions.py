@@ -40,6 +40,7 @@ class SemgrepSuppressionTests(unittest.TestCase):
             rules.write_text("rules:\n  - id: qmp-test-rule\n", encoding="utf-8")
             for comment in (
                 "/* nosemgrep */", "// NOSEMGREP", "// nosem",
+                "// nosemgrep_disabled", "// nosem_disabled",
                 "// nosem: qmp-test-rule -- reason: bypass",
                 "// NOSEMGREP: qmp-test-rule -- reason: bypass",
                 "/* nosemgrep: qmp-test-rule -- reason: bypass */",

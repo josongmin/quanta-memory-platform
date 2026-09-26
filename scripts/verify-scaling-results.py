@@ -679,7 +679,7 @@ def validate_release(
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(allow_abbrev=False)
     parser.add_argument("--input", type=Path, action="append", required=True)
     parser.add_argument("--baseline", type=Path, action="append")
     parser.add_argument("--release", action="store_true", help="compare three independent full runs per source")
