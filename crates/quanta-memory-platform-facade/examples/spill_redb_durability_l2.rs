@@ -213,6 +213,15 @@ fn traced_worker_with_dm_fault(
     dm_name: &str,
     sectors: u64,
 ) -> Result<Output, Box<dyn Error>> {
+    let marker_timeout_secs = match std::env::var("QMP_DURABILITY_L2_MARKER_TIMEOUT_SECS") {
+        Ok(value) => value
+            .parse::<u64>()
+            .ok()
+            .filter(|seconds| *seconds > 0)
+            .ok_or("QMP_DURABILITY_L2_MARKER_TIMEOUT_SECS must be a positive integer")?,
+        Err(std::env::VarError::NotPresent) => 30,
+        Err(error) => return Err(error.into()),
+    };
     let mut command = Command::new("strace");
     command
         .arg("-f")
@@ -262,15 +271,6 @@ fn traced_worker_with_dm_fault(
         }
         Ok::<Vec<u8>, std::io::Error>(stdout)
     });
-    let marker_timeout_secs = match std::env::var("QMP_DURABILITY_L2_MARKER_TIMEOUT_SECS") {
-        Ok(value) => value
-            .parse::<u64>()
-            .ok()
-            .filter(|seconds| *seconds > 0)
-            .ok_or("QMP_DURABILITY_L2_MARKER_TIMEOUT_SECS must be a positive integer")?,
-        Err(std::env::VarError::NotPresent) => 30,
-        Err(error) => return Err(error.into()),
-    };
     let marker_result = marker_rx.recv_timeout(Duration::from_secs(marker_timeout_secs));
     if let Err(marker_error) = marker_result {
         drop(child_stdin);

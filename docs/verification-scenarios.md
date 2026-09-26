@@ -4,6 +4,9 @@ What must be **verified** in this repo, derived from the contracts and invariant
 (ledger SSOT, policy/config validation, control plane, scheduler, facade stores,
 testkit conformance, extraction rails).
 
+Catalogue audited against `e21a3ddac4f8bc4d7dade34066ee8da4123b5aca` on
+2026-09-26. This identifies the source reviewed, not a release receipt.
+
 This is a living checklist. Correctness scenarios are **tests** (not benchmarks);
 performance/allocation regressions are guarded separately (see *Test vs Bench*).
 
@@ -12,38 +15,44 @@ performance/allocation regressions are guarded separately (see *Test vs Bench*).
 This document is a source-level contract catalogue, not a release or deployment
 receipt. Hard pass/fail counts go stale fast and are deliberately **not** pinned
 here — re-run the rail (see *How evidence was gathered / re-verify*) for current
-results. Each scenario below cites the exact `#[test]` fn name and its file as
-its own evidence; trust those citations over aggregate counts.
+results. Each scenario below cites an owning test, not an independently
+certified pass. The selector gate requires the test to be registered and
+defined in its recorded Rust owner; the canonical gate additionally checks
+completed execution. Read assertions to determine the actual proof boundary.
 For the current qualification boundary, see
 [ADR 0003](adr/0003-source-bound-qualification.md) and the
 [remaining-work index](plans/README.md). Historical receipts remain in Git
 history and do not qualify a later source.
 
-Repo-local success establishes the portable library's source, feature, and
-standalone-extraction contracts only. Semantica host adoption, deployment, and
-activation require exact-source evidence outside this repository.
+Active product scope is portable 0.2 in-memory accounting/reclaim. Redb and
+the Linux durability runners are maintenance-only optional evidence, not
+in-memory release prerequisites. Async waiting, FFI, engine cache validity,
+and the accepted but unimplemented 0.3 SDK are not capabilities inferred from
+this catalogue. Repo-local test success does not prove actual extraction,
+host adoption, deployment, or activation; each requires its separate rail.
 
 ## Legend
 
 | Mark | Meaning |
 | --- | --- |
-| ✅ | covered — evidence (test name + file) listed |
+| ✅ | owning test/catalogue entry exists; not a current-source execution receipt |
 | 🚧 | partially covered — some sub-cases done, residual noted |
 | ⚠️ | **open** — not yet implemented (residual / next tranche) |
 | 🔬 | property-based / deterministic-fuzz |
 | 🧵 | concurrency |
 | 🔢 | numeric / boundary |
+| 🧪 | environment-specific optional runner; not executed by ordinary workspace tests |
 
 ## Test vs Bench split (how to manage these)
 
 Correctness is managed as **tests**; benchmarks answer a different question
 (speed, not correctness) and never host a correctness scenario.
 
-- **~70% unit / module tests** (`#[cfg(test)]` in the owning module) — invariants,
+- **Unit / module tests** (`#[cfg(test)]` in the owning module) — invariants,
   fail-closed, validation. Fast, localizing.
-- **~25% e2e / conformance** (broker surface, testkit conformance, cross-crate) —
-  emergent gaps only visible end-to-end (e.g. F#3 facade↔ledger).
-- **~5% benchmarks** — `scripts/run-scaling-bench.sh` executes public
+- **Public API / e2e / conformance tests** — actual dispatch, composition,
+  cross-store and process-boundary transitions that owner tests cannot prove.
+- **Benchmarks** — `scripts/run-scaling-bench.sh` executes public
   store/broker paths with repeated latency/throughput distributions and a real
   tracking allocator. `scripts/verify-scaling-results.py` owns the executable
   absolute and optional same-host baseline thresholds; its negative fixtures
@@ -146,6 +155,13 @@ cloning all live owner/context maps.
 
 ## B. Policy / config / presets — ✅ (`core/src/domain/{policy,config}.rs`)
 
+- ✅ **Bounded policy and provenance inputs** —
+  `validate_rejects_policy_map_cardinality_above_the_caps`,
+  `validate_rejects_zero_admission_weight_with_burst_demand`, and
+  `reserved_floor_checked_add_overflow_is_config_error`
+  (`core/src/domain/config.rs`) test logical policy bounds and arithmetic;
+  they do not establish lock-time or RSS limits.
+
 Impl: `validate_residency` now also validates `resource_groups`, per-axis
 `hard <= global`, and owner→group mappings; `ExecutionBudget` exposes admission
 check helpers that the control plane enforces (see group C/D).
@@ -159,6 +175,21 @@ check helpers that the control plane enforces (see group C/D).
 - ✅ **ExecutionBudget admission helpers** — `check_helpers_admit_within_cap_and_reject_over_cap`, `unlimited_budget_admits_everything` (`core/src/domain/policy.rs`); the cap is enforced at the control surface (see group C scratch enforcement).
 
 ## C. Control plane / live broker — ✅ (`core/src/api/{control,builder}.rs`)
+
+- ✅ **Exact grouped Headroom attribution** —
+  `grouped_headroom_preserves_protected_floor_across_reconfigure_and_release`
+  separates total group usage from non-Headroom floor consumption through
+  admission, reconfigure and mixed-class batch release.
+- ✅ **Terminal diagnostic and fence failure atomicity** —
+  `terminal_preflight_preserves_the_live_first_breach_when_zero_axis_differs`
+  requires public reserve and preflight to return the actual live first
+  breach, not the zero-usage diagnostic. Ticket-ID exhaustion is terminal
+  even for an over-cap request in
+  `sep23_fup003_ticket_exhaustion_blocks_without_callback`.
+  `begin_rebuild_epoch_exhaustion_leaves_fence_state_untouched` and
+  `competing_rebuild_fence_preserves_deferred_authority_and_original_error`
+  preserve fence/cleanup authority on failure. The latter injects a competing
+  fence deterministically; it is not an exhaustive production race proof.
 
 - ✅ reconfigure atomicity — `denied_reconfigure_leaves_scheduler_controller_and_report_unchanged`.
 - ✅ reconfigure accept rebuilds — `accepted_reconfigure_rebuilds_controller_to_new_global_limit`.
@@ -247,6 +278,15 @@ check helpers that the control plane enforces (see group C/D).
 
 ## D. Scheduler — ✅ (`core/src/application/scheduler.rs`)
 
+- ✅ **Floor and cached-share work** —
+  `headroom_usage_never_consumes_a_non_headroom_group_floor` checks that
+  Headroom usage does not spend a protected non-Headroom reservation.
+  `admission_reuses_policy_static_fair_share_table_at_high_group_cardinality`
+  observes share-table reuse, not just equal admission results.
+  `single_release_preflight_is_bounded_independent_of_owner_cardinality`
+  (`core/src/domain/ledger.rs`) observes release work. These mechanism
+  oracles are not latency benchmarks.
+
 - ✅ edges — `empty_scheduler_has_zero_share_and_denies_all`, `unknown_group_denied_even_with_pool_available`, `weighted_share_distributes_remainder_work_conservingly`, `usage_release_round_trip_readmits_burst` (+ existing starvation/admission tests).
 - ✅ **wired into reserve** — owner→group mapping gates a `reserve` at the broker surface; admission denial blocks the reserve fail-closed. Evidence: `reserve_gated_by_resource_group_admission_fail_closed`, `owner_without_group_mapping_is_not_gated_by_admission` (`core/src/api/control.rs`); mapping validation `validate_rejects_owner_group_mapping_to_unknown_group` (`core/src/domain/config.rs`).
 
@@ -258,6 +298,38 @@ check helpers that the control plane enforces (see group C/D).
 - ✅ reclaim ladder — `reclaim_returns_zero_under_fatal_pressure_without_spill`, `reclaim_uses_spillable_under_fatal_pressure`, `first_priority_owner_does_not_self_reclaim_below_fatal`.
 
 ## F. Facade stores — ✅ (`facade/src/*`)
+
+- ✅ **Reference identity and real seed construction** —
+  `non_injective_public_reference_conversion_is_rejected_before_charge` and
+  `canonical_digests_are_randomized_per_store_seed`
+  (`facade/src/payload_store/service.rs`) reject a generated reference alias
+  without losing the first payload or changing charge, and check actual
+  store seed independence. A hash bucket is not an equality authority.
+- ✅ **Compound caller panic and partial-copy retirement** —
+  `compound_hostile_remove_panic_cannot_abort_process`,
+  `compound_hostile_insert_panic_cannot_abort_process`, and
+  `partial_entry_read_clone_and_drop_panics_cannot_abort`
+  (`facade/src/retained_map/service.rs`),
+  `compound_measurement_and_drop_panic_does_not_abort_insert`
+  (`facade/src/revocable_store/service.rs`), and
+  `partial_snapshot_clone_and_drop_panics_cannot_abort`,
+  `partial_load_clone_and_drop_panics_cannot_abort`,
+  `new_session_clone_and_drop_panics_cannot_abort`,
+  `owned_session_key_order_and_drop_panics_cannot_abort`, and
+  `partial_append_identity_clone_and_drop_panics_cannot_abort`
+  (`facade/src/transcript_store/service.rs`) run selected subprocess cases
+  combining trait unwind with hostile destructors. They prove the specific
+  reusable-store/cleanup postimages, not recovery from allocator abort or
+  arbitrary external side effects.
+- ✅ **Reclaim partition and complete root feasibility** —
+  `sparse_reclaim_partition_and_rollback_preserve_large_fifo`
+  (`facade/src/revocable_store/service.rs`) round-trips oldest-half and
+  sparse 16,384-entry selections in exact FIFO order; it is not a measured
+  asymptotic-work oracle.
+  `unbudgeted_admission_never_exceeds_a_complete_gc_root_set`
+  (`facade/src/publish_pipeline/prepared_publication.rs`) proves at-cap
+  distinct roots can be supplied completely, cap+1 admission fails, and GC
+  frees a slot even in the explicit unbudgeted fixture mode.
 
 - ✅ payload_store round-trip/dedup/pin/delete — `canonical_put_deduplicates_and_charges_once`, `dedup_hit_preserves_first_context_and_stores_no_second_entry`, `delete_unpinned_releases_bytes_exactly_once`, `pin_is_metadata_only_and_pinned_delete_is_rejected`.
 - ✅ **Payload reference Eq panic before mutation** —
@@ -338,6 +410,15 @@ check helpers that the control plane enforces (see group C/D).
   prepared publication).
 - ✅ charged facade mutators are fail-closed before store mutation — `charged_remove_during_rebuild_is_fail_closed`, `charged_sweep_during_rebuild_is_fail_closed`, `reclaim_one_during_rebuild_is_fail_closed`, `reclaim_until_during_rebuild_is_fail_closed`, `truncate_refund_failure_preserves_rows_indexes_and_accounting`.
 - ✅ transcript charged breadth now matches the closeout bar — `append_identity_is_partitioned_by_session` proves session-local identity partitioning, and `truncate_refund_failure_preserves_rows_indexes_and_accounting` proves refund denial leaves both ledger and store untouched.
+
+### Optional durable maintenance (`spill-redb`, not active product support)
+
+- ✅ **Ambiguous ACK with another active claim** —
+  `ambiguous_finalize_probe_uses_own_record_proof_with_foreign_claim_live` and
+  `lost_finalize_and_abort_acks_allow_a_new_claim_before_reconciliation`
+  (`facade/src/spill/backings/redb.rs`) inject lost ACKs and require the old
+  claim's exact outcome without consuming a newer claim. Owner-local fault
+  injection is distinct from process kill, filesystem failure and power loss.
 - ✅ **Durable record exact terminal state** —
   `sep23_fup001_reserved_hole_is_not_finalized_by_later_record`,
   `sep23_fup001_reserve_only_reopen_is_not_consumed`,
@@ -547,6 +628,14 @@ The retaining prepared-publication service is separately charged.
 
 ## G. Testkit conformance — ✅ ("the suite must bite", `testkit/`)
 
+- ✅ **Fake reclaim preserves provenance** —
+  `reclaim_preserves_ticket_provenance_kind_axes_and_group_refunds`,
+  `reclaim_terminates_full_tickets_and_preserves_partial_commit_authority`, and
+  `reclaim_rebuild_and_incomplete_group_preflight_leave_all_authority_untouched`
+  (`testkit/src/fake/broker.rs`) check class/context/kind/original-group
+  refunds, partial and zero-byte authority, and atomic preflight rejection.
+  This validates the reusable fake, not a new production broker guarantee.
+
 - ✅ ReserveFailClosed bites — `suite_rejects_target_that_mutates_accounting_on_a_denied_reserve`, `honest_fake_passes_the_strengthened_fail_closed_check`.
 - ✅ commit→release both targets — `commit_then_release_returns_balance_to_zero_on_honest_fake`, `..._on_real_broker`.
 - ✅ cap-deny agreement — `cap_deny_agrees_between_honest_fake_and_real_broker`.
@@ -618,6 +707,7 @@ The retaining prepared-publication service is separately charged.
 ## R. Cross-cutting contracts — ✅ (`crates/quanta-memory-platform-core/tests/policy_contracts.rs`)
 
 New invariants promoted to the public API boundary:
+
 - ✅ `global_hard_limit_denies_reserve_through_public_broker_and_is_fail_closed`
 - ✅ `headroom_band_is_reserved_for_headroom_class_at_public_surface`
 - ✅ `shared_burst_pool_bounds_borrowing_through_public_broker`
@@ -640,6 +730,18 @@ Actual standalone export and public examples require the separate executable
 [extraction procedure](../EXTRACTION.md) at the chosen clean source. The checks
 here do not qualify a consumer deployment. See
 [ADR 0003](adr/0003-source-bound-qualification.md) for evidence boundaries.
+
+Subprocess selection/move contracts are
+`isolated_child_selection_rejects_zero_tests`,
+`isolated_child_selection_rejects_multiple_tests`, and
+`validated_child_owns_selector_environment_and_stdio`
+(`facade/src/test_support.rs`). They reject empty/ambiguous selections and
+move validated configuration into a sealed launch handle. Each scenario still
+owns its timeout and terminal-result checks. Static regression fixture tests
+execute Semgrep but do not compile or execute their fixture Rust; see
+[ADR 0006](adr/0006-bugbash-static-regression-guards.md). Baseline/mutant/restored
+behavioral receipts remain distinct from an ordinary GREEN run; see
+[ADR 0005](adr/0005-regression-oracle-acceptance.md).
 
 ## How evidence was gathered / re-verify
 
