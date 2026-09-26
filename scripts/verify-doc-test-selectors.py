@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import subprocess
 import sys
@@ -40,6 +41,44 @@ NON_TEST_IDENTIFIERS = {
     "total_retained_payload_bytes",
     "transcript_truncate_refund",
 }
+
+
+def owner_contract_errors(candidates: dict[str, set[str]], root: Path = ROOT) -> list[str]:
+    """Pin each documented selector to the Rust source that owns its test."""
+    def unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"duplicate selector owner: {key}")
+            result[key] = value
+        return result
+
+    try:
+        owners = json.loads((root / "scripts/test-selector-owners.json").read_text(encoding="utf-8"),
+                            object_pairs_hook=unique_object)
+    except (OSError, ValueError) as error:
+        return [f"selector owner manifest cannot be read: {error}"]
+    if not isinstance(owners, dict):
+        return ["selector owner manifest must be an object"]
+    selectors = set(candidates) - NON_TEST_IDENTIFIERS
+    errors = [f"selector owner inventory differs: missing={sorted(selectors - owners.keys())} "
+              f"extra={sorted(owners.keys() - selectors)}"] if owners.keys() != selectors else []
+    source_contents: dict[Path, str] = {}
+    for selector in sorted(selectors & owners.keys()):
+        owner = owners[selector]
+        if not isinstance(owner, str) or not owner.startswith("crates/") or ".." in Path(owner).parts or not owner.endswith(".rs"):
+            errors.append(f"{selector}: invalid owner path {owner!r}")
+            continue
+        path = root / owner
+        if path.is_symlink() or not path.is_file():
+            errors.append(f"{selector}: owner source is missing: {owner}")
+            continue
+        leaf = selector.rsplit("::", 1)[-1]
+        if path not in source_contents:
+            source_contents[path] = path.read_text(encoding="utf-8")
+        if re.search(rf"\bfn\s+{re.escape(leaf)}\s*\(", source_contents[path]) is None:
+            errors.append(f"{selector}: owner source no longer defines test: {owner}")
+    return errors
 
 
 def documented_candidates(
@@ -121,26 +160,41 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     candidates = documented_candidates()
+    owner_errors = owner_contract_errors(candidates)
+    if owner_errors:
+        for error in owner_errors:
+            print(f"doc-test-selectors: {error}", file=sys.stderr)
+        return 1
     registered = listed_tests()
+    selectors = set(candidates) - NON_TEST_IDENTIFIERS
+    if not selectors or not registered:
+        print("doc-test-selectors: no documented or registered tests", file=sys.stderr)
+        return 1
     tests = registered
     if args.test_output:
         # Cargo's successful output proves execution, while --list proves the
         # name was registered by the harness rather than printed by a test.
         tests = registered & parse_executed_tests(args.test_output.read_text(encoding="utf-8"))
-    test_leaves = {name.rsplit("::", 1)[-1] for name in tests}
-    missing = sorted(
-        candidate for candidate in candidates
-        if candidate not in NON_TEST_IDENTIFIERS
-        and candidate not in (tests if "::" in candidate else test_leaves)
-    )
-    if missing:
+    missing: list[str] = []
+    ambiguous: list[str] = []
+    for candidate in sorted(selectors):
+        matches = {name for name in registered if (
+            name == candidate if "::" in candidate else name.rsplit("::", 1)[-1] == candidate
+        )}
+        if len(matches) > 1:
+            ambiguous.append(candidate)
+        elif len(matches) != 1 or not matches <= tests:
+            missing.append(candidate)
+    for selector in ambiguous:
+        print(f"ambiguous documented test selector: {selector}; use a qualified path", file=sys.stderr)
+    if missing or ambiguous:
         for selector in missing:
             locations = ", ".join(sorted(candidates[selector]))
             print(f"stale documented test selector: {selector} ({locations})", file=sys.stderr)
         return 1
     print(
         "doc-test-selectors: OK "
-        f"({len(set(candidates) - NON_TEST_IDENTIFIERS)} selectors resolve)"
+        f"({len(selectors)} selectors resolve)"
     )
     return 0
 

@@ -10,14 +10,13 @@ import subprocess
 import sys
 from pathlib import Path
 
-
-def section(text: str, name: str) -> str:
-    match = re.search(
-        rf"^\[{re.escape(name)}\]\s*$\n(?P<body>.*?)(?=^\[|\Z)",
-        text,
-        flags=re.MULTILINE | re.DOTALL,
-    )
-    return match.group("body") if match else ""
+try:
+    import tomllib  # type: ignore[import-not-found]
+except ImportError:
+    try:
+        import tomli as tomllib  # type: ignore[import-not-found,no-redef]
+    except ImportError as error:
+        raise SystemExit("workspace policy requires Python 3.11+ or tomli") from error
 
 
 def cargo_metadata(root: Path) -> dict:
@@ -51,10 +50,12 @@ def workspace_members(root: Path, metadata: dict) -> list[Path]:
 
 
 def lint_policy_errors(root: Path, metadata: dict | None = None) -> list[str]:
-    root_manifest = (root / "Cargo.toml").read_text(encoding="utf-8")
     errors: list[str] = []
-    rust_lints = section(root_manifest, "workspace.lints.rust")
-    if not re.search(r'^unsafe_code\s*=\s*"deny"\s*$', rust_lints, re.MULTILINE):
+    try:
+        root_manifest = tomllib.loads((root / "Cargo.toml").read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        return [f"root Cargo.toml cannot be parsed: {error}"]
+    if root_manifest.get("workspace", {}).get("lints", {}).get("rust", {}).get("unsafe_code") != "deny":
         errors.append("workspace.lints.rust.unsafe_code must be `deny`")
 
     try:
@@ -66,9 +67,12 @@ def lint_policy_errors(root: Path, metadata: dict | None = None) -> list[str]:
         if not manifest_path.is_file():
             errors.append(f"workspace member manifest is missing: {member}/Cargo.toml")
             continue
-        manifest = manifest_path.read_text(encoding="utf-8")
-        member_lints = section(manifest, "lints")
-        if not re.search(r"^workspace\s*=\s*true\s*$", member_lints, re.MULTILINE):
+        try:
+            manifest = tomllib.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as error:
+            errors.append(f"workspace member manifest cannot be parsed: {member}: {error}")
+            continue
+        if manifest.get("lints", {}).get("workspace") is not True:
             errors.append(f"workspace member does not inherit lints: {member}")
         library_root = root / member / "src/lib.rs"
         if library_root.is_file() and not library_root.read_text().startswith(

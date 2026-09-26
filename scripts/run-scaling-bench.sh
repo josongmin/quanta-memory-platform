@@ -13,13 +13,16 @@ else
   cargo_features=(--all-features)
 fi
 
-if [[ -n "$(git status --porcelain --untracked-files=all)" ]]; then
-  echo "run-scaling-bench: source tree is dirty; commit/freeze the benchmark source first" >&2
-  exit 2
-fi
-
 source_sha="$(git rev-parse HEAD)"
 source_tree="$(git rev-parse 'HEAD^{tree}')"
+source_manifest="$(mktemp /tmp/qmp-benchmark-source.XXXXXX)"
+trap 'rm -f -- "${source_manifest}"' EXIT
+python3 scripts/lib/extraction_manifest.py snapshot --repo "${repo_root}" \
+  --revision "${source_sha}" --output "${source_manifest}" . >/dev/null
+python3 scripts/lib/extraction_manifest.py assert-clean --repo "${repo_root}" \
+  --commit "${source_sha}" .
+python3 scripts/lib/extraction_manifest.py verify --manifest "${source_manifest}" \
+  --destination "${repo_root}" >/dev/null
 rustc_version="$(rustc --version)"
 cargo_version="$(cargo --version)"
 # A uname-only label aliases different hosts with the same OS/architecture.
@@ -100,7 +103,10 @@ end_source_sha="$(git rev-parse HEAD)"
 end_source_tree="$(git rev-parse 'HEAD^{tree}')"
 end_bench_build_config_sha256="$(python3 scripts/lib/scaling_build_config.py)"
 source_clean=true
-if [[ -n "$(git status --porcelain --untracked-files=all)" ]]; then
+if ! python3 scripts/lib/extraction_manifest.py assert-clean --repo "${repo_root}" \
+    --commit "${source_sha}" . || \
+   ! python3 scripts/lib/extraction_manifest.py verify --manifest "${source_manifest}" \
+    --destination "${repo_root}" >/dev/null; then
   source_clean=false
 fi
 python3 - "$end_source_sha" "$end_source_tree" "$end_bench_build_config_sha256" "$source_clean" "$run_id" "$bench_status" <<'PY' | tee -a "$result_file"

@@ -241,35 +241,30 @@ def run_metadata(records: list[dict[str, object]]) -> tuple[dict[str, object], B
             raise ValidationError(f"run metadata field {field!r} is missing")
     for field in (BENCHMARK_SOURCE_FIELD, BUILD_CONFIG_FIELD):
         digest = run.get(field)
-        if digest is not None and (
-            not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None
-        ):
-            raise ValidationError(f"run metadata field {field!r} is invalid")
+        if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+            raise ValidationError(f"run metadata field {field!r} is missing or invalid")
     for field in ("source_sha", "source_tree"):
         if end.get(field) != run[field]:
             raise ValidationError(f"source changed during benchmark: {field}")
-    if BUILD_CONFIG_FIELD in run or BUILD_CONFIG_FIELD in end:
-        if not run.get(BUILD_CONFIG_FIELD) or end.get(BUILD_CONFIG_FIELD) != run[BUILD_CONFIG_FIELD]:
-            raise ValidationError("build configuration changed during benchmark")
+    if end.get(BUILD_CONFIG_FIELD) != run[BUILD_CONFIG_FIELD]:
+        raise ValidationError("build configuration changed during benchmark")
     if end.get("source_clean") is not True:
         raise ValidationError("source changed during benchmark: working tree is dirty")
-    has_run_identity = "run_id" in run or "run_id" in end
-    if has_run_identity and "bench_exit_code" not in end:
+    if "bench_exit_code" not in end:
         raise ValidationError("bench exit status is missing")
-    if "bench_exit_code" in end and (
+    if (
         not isinstance(end["bench_exit_code"], int)
         or isinstance(end["bench_exit_code"], bool)
         or end["bench_exit_code"] != 0
     ):
         raise ValidationError("bench exited nonzero or has invalid exit status")
-    if has_run_identity:
-        if (
-            not isinstance(run.get("run_id"), str) or not run["run_id"]
-            or not isinstance(end.get("run_id"), str) or not end["run_id"]
-        ):
-            raise ValidationError("run identity is invalid")
-        if run["run_id"] != end["run_id"]:
-            raise ValidationError("run identity changed during benchmark")
+    if (
+        not isinstance(run.get("run_id"), str) or not run["run_id"]
+        or not isinstance(end.get("run_id"), str) or not end["run_id"]
+    ):
+        raise ValidationError("run identity is invalid")
+    if run["run_id"] != end["run_id"]:
+        raise ValidationError("run identity changed during benchmark")
     spec = parse_benchmark_args(run.get("benchmark_args"))
     expected_features = "full" if spec.profile == "in-memory-pressure" else "all-features"
     if run.get("feature_set") != expected_features:
@@ -299,6 +294,8 @@ def validate_samples(
         p50, p95, p99 = (integer(sample, field) for field in ("p50_ns", "p95_ns", "p99_ns"))
         if not (0 <= p50 <= p95 <= p99 <= max_p99_ns):
             raise ValidationError(f"{key}: invalid/over-limit latency distribution {p50}/{p95}/{p99}")
+        if p99 > integer(sample, "elapsed_ns"):
+            raise ValidationError(f"{key}: operation p99 exceeds measured wall time")
         throughput = integer(sample, "throughput_ops_per_sec")
         if throughput <= 0:
             raise ValidationError(f"{key}: throughput must be positive")
@@ -337,6 +334,10 @@ def validate_samples(
                 values = tuple(integer(sample, field) for field in fields)
                 if not (0 <= values[0] <= values[1] <= values[2] <= max_p99_ns):
                     raise ValidationError(f"{key}: invalid/over-limit {outcome} latency distribution {values}")
+            if sample.get("operation") in FIXED_OUTCOME_OPERATIONS and p99 < max(
+                integer(sample, "admitted_p50_ns"), integer(sample, "denied_p50_ns")
+            ):
+                raise ValidationError(f"{key}: outcome median exceeds combined p99")
         elif present:
             raise ValidationError(f"{key}: outcome latency fields are only valid for admission operations")
         detail_fields = DETAIL_LATENCY_FIELDS.get(sample.get("operation"), ())
@@ -432,12 +433,17 @@ def validate(
     max_p99_regression_percent: int = 200,
     p99_noise_floor_ns: int = 1_000_000,
     baseline_min_elapsed_ns: int = 10_000_000,
+    comparison_stats: dict[str, int] | None = None,
 ) -> int:
+    if max_p99_ns <= 0 or not 0 <= max_throughput_regression_percent < 100 or max_p99_regression_percent < 0 or p99_noise_floor_ns < 0 or baseline_min_elapsed_ns < 0:
+        raise ValidationError("invalid ordinary benchmark limits")
     run, spec = run_metadata(records)
     samples, grouped = validate_samples(records, spec, max_p99_ns)
     validate_growth(samples)
     if baseline_records is not None:
         baseline_run, baseline_spec = run_metadata(baseline_records)
+        if run["run_id"] == baseline_run["run_id"]:
+            raise ValidationError("baseline reuses candidate run identity")
         if baseline_spec != spec:
             raise ValidationError(f"baseline benchmark matrix differs: {baseline_spec} != {spec}")
         for field in COMPAT_FIELDS:
@@ -457,9 +463,14 @@ def validate(
         validate_growth(baseline_samples)
         throughput_allowed = max_throughput_regression_percent / 100.0
         p99_allowed = max_p99_regression_percent / 100.0
+        compared = skipped = 0
         for key, current in grouped.items():
             baseline = baseline_groups[key]
             baseline_elapsed = statistics.median(integer(sample, "elapsed_ns") for sample in baseline)
+            if baseline_elapsed < baseline_min_elapsed_ns:
+                skipped += 1
+            else:
+                compared += 1
             for field, label in (
                 ("throughput_ops_per_sec", "throughput"),
                 ("successful_throughput_ops_per_sec", "successful throughput"),
@@ -487,6 +498,13 @@ def validate(
                 p99_limit = max(baseline_p99 * (1.0 + p99_allowed), baseline_p99 + p99_noise_floor_ns)
                 if current_p99 > p99_limit:
                     raise ValidationError(f"{key}: {label} regressed beyond {max_p99_regression_percent}%")
+        if skipped:
+            raise InconclusiveError(
+                f"baseline throughput comparison skipped {skipped} short cells "
+                f"(compared {compared}); no complete regression verdict"
+            )
+        if comparison_stats is not None:
+            comparison_stats.update(compared=compared, skipped=skipped)
     return len(samples)
 
 
@@ -670,6 +688,13 @@ def main() -> int:
     args = parser.parse_args()
     try:
         if args.release:
+            ordinary_options = (
+                "--smoke", "--max-p99-ns", "--max-throughput-regression-percent",
+                "--max-p99-regression-percent", "--p99-noise-floor-ns",
+                "--baseline-min-elapsed-ns",
+            )
+            if any(any(arg == option or arg.startswith(option + "=") for option in ordinary_options) for arg in sys.argv[1:]):
+                raise ValidationError("release comparison cannot use ordinary or smoke options")
             policy_fields = (
                 args.release_max_p99_ns,
                 args.release_max_throughput_regression_percent,
@@ -691,15 +716,19 @@ def main() -> int:
             return 0
         if len(args.input) != 1 or (args.baseline and len(args.baseline) != 1):
             raise ValidationError("ordinary validation requires one input and at most one baseline")
+        if args.baseline and args.input[0].resolve() == args.baseline[0].resolve():
+            raise ValidationError("baseline and candidate refer to the same receipt")
         records = load_jsonl(args.input[0])
         if args.smoke:
             run, _ = run_metadata(records)
             if "--smoke" not in run["benchmark_args"]:
                 raise ValidationError("--smoke was requested but run metadata is not smoke")
         baseline = load_jsonl(args.baseline[0]) if args.baseline else None
+        comparison_stats: dict[str, int] = {}
         sample_count = validate(
             records, baseline, args.max_p99_ns, args.max_throughput_regression_percent,
             args.max_p99_regression_percent, args.p99_noise_floor_ns, args.baseline_min_elapsed_ns,
+            comparison_stats,
         )
     except (OSError, ValidationError) as error:
         print(f"verify-scaling-results: FAIL: {error}", file=sys.stderr)
@@ -707,7 +736,9 @@ def main() -> int:
     except InconclusiveError as error:
         print(f"verify-scaling-results: INCONCLUSIVE: {error}", file=sys.stderr)
         return 2
-    print(f"verify-scaling-results: OK ({sample_count} samples)")
+    coverage = (f"; baseline throughput cells compared={comparison_stats['compared']} "
+                f"skipped={comparison_stats['skipped']}") if comparison_stats else ""
+    print(f"verify-scaling-results: OK ({sample_count} samples{coverage})")
     return 0
 
 

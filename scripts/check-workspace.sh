@@ -26,12 +26,13 @@ cleanup() {
   if [[ -n "${regression_pid}" ]]; then
     wait "${regression_pid}" >/dev/null 2>&1 || true
   fi
+  if [[ -n "${regression_output}" && -f "${regression_output}" ]]; then
+    cat "${regression_output}"
+  fi
   if [[ -n "${workspace_test_output}" && -f "${workspace_test_output}" ]]; then
     rm -f -- "${workspace_test_output}"
   fi
-  if [[ -n "${regression_output}" && -f "${regression_output}" ]]; then
-    rm -f -- "${regression_output}"
-  fi
+  [[ -z "${regression_output}" ]] || rm -f -- "${regression_output}"
   if [[ -n "${shell_script_list}" && -f "${shell_script_list}" ]]; then
     rm -f -- "${shell_script_list}"
   fi
@@ -95,14 +96,16 @@ scripts/regression-guards.sh >"${regression_output}" 2>&1 &
 regression_pid=$!
 
 echo "[check-workspace] Python contract tests"
-python3 -m unittest discover -s scripts/tests -p 'test_*.py'
-python3 -m unittest -q tools/pm/tests/test_pm.py
+python3 scripts/lib/run_python_contracts.py scripts
+python3 scripts/lib/run_python_contracts.py pm
 scripts/tests/extraction-contracts.sh
 
 regression_status=0
 wait "${regression_pid}" || regression_status=$?
 regression_pid=""
 cat "${regression_output}"
+rm -f -- "${regression_output}"
+regression_output=""
 if [[ "${regression_status}" -ne 0 ]]; then
   echo "check-workspace: regression-guards failed (${regression_status})" >&2
   exit "${regression_status}"
@@ -115,6 +118,7 @@ if [[ "${mode}" == "full" ]]; then
   echo "[check-workspace] cargo test --workspace --all-features"
   workspace_test_output="$(mktemp /tmp/qmp-workspace-tests.XXXXXX)"
   cargo test --locked --workspace --all-features 2>&1 | tee "${workspace_test_output}"
+  python3 scripts/lib/verify_rust_test_output.py "${workspace_test_output}"
 
   echo "[check-workspace] advertised feature runtime capabilities"
   scripts/verify-feature-capabilities.sh
@@ -127,8 +131,10 @@ else
     --features "${in_memory_features}" -- -D warnings
 
   echo "[check-workspace] in-memory workspace tests"
+  workspace_test_output="$(mktemp /tmp/qmp-workspace-tests.XXXXXX)"
   cargo test --locked --workspace --no-default-features \
-    --features "${in_memory_features}"
+    --features "${in_memory_features}" 2>&1 | tee "${workspace_test_output}"
+  python3 scripts/lib/verify_rust_test_output.py "${workspace_test_output}"
 
   echo "[check-workspace] in-memory feature capabilities"
   scripts/verify-feature-capabilities.sh --in-memory

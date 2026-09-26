@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 from dataclasses import dataclass
@@ -25,6 +26,21 @@ Hand edits are overwritten and will fail `pm lint`.
 
 class PmError(Exception):
     """Raised for invalid configuration, paths, or usage."""
+
+
+def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise PmError(f"duplicate manifest key: {key}")
+        result[key] = value
+    return result
+
+
+def _reject_unknown_keys(value: dict[str, object], allowed: set[str], where: str) -> None:
+    unknown = sorted(value.keys() - allowed)
+    if unknown:
+        raise PmError(f"unknown {where} key(s): {', '.join(unknown)}")
 
 
 FrontmatterValue = Union[str, bool, tuple[str, ...]]
@@ -104,9 +120,11 @@ def load_manifest(targets_path: Path) -> Manifest:
     if not targets_path.is_file():
         raise PmError(f"targets file not found: {targets_path}")
     try:
-        raw = json.loads(targets_path.read_text(encoding="utf-8"))
+        raw = json.loads(targets_path.read_text(encoding="utf-8"), object_pairs_hook=_unique_object)
     except json.JSONDecodeError as error:
         raise PmError(f"invalid targets JSON: {error}") from error
+    if isinstance(raw, dict):
+        _reject_unknown_keys(raw, {"targets", "retired_outputs"}, "manifest")
     targets_raw = raw.get("targets") if isinstance(raw, dict) else None
     if not isinstance(targets_raw, dict) or not targets_raw:
         raise PmError(f"targets file has no non-empty 'targets' mapping: {targets_path}")
@@ -117,6 +135,11 @@ def load_manifest(targets_path: Path) -> Manifest:
     for name, spec in targets_raw.items():
         if not isinstance(name, str) or not name or not isinstance(spec, dict):
             raise PmError("target names and specifications must be mappings")
+        _reject_unknown_keys(
+            spec,
+            {"output", "title", "sections", "frontmatter", "max_lines", "max_bytes"},
+            f"target '{name}'",
+        )
         output = _safe_relative_path(spec.get("output"), field="output", target=name)
         title = spec.get("title")
         sections = spec.get("sections")
@@ -258,6 +281,36 @@ def check_drift(target: Target, pm_dir: Path = PM_DIR, repo_root: Path = REPO_RO
     return "ok" if out.read_text(encoding="utf-8") == render_target(target, pm_dir) else "drift"
 
 
+def orphaned_generated_outputs(manifest: Manifest, repo_root: Path) -> list[str]:
+    """Find generated files whose targets were removed without retiring them."""
+    known = {target.output for target in manifest.targets.values()} | set(manifest.retired_outputs)
+    marker = BANNER.encode("utf-8")
+    orphaned: list[str] = []
+    def fail_walk(error: OSError) -> None:
+        raise PmError(f"cannot inspect generated outputs: {error}") from error
+
+    for directory, subdirs, files in os.walk(repo_root, onerror=fail_walk):
+        subdirs[:] = [
+            name for name in subdirs
+            if name not in {".git", "target", ".venv", "__pycache__"}
+            and not (Path(directory) / name).is_symlink()
+        ]
+        for name in files:
+            path = Path(directory) / name
+            if path.is_symlink():
+                continue
+            relative = path.relative_to(repo_root).as_posix()
+            if relative in known:
+                continue
+            with path.open("rb") as stream:
+                prefix = stream.read(65536)
+            if prefix.startswith(marker) or (
+                prefix.startswith(b"---\n") and b"\n---\n" + marker in prefix
+            ):
+                orphaned.append(relative)
+    return sorted(orphaned)
+
+
 def cmd_sync(args: argparse.Namespace) -> int:
     manifest = load_manifest(args.targets)
     for value in manifest.retired_outputs:
@@ -285,12 +338,15 @@ def cmd_lint(args: argparse.Namespace) -> int:
         for value in manifest.retired_outputs
         if (path := retired_output_path(value, args.repo_root)).exists() or path.is_symlink()
     ]
-    if drifted or retired_present:
+    orphaned = orphaned_generated_outputs(manifest, args.repo_root)
+    if drifted or retired_present or orphaned:
         print("pm lint FAILED: generated docs are out of date.", file=sys.stderr)
         for line in drifted:
             print(f"  - {line}", file=sys.stderr)
         for value in retired_present:
             print(f"  - retired output still exists -> {value}", file=sys.stderr)
+        for value in orphaned:
+            print(f"  - generated output has no target or retirement -> {value}", file=sys.stderr)
         print("run `python3 tools/pm/pm.py sync`", file=sys.stderr)
         return 1
     print(f"pm lint OK: {len(targets)} target(s) up to date")

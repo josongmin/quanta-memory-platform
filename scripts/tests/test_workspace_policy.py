@@ -28,6 +28,22 @@ def policy_errors_for(root: Path) -> list[str]:
 
 
 class WorkspaceLintPolicyTest(unittest.TestCase):
+    def test_toml_string_cannot_spoof_workspace_lint_table(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="qmp-lint-string-") as directory:
+            root = Path(directory)
+            (root / "member/src").mkdir(parents=True)
+            (root / "Cargo.toml").write_text(
+                '[workspace]\nmembers = ["member"]\n'
+                '[workspace.metadata]\ndescription = """\n[workspace.lints.rust]\nunsafe_code = "deny"\n"""\n'
+                '[workspace.lints.rust]\nunsafe_code = "allow"\n', encoding="utf-8",
+            )
+            (root / "member/Cargo.toml").write_text(
+                '[package]\nname = "member"\nversion = "0.1.0"\n[lints]\nworkspace = true\n',
+                encoding="utf-8",
+            )
+            (root / "member/src/lib.rs").write_text("#![forbid(unsafe_code)]\n", encoding="utf-8")
+            self.assertIn("workspace.lints.rust.unsafe_code must be `deny`", policy_errors_for(root))
+
     def test_new_non_inheriting_member_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory(prefix="qmp-lints-") as directory:
             root = Path(directory)

@@ -12,6 +12,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 CIRCLECI_CONFIG = ROOT / ".circleci" / "config.yml"
+BENCHMARK_CONFIG = ROOT / ".circleci" / "benchmark.yml"
 GITHUB_WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
 EXAMPLE_SCRIPT = ROOT / "scripts" / "verify-extracted-examples.sh"
 STEP_NAME = "Verify actual standalone extraction and full workspace gate"
@@ -50,6 +51,8 @@ def executable_step_errors(text: str, name: str, body_key: str) -> list[str]:
     errors: list[str] = []
     if any(re.fullmatch(r"if:\s*(false|0|\$\{\{\s*false\s*\}\})", line) for line in stripped):
         errors.append("extraction step is disabled")
+    if any(line.startswith(("when:", "continue-on-error:")) for line in stripped):
+        errors.append("extraction step has conditional or ignored failure")
     if f"{body_key}: |" not in stripped:
         errors.append("extraction step has no executable command block")
     else:
@@ -72,7 +75,20 @@ def github_event_errors(text: str) -> list[str]:
             break
         if re.match(r"^  [A-Za-z_]+:\s*", line):
             events.append(line.strip().split(":", 1)[0])
-    return [] if events == ["workflow_dispatch"] else [f"expected dispatch-only events, got {events}"]
+    if events != ["workflow_dispatch"]:
+        return [f"expected dispatch-only events, got {events}"]
+    sentinel = re.search(
+        r"(?ms)^  reject-unexpected-trigger:\n"
+        r"    if: github\.event_name != 'workflow_dispatch'\n"
+        r"    runs-on: ubuntu-24\.04\n"
+        r"    steps:\n"
+        r"      - name: Reject CI configuration bound to a push trigger\n"
+        r"        run: \|\n"
+        r"          echo [^\n]+\n"
+        r"          exit 1\n",
+        text,
+    )
+    return [] if sentinel else ["dispatch config must fail closed when bound to a push trigger"]
 
 
 def github_full_job_errors(text: str) -> list[str]:
@@ -81,17 +97,32 @@ def github_full_job_errors(text: str) -> list[str]:
         return ["missing GitHub jobs"]
     match = re.search(r"(?m)^  full-extraction:\s*\n    if: (.+)$", jobs[1])
     expected = "github.event_name == 'workflow_dispatch' && inputs.verification == 'full'"
-    return [] if match and match.group(1) == expected else ["full extraction must require explicit full dispatch"]
+    if not match or match.group(1) != expected:
+        return ["full extraction must require explicit full dispatch"]
+    job = re.split(r"(?m)^  [A-Za-z][\w-]*:\s*$", jobs[1][match.end():], maxsplit=1)[0]
+    if re.search(r"(?m)^    (?:needs|continue-on-error):", job):
+        return ["full extraction must not depend on a skipped job or ignore failures"]
+    return []
 
 
-def circleci_main_filter_errors(text: str) -> list[str]:
+def circleci_push_workflow_errors(text: str) -> list[str]:
     workflow = text.split("\nworkflows:\n", 1)
     if len(workflow) != 2:
         return ["missing CircleCI workflows"]
-    expected = re.compile(
-        r"(?m)^\s+- full-extraction:\s*\n\s+filters: pipeline\.git\.branch == \"main\"\s*$"
+    lines = [line.strip() for line in workflow[1].splitlines() if line.strip()]
+    return [] if lines == ["push-verification:", "jobs:", "- full-extraction"] else [
+        "every push must schedule exactly one unconditional full-extraction job"
+    ]
+
+
+def benchmark_artifact_errors(text: str) -> list[str]:
+    required = (
+        "path: /tmp/qmp-benchmark\n          destination: qmp-in-memory-pressure",
+        "path: /tmp/qmp-benchmark/results.jsonl\n          destination: qmp-standard-full/results.jsonl",
     )
-    return [] if len(expected.findall(workflow[1])) == 1 else ["full-extraction must be main-filtered"]
+    return ["benchmark receipt artifact is not retained"] if (
+        text.count("- store_artifacts:") != 2 or any(item not in text for item in required)
+    ) else []
 
 
 def example_script_errors(text: str) -> list[str]:
@@ -107,7 +138,11 @@ def example_script_errors(text: str) -> list[str]:
         'scripts/extract-to-standalone-repo.sh "${qmp_extract_dir}"',
         'cargo run --locked --manifest-path "${qmp_extract_dir}/Cargo.toml" -p quanta-memory-platform-facade --example hello_world',
         'cargo run --locked --manifest-path "${qmp_extract_dir}/Cargo.toml" -p quanta-memory-platform-facade --example effective_budget_report',
-        'test -z "$(git -C "${qmp_extract_dir}" status --porcelain)"',
+        'extracted_status="$(git -C "${qmp_extract_dir}" status --porcelain)" || {',
+        'echo "Failed to inspect extracted checkout: ${qmp_extract_dir}" >&2',
+        'exit 1',
+        '}',
+        'test -z "${extracted_status}"',
         'echo "Verified extracted checkout: ${qmp_extract_dir}"',
     ]
     return [] if lines == expected else ["extraction/example/clean command sequence drifted"]
@@ -120,7 +155,8 @@ class CiEntryPointContracts(unittest.TestCase):
         script = EXAMPLE_SCRIPT.read_text(encoding="utf-8")
         self.assertEqual(executable_step_errors(circle, STEP_NAME, "command"), [])
         self.assertEqual(executable_step_errors(github, STEP_NAME, "run"), [])
-        self.assertEqual(circleci_main_filter_errors(circle), [])
+        self.assertEqual(circleci_push_workflow_errors(circle), [])
+        self.assertEqual(benchmark_artifact_errors(BENCHMARK_CONFIG.read_text(encoding="utf-8")), [])
         self.assertEqual(github_event_errors(github), [])
         self.assertEqual(github_full_job_errors(github), [])
         self.assertEqual(example_script_errors(script), [])
@@ -130,15 +166,29 @@ class CiEntryPointContracts(unittest.TestCase):
         github = GITHUB_WORKFLOW.read_text(encoding="utf-8")
         mutated = github.replace("on:\n", "on:\n  schedule:\n    - cron: '0 0 * * *'\n", 1)
         self.assertTrue(github_event_errors(mutated))
+        self.assertTrue(github_event_errors(github.replace("          exit 1\n", "          exit 0\n", 1)))
         self.assertTrue(github_full_job_errors(github.replace("github.event_name == 'workflow_dispatch' && inputs.verification == 'full'", "github.event_name != 'workflow_dispatch' || inputs.verification == 'full'")))
         circle = CIRCLECI_CONFIG.read_text(encoding="utf-8")
-        self.assertTrue(circleci_main_filter_errors(circle.replace('filters: pipeline.git.branch == "main"', 'filters: pipeline.git.branch == "dev"')))
+        self.assertTrue(circleci_push_workflow_errors(circle.replace("- full-extraction", "- full-extraction:\n          filters: pipeline.git.branch == \"main\"")))
 
     def test_disabled_step_and_missing_command_are_rejected(self) -> None:
         github = GITHUB_WORKFLOW.read_text(encoding="utf-8")
         self.assertTrue(executable_step_errors(github.replace(f"- name: {STEP_NAME}", f"- name: {STEP_NAME}\n        if: false"), STEP_NAME, "run"))
         self.assertTrue(executable_step_errors(github.replace(SCRIPT_COMMAND, "echo skipped"), STEP_NAME, "run"))
         self.assertTrue(executable_step_errors(github.replace(SCRIPT_COMMAND, "exit 0\n          " + SCRIPT_COMMAND), STEP_NAME, "run"))
+        self.assertTrue(executable_step_errors(github.replace(f"- name: {STEP_NAME}", f"- name: {STEP_NAME}\n        continue-on-error: true"), STEP_NAME, "run"))
+        circle = CIRCLECI_CONFIG.read_text(encoding="utf-8")
+        self.assertTrue(executable_step_errors(circle.replace(f"name: {STEP_NAME}", f"name: {STEP_NAME}\n          when: on_fail"), STEP_NAME, "command"))
+
+    def test_workflow_and_job_skip_paths_are_rejected(self) -> None:
+        circle = CIRCLECI_CONFIG.read_text(encoding="utf-8")
+        self.assertTrue(circleci_push_workflow_errors(circle.replace("workflows:\n", "workflows:\n  when: false\n", 1)))
+        github = GITHUB_WORKFLOW.read_text(encoding="utf-8")
+        self.assertTrue(github_full_job_errors(github.replace("  full-extraction:\n", "  full-extraction:\n    needs: billing-probe\n", 1)))
+
+    def test_benchmark_artifact_steps_cannot_disappear(self) -> None:
+        text = BENCHMARK_CONFIG.read_text(encoding="utf-8")
+        self.assertTrue(benchmark_artifact_errors(text.replace("- store_artifacts:", "- ignored_artifact:", 1)))
 
     def test_early_close_and_source_checkout_examples_are_rejected(self) -> None:
         script = EXAMPLE_SCRIPT.read_text(encoding="utf-8")

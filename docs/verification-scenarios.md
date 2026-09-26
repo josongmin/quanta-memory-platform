@@ -331,8 +331,10 @@ check helpers that the control plane enforces (see group C/D).
   in `reference_eq_panic_before_mutation_keeps_public_store_available` (pin
   count lookup), `checked_reads_propagate_client_clone_panics_without_poisoning_owner_mutex_v1`
   (map get/entries clones), `resolve_clone_panic_preserves_readability_and_charge`
-  (prepared payload clone), and the `counter_reads_show_open_busy_and_closed_images`
-  family (open/Busy/closed counter images for payload, retained map, and
+  (prepared payload clone), and the
+  `payload_store::service::tests::counter_reads_show_open_busy_and_closed_images` and
+  `retained_map::service::tests::charged::counter_reads_show_open_busy_and_closed_images`
+  tests (open/Busy/closed counter images for payload, retained map, and
   prepared publication).
 - ✅ charged facade mutators are fail-closed before store mutation — `charged_remove_during_rebuild_is_fail_closed`, `charged_sweep_during_rebuild_is_fail_closed`, `reclaim_one_during_rebuild_is_fail_closed`, `reclaim_until_during_rebuild_is_fail_closed`, `truncate_refund_failure_preserves_rows_indexes_and_accounting`.
 - ✅ transcript charged breadth now matches the closeout bar — `append_identity_is_partitioned_by_session` proves session-local identity partitioning, and `truncate_refund_failure_preserves_rows_indexes_and_accounting` proves refund denial leaves both ledger and store untouched.

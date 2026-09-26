@@ -65,6 +65,7 @@ rules:
       - pattern: std::fs::$FUNC(...)
       - pattern: std::fs::$TYPE::$FUNC(...)
       - pattern: std::env::$FUNC(...)
+      - pattern-regex: 'std::(?:fs|env)::[A-Za-z_][A-Za-z0-9_:]*'
       - pattern-regex: '(?ms)^\s*(?:pub(?:\([^)]*\))?\s+)?use\s+std::(?:(?:fs|env)\b|\{[^;]*(?:fs|env)\b)'
 
   - id: qmp-pure-layer-no-wall-clock
@@ -82,6 +83,7 @@ rules:
       - pattern: Instant::now()
       - pattern: std::time::SystemTime::now()
       - pattern: std::time::Instant::now()
+      - pattern-regex: '\b(?:SystemTime|Instant)::now\b'
 
   - id: qmp-pure-layer-no-adapter-import
     languages: [rust]

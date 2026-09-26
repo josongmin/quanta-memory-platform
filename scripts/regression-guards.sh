@@ -21,6 +21,7 @@ if ! command -v semgrep >/dev/null 2>&1; then
 fi
 
 echo "[regression-guards] semgrep ${config}"
+python3 scripts/lib/verify_semgrep_suppressions.py
 # --error makes any finding non-zero; --strict fails on rule/parse errors.
 scan_output="$(mktemp /tmp/qmp-semgrep-scan.XXXXXX)"
 trap 'rm -f -- "${scan_output}"' EXIT

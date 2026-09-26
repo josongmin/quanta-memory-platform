@@ -97,6 +97,10 @@ use std::{
 };
 fn bad() {
     let _ = std::fs::File::open("state");
+    let read = std::fs::read;
+    let now = std::time::SystemTime::now;
+    let _ = read("state");
+    let _ = now();
 }
 EOF
 
@@ -150,6 +154,8 @@ expected_bypass = {
     ("qmp-pure-layer-no-adapter-import", 2),
     ("qmp-pure-layer-no-fs-env", 3),
     ("qmp-pure-layer-no-fs-env", 7),
+    ("qmp-pure-layer-no-fs-env", 8),
+    ("qmp-pure-layer-no-wall-clock", 9),
 }
 if not expected_bypass <= bypass_hits:
     failures.append(f"scoped bypass fixtures missed: {sorted(expected_bypass - bypass_hits)}")

@@ -4,6 +4,7 @@ import copy
 import contextlib
 import io
 import importlib.util
+import itertools
 import json
 import sys
 import unittest.mock
@@ -27,6 +28,7 @@ CONTENTIONS = ("metadata-stats-heavy", "write-heavy", "mixed-stats-put")
 PAIRWISE = (
     "shared-single-owner", "shared-per-thread-owner", "independent-per-thread-owner",
 )
+RUN_SEQUENCE = itertools.count()
 
 
 def sample(
@@ -46,9 +48,9 @@ def sample(
         "entries": entries,
         "threads": threads,
         "repetition": repetition,
-        "elapsed_ns": entries,
-        "throughput_ops_per_sec": round(timed * 1_000_000_000 / entries),
-        "successful_throughput_ops_per_sec": round(successful * 1_000_000_000 / entries),
+        "elapsed_ns": 20_000_000,
+        "throughput_ops_per_sec": round(timed * 1_000_000_000 / 20_000_000),
+        "successful_throughput_ops_per_sec": round(successful * 1_000_000_000 / 20_000_000),
         "timed_operations": timed,
         "successful_operations": successful,
         "denied_operations": timed - successful,
@@ -115,6 +117,7 @@ def valid_records(
             threads = (1, 2) if "--smoke" in benchmark_args else (1, 2, 8, 32)
     if repetitions is None:
         repetitions = 3 if "--smoke" in benchmark_args else 5
+    run_id = f"fixture-{next(RUN_SEQUENCE)}"
     records: list[dict[str, object]] = [{
         "schema": MODULE.RUN_SCHEMA,
         "source_sha": "a" * 40,
@@ -130,6 +133,7 @@ def valid_records(
         "package": "quanta-memory-platform-facade",
         "bench_target": "scaling",
         "benchmark_args": benchmark_args,
+        "run_id": run_id,
     }]
     for entries in sizes:
         for repetition in range(repetitions):
@@ -164,6 +168,7 @@ def valid_records(
         "source_clean": True,
         "bench_build_config_sha256": "7" * 64,
         "bench_exit_code": 0,
+        "run_id": run_id,
     })
     return records
 
@@ -284,6 +289,60 @@ class ScalingResultTests(unittest.TestCase):
                 records[0]["run_id"] = records[-1]["run_id"] = invalid
                 with self.assertRaisesRegex(MODULE.ValidationError, "run identity is invalid"):
                     MODULE.validate(records)
+
+    def test_ordinary_receipt_requires_all_provenance_fields(self) -> None:
+        for record_index, field, message in (
+            (0, "run_id", "run identity"),
+            (0, "benchmark_source_sha256", "benchmark_source_sha256"),
+            (0, "bench_build_config_sha256", "bench_build_config_sha256"),
+            (-1, "bench_exit_code", "bench exit status"),
+        ):
+            with self.subTest(field=field):
+                records = valid_records(["--smoke"])
+                del records[record_index][field]
+                with self.assertRaisesRegex(MODULE.ValidationError, message):
+                    MODULE.validate(records)
+
+    def test_impossible_wall_and_outcome_latencies_are_rejected(self) -> None:
+        records = valid_records(["--smoke"])
+        set_elapsed(records[1], 1)
+        with self.assertRaisesRegex(MODULE.ValidationError, "p99 exceeds measured wall time"):
+            MODULE.validate(records)
+        records = valid_records(["--smoke"])
+        scheduler = next(row for row in records if row.get("operation") == "scheduler_admission_group_cardinality")
+        scheduler["admitted_p50_ns"] = scheduler["admitted_p95_ns"] = scheduler["admitted_p99_ns"] = 100
+        with self.assertRaisesRegex(MODULE.ValidationError, "outcome median exceeds combined p99"):
+            MODULE.validate(records)
+
+    def test_ordinary_baseline_requires_distinct_run_and_comparable_cells(self) -> None:
+        records = valid_records(["--smoke"])
+        with self.assertRaisesRegex(MODULE.ValidationError, "reuses candidate run identity"):
+            MODULE.validate(records, records)
+        baseline = valid_records(["--smoke"])
+        for row in baseline[1:-1]:
+            set_elapsed(row, 9_000_000)
+        with self.assertRaisesRegex(MODULE.InconclusiveError, "skipped .* short cells"):
+            MODULE.validate(records, baseline)
+        baseline = valid_records(["--smoke"])
+        short_key = MODULE.scenario_key(baseline[1])
+        for row in baseline[1:-1]:
+            if MODULE.scenario_key(row) == short_key:
+                set_elapsed(row, 9_000_000)
+        with self.assertRaisesRegex(MODULE.InconclusiveError, "skipped 1 short cells"):
+            MODULE.validate(records, baseline)
+
+    def test_ordinary_limits_reject_100_percent_throughput_regression(self) -> None:
+        with self.assertRaisesRegex(MODULE.ValidationError, "invalid ordinary benchmark limits"):
+            MODULE.validate(valid_records(["--smoke"]), max_throughput_regression_percent=100)
+
+    def test_cli_rejects_vacuous_baseline_and_release_option_mix(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "receipt.jsonl"
+            path.write_text("\n".join(json.dumps(row) for row in valid_records(["--smoke"])) + "\n", encoding="utf-8")
+            with unittest.mock.patch.object(sys, "argv", ["verify", "--input", str(path), "--baseline", str(path)]), contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(MODULE.main(), 1)
+            with unittest.mock.patch.object(sys, "argv", ["verify", "--input", str(path), "--release", "--max-p99-ns", "1"]), contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(MODULE.main(), 1)
 
     def test_pressure_one_byte_peak_cannot_be_forged_as_two(self) -> None:
         records = valid_records(["--profile=in-memory-pressure", "--smoke"])
@@ -824,7 +883,7 @@ class ScalingResultTests(unittest.TestCase):
         with self.assertRaisesRegex(MODULE.ValidationError, "baseline incompatible benchmark_source_sha256"):
             MODULE.validate(current, baseline)
         del baseline[0]["benchmark_source_sha256"]
-        with self.assertRaisesRegex(MODULE.ValidationError, "baseline incompatible benchmark_source_sha256"):
+        with self.assertRaisesRegex(MODULE.ValidationError, "benchmark_source_sha256.*missing or invalid"):
             MODULE.validate(current, baseline)
         baseline[0]["benchmark_source_sha256"] = "not-a-digest"
         with self.assertRaisesRegex(MODULE.ValidationError, "benchmark_source_sha256.*invalid"):
@@ -838,7 +897,7 @@ class ScalingResultTests(unittest.TestCase):
             MODULE.validate(current, baseline)
         del baseline[0]["bench_build_config_sha256"]
         del baseline[-1]["bench_build_config_sha256"]
-        with self.assertRaisesRegex(MODULE.ValidationError, "baseline incompatible bench_build_config_sha256"):
+        with self.assertRaisesRegex(MODULE.ValidationError, "bench_build_config_sha256.*missing or invalid"):
             MODULE.validate(current, baseline)
 
     def test_baseline_regressions_are_rejected(self) -> None:

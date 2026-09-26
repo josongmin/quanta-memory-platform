@@ -39,7 +39,6 @@ jobs:
             scripts/verify-extracted-examples.sh
 
 workflows:
-  main-verification:
+  push-verification:
     jobs:
-      - full-extraction:
-          filters: pipeline.git.branch == "main"
+      - full-extraction

@@ -104,6 +104,19 @@ class PromptManagerTest(unittest.TestCase):
         with self.assertRaisesRegex(pm.PmError, "duplicate generated output"):
             pm.load_targets(self.targets_path)
 
+    def test_unknown_and_duplicate_manifest_keys_are_rejected(self) -> None:
+        original = self.targets_path.read_text(encoding="utf-8")
+        for old, new, message in (
+            ('"output":', '"max_byte": 1, "output":', "unknown target"),
+            ('"targets":', '"retired_output": [], "targets":', "unknown manifest"),
+            ('"output":', '"max_bytes": 1, "max_bytes": 10000, "output":', "duplicate manifest key"),
+        ):
+            with self.subTest(message=message):
+                self.targets_path.write_text(original.replace(old, new, 1), encoding="utf-8")
+                with self.assertRaisesRegex(pm.PmError, message):
+                    pm.load_manifest(self.targets_path)
+        self.targets_path.write_text(original, encoding="utf-8")
+
     def test_active_and_retired_output_overlap_is_rejected(self) -> None:
         config = json.loads(self.targets_path.read_text(encoding="utf-8"))
         config["retired_outputs"] = ["out/DEMO.md"]
@@ -182,6 +195,26 @@ class PromptManagerTest(unittest.TestCase):
         with redirect_stdout(StringIO()):
             self.assertEqual(sync_args.func(sync_args), 0)
             self.assertEqual(lint_args.func(lint_args), 0)
+
+    def test_lint_rejects_removed_target_output_without_retirement(self) -> None:
+        parser = pm.build_parser()
+        base = ["--targets", str(self.targets_path), "--pm-dir", str(self.pm_dir),
+                "--repo-root", str(self.repo)]
+        lint_args = parser.parse_args(base + ["lint"])
+        target = self.target()
+        pm.sync_target(target, self.pm_dir, self.repo)
+        config = json.loads(self.targets_path.read_text(encoding="utf-8"))
+        config["targets"]["replacement"] = {
+            "output": "out/REPLACEMENT.md", "title": "Replacement",
+            "sections": ["sources/a.md", "sources/b.md"],
+        }
+        del config["targets"]["demo"]
+        self.targets_path.write_text(json.dumps(config), encoding="utf-8")
+        pm.sync_target(pm.load_targets(self.targets_path)["replacement"], self.pm_dir, self.repo)
+        errors = StringIO()
+        with redirect_stdout(StringIO()), redirect_stderr(errors):
+            self.assertEqual(lint_args.func(lint_args), 1)
+        self.assertIn("generated output has no target or retirement -> out/DEMO.md", errors.getvalue())
 
     def test_retired_output_is_removed_by_sync_and_rejected_by_lint(self) -> None:
         config = json.loads(self.targets_path.read_text(encoding="utf-8"))

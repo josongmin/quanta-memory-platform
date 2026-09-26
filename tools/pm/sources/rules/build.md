@@ -43,7 +43,11 @@ python3 -m unittest -q tools/pm/tests/test_pm.py
 ```
 
 The prompt manager is Python-standard-library-only. Its JSON manifest rejects
-orphan sources, duplicate outputs, path escapes, missing outputs, and drift.
+orphan sources, duplicate and unknown keys, orphaned generated outputs,
+path escapes, missing outputs, and drift. The workspace-policy parser uses
+Python 3.11+ `tomllib` or `tomli` on older Python; a missing parser fails the gate.
+The full and in-memory gates reject ignored Rust tests. Live CircleCI trigger
+binding is a separate external check: `python3 scripts/verify-hosted-ci-binding.py`.
 The Rust toolchain version is owned solely by `rust-toolchain.toml`; dependency
 policy is owned by `deny.toml`; formatting is owned by `rustfmt.toml`. Workspace
 Rust/Clippy lint levels are owned by the root `Cargo.toml`; each library root

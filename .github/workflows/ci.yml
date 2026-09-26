@@ -16,6 +16,15 @@ permissions:
   contents: read
 
 jobs:
+  reject-unexpected-trigger:
+    if: github.event_name != 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Reject CI configuration bound to a push trigger
+        run: |
+          echo 'This dispatch-only config was used for a push; bind push CI to .circleci/config.yml' >&2
+          exit 1
+
   billing-probe:
     if: github.event_name == 'workflow_dispatch' && inputs.verification == 'probe'
     runs-on: ubuntu-24.04

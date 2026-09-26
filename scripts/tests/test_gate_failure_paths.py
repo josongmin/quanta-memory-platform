@@ -20,6 +20,32 @@ def executable(path: Path, contents: str) -> None:
 
 
 class GateFailurePathsTests(unittest.TestCase):
+    def test_extracted_checkout_status_error_cannot_report_success(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="qmp-extract-git-failure-") as directory:
+            root = Path(directory)
+            scripts = root / "scripts"
+            binary = root / "bin"
+            scripts.mkdir()
+            binary.mkdir()
+            shutil.copy2(ROOT / "scripts/verify-extracted-examples.sh", scripts)
+            executable(scripts / "extract-to-standalone-repo.sh", "#!/bin/sh\nexit 0\n")
+            executable(binary / "cargo", "#!/bin/sh\nexit 0\n")
+            executable(binary / "git", "#!/bin/sh\n"
+                       'if [ "$1" = "-C" ]; then echo "git status failed" >&2; exit 37; fi\n'
+                       'if [ "$1" = "rev-parse" ]; then echo "fixture-head"; exit 0; fi\n'
+                       "exit 38\n")
+            result = subprocess.run(
+                ["bash", str(scripts / "verify-extracted-examples.sh")],
+                cwd=root,
+                env={**os.environ, "PATH": f"{binary}:{os.environ['PATH']}"},
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertNotIn("Verified extracted checkout", result.stdout)
+            self.assertIn("Failed to inspect extracted checkout", result.stderr)
+
     def test_feature_matrix_rejects_missing_ripgrep_before_cargo(self) -> None:
         with tempfile.TemporaryDirectory(prefix="qmp-missing-rg-") as directory:
             root = Path(directory)

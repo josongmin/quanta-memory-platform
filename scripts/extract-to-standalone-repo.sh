@@ -39,9 +39,15 @@ if [[ "${dest}" == "${repo_root}" ]] || [[ "${dest}" == "${repo_root}/"* ]] || \
   echo "FAIL: destination overlaps source repository: ${dest}" >&2
   exit 2
 fi
-if [[ -e "${dest}" ]] && [[ -n "$(find "${dest}" -mindepth 1 -maxdepth 1 -print -quit)" ]]; then
-  echo "FAIL: destination must be absent or empty: ${dest}" >&2
-  exit 2
+if [[ -e "${dest}" ]]; then
+  dest_contents="$(find "${dest}" -mindepth 1 -maxdepth 1 -print -quit)" || {
+    echo "FAIL: could not inspect destination: ${dest}" >&2
+    exit 1
+  }
+  if [[ -n "${dest_contents}" ]]; then
+    echo "FAIL: destination must be absent or empty: ${dest}" >&2
+    exit 2
+  fi
 fi
 
 run() {
@@ -164,17 +170,28 @@ python3 scripts/lib/extraction_manifest.py assert-clean \
   "${SELF_HOSTING_COPY_PATHS[@]}"
 run git -C "${dest}" init -q
 run git -C "${dest}" add --pathspec-from-file="${path_manifest}" --pathspec-file-nul
-if [[ "${dry_run}" -eq 0 ]] && \
-   git -C "${dest}" status --porcelain --untracked-files=all | grep -q '^?? '; then
-  echo "FAIL: verification left non-canonical untracked files in destination" >&2
-  exit 1
+if [[ "${dry_run}" -eq 0 ]]; then
+  dest_status="$(git -C "${dest}" status --porcelain --untracked-files=all)" || {
+    echo "FAIL: could not inspect extracted destination before commit" >&2
+    exit 1
+  }
+  if grep -q '^?? ' <<<"${dest_status}"; then
+    echo "FAIL: verification left non-canonical untracked files in destination" >&2
+    exit 1
+  fi
 fi
 run git -C "${dest}" -c user.name="quanta-memory-platform bootstrap" \
   -c user.email="qmp-bootstrap@local.invalid" \
   commit -q -m "chore: bootstrap extracted quanta-memory-platform repo"
-if [[ "${dry_run}" -eq 0 ]] && [[ -n "$(git -C "${dest}" status --porcelain)" ]]; then
-  echo "FAIL: extracted git worktree is dirty after bootstrap" >&2
-  exit 1
+if [[ "${dry_run}" -eq 0 ]]; then
+  dest_status="$(git -C "${dest}" status --porcelain)" || {
+    echo "FAIL: could not inspect extracted destination after commit" >&2
+    exit 1
+  }
+  if [[ -n "${dest_status}" ]]; then
+    echo "FAIL: extracted git worktree is dirty after bootstrap" >&2
+    exit 1
+  fi
 fi
 
 # ---------------------------------------------------------------------------
