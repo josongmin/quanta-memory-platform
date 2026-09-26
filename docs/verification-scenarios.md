@@ -14,9 +14,10 @@ receipt. Hard pass/fail counts go stale fast and are deliberately **not** pinned
 here — re-run the rail (see *How evidence was gathered / re-verify*) for current
 results. Each scenario below cites the exact `#[test]` fn name and its file as
 its own evidence; trust those citations over aggregate counts.
-For the 2026-09-24 implementation and qualification boundary, see the
-[current plan index](plans/README.md) and the
-[source-bound receipt](plans/sep-23-followup-misc/RECEIPT.md).
+For the current qualification boundary, see
+[ADR 0003](adr/0003-source-bound-qualification.md) and the
+[remaining-work index](plans/README.md). Historical receipts remain in Git
+history and do not qualify a later source.
 
 Repo-local success establishes the portable library's source, feature, and
 standalone-extraction contracts only. Semantica host adoption, deployment, and
@@ -397,7 +398,7 @@ check helpers that the control plane enforces (see group C/D).
   (`facade/tests/spill_redb_kill_reopen.rs`, public API only). The child
   dies by `SIGKILL` (no destructors, no flush) and the survivor reopens
   cold. Power loss is NOT covered; mid-finalize instruction-point kills
-  moved to the L1 rail below (see residual boundaries in the Sep-23 receipt).
+  moved to the L1 rail below; its residual boundaries are stated there.
 - ✅ **Store+ledger spill process boundary** —
   `durable_spill_store_charge_and_record_survive_process_boundary`
   (`facade/tests/spill_redb_kill_reopen.rs`, features
@@ -406,7 +407,7 @@ check helpers that the control plane enforces (see group C/D).
   cold-reopens with a new broker/store. Exactly one whole payload is restored
   and the survivor ledger drains to zero. This does not inject an ACK loss or
   stop between commit and source retirement.
-- ✅ **Finalize instruction-point kill rail (DURABILITY-001 L1)** —
+- ✅ **Finalize instruction-point kill rail** —
   `durability_l1_finalize_before_commit_kill_recovers_present_and_drains_exactly_once`,
   and `durability_l1_finalize_after_commit_kill_resolves_finalized_without_resurrection`
   (`facade/tests/spill_redb_finalize_kill.rs`, public API only, features
@@ -516,34 +517,31 @@ check helpers that the control plane enforces (see group C/D).
   The runner fingerprints all present source files before and after. This is a
   standalone Linux volume-error oracle, not the consuming host's volume/quota
   policy, physical power-loss durability, or a caller codec scratch bound.
-- 🧪 **Optional Linux syscall-error subrail (DURABILITY-001 L2 partial)** —
+- 🧪 **Optional Linux syscall-error subrail** —
   `scripts/durability/run-emulated-linux.sh` calibrates the real finalize
   boundary, injects EIO into the first `pwrite64` and `fdatasync` after it, then
   cold-reopens and checks whole-state recovery/finalization plus exact drain.
   Raw traces, Redb files, source digest, and SHA-256 receipt are retained in a
   caller-selected temp artifact directory. This exercises syscall error
   handling only; it does not inject block-device failures or simulate power
-  loss. One device-mapper sample is recorded separately below; physical L3
-  remains unqualified.
-- 🧪 **Optional disposable device-mapper subrail (DURABILITY-001 L2, 1 sample)** —
+  loss. The device-mapper subrail below exercises a distinct failure boundary.
+- 🧪 **Optional disposable device-mapper subrail** —
   `scripts/durability/run-device-mapper-linux.sh` creates an owned sparse image,
   loop device and ext4 filesystem; at the finalize hook it swaps the DM table to
   `error`, requires a post-marker syscall EIO, restores the table without
   flushing failed I/O, repairs/unmounts, detaches the DM target, then cold-opens
   the image through the loop device and checks the public state-machine oracle.
-  The 2026-09-25 ARM64 Linux 6.10.14 run passed `Present -> recovered ->
-  Finalized` on source digest
-  `afd110378590610d47d45a5e8cbc7cf7239ce9f51a86598010fdb9663b33e6c7`. This is
-  one disposable ext4 block-I/O disruption sample, not a power-loss claim or
-  general hardware qualification. Opt in only inside a disposable Linux VM by
+  This is a disposable ext4 block-I/O disruption test, not a power-loss claim
+  or general hardware qualification. Opt in only inside a disposable Linux VM by
   setting `QMP_DURABILITY_L2_DM_ALLOW_DISPOSABLE=1`.
 
-**publish_pipeline is intentionally not charged.** It is a non-retaining
+**`SimplePublishPipeline` is intentionally not charged.** It is a non-retaining
 *transition* stage (zero bytes held): it transforms a staged value into a
 published one and hands it off to the store that retains it. The destination
 store (payload / retained-map / transcript) is what charges those bytes; wiring
 a charger into the pipeline would double-count. This is a deliberate design
 choice documented in `facade/src/publish_pipeline/service.rs`, not a gap.
+The retaining prepared-publication service is separately charged.
 
 ## G. Testkit conformance — ✅ ("the suite must bite", `testkit/`)
 

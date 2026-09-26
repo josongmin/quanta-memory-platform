@@ -1,19 +1,21 @@
 # Memory/state substrate review checklist
 
-검토 기준일: 2026-09-23
+체크리스트 제정일: 2026-09-23. 특정 QMP HEAD의 현행 점수표가 아니다.
 
 대상: QMP와 같은 process-local memory/state substrate
 
 성격: 13개 영역, 100개 계약의 **리뷰 도구**. 점수표나 현재 구현의 합격 판정이 아니다.
 
-가장 최근 항목별 점수·적용 범위·증거 상한은 [2026-09-24 `db0b03c` 재채점](memory-state-substrate-score-reaudit-2026-09-24-db0b03c.md)이며, 해당 source snapshot에 한정된다. 이후 Cargo/Rust 변경은 주석이고 실행 동작은 바뀌지 않았지만, 이 체크리스트의 점수는 재산정하지 않았다. 현재-source qualification은 정확한 HEAD를 대상으로 한 별도 receipt를 따른다. 이 체크리스트의 미체크 박스는 점수나 구현 상태를 뜻하지 않는다.
+과거 점수표는 해당 소스 스냅샷에만 유효하여 현재 판정에서 제거했다.
+현재-source qualification은 정확한 HEAD를 대상으로 한 별도 receipt를 따른다.
+이 체크리스트의 미체크 박스는 점수나 구현 상태를 뜻하지 않는다.
 
 ## 사용 원칙
 
 - 기본 항목은 해당 substrate가 표방하는 계약에 적용한다. `조건:` 항목은 명시한 capability를 제공할 때만 적용한다. 미지원 기능은 이유와 노출되는 오류를 기록한 뒤 N/A로 둘 수 있다.
 - `[ ]`는 미검증을 뜻한다. 문서 명시, 구현 확인, 테스트 통과, 실제 host 검증을 서로 다른 상태로 기록한다. 테스트 파일의 존재만으로 테스트 통과를 표시하지 않는다.
 - 각 판정에 `항목 ID | 적용 여부 | 상태 | source SHA/경로 | test/receipt | 담당 경계 | 잔여 위험`을 남긴다. 현재 소스와 다른 SHA의 receipt는 현재 판정의 증거가 아니다.
-- semantic charge는 등록된 비용 모델을 집행한다. allocator allocation, RSS, 임시 복사, 디스크 사용량의 상한을 자동으로 뜻하지 않는다. QMP의 범위는 [설계 가이드](../../README-detailed.md)와 [최종 closeout 기록](../../tickets/FINAL-CLOSEOUT.md)을 각각 확인한다.
+- semantic charge는 등록된 비용 모델을 집행한다. allocator allocation, RSS, 임시 복사, 디스크 사용량의 상한을 자동으로 뜻하지 않는다. QMP의 범위는 [ADR 0001](../adr/0001-portable-accounting-authority.md)을 확인한다.
 - QMP가 소유한 객체/guard의 수명과 caller에게 넘긴 clone/버퍼의 수명을 구분한다. 공유 backing이나 내부 가변성으로 물리 payload가 남는 경우에는 누가 과금하거나 제한하는지 계약에 적는다.
 - 특정 알고리즘(Hamilton, dynamic borrowing, S3-FIFO, W-TinyLFU, DRF, lock-free 등)은 필수로 두지 않는다. 현재 workload와 실패 모델에서 계약이 성립하는지를 본다.
 

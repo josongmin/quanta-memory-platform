@@ -7,7 +7,7 @@ must migrate atomically and qualify their own host composition against the exact
 QMP Git tree. No deprecated alias is retained when it would reopen an
 unbudgeted or unbounded path.
 
-## Sep-23 follow-up (`qmp-final-qualified-sep23-followup-v3`)
+## Post-0.2 authority and durable API changes
 
 ### Durable restore calls now take a claim (BREAKING for external implementers)
 
@@ -125,7 +125,7 @@ mutex normally so later operations are not rejected solely because that read
 poisoned the lock. This does not bound callback duration or roll back
 caller-owned interior side effects.
 
-## Sep-26 engine remediation (`main` post-`438b869`)
+## Later 0.2 API and behavior changes
 
 ### Rebuild fence requires a permit (source-breaking)
 

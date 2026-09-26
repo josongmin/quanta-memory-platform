@@ -1,50 +1,19 @@
-# Historical plan status (2026-09-24) and current receipt lookup
+# Remaining work
 
-The [Sep-26 engine architecture bugbash](bugbash-sep-26-engine/README.md) records
-read-only findings at QMP `96d0a25`; it is an audit queue, not an implementation
-or exact-source qualification receipt.
+This index lists work that is still conditional or unqualified. Completed
+implementation tickets and dated audit snapshots are not a dispatch queue;
+their source is available in Git history. Architectural decisions are in
+[the ADR index](../adr/README.md).
 
-Its [structural remediation plan](bugbash-sep-26-engine/STRUCTURAL-REMEDIATION-PLAN.md)
-maps all 13 findings to owner-level repairs, explicit contracts, conditional SDK
-work, and measurement gates at `438b869`; four public-API diagnostic reproductions
-are recorded separately. STR-01–05/07 were implemented after that plan; the
-plan's `PLANNED` wording is historical, not the current implementation state.
-The post-`f5e20c5` hardening and remaining proof boundary are tracked in
-[the Sep-26 follow-up](bugbash-sep-26-engine/POST-RR-HARDENING.md).
-The [file-by-file runbook](bugbash-sep-26-engine/IMPLEMENTATION-RUNBOOK.md)
-gives future workers concrete edit and test instructions.
-
-The `db0b03c` snapshot below is the last audited implementation base, not
-current HEAD. Current local qualification is asserted only when an annotated
-`qmp-local-qualified-*` tag peels to exact `HEAD`; its annotation binds the
-canonical workspace rail, fresh full benchmark, and extraction dry-run. Check
-the tag target before relying on a receipt after any new commit. Host-pair,
-hosted CI, deployment, and activation are separate claims.
-
-| Plan | Implementation | Evidence and remaining gate |
+| Area | Remaining gate | Status |
 | --- | --- | --- |
-| [Sep-24 Semantica memory adoption — remaining work](sep-24-semantica-memory-adoption/README.md) | SMA-001/002/003 integrated into Semantica main at `31a07f43e1f`; QMP code unchanged. | Adapter/host/composer owner lib all-features passed only on earlier snapshots (122/119/51 tests). Current-main Rust/QBC and SDK/query product proof are blocked by disk capacity; no product GREEN asserted. |
-| [Sep-23 FUP-001/002](sep-23-followup-misc/README.md) | Implemented and historically verified for opt-in Redb; outside the current in-memory product scope. | Prior Redb receipts remain historical. A future durable consumer needs its own feature and failure-model qualification. |
-| [Sep-23 FUP-003/004/005/007](sep-23-followup-misc/README.md) | Implemented with owner-local GREEN and temporary-mutant RED. | The Sep-23 candidate has an annotated v5 receipt. The newer in-memory pair was qualified at QMP `7f1c2f8` with Semantica `a71e3e9`; neither receipt names this audit base. |
-| [Sep-23 FUP-006](sep-23-followup-misc/FUP-006-integration-qualification.md) | Prior local QMP and committed-host pair gates passed. | Verifier change and focused proof are at `db0b03c`; current local qualification requires an exact-target `qmp-local-qualified-*` receipt. Extraction dry-run is included; host proof is separate and conditional on a host-adoption claim. |
-| [Sep-24 T1](sep-24-adversarial-e2e-bench/README.md) | Cross-store E2E implemented. | Two selected cases passed at the `db0b03c` audit base; not rerun at current HEAD. |
-| [Sep-24 T4/T5](sep-24-adversarial-e2e-bench/README.md) | Benchmark verifier and workloads implemented. | Python contracts passed 20/20 at `db0b03c`; prior 48-row smoke and 220-row full artifacts from `7f1c2f8` passed the revised verifier. A clean `db0b03c` smoke artifact passed 48/48 (SHA-256 `502f6e70a2009f6e1c725a72a9167db8895a25117bb4facfc738fd7532b4f8a4`). The two `fdf34cf` misses (9.80x/12.25x) and a `2dc071a` miss (4.61x) are preserved in the receipt; the `267cdc9` exact-source run passed 220/220. Requalify after doc/source commits; current qualification requires a `qmp-local-qualified-*` tag whose peeled target equals HEAD. |
-| Sep-24 T6 | Optional only. | No newly identified invariant justifies adding a daily endurance sweep. |
+| Semantica adoption | [SMA-009 product qualification](sep-24-semantica-memory-adoption/SMA-009-product-qualification.md): exact resolved QMP/Semantica pair, owner/public tests, SDK query and SQL worker product paths | Open in the last recorded host audit; recheck current host source before dispatch |
+| Performance claim | Measure the actual group/recharge/reclaim, transcript, retained-map concurrency and prepared-root paths on a quiet host; set consumer SLOs and run compatible repeated baseline/candidate receipts | Conditional; no universal “SOTA” claim |
+| 0.3 SDK | [RFC 0001](../rfcs/0001-sdk-interface-contract.md) migration and its own compatibility/acceptance proof | Proposed; not part of the 0.2 completion claim |
+| Durable product | Opt-in Redb device/power-loss and host failure-model qualification, only if a durable consumer is adopted | Out of the active in-memory product scope |
 
-The [Sep-22 TO-01..09 queue](../../tickets/TEST-OPTIMIZATION-EXECUTION.md)
-was implemented and owner-mutant proofs were recorded. The annotated
-`qmp-final-qualified-sep23-followup-v5` tag qualified a past source containing
-that work. Its old audit tables are historical snapshots, not a current
-`receipt pending` queue. The [receipt index](../../tickets/FINAL-CLOSEOUT.md)
-explains the exact source boundary.
-
-Do not infer current qualification from this historical table. Resolve the
-newest `qmp-local-qualified-*` tag and require its peeled target to equal HEAD;
-the annotation records exact-source canonical CI, full benchmark, and
-extraction dry-run evidence. B07/J06 live-ticket, identifier-byte and
-deferred-batch bounds are implemented. Broader policy-map/lifetime-metadata
-bounds remain family-specific work; the
-[Sep-26 plan](bugbash-sep-26-engine/STRUCTURAL-REMEDIATION-PLAN.md) tracks that
-distinction without reopening the completed zero-byte authority fix.
-Semantica deployment and activation remain host-owned. Physical power
-loss and the Redb failure model are outside the active in-memory release scope.
+For this repository, a current local release claim requires a clean committed
+source, `scripts/check-workspace.sh`, real standalone extraction with its
+public examples, and the benchmark/profile receipt appropriate to the claim.
+Use [ADR 0003](../adr/0003-source-bound-qualification.md) for the evidence
+boundary. No historical tag or this index qualifies the present HEAD.

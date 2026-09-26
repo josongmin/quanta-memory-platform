@@ -92,8 +92,8 @@ orphan enumeration and GC also bound the raw caller-supplied
 reference-root slice at 16,384 tokens (duplicates counted) and reject a
 larger slice with a typed storage capacity error before any state lock.
 
-The detailed authority map, feature choices, lifecycle transitions, failure
-semantics, and verification scope are in [README-detailed.md](README-detailed.md).
+The authority, lifecycle, failure and verification boundaries are in the
+[architecture decisions](docs/adr/README.md).
 
 ## Feature selection
 
@@ -152,9 +152,10 @@ Extraction and host adoption are separate operations; see
 
 | Need | Document |
 | --- | --- |
-| Architecture, ownership, scenarios, failure modes, and rails | [README-detailed.md](README-detailed.md) |
+| Architecture and ownership decisions | [docs/adr/README.md](docs/adr/README.md) |
 | Standalone-repository extraction procedure | [EXTRACTION.md](EXTRACTION.md) |
 | Consumer breaking changes | [MIGRATION.md](MIGRATION.md) |
 | Release inventory | [CHANGELOG.md](CHANGELOG.md) |
+| Accepted architecture decisions | [docs/adr/README.md](docs/adr/README.md) |
 | Current plan status and remaining gates | [docs/plans/README.md](docs/plans/README.md) |
-| Exact audit/qualification records | [tickets/FINAL-CLOSEOUT.md](tickets/FINAL-CLOSEOUT.md) |
+| Executable verification contract | [docs/verification-scenarios.md](docs/verification-scenarios.md) |

@@ -1,4 +1,4 @@
-//! Real forced-termination / reopen rail for the durable spill tier (FUP-006).
+//! Real forced-termination / reopen rail for the durable spill tier.
 //!
 //! Boundary proved here: the child process is ended with
 //! [`std::process::Child::kill`] — `SIGKILL` on Unix, which runs no
@@ -8,8 +8,8 @@
 //! crash-point tests (faults at write boundaries, same address space).
 //!
 //! Boundary NOT proved here: power loss. A `SIGKILL` rail cannot fail the
-//! storage device mid-sector-write, so power-loss durability stays
-//! `UNVERIFIED` in the FUP-006 receipt.
+//! storage device mid-sector-write, so power-loss durability remains
+//! unverified by this rail.
 //!
 //! Backing-only cases drive recovery through the public
 //! [`ReconciledDurableSpillTarget`] / [`DurableRestoreTarget`] surface. The
