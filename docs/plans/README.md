@@ -17,3 +17,7 @@ source, `scripts/check-workspace.sh`, real standalone extraction with its
 public examples, and the benchmark/profile receipt appropriate to the claim.
 Use [ADR 0003](../adr/0003-source-bound-qualification.md) for the evidence
 boundary. No historical tag or this index qualifies the present HEAD.
+
+Recovered historical notes: [P08 post-review hardening](bugbash-sep-26-engine/POST-RR-HARDENING.md).
+Its original local changes are committed and reconciled into main; the note
+is historical evidence, not an additional remaining-work queue.
