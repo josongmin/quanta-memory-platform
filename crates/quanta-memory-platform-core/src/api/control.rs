@@ -170,6 +170,7 @@ struct BrokerCore {
     rebuild_abandoned: bool,
     reclaimer: Option<Arc<dyn MemoryReclaimer>>,
     reclaim_stats: ReclaimRuntimeStats,
+    last_allocator_resident: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -632,6 +633,7 @@ impl LiveProcessMemoryBroker {
                 rebuild_abandoned: false,
                 reclaimer,
                 reclaim_stats: ReclaimRuntimeStats::default(),
+                last_allocator_resident: None,
             })),
             events,
             event_sink_active: Arc::new(AtomicBool::new(false)),
@@ -1891,7 +1893,10 @@ impl LiveProcessMemoryBroker {
             let core = self.lock()?;
             let snapshot = core.ledger.snapshot();
             snapshot.validate_exact()?;
-            let used = snapshot.checked_total_owner_bytes()?;
+            let used = match core.last_allocator_resident {
+                Some(resident) => resident,
+                None => snapshot.checked_total_owner_bytes()?,
+            };
             Ok(core.controller.update_from_semantic(used))
         })();
         self.emit_result(MemoryOperation::Pressure, None, &result);
@@ -1906,10 +1911,11 @@ impl LiveProcessMemoryBroker {
         snapshot: &AllocatorSnapshot,
     ) -> MemoryResult<AllocatorAdvisory> {
         let result = (|| {
-            let core = self.lock()?;
+            let mut core = self.lock()?;
             let semantic_snapshot = core.ledger.snapshot();
             semantic_snapshot.validate_exact()?;
             let semantic = semantic_snapshot.checked_total_owner_bytes()?;
+            core.last_allocator_resident = snapshot.resident_bytes;
             Ok(AllocatorAdvisory::compare(snapshot, semantic))
         })();
         let outcome = result.as_ref().map_or_else(Self::outcome, |advisory| {
