@@ -6,6 +6,21 @@ are review contracts, not automated gates. Do not claim a review-only rule is
 fail-closed. A Semgrep exception requires a trailing
 `// nosemgrep: <rule-id> -- reason: <…>`.
 
+### Before Behavioral Rust Changes
+
+1. Trace the real public entry point to the owning state and side effects.
+   Identify the invariant, charge axes/lifetimes, and unchanged state required
+   on rejection. Include callbacks, destructors and cleanup in failure paths.
+2. Choose a representation that preserves the invariant until use: private
+   validated fields, single-use authority, or an owned sealed execution handle.
+   A validation call on a builder that can still change is insufficient.
+3. Name a reachable wrong implementation and the independent observation that
+   distinguishes it. Reuse an adequate owner test; extend it when identity,
+   content, accounting axes, actual work or public dispatch is unobserved.
+4. Review the completed diff for alternate assignment forms, renamed bindings,
+   helper indirection and exceptions that bypass the intended boundary. A lint
+   pass proves only matched syntax; use compiler/runtime contracts for the rest.
+
 ### Design Questions Before Writing Code
 
 Apply the rows relevant to the changed owner; do not add unrelated machinery.

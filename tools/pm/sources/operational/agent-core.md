@@ -16,18 +16,5 @@
 - Put new traits in `ports/` and implementations in adapters or facade backings.
   Keep production backings feature-gated and testkit out of production graphs.
 - For public API changes, update re-exports and the real public examples.
-
-### Before Behavioral Rust Changes
-
-1. Trace the real public entry point to the owning state and side effects.
-   Identify the invariant, charge axes/lifetimes, and unchanged state required
-   on rejection. Include callbacks, destructors and cleanup in failure paths.
-2. Choose a representation that preserves the invariant until use: private
-   validated fields, single-use authority, or an owned sealed execution handle.
-   A validation call on a builder that can still change is insufficient.
-3. Name a reachable wrong implementation and the independent observation that
-   distinguishes it. Reuse an adequate owner test; extend it when identity,
-   content, accounting axes, actual work or public dispatch is unobserved.
-4. Review the completed diff for alternate assignment forms, renamed bindings,
-   helper indirection and exceptions that bypass the intended boundary. A lint
-   pass proves only matched syntax; use compiler/runtime contracts for the rest.
+- Before behavioral Rust changes, follow the pre-edit procedure in
+  `tools/pm/sources/rules/cheatsheet.md` and inspect the owning source/tests.
