@@ -48,7 +48,7 @@ loop_device=""
 loop_used=""
 mapping_created=false
 mounted=false
-# shellcheck disable=SC2329 # Called indirectly by EXIT trap.
+# shellcheck disable=SC2317,SC2329 # Called indirectly by EXIT trap; 0.9 and 0.11 report different codes.
 cleanup() {
   local status=$?
   trap - EXIT
