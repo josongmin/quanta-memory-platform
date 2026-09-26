@@ -37,14 +37,16 @@ trap 'rm -rf "${fixture}"' EXIT
 mkdir -p "${fixture}/scripts"
 cp scripts/regression-guards.sh "${fixture}/scripts/regression-guards.sh"
 expect_failure "missing semgrep config" "${fixture}/scripts/regression-guards.sh"
-expect_failure "missing semgrep binary" env PATH=/usr/bin:/bin scripts/regression-guards.sh
+# CircleCI's BASH_ENV prepends the installed tool directory in every child
+# Bash shell. Remove it when a fixture deliberately controls PATH.
+expect_failure "missing semgrep binary" env -u BASH_ENV PATH=/usr/bin:/bin scripts/regression-guards.sh
 mkdir -p "${fixture}/bin"
 cat > "${fixture}/bin/semgrep" <<'EOF'
 #!/usr/bin/env bash
 printf '{"paths":{"scanned":[]},"results":[],"errors":[]}\n'
 EOF
 chmod +x "${fixture}/bin/semgrep"
-expect_failure "zero-target semgrep scan" env PATH="${fixture}/bin:${PATH}" scripts/regression-guards.sh
+expect_failure "zero-target semgrep scan" env -u BASH_ENV PATH="${fixture}/bin:${PATH}" scripts/regression-guards.sh
 
 # Build one fixture corpus so Semgrep starts once. The result check below proves
 # every historical rule ID bites and the documented clean/suppressed cases stay
@@ -186,7 +188,7 @@ exec "${QMP_REAL_PYTHON}" "$@"
 EOF
 chmod +x "${fixture}/matrix-bin/cargo" "${fixture}/matrix-bin/python3"
 matrix_status=0
-env QMP_REAL_CARGO="$(command -v cargo)" QMP_REAL_PYTHON="$(command -v python3)" \
+env -u BASH_ENV QMP_REAL_CARGO="$(command -v cargo)" QMP_REAL_PYTHON="$(command -v python3)" \
   PATH="${fixture}/matrix-bin:${PATH}" scripts/verify-feature-matrix.sh \
   >/dev/null 2>&1 || matrix_status=$?
 if [[ "${matrix_status}" -ne 37 ]]; then
