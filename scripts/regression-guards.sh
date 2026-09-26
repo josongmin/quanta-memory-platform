@@ -27,7 +27,7 @@ scan_output="$(mktemp /tmp/qmp-semgrep-scan.XXXXXX)"
 trap 'rm -f -- "${scan_output}"' EXIT
 scan_status=0
 semgrep --config "${config}" --error --strict --metrics=off \
-  --disable-version-check --jobs=1 --include 'crates/**/*.rs' --json . \
+  --disable-version-check --jobs=1 --timeout=30 --include 'crates/**/*.rs' --json . \
   >"${scan_output}" || scan_status=$?
 python3 - "${scan_output}" <<'PY'
 import json
@@ -46,6 +46,8 @@ if not production or missing:
         + ", ".join(missing or ["<no production files found>"])
     )
 if scan.get("errors") or scan.get("results"):
+    for error in scan.get("errors", []):
+        print(f"regression-guards: {error.get('type')}: {error.get('message')}", file=sys.stderr)
     for result in scan.get("results", []):
         print(f"regression-guards: {result['check_id']}: {result['path']}", file=sys.stderr)
     raise SystemExit("regression-guards: Semgrep reported findings or errors")

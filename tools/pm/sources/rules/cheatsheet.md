@@ -19,7 +19,21 @@ fail-closed. A Semgrep exception requires a trailing
 | `x as i64` / `as i32` / `as i16` / `as i8` (sign-flips a magnitude — the `bytes as i64` ledger-corruption bug) | keep `u64` magnitudes with saturating/checked ops; `i64::try_from(..)?`; widen a signed *diff* to `i128` | regression-guards (`qmp-magnitude-as-signed`) |
 | `a.saturating_mul(b) / c` (saturates BEFORE the divide → under-reports the ratio: the pressure-percent / weighted-cap bug) | `u64::try_from(u128::from(a) * u128::from(b) / u128::from(c))` | regression-guards (`qmp-saturating-mul-then-divide`) |
 | `Atomic::fetch_sub(..)` on a counter (can underflow → wraps to MAX: the spilled-count drift) | saturating CAS: `c.fetch_update(SeqCst, SeqCst, \|v\| Some(v.saturating_sub(n)))` | regression-guards (`qmp-atomic-fetch-sub`) |
-| wrapping arithmetic on byte/budget counters | `checked_add` / `saturating_sub` per the documented invariant | review (ledger correctness) |
+| wrapping multiply followed by division | widen the product to `u128` before division | regression-guards (`qmp-wrapping-mul-then-divide`) |
+| saturation in exact `UsageBreakdown` / `LedgerSnapshot` arithmetic | checked arithmetic after full postimage validation | regression-guards (`qmp-exact-ledger-no-saturation`) |
+| whole-owner iteration or snapshot copy in release preflight | keyed owner reads; preserve metered work tests | regression-guards (`qmp-release-preflight-no-owner-scan`); indirect work remains runtime-tested |
+| fair-share precomputation inside scheduler admission | borrow the construction-time table | regression-guards (`qmp-admission-no-share-recompute`) |
+| semantic pressure update inside allocator observation | compare advisory telemetry to semantic usage | regression-guards (`qmp-allocator-observation-no-pressure-write`) |
+| direct scratch-peak replacement | `max(previous, observed)` | regression-guards (`qmp-scratch-peak-monotonic`) |
+| public pressure-threshold fields | private fields and validated construction | regression-guards (`qmp-threshold-fields-private`); compile-fail contract |
+| persistent prepared-publication lease charged as payload | `RetainedMetadata` for identity/tombstone lifetime | regression-guards (`qmp-persistent-publication-metadata-kind`); independent axis oracle |
+| shared/fixed payload-store seed initialization | fresh `RandomState::new()` for each store | regression-guards (`qmp-store-digest-seed-construction`); real-store seed oracle |
+| unused `.ok()` on release/rollback/restore cleanup | handle the error and retain exact recovery authority | regression-guards (`qmp-cleanup-result-not-erased`); production `let _ =` also Clippy |
+| legacy finalized watermark read/write in production | exact record disposition and generation proof | regression-guards (`qmp-durable-no-watermark-resolution`); legacy fixtures permitted |
+| public kit dispatcher manufacturing Passed | return the real conformance fold | regression-guards (`qmp-kit-no-constant-pass`); public negative pole |
+| facade suite dropping a required store slice | compose all four slices | regression-guards (`qmp-facade-suite-required-slices`); runtime assertion-name inventory |
+| test-binary subprocess launch without selection guard | `require_one_test()` before launch | regression-guards (`qmp-isolated-child-requires-selection-guard`); actual selection verified at runtime |
+| other wrapping arithmetic on byte/budget counters | checked arithmetic per the documented invariant | review (ledger correctness) |
 | live reconfigure / policy swap that re-checks only future reserves, not the CURRENT resident usage (e.g. raising `headroom_bytes` over live non-Headroom bytes) | re-validate the live snapshot against the NEW policy and fail-closed before installing it | review (ledger invariant 5) |
 | byte-target sweep/reclaim loop that breaks only on `reclaimed >= target` | also handle zero-contribution entries / exhaustion so a positive target can't over-evict (skip zero-byte entries) | review |
 | durable-queue FIFO key taken from an atomic counter OUTSIDE the write txn | derive the next key from the table INSIDE the write transaction (atomic, restart-safe, no skipped/duplicate keys) | review (spill backing) |

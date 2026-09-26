@@ -1,4 +1,4 @@
-# Regression guards for bug classes found during the 2026-06 audit sweep.
+# Regression guards for accounting and Sep-26 bugbash regressions.
 #
 # Each rule pins a SPECIFIC defect this codebase already hit, so the same shape
 # cannot silently come back. They are intentionally narrow (the broad clippy cast
@@ -50,6 +50,190 @@ rules:
       `// nosemgrep: qmp-atomic-fetch-sub -- reason: <why>`.
     patterns:
       - pattern: $A.fetch_sub($N, $O)
+
+  - id: qmp-wrapping-mul-then-divide
+    languages: [rust]
+    severity: ERROR
+    message: A wrapping product under-reports pressure ratios. Widen the product to u128 before division.
+    pattern: $A.wrapping_mul($B) / $C
+
+  - id: qmp-exact-ledger-no-saturation
+    languages: [rust]
+    severity: ERROR
+    message: Exact ledger slots and totals must reject overflow/underflow rather than hide it with saturation. Use checked arithmetic after preflight.
+    paths:
+      include: [/crates/quanta-memory-platform-core/src/domain/ledger.rs]
+    patterns:
+      - pattern-either:
+          - pattern-inside: |
+              impl UsageBreakdown { ... }
+          - pattern-inside: |
+              impl LedgerSnapshot { ... }
+      - pattern-either:
+          - pattern: $A.saturating_add($B)
+          - pattern: $A.saturating_sub($B)
+          - pattern: u64::saturating_add
+          - pattern: u64::saturating_sub
+
+  - id: qmp-release-preflight-no-owner-scan
+    languages: [rust]
+    severity: ERROR
+    message: Release preflight must use keyed owner reads, not whole-owner iteration or snapshot copying. Keep the metered complexity oracle too.
+    paths:
+      include: [/crates/quanta-memory-platform-core/src/domain/ledger.rs]
+    patterns:
+      - pattern-inside: |
+          fn preflight_release_batch(...) -> $RET { ... }
+      - pattern-either:
+          - pattern: self.owner_usage.iter()
+          - pattern: self.owner_usage.values()
+          - pattern: self.owner_usage.keys()
+          - pattern: self.owner_usage.into_iter()
+          - pattern: self.snapshot()
+          - pattern: for $ITEM in &self.owner_usage { ... }
+
+  - id: qmp-admission-no-share-recompute
+    languages: [rust]
+    severity: ERROR
+    message: Admission must borrow the cached fair-share table. Precompute shares when constructing the scheduler.
+    paths:
+      include: [/crates/quanta-memory-platform-core/src/application/scheduler.rs]
+    patterns:
+      - pattern-inside: |
+          fn admits(...) -> $RET { ... }
+      - pattern: admission::precompute_fair_burst_shares(...)
+
+  - id: qmp-allocator-observation-no-pressure-write
+    languages: [rust]
+    severity: ERROR
+    message: Allocator observation is advisory and cannot update semantic pressure. Keep ledger/cache postimage tests.
+    paths:
+      include: [/crates/quanta-memory-platform-core/src/api/control.rs]
+    patterns:
+      - pattern-inside: |
+          pub fn observe_allocator(...) -> $RET { ... }
+      - pattern: $CONTROLLER.update_from_semantic(...)
+
+  - id: qmp-scratch-peak-monotonic
+    languages: [rust]
+    severity: ERROR
+    message: Scratch observation is a high-water mark. Update it with max(previous, observed).
+    paths:
+      include: [/crates/quanta-memory-platform-core/src/ports/scratch.rs]
+    patterns:
+      - pattern-inside: |
+          pub fn grow_to_observed(...) -> $RET { ... }
+      - pattern: self.observed_bytes = $VALUE
+      - pattern-not: self.observed_bytes = self.observed_bytes.max($OBSERVED)
+
+  - id: qmp-threshold-fields-private
+    languages: [rust]
+    severity: ERROR
+    message: Pressure thresholds must remain sealed behind validated constructors; public fields bypass validation.
+    paths:
+      include: [/crates/quanta-memory-platform-core/src/application/controller.rs]
+    pattern-either:
+      - pattern: 'pub struct PressureThresholds { ..., pub $FIELD: $TYPE, ... }'
+      - pattern: 'pub struct PressureThresholds { ..., pub(crate) $FIELD: $TYPE, ... }'
+
+  - id: qmp-persistent-publication-metadata-kind
+    languages: [rust]
+    severity: ERROR
+    message: The persistent identity/tombstone lease must be RetainedMetadata, independently of the active payload lease.
+    paths:
+      include: [/crates/quanta-memory-platform-facade/src/publish_pipeline/prepared_publication.rs]
+    patterns:
+      - pattern: let persistent_charge = $ACCOUNTING.charge($CLASS, $OWNER, $CONTEXT, $KIND, $BYTES).map_err(...);
+      - metavariable-pattern:
+          metavariable: $KIND
+          patterns:
+            - pattern-not: ChargeKind::RetainedMetadata
+
+  - id: qmp-store-digest-seed-construction
+    languages: [rust]
+    severity: ERROR
+    message: Construct a fresh RandomState for each payload store. A shared or deterministic seed permits cross-store bucket grinding.
+    paths:
+      include: [/crates/quanta-memory-platform-facade/src/payload_store/service.rs]
+    patterns:
+      - pattern-inside: |
+          fn with_accounting(...) -> $RET { ... }
+      - pattern-regex: '\bdigest_seed\s*:\s*(?!RandomState\s*::\s*new\s*\(\s*\))\S'
+
+  - id: qmp-cleanup-result-not-erased
+    languages: [rust]
+    severity: ERROR
+    message: Preserve cleanup errors and exact rollback authority. Do not turn a release/rollback Result into an unused Option.
+    pattern-either:
+      - pattern: $OWNER.release(...).ok();
+      - pattern: $OWNER.rollback_pending(...).ok();
+      - pattern: $OWNER.abort_restore(...).ok();
+      - pattern: $OWNER.finalize_restore(...).ok();
+
+  - id: qmp-durable-no-watermark-resolution
+    languages: [rust]
+    severity: ERROR
+    message: The legacy finalized watermark cannot distinguish reserved holes. Resolve records from exact disposition/proof rows.
+    paths:
+      include: [/crates/quanta-memory-platform-facade/src/spill/backings/redb.rs]
+    patterns:
+      - pattern-either:
+          - pattern: $TABLE.get(FINALIZED_THROUGH)
+          - pattern: $TABLE.insert(FINALIZED_THROUGH, ...)
+      - pattern-not-inside: |
+          mod tests { ... }
+
+  - id: qmp-kit-no-constant-pass
+    languages: [rust]
+    severity: ERROR
+    message: The public kit dispatcher must fold the actual conformance suite, never manufacture a Passed verdict.
+    paths:
+      include: [/crates/quanta-memory-platform-testkit/src/fixtures/mod.rs]
+    patterns:
+      - pattern-inside: |
+          pub fn run_conformance(...) -> $RET { ... }
+      - pattern: ConformanceVerdict::Passed
+
+  - id: qmp-facade-suite-required-slices
+    languages: [rust]
+    severity: ERROR
+    message: The facade suite must compose payload, retained-map, transcript and spill slices. Runtime assertion-name inventory remains authoritative for completeness.
+    paths:
+      include: [/crates/quanta-memory-platform-testkit/src/conformance/suites.rs]
+    pattern-either:
+      - patterns:
+          - pattern: pub fn run_facade_store_suite(...) -> $RET { ... }
+          - pattern-not: pub fn run_facade_store_suite(...) -> $RET { ... run_payload_store_slice(...); ... }
+      - patterns:
+          - pattern: pub fn run_facade_store_suite(...) -> $RET { ... }
+          - pattern-not: pub fn run_facade_store_suite(...) -> $RET { ... run_retained_map_slice(...); ... }
+      - patterns:
+          - pattern: pub fn run_facade_store_suite(...) -> $RET { ... }
+          - pattern-not: pub fn run_facade_store_suite(...) -> $RET { ... run_transcript_slice(...); ... }
+      - patterns:
+          - pattern: pub fn run_facade_store_suite(...) -> $RET { ... }
+          - pattern-not: pub fn run_facade_store_suite(...) -> $RET { ... run_spill_slice(...); ... }
+
+  - id: qmp-isolated-child-requires-selection-guard
+    languages: [rust]
+    severity: ERROR
+    message: Test-binary subprocesses must require_one_test before launch. Exit zero alone also succeeds for stale filters.
+    paths:
+      include: [/crates/quanta-memory-platform-facade/src/**/*.rs]
+      exclude: [/crates/quanta-memory-platform-facade/src/test_support.rs]
+    mode: taint
+    pattern-sources:
+      - pattern: std::env::current_exe(...)
+    pattern-sanitizers:
+      - patterns:
+          - pattern: $COMMAND.require_one_test()
+          - focus-metavariable: $COMMAND
+        by-side-effect: true
+    pattern-sinks:
+      - pattern-either:
+          - pattern: $COMMAND.output()
+          - pattern: $COMMAND.spawn()
+          - pattern: $COMMAND.status()
 
   - id: qmp-pure-layer-no-fs-env
     languages: [rust]

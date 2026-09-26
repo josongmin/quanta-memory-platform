@@ -7,6 +7,11 @@ Semgrep regression guards, the Cargo feature matrix, workspace tests, isolated
 feature capability tests, documented selector validation, generated-guidance
 drift, and dependency policy.
 
+Semgrep contracts execute the actual engine against repository-shaped rejecting
+and permitted fixtures for every rule. Missing rule fixtures, skipped source
+files, parse errors and timeouts fail closed. Per-rule scan timeout is 30 seconds;
+this accommodates large owner files without accepting incomplete scans.
+
 ```bash
 scripts/check-workspace.sh
 ```

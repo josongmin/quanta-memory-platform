@@ -2688,6 +2688,7 @@ mod tests {
                 .arg("retained_map::service::tests::charged::sweep_multiple_panicking_destructors_does_not_abort_process")
                 .arg("--nocapture")
                 .env(CHILD, "1")
+                .require_one_test()
                 .output()
                 .expect("run isolated destructor-panic scenario");
             assert!(

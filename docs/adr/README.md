@@ -11,6 +11,7 @@ future SDK design has shipped.
 | [0003 — Source-bound qualification](0003-source-bound-qualification.md) | Tests, benchmark claims, extraction, CI, and host proof |
 | [0004 — Host adoption without duplicate authority](0004-host-adoption-boundary.md) | Semantica composition, execution limits, and memo retention |
 | [0005 — Regression oracle acceptance](0005-regression-oracle-acceptance.md) | Fake provenance, behavioral mutations, dispatcher and subprocess proof |
+| [0006 — Bugbash static regression guards](0006-bugbash-static-regression-guards.md) | Executed AST fixtures, owner-scoped prevention and runtime proof boundaries |
 
 The [0.3 SDK RFC](../rfcs/0001-sdk-interface-contract.md) is an accepted design
 target that is not implemented or qualified; it is not a shipped 0.2 decision. The

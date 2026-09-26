@@ -81,6 +81,8 @@ SELF_HOSTING_REQUIRED_PATHS=(
   "scripts/tests/test_run_cargo_test.py"
   "scripts/tests/test_workspace_policy.py"
   "scripts/tests/test_semgrep_suppressions.py"
+  "scripts/tests/test_regression_rules.py"
+  "scripts/tests/fixtures/semgrep"
   "scripts/tests/test_python_contract_runner.py"
   "scripts/tests/test_hosted_ci_binding.py"
   "scripts/tests/test_rust_test_output.py"
