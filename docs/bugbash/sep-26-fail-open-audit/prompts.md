@@ -1,9 +1,26 @@
 # Fail-open test audit — copy-paste prompts (sep-26 round)
 
 11 self-contained prompts. Run 01–09 in parallel (disjoint file ownership, no
-conflicts). Run 10 (critic) after 01–09 reports exist. Run 11 (synthesis) last.
+conflicts). Run 10 (critic) after the 01–09 findings exist. Run 11
+(synthesis) last.
 
-Round directory for all reports: `docs/bugbash/sep-26-fail-open-deep/`
+Round directory for all reports: `docs/bugbash/sep-26-fail-open-audit/`
+Naming convention: every report is `findings-{범위}.md` (scope slug in
+english, kebab-case). The synthesis index stays `99-index.md`.
+
+| # | Scope slug | Report file |
+|---|---|---|
+| 01 | core-domain | `findings-core-domain.md` |
+| 02 | core-api | `findings-core-api.md` |
+| 03 | app-ports | `findings-app-ports.md` |
+| 04 | revocable-store | `findings-revocable-store.md` |
+| 05 | facade-stores | `findings-facade-stores.md` |
+| 06 | spill-redb | `findings-spill-redb.md` |
+| 07 | crash-rails | `findings-crash-rails.md` |
+| 08 | pipeline-shared | `findings-pipeline-shared.md` |
+| 09 | testkit | `findings-testkit.md` |
+| 10 | critic | `findings-critic.md` |
+| 11 | synthesis | `99-index.md` |
 
 ---
 
@@ -21,9 +38,9 @@ leaves state untouched. Allocator telemetry is advisory only. Tests exist to
 catch real regressions, not merely to import modules.
 
 GROUND RULES (hard):
-- READ-ONLY for code. You may create exactly ONE new file: your report at
-  docs/bugbash/sep-26-fail-open-deep/t01-core-domain.md. No other edits,
-  no `pm sync`, no commits.
+- READ-ONLY for code. You may create exactly ONE new file, your report:
+  docs/bugbash/sep-26-fail-open-audit/findings-core-domain.md
+  No other edits, no `pm sync`, no commits.
 - The worktree has unrelated dirty changes (README.md, README-detailed.md,
   facade/tests/spill_redb_kill_reopen.rs, deleted
   docs/bugbash/sep-22-test-optimization-deep/**). Leave them untouched.
@@ -83,7 +100,8 @@ or equivalent), or only that an Err came back? An Err-with-corrupted-state is
 exactly the bug class this repo must never ship. Also check: are error paths
 asserted with exact variants, or just is_err()?
 
-REPORT FORMAT (docs/bugbash/sep-26-fail-open-deep/t01-core-domain.md):
+REPORT FORMAT — write your findings to
+docs/bugbash/sep-26-fail-open-audit/findings-core-domain.md:
 - Header: scope file list, your grep counts per file, your row count.
 - Census table: | test fn (file:line) | verdict | mechanism / reason |
   minimal fix | critic mutation |
@@ -96,7 +114,8 @@ REPORT FORMAT (docs/bugbash/sep-26-fail-open-deep/t01-core-domain.md):
 FINISH CHECKLIST:
 - Row count == grep count; both numbers stated in the header.
 - Every FAILOPEN/VACUOUS row has a concrete critic mutation.
-- `git status --porcelain` shows no changes except your report file.
+- `git status --porcelain` shows no changes except your report file
+  (docs/bugbash/sep-26-fail-open-audit/findings-core-domain.md).
 ```
 
 ---
@@ -115,9 +134,9 @@ leaves state untouched. Allocator telemetry is advisory only. Tests exist to
 catch real regressions, not merely to import modules.
 
 GROUND RULES (hard):
-- READ-ONLY for code. You may create exactly ONE new file: your report at
-  docs/bugbash/sep-26-fail-open-deep/t02-core-api.md. No other edits,
-  no `pm sync`, no commits.
+- READ-ONLY for code. You may create exactly ONE new file, your report:
+  docs/bugbash/sep-26-fail-open-audit/findings-core-api.md
+  No other edits, no `pm sync`, no commits.
 - The worktree has unrelated dirty changes (README.md, README-detailed.md,
   facade/tests/spill_redb_kill_reopen.rs, deleted
   docs/bugbash/sep-22-test-optimization-deep/**). Leave them untouched.
@@ -178,7 +197,8 @@ signatures (extraction contract — see EXTRACTION.md), but flag any that only
 "use" an item without locking its shape, and any behavior claim hiding inside
 a surface test.
 
-REPORT FORMAT (docs/bugbash/sep-26-fail-open-deep/t02-core-api.md):
+REPORT FORMAT — write your findings to
+docs/bugbash/sep-26-fail-open-audit/findings-core-api.md:
 - Header: scope file list, your grep counts per file, your row count.
 - Census table: | test fn (file:line) | verdict | mechanism / reason |
   minimal fix | critic mutation |
@@ -190,7 +210,8 @@ REPORT FORMAT (docs/bugbash/sep-26-fail-open-deep/t02-core-api.md):
 FINISH CHECKLIST:
 - Row count == grep count; both numbers stated in the header.
 - Every FAILOPEN/VACUOUS row has a concrete critic mutation.
-- `git status --porcelain` shows no changes except your report file.
+- `git status --porcelain` shows no changes except your report file
+  (docs/bugbash/sep-26-fail-open-audit/findings-core-api.md).
 ```
 
 ---
@@ -209,9 +230,9 @@ leaves state untouched. Allocator telemetry is advisory only. Tests exist to
 catch real regressions, not merely to import modules.
 
 GROUND RULES (hard):
-- READ-ONLY for code. You may create exactly ONE new file: your report at
-  docs/bugbash/sep-26-fail-open-deep/t03-app-ports.md. No other edits,
-  no `pm sync`, no commits.
+- READ-ONLY for code. You may create exactly ONE new file, your report:
+  docs/bugbash/sep-26-fail-open-audit/findings-app-ports.md
+  No other edits, no `pm sync`, no commits.
 - The worktree has unrelated dirty changes (README.md, README-detailed.md,
   facade/tests/spill_redb_kill_reopen.rs, deleted
   docs/bugbash/sep-22-test-optimization-deep/**). Leave them untouched.
@@ -261,7 +282,8 @@ and the test would still pass. KNOWN LEADS to verify:
 - ports/telemetry.rs: are the trait-level tests asserting behavior or just
   wiring?
 
-REPORT FORMAT (docs/bugbash/sep-26-fail-open-deep/t03-app-ports.md):
+REPORT FORMAT — write your findings to
+docs/bugbash/sep-26-fail-open-audit/findings-app-ports.md:
 - Header: scope file list, your grep counts per file, your row count.
 - Census table: | test fn (file:line) | verdict | mechanism / reason |
   minimal fix | critic mutation |
@@ -273,7 +295,8 @@ REPORT FORMAT (docs/bugbash/sep-26-fail-open-deep/t03-app-ports.md):
 FINISH CHECKLIST:
 - Row count == grep count; both numbers stated in the header.
 - Every FAILOPEN/VACUOUS row has a concrete critic mutation.
-- `git status --porcelain` shows no changes except your report file.
+- `git status --porcelain` shows no changes except your report file
+  (docs/bugbash/sep-26-fail-open-audit/findings-app-ports.md).
 ```
 
 ---
@@ -292,9 +315,9 @@ leaves state untouched. Allocator telemetry is advisory only. Tests exist to
 catch real regressions, not merely to import modules.
 
 GROUND RULES (hard):
-- READ-ONLY for code. You may create exactly ONE new file: your report at
-  docs/bugbash/sep-26-fail-open-deep/t04-revocable-store.md. No other edits,
-  no `pm sync`, no commits.
+- READ-ONLY for code. You may create exactly ONE new file, your report:
+  docs/bugbash/sep-26-fail-open-audit/findings-revocable-store.md
+  No other edits, no `pm sync`, no commits.
 - The worktree has unrelated dirty changes (README.md, README-detailed.md,
   facade/tests/spill_redb_kill_reopen.rs, deleted
   docs/bugbash/sep-22-test-optimization-deep/**). Leave them untouched.
@@ -342,7 +365,8 @@ claims to verify — a fail-open). Quote each ambiguous one. KNOWN LEADS:
   preservation): does the test assert WHERE the panic came from and that the
   payload survived intact, or only that some panic happened?
 
-REPORT FORMAT (docs/bugbash/sep-26-fail-open-deep/t04-revocable-store.md):
+REPORT FORMAT — write your findings to
+docs/bugbash/sep-26-fail-open-audit/findings-revocable-store.md:
 - Header: scope file list, your grep counts per file, your row count.
 - Census table: | test fn (file:line) | verdict | mechanism / reason |
   minimal fix | critic mutation |
@@ -352,7 +376,8 @@ REPORT FORMAT (docs/bugbash/sep-26-fail-open-deep/t04-revocable-store.md):
 FINISH CHECKLIST:
 - Row count == grep count; both numbers stated in the header.
 - Every FAILOPEN/VACUOUS row has a concrete critic mutation.
-- `git status --porcelain` shows no changes except your report file.
+- `git status --porcelain` shows no changes except your report file
+  (docs/bugbash/sep-26-fail-open-audit/findings-revocable-store.md).
 ```
 
 ---
@@ -371,9 +396,9 @@ leaves state untouched. Allocator telemetry is advisory only. Tests exist to
 catch real regressions, not merely to import modules.
 
 GROUND RULES (hard):
-- READ-ONLY for code. You may create exactly ONE new file: your report at
-  docs/bugbash/sep-26-fail-open-deep/t05-facade-stores.md. No other edits,
-  no `pm sync`, no commits.
+- READ-ONLY for code. You may create exactly ONE new file, your report:
+  docs/bugbash/sep-26-fail-open-audit/findings-facade-stores.md
+  No other edits, no `pm sync`, no commits.
 - The worktree has unrelated dirty changes (README.md, README-detailed.md,
   facade/tests/spill_redb_kill_reopen.rs, deleted
   docs/bugbash/sep-22-test-optimization-deep/**). Leave them untouched.
@@ -420,7 +445,8 @@ KNOWN LEADS:
   (exercise_endpoint_point_operations_without_linear_probe_growth) and verify
   its end asserts are reachable for the arguments passed.
 
-REPORT FORMAT (docs/bugbash/sep-26-fail-open-deep/t05-facade-stores.md):
+REPORT FORMAT — write your findings to
+docs/bugbash/sep-26-fail-open-audit/findings-facade-stores.md:
 - Header: scope file list, your grep counts per file, your row count.
 - Census table: | test fn (file:line) | verdict | mechanism / reason |
   minimal fix | critic mutation |
@@ -430,7 +456,8 @@ REPORT FORMAT (docs/bugbash/sep-26-fail-open-deep/t05-facade-stores.md):
 FINISH CHECKLIST:
 - Row count == grep count; both numbers stated in the header.
 - Every FAILOPEN/VACUOUS row has a concrete critic mutation.
-- `git status --porcelain` shows no changes except your report file.
+- `git status --porcelain` shows no changes except your report file
+  (docs/bugbash/sep-26-fail-open-audit/findings-facade-stores.md).
 ```
 
 ---
@@ -449,9 +476,9 @@ leaves state untouched. Allocator telemetry is advisory only. Tests exist to
 catch real regressions, not merely to import modules.
 
 GROUND RULES (hard):
-- READ-ONLY for code. You may create exactly ONE new file: your report at
-  docs/bugbash/sep-26-fail-open-deep/t06-spill-redb.md. No other edits,
-  no `pm sync`, no commits.
+- READ-ONLY for code. You may create exactly ONE new file, your report:
+  docs/bugbash/sep-26-fail-open-audit/findings-spill-redb.md
+  No other edits, no `pm sync`, no commits.
 - The worktree has unrelated dirty changes (README.md, README-detailed.md,
   facade/tests/spill_redb_kill_reopen.rs, deleted
   docs/bugbash/sep-22-test-optimization-deep/**). Leave them untouched.
@@ -497,7 +524,8 @@ from an earlier, unrelated check). Also: redb round-trip tests — byte-for-byte
 content equality on restore, and does any test verify the record content
 after reopen rather than only key existence?
 
-REPORT FORMAT (docs/bugbash/sep-26-fail-open-deep/t06-spill-redb.md):
+REPORT FORMAT — write your findings to
+docs/bugbash/sep-26-fail-open-audit/findings-spill-redb.md:
 - Header: scope file list, your grep counts per file, your row count.
 - Census table: | test fn (file:line) | verdict | mechanism / reason |
   minimal fix | critic mutation |
@@ -508,7 +536,8 @@ REPORT FORMAT (docs/bugbash/sep-26-fail-open-deep/t06-spill-redb.md):
 FINISH CHECKLIST:
 - Row count == grep count; both numbers stated in the header.
 - Every FAILOPEN/VACUOUS row has a concrete critic mutation.
-- `git status --porcelain` shows no changes except your report file.
+- `git status --porcelain` shows no changes except your report file
+  (docs/bugbash/sep-26-fail-open-audit/findings-spill-redb.md).
 ```
 
 ---
@@ -527,9 +556,9 @@ leaves state untouched. Allocator telemetry is advisory only. Tests exist to
 catch real regressions, not merely to import modules.
 
 GROUND RULES (hard):
-- READ-ONLY for code. You may create exactly ONE new file: your report at
-  docs/bugbash/sep-26-fail-open-deep/t07-crash-rails.md. No other edits,
-  no `pm sync`, no commits.
+- READ-ONLY for code. You may create exactly ONE new file, your report:
+  docs/bugbash/sep-26-fail-open-audit/findings-crash-rails.md
+  No other edits, no `pm sync`, no commits.
 - The worktree has unrelated dirty changes (README.md, README-detailed.md,
   facade/tests/spill_redb_kill_reopen.rs — which is IN YOUR SCOPE in its
   current working-tree form — and deleted
@@ -585,7 +614,8 @@ crash actually land where the test claims? For every kill/crash rail:
    asserted post-crash invariants ledger-level (fail-closed) or merely
    process-level ("it didn't hang")?
 
-REPORT FORMAT (docs/bugbash/sep-26-fail-open-deep/t07-crash-rails.md):
+REPORT FORMAT — write your findings to
+docs/bugbash/sep-26-fail-open-audit/findings-crash-rails.md:
 - Header: scope file list, your grep counts per file, your row count.
 - Census table: | test fn (file:line) | verdict | mechanism / reason |
   minimal fix | critic mutation |
@@ -597,7 +627,8 @@ FINISH CHECKLIST:
 - Row count == grep count; both numbers stated in the header.
 - Every FAILOPEN/VACUOUS row has a concrete critic mutation (for child-process
   rails the mutation may target the child example source — name the file).
-- `git status --porcelain` shows no changes except your report file.
+- `git status --porcelain` shows no changes except your report file
+  (docs/bugbash/sep-26-fail-open-audit/findings-crash-rails.md).
 ```
 
 ---
@@ -616,9 +647,9 @@ leaves state untouched. Allocator telemetry is advisory only. Tests exist to
 catch real regressions, not merely to import modules.
 
 GROUND RULES (hard):
-- READ-ONLY for code. You may create exactly ONE new file: your report at
-  docs/bugbash/sep-26-fail-open-deep/t08-pipeline-shared.md. No other edits,
-  no `pm sync`, no commits.
+- READ-ONLY for code. You may create exactly ONE new file, your report:
+  docs/bugbash/sep-26-fail-open-audit/findings-pipeline-shared.md
+  No other edits, no `pm sync`, no commits.
 - The worktree has unrelated dirty changes (README.md, README-detailed.md,
   facade/tests/spill_redb_kill_reopen.rs, deleted
   docs/bugbash/sep-22-test-optimization-deep/**). Leave them untouched.
@@ -666,7 +697,8 @@ lock paths and signatures (extraction contract — EXTRACTION.md), but flag any
 item that is merely "used" without its shape being locked, and any behavior
 claim hiding inside a surface test.
 
-REPORT FORMAT (docs/bugbash/sep-26-fail-open-deep/t08-pipeline-shared.md):
+REPORT FORMAT — write your findings to
+docs/bugbash/sep-26-fail-open-audit/findings-pipeline-shared.md:
 - Header: scope file list, your grep counts per file, your row count.
 - Census table: | test fn (file:line) | verdict | mechanism / reason |
   minimal fix | critic mutation |
@@ -677,7 +709,8 @@ REPORT FORMAT (docs/bugbash/sep-26-fail-open-deep/t08-pipeline-shared.md):
 FINISH CHECKLIST:
 - Row count == grep count; both numbers stated in the header.
 - Every FAILOPEN/VACUOUS row has a concrete critic mutation.
-- `git status --porcelain` shows no changes except your report file.
+- `git status --porcelain` shows no changes except your report file
+  (docs/bugbash/sep-26-fail-open-audit/findings-pipeline-shared.md).
 ```
 
 ---
@@ -696,9 +729,9 @@ leaves state untouched. Allocator telemetry is advisory only. Conformance
 must reject a broken fake, not only accept honest implementations.
 
 GROUND RULES (hard):
-- READ-ONLY for code. You may create exactly ONE new file: your report at
-  docs/bugbash/sep-26-fail-open-deep/t09-testkit.md. No other edits,
-  no `pm sync`, no commits.
+- READ-ONLY for code. You may create exactly ONE new file, your report:
+  docs/bugbash/sep-26-fail-open-audit/findings-testkit.md
+  No other edits, no `pm sync`, no commits.
 - The worktree has unrelated dirty changes (README.md, README-detailed.md,
   facade/tests/spill_redb_kill_reopen.rs, deleted
   docs/bugbash/sep-22-test-optimization-deep/**). Leave them untouched.
@@ -756,7 +789,8 @@ fail because the oracle itself computes the expected value from the SUT
 Also: fake/broker.rs — if the fake used by all conformance runs has a bug,
 which suite test would catch it? If none, that is a finding.
 
-REPORT FORMAT (docs/bugbash/sep-26-fail-open-deep/t09-testkit.md):
+REPORT FORMAT — write your findings to
+docs/bugbash/sep-26-fail-open-audit/findings-testkit.md:
 - Header: scope file list, your grep counts per file, your row count.
 - Census table: | test fn (file:line) | verdict | mechanism / reason |
   minimal fix | critic mutation |
@@ -766,7 +800,8 @@ REPORT FORMAT (docs/bugbash/sep-26-fail-open-deep/t09-testkit.md):
 FINISH CHECKLIST:
 - Row count == grep count; both numbers stated in the header.
 - Every FAILOPEN/VACUOUS row has a concrete critic mutation.
-- `git status --porcelain` shows no changes except your report file.
+- `git status --porcelain` shows no changes except your report file
+  (docs/bugbash/sep-26-fail-open-audit/findings-testkit.md).
 ```
 
 ---
@@ -777,8 +812,11 @@ FINISH CHECKLIST:
 You are the CRITIC of a parallel fail-open test audit of the repo at
 /Users/songmin/Documents/code-new/quanta-memory-platform (cd there first; verify with pwd).
 
-Your job: the auditor reports t01..t09 exist under
-docs/bugbash/sep-26-fail-open-deep/. If any tNN report is missing, state
+Your job: the auditor findings live under docs/bugbash/sep-26-fail-open-audit/
+as findings-core-domain.md, findings-core-api.md, findings-app-ports.md,
+findings-revocable-store.md, findings-facade-stores.md,
+findings-spill-redb.md, findings-crash-rails.md,
+findings-pipeline-shared.md, findings-testkit.md. If any is missing, state
 which and audit only what exists.
 
 WHY YOU EXIST: fail-open means "the SUT breaks and the test stays green".
@@ -796,15 +834,15 @@ SAFETY (hard rules):
 - For EVERY mutation you apply: run the scoped test, then IMMEDIATELY restore
   with `git checkout -- <file>` (only ever files YOU mutated). Never commit.
   Never run scripts that write outside /tmp and your report file.
-- You may create exactly ONE new file:
-  docs/bugbash/sep-26-fail-open-deep/critic-mutation.md
+- You may create exactly ONE new file, your report:
+  docs/bugbash/sep-26-fail-open-audit/findings-critic.md
 - At the end: git status --porcelain must equal the baseline snapshot except
   for your report file. State this comparison in your report.
 
 TASKS:
-1. CENSUS AUDIT: for each tNN report, re-count the test fns in its scope
-   files (grep #[test] and #[tokio::test]) and compare with the report's
-   claimed row count. Mismatch = reject the report (list it).
+1. CENSUS AUDIT: for each findings-{scope}.md report, re-count the test fns
+   in its scope files (grep #[test] and #[tokio::test]) and compare with the
+   report's claimed row count. Mismatch = reject the report (list it).
 2. MUTATION VERIFICATION: for EVERY row verdicted FAILOPEN or VACUOUS (and a
    random sample of at least 5 WEAK rows per report):
    a. Read the finding's critic-mutation suggestion. Apply the minimal SUT
@@ -825,10 +863,11 @@ TASKS:
 3. SPOT CHECK: open bodies of 5 random census rows per report and judge
    whether the verdict is plausible; flag clear misverdicts.
 
-REPORT FORMAT (docs/bugbash/sep-26-fail-open-deep/critic-mutation.md):
+REPORT FORMAT — write your results to
+docs/bugbash/sep-26-fail-open-audit/findings-critic.md:
 - Summary: reports checked, census pass/fail per report.
-- Per finding: | tNN | test fn | auditor verdict | mutation applied (file:line,
-  one line) | test result | critic verdict |.
+- Per finding: | findings-{scope} | test fn | auditor verdict | mutation
+  applied (file:line, one line) | test result | critic verdict |.
 - Final confirmed fail-open inventory (CONFIRMED rows only), each with the
   mutation that proved it — this inventory is the input for the fix phase.
 - Safety attestation: baseline comparison result.
@@ -845,11 +884,13 @@ to the auditors' reports and the synthesis step.
 You are the SYNTHESIS step of a parallel fail-open test audit of the repo at
 /Users/songmin/Documents/code-new/quanta-memory-platform (cd there first; verify with pwd).
 
-Inputs (all under docs/bugbash/sep-26-fail-open-deep/): t01..t09 census
-reports + critic-mutation.md. If some are missing, synthesize what exists and
-say so up front.
+Inputs (all under docs/bugbash/sep-26-fail-open-audit/): the nine
+findings-{scope}.md census reports (core-domain, core-api, app-ports,
+revocable-store, facade-stores, spill-redb, crash-rails, pipeline-shared,
+testkit) plus findings-critic.md. If some are missing, synthesize what exists
+and say so up front.
 
-TASK: produce docs/bugbash/sep-26-fail-open-deep/99-index.md — the round's
+TASK: produce docs/bugbash/sep-26-fail-open-audit/99-index.md — the round's
 single decision document. NO code changes; this is the only file you create.
 
 Contents (in this order):
@@ -863,14 +904,14 @@ Contents (in this order):
    Tier 2 — public API surface and control.rs state-machine claims
    Tier 3 — store/spill/pipeline behavior (round-trips, catch_unwind sites,
    let _ = swallowed verification)
-   Tier 4 — crash-rail coordinate proofs (T7 findings)
+   Tier 4 — crash-rail coordinate proofs (crash-rails findings)
    Each row: test, file:line, broken-by mutation (from critic), one-line fix.
 3. Fix phase plan: group confirmed findings by the ORIGINAL track ownership
-   (t01..t09 file boundaries stay the fix owners — disjoint by construction),
-   with a suggested order (Tier 1 first) and per-track estimated effort
-   (S/M/L based on finding count and fix depth).
-4. The conformance gap map from t09 reproduced verbatim (or linked) with a
-   priority ordering of missing negative poles.
+   (the nine scope boundaries stay the fix owners — disjoint by
+   construction), with a suggested order (Tier 1 first) and per-track
+   estimated effort (S/M/L based on finding count and fix depth).
+4. The conformance gap map from findings-testkit.md reproduced verbatim (or
+   linked) with a priority ordering of missing negative poles.
 5. Process notes: census quality per report, auditor overclaim rate (REJECTED
    / mutated), anything the next round should do differently.
 
