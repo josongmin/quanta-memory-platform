@@ -41,8 +41,8 @@ ownership. Same-claimant ACK-loss retries of commit/finalize stay
 idempotent `Ok`. A second claimant can no longer finalize with a bare
 sequence.
 
-Host impact: none required — `quanta-memory-host` enables facade
-`full` (without `spill-redb`) and calls no durable API.
+This change applies only to consumers implementing or using durable restore.
+Each consumer chooses its own feature set; no host checkout is qualified here.
 
 ### Redb storage schema v2 (automatic, fail-closed)
 
@@ -86,8 +86,8 @@ memory and account for that copy under its own budget.
 `override_provenance` keeps the initial resolver records plus at most
 one current `residency.active` record; entries from accepted live
 reconfigures upsert the single `residency.active` record. It is not a
-chronological history (see the field rustdoc). No reader outside core
-exists; no caller migration needed.
+chronological history (see the field rustdoc). Consumers requiring an audit
+history must keep it separately.
 
 ### Group/owner removal now consults live tickets (behavior)
 
@@ -163,9 +163,7 @@ out-of-range ladders) and the valid `Default` (75/90/98). Read the rungs
 through the new `soft_percent()`, `hard_percent()`, and `fatal_percent()`
 getters. This closes the path where a caller-forged literal bypassed
 validation and reached `LadderPressureController::new` unvalidated. Treat
-this as a source API change in the next versioned release; a repository and
-host-source scan found no production struct-literal construction outside
-core's own tests, but any external literal must migrate to
+this as a source API change; existing external literals must migrate to
 `PressureThresholds::new`.
 
 ### Scratch peak observation is monotonic
@@ -242,7 +240,6 @@ references keep their previous typed semantics under the cap.
 
 ## Host qualification boundary
 
-Standalone GREEN does not qualify Semantica. The host must prove that both its
-top-level and nested Cargo workspaces resolve the same committed QMP root/tree,
-then run its registered memory-host, production-composition, execution-budget,
-and owning-product suites on that exact source.
+Direct SDK use does not require a particular host integration. When a host
+is adopted, qualify its actual dependency resolution and product path according
+to [ADR 0004](docs/adr/0004-host-adoption-boundary.md).

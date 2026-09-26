@@ -629,28 +629,17 @@ New invariants promoted to the public API boundary:
 
 ---
 
-## Local verification status — 🚧
+## Executing this catalogue
 
-- Standalone implementation is locally covered by default/bare/leaf/full/all
-  warning-free feature slices, non-zero runtime capability tests for every
-  advertised facade feature path, runtime scratch owner tests, public surface
-  compile-fail tests, examples, and performance gates. Full standalone export
-  proof requires executing `scripts/extract-to-standalone-repo.sh <dest>` on
-  the exact clean source under qualification; `--dry-run` establishes only the
-  source-side preflight.
-- `scripts/verify-doc-test-selectors.py` resolves the selectors named by this
-  document against `cargo test --workspace --all-features -- --list`; stale or
-  zero-test documentation is a release-gate failure.
-- External Semantica host adoption, deployment, and activation remain separate
-  authorities. Do not infer those closures from this file.
-- Charged facade mutations are now uniformly fail-closed: charge via `reserve_committed`,
-  overwrite via `recharge`, and refund-bearing delete/reclaim/truncate paths via
-  fallible refund-before-mutate APIs.
-- Live reconfigure preserves scheduler truth for accepted raises and rejects
-  owner-group remaps while the owner holds live tickets, including pending or
-  committed 0-byte authority.
-- `AccountingLedger` is intentionally non-`Clone`, so tickets stay bound to one
-  live ledger epoch.
+The canonical gate runs the feature matrix, runtime capability checks and
+`scripts/verify-doc-test-selectors.py`. That verifier resolves the documented
+selectors against the workspace test list and their owning source; a stale
+or zero-test selector fails the documentation gate.
+
+Actual standalone export and public examples require the separate executable
+[extraction procedure](../EXTRACTION.md) at the chosen clean source. The checks
+here do not qualify a consumer deployment. See
+[ADR 0003](adr/0003-source-bound-qualification.md) for evidence boundaries.
 
 ## How evidence was gathered / re-verify
 

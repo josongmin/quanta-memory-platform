@@ -1,114 +1,48 @@
-# Extraction Checklist — quanta-memory-platform
+# Standalone extraction
 
-Mechanical, executable steps to split this library into its own git repository
-while preserving the package split (`core <- facade <- testkit`) and the
-dependency direction. Not prose: every step is a command or a verifiable gate.
+Export a clean committed QMP source into an independently verified Git repository.
+Package direction remains `core <- facade <- testkit`; host adapters remain
+outside QMP. No local path dependency may escape the extracted workspace.
+Direct SDK use does not require extraction or Semantica adoption.
 
-## Invariants preserved by extraction
+## Run
 
-1. Package split stays `core <- facade <- testkit` (three members).
-2. The Semantica host adapter (`quanta-memory-host`) is NOT moved; it stays in
-   the Semantica monorepo and depends on this repo (direction:
-   `quanta-memory-host -> quanta-memory-platform-{core,facade}`).
-3. No cyclic dependency among the three members.
-4. No path dependency escaping the workspace after extraction.
+Requirements: the committed lockfile and pinned toolchain, Python 3.9+,
+ShellCheck, Semgrep and cargo-deny. Missing requirements fail closed.
 
-## Inputs / Outputs
+```bash
+# Source-side graph, lockfile and canonical-file preflight only
+scripts/extract-to-standalone-repo.sh --dry-run /tmp/qmp-extracted
 
-- Input: this repo (`quanta-memory-platform/`) with committed `Cargo.lock`,
-  pinned `rust-toolchain.toml`, Python 3.9+, and installed ShellCheck,
-  `cargo-deny`, and `semgrep`.
-- Output: a standalone git repo at `<dest>` that builds in isolation with its
-  own repo-local rails. Semantica dependency rewiring is a separate, optional
-  consumer integration; it is not required to use the SDK.
+# Actual export, destination verification and bootstrap commit
+scripts/extract-to-standalone-repo.sh /path/to/qmp-extracted
+```
 
-## Step-by-step
+The actual command freezes HEAD/tree, rejects relevant staged, unstaged,
+untracked and file-mode drift, and exports committed bytes. The canonical
+manifest binds paths to Git mode, blob ID and SHA-256; destination content
+must match. The destination runs `scripts/check-workspace.sh` before Git
+initialization and the bootstrap commit. Failed verification creates no
+success commit; a successful destination has a clean worktree.
 
-1. Dry-run the bootstrap (no repository or destination writes; temporary
-   manifest files are created and removed under `/tmp`):
+## Public examples and CI
 
-   ```bash
-   scripts/extract-to-standalone-repo.sh --dry-run /tmp/qmp-extracted
-   ```
+```bash
+# Shared verifier: actual extraction plus both public examples against its manifest
+scripts/verify-extracted-examples.sh
+```
 
-   This runs the fail-closed pre-flight:
-   - all three member manifests exist,
-   - the resolved Cargo graph has no upward core/facade dependency,
-   - the resolved graph contains no host back-edge or local path dependency
-     escaping the workspace, including renamed dependencies,
-   - `cargo metadata --locked` resolves without changing the lockfile,
-   - the self-hosting extracted file set is present in-source.
+Both checked-in CI providers use that verifier. A CI configuration or dry-run
+pass does not prove that extraction, examples or a hosted job executed. Record
+the exact source and actual result as specified by
+[ADR 0003](docs/adr/0003-source-bound-qualification.md).
 
-   If any check fails, STOP and resolve before extracting (the pre-flight is the
-   cyclic-dependency / direction guard).
+## Optional consumer integration
 
-2. Perform the extraction:
-
-   ```bash
-   scripts/extract-to-standalone-repo.sh /path/to/new/quanta-memory-platform
-   ```
-
-   This freezes `HEAD` and its tree ID, rejects relevant staged, unstaged,
-   untracked, or executable-bit drift, and exports bytes directly from that
-   committed tree.
-   The canonical manifest binds every path to its Git mode, blob ID, and
-   content SHA-256. Source and extracted manifest digests must match. It
-   verifies the extracted workspace before `git init` or any bootstrap commit,
-   using:
-
-   ```bash
-   scripts/check-workspace.sh
-   ```
-
-   The canonical rail requires the lockfile, ShellCheck, `semgrep`, and
-   `cargo-deny`; missing tooling fails the extraction. After verification, the
-   script commits the extracted tree and requires `git status --porcelain` to be
-   empty. A failed verification leaves no success commit.
-
-3. Validate repo-local rails in the extracted repo:
-
-   ```bash
-   cd /path/to/new/quanta-memory-platform
-   scripts/check-workspace.sh          # canonical static, contract, test, feature, selector, PM, and deny rail
-   scripts/run-scaling-bench.sh --smoke # public store/broker + allocator drift smoke
-   cargo metadata --locked --format-version 1 # no re-resolution
-   ```
-
-4. Optional Semantica adoption only: rewire its dependency contract
-   (manual, coordinated change; skip for direct SDK use):
-
-   Keep consumer manifests such as `quanta-memory-host/Cargo.toml` on
-   `workspace = true`. Update the `quanta-memory-platform-core` and
-   `quanta-memory-platform-facade` entries in **both** Semantica workspace
-   roots (`packages/analysis/quanta-v2/Cargo.toml` and the top-level
-   `Cargo.toml`), their matching
-   `[workspace.metadata.quanta_memory_platform_contract]` blocks, and the
-   Semantica dependency-contract document together. Change the two mirrored
-   entries to the chosen path, pinned Git revision, or published version. Do
-   NOT add a dependency from this extracted repo back to Semantica or move
-   dependency ownership into a consumer manifest.
-
-5. If Semantica adoption was requested, host integration proof is separate
-   from extraction. After the rewire, use
-   `cargo metadata` from both Semantica workspace roots to prove that Cargo
-   resolves the intended identical QMP source. Then run the host's currently
-   registered adoption suites from its suite registry. Do not treat an
-   external-repository validation override as Cargo dependency resolution.
-
-## Standalone extraction qualification
-
-- Extracted repo: `scripts/check-workspace.sh` passes. It includes ShellCheck,
-  resolved dependency-graph, static, contract, test, feature, selector,
-  prompt-manager, and dependency checks.
-- Source/extracted tree-bound canonical digests and file modes match, the source
-  stays at the frozen clean `HEAD`, and the extracted git worktree is clean.
-- All Cargo resolution is locked; missing ShellCheck, Semgrep, or cargo-deny
-  fails closed.
-- Qualification runs the fresh actual extraction command directly from a clean,
-  frozen source checkout. CircleCI's main-branch job and the dispatch-only
-  GitHub workflow call the same `scripts/verify-extracted-examples.sh`; both
-  run the public examples against the extracted checkout. A checked-in CI
-  configuration is not evidence that a hosted job passed at a given SHA.
-
-Host adapter compilation and Semantica static guards are host-adoption proof,
-not evidence that this repo-local extraction rail passed.
+After extraction a consumer may select a local path or pinned Git revision.
+That integration is owned by the consumer and does not block SDK completion.
+For Semantica, keep consumer dependencies on `workspace = true`; update both
+workspace roots, their QMP dependency-contract metadata and contract document
+together. Confirm Cargo resolves the same intended QMP source from both roots
+before executing applicable host suites. An environment override is not proof
+of dependency resolution. See [ADR 0004](docs/adr/0004-host-adoption-boundary.md).

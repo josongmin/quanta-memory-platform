@@ -113,8 +113,9 @@ store slices a consumer needs:
 | `full` | All in-memory facade slices; no durable backing dependency. |
 | `full-backings` | Existing aggregate feature that adds `spill-redb`; not a current release target or production qualification claim. |
 
-The Redb/codec implementation remains documented in the detailed current-code
-guide for maintainers, but is not an SDK integration or release prerequisite.
+The optional durable custody contract is recorded in
+[ADR 0002](docs/adr/0002-store-custody-and-durable-spill.md); it is not an
+SDK integration or release prerequisite.
 
 `unbudgeted-stores` is an explicit, distinct product type for fixtures or
 deliberate non-accounted use. It is absent from `default`, `full`, and
@@ -160,6 +161,5 @@ Extraction and host adoption are separate operations; see
 | Standalone-repository extraction procedure | [EXTRACTION.md](EXTRACTION.md) |
 | Consumer breaking changes | [MIGRATION.md](MIGRATION.md) |
 | Release inventory | [CHANGELOG.md](CHANGELOG.md) |
-| Accepted architecture decisions | [docs/adr/README.md](docs/adr/README.md) |
 | Current plan status and remaining gates | [docs/plans/README.md](docs/plans/README.md) |
 | Executable verification contract | [docs/verification-scenarios.md](docs/verification-scenarios.md) |
