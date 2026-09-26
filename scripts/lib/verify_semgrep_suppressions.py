@@ -10,7 +10,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 RULES = ROOT / "tools/semgrep/qmp-regressions.yml"
-SUPPRESSION = re.compile(r"//\s*nosemgrep\b(.*)")
+SUPPRESSION = re.compile(r"\bnosem(?:grep)?\b", re.IGNORECASE)
 REASON = re.compile(r":\s*(qmp-[a-z0-9-]+)\s+--\s+reason:\s*(\S.*)$")
 
 
@@ -24,8 +24,9 @@ def errors_for(root: Path, rules: Path) -> list[str]:
             match = SUPPRESSION.search(line)
             if not match:
                 continue
-            reason = REASON.fullmatch(match.group(1))
-            if reason is None or reason.group(1) not in ids:
+            reason = REASON.fullmatch(line[match.end():])
+            canonical = match.group() == "nosemgrep" and line[:match.start()].rstrip().endswith("//")
+            if not canonical or reason is None or reason.group(1) not in ids:
                 errors.append(f"{path.relative_to(root)}:{number}: suppression requires a known rule ID and reason")
     return errors
 

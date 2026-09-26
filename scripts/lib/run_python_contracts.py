@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run every discovered Python contract module and reject empty suites."""
+"""Run every discovered Python contract and reject incomplete execution."""
 
 from __future__ import annotations
 
@@ -28,7 +28,15 @@ def run_suite(directory: Path, pattern: str = "test_*.py") -> bool:
         print(f"Python contract modules have no tests: {', '.join(sorted(missing))}", file=sys.stderr)
         return False
     print(f"Python contracts: {len(files)} modules, {len(found)} tests", flush=True)
-    return unittest.TextTestRunner(verbosity=1).run(suite).wasSuccessful()
+    result = unittest.TextTestRunner(verbosity=1).run(suite)
+    if result.skipped or result.expectedFailures or result.testsRun != len(found):
+        print(
+            f"Python contracts incomplete: selected={len(found)} executed={result.testsRun} "
+            f"skipped={len(result.skipped)} expected_failures={len(result.expectedFailures)}",
+            file=sys.stderr,
+        )
+        return False
+    return result.wasSuccessful()
 
 
 def main() -> int:

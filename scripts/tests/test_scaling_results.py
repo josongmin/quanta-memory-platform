@@ -497,6 +497,24 @@ class ScalingResultTests(unittest.TestCase):
                 max_throughput_regression_percent=90 + 10,
             ))
 
+    def test_release_limits_without_release_mode_are_rejected_before_loading(self) -> None:
+        options = (
+            "--release-max-p99-ns", "--release-max-throughput-regression-percent",
+            "--release-max-p99-regression-percent", "--release-p99-noise-floor-ns",
+            "--release-max-busy-retries-per-operation", "--release-max-run-noise-percent",
+            "--release-max-load-per-cpu",
+        )
+        for option in options:
+            for arguments in ([option, "1"], [option + "=1"]):
+                with self.subTest(arguments=arguments), unittest.mock.patch(
+                    "sys.argv", ["verify-scaling-results.py", "--input", "missing.jsonl", *arguments],
+                ), unittest.mock.patch.object(MODULE, "load_jsonl") as load:
+                    output = io.StringIO()
+                    with contextlib.redirect_stderr(output):
+                        self.assertEqual(MODULE.main(), 1)
+                    self.assertIn("release limits require --release", output.getvalue())
+                    load.assert_not_called()
+
     def test_release_cli_does_not_default_unapproved_limits(self) -> None:
         output = io.StringIO()
         with unittest.mock.patch("sys.argv", ["verify-scaling-results.py", "--release", "--input", "missing.jsonl"]):

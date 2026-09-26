@@ -725,6 +725,8 @@ def main() -> int:
             )
             print(f"verify-scaling-results: RELEASE OK ({sample_count} candidate samples; 3 runs)")
             return 0
+        if any(value is not None for key, value in vars(args).items() if key.startswith("release_")):
+            raise ValidationError("release limits require --release")
         if len(args.input) != 1 or (args.baseline and len(args.baseline) != 1):
             raise ValidationError("ordinary validation requires one input and at most one baseline")
         if args.baseline and args.input[0].resolve() == args.baseline[0].resolve():
