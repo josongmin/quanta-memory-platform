@@ -13,8 +13,10 @@ Hand edits are overwritten and will fail `pm lint`.
 
 ## Dependency Policy
 
-Runtime dependencies are declared in each crate's `Cargo.toml`, pinned in the
-root `[workspace.dependencies]`, and audited by `cargo deny --all-features check`
+Runtime dependencies are declared in each crate's `Cargo.toml`; shared version
+requirements live in the root `[workspace.dependencies]`. Exact resolved
+versions are owned by `Cargo.lock`; use `--locked` for verification. Audit the
+resolved graph with `cargo deny --locked --all-features check -D warnings`
 against `deny.toml`.
 
 **Shared versions** (declare in root `[workspace.dependencies]`, opt in per crate):
@@ -29,14 +31,14 @@ against `deny.toml`.
 
 **Rules:**
 
-- Every non-trivial third-party crate is **optional** and behind a feature gate.
+- Third-party runtime crates are **optional** and behind a feature gate.
   `core` and `facade` build with `--no-default-features` and pull infra crates in
   only via their feature (`telemetry`, `retained_map`, `transcript`,
   `publish_pipeline`, `spill-redb`). Dev-only test dependencies are not runtime
   graph members.
 - `tracking-allocator` may appear ONLY under testkit `alloc_tracking`; it must
   never reach a production dependency graph.
-- New runtime deps must pass `cargo deny --all-features check`. `deny.toml`
+- New runtime deps must pass `cargo deny --locked --all-features check -D warnings`. `deny.toml`
   allows only licenses actually encountered in the `--all-features` graph, so an
   unused allowance warns and a newly introduced license fails closed. If you add
   a dep with a new license, add it to the allow-list with a one-line rationale.

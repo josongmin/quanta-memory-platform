@@ -9,3 +9,11 @@ mod crate_bypass {
 mod validated {
     pub struct PressureThresholds { soft_percent: u8, hard_percent: u8, fatal_percent: u8 }
 }
+mod parent_bypass {
+    // ruleid: qmp-threshold-fields-private
+    pub struct PressureThresholds { pub(super) soft_percent: u8 }
+}
+mod path_bypass {
+    // ruleid: qmp-threshold-fields-private
+    pub struct PressureThresholds { pub(in crate::application) soft_percent: u8 }
+}

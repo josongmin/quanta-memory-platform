@@ -21,8 +21,20 @@ Existing signed-magnitude, atomic underflow and pure-layer rules remain active.
 
 Every test-binary launch in facade source uses `require_one_test`, including the
 retained-map sweep launch that previously checked only the child's summary.
-The helper checks actual selection and includes ignored children; timeout and
-exit assertions remain the responsibility of each scenario.
+The helper checks actual selection and includes ignored children, then moves the
+entire command (including environment and stdio) into a sealed launch handle.
+Launch the returned handle; the consumed builder cannot relaunch the test binary.
+The handle has no selector/environment/configuration methods, so validation
+cannot become stale through a later builder mutation. Runtime selection/move
+tests and compiler rejection contracts cover this boundary. Timeout and exit
+assertions remain the responsibility of each scenario.
+
+Owner fixtures also cover compound scratch assignments, renamed persistent
+leases without `map_err`, every missing facade slice, and restricted threshold
+visibility. The persistent-kind guard follows the `persistent_bytes` charge
+argument, rather than the destination variable or error handling. Watermark
+access has no blanket exception for modules named `tests`: obsolete fixture
+writes require an explicit rule-specific suppression with a reason.
 
 ## Evidence boundaries
 

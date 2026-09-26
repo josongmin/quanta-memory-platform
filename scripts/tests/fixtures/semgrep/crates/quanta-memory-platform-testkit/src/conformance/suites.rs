@@ -18,3 +18,33 @@ mod complete {
         verdicts
     }
 }
+mod missing_payload_store {
+    // ruleid: qmp-facade-suite-required-slices
+    pub fn run_facade_store_suite(kit: &Kit) -> Vec<Verdict> {
+        let mut verdicts = Vec::new();
+        verdicts.extend(run_retained_map_slice(kit));
+        verdicts.extend(run_transcript_slice(kit));
+        verdicts.extend(run_spill_slice());
+        verdicts
+    }
+}
+mod missing_retained_map {
+    // ruleid: qmp-facade-suite-required-slices
+    pub fn run_facade_store_suite(kit: &Kit) -> Vec<Verdict> {
+        let mut verdicts = Vec::new();
+        verdicts.extend(run_payload_store_slice(kit));
+        verdicts.extend(run_transcript_slice(kit));
+        verdicts.extend(run_spill_slice());
+        verdicts
+    }
+}
+mod missing_transcript {
+    // ruleid: qmp-facade-suite-required-slices
+    pub fn run_facade_store_suite(kit: &Kit) -> Vec<Verdict> {
+        let mut verdicts = Vec::new();
+        verdicts.extend(run_payload_store_slice(kit));
+        verdicts.extend(run_retained_map_slice(kit));
+        verdicts.extend(run_spill_slice());
+        verdicts
+    }
+}

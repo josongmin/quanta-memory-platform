@@ -4,6 +4,10 @@ This repo is `quanta-memory-platform`: a **portable, host-independent** memory
 budgeting/accounting library designed for mechanical extraction. The Semantica
 host adapter lives outside this repository.
 
+Current product scope is in-memory accounting and reclaim. Optional durable
+spill/Redb code is maintenance scope, not an active release prerequisite;
+consult `README.md` before proposing capability or SDK work.
+
 Hard rules:
 
 - **Dependency direction is strict and acyclic:** `core <- facade <- testkit`.
@@ -29,8 +33,9 @@ the task enters that area:
 | Crate edges, layers, public surface | `tools/pm/sources/rules/architecture.md` |
 | Ledger, policy, reclaim, snapshots | `tools/pm/sources/rules/determinism.md` and the owning source |
 | Tests or conformance | `tools/pm/sources/rules/tests.md` |
+| Source qualification or historical receipts | `docs/adr/0003-source-bound-qualification.md` |
 | Fallible Rust paths | `tools/pm/sources/rules/error-handling.md` |
 | Cargo deps or features | `tools/pm/sources/rules/dependencies.md` |
-| Known regression review | `tools/pm/sources/rules/cheatsheet.md` |
+| Behavioral Rust changes or known regression review | `tools/pm/sources/rules/cheatsheet.md` |
 | Workspace gate or extraction | `tools/pm/sources/rules/build.md` |
 | Repository overview | `README.md`; extraction contract: `EXTRACTION.md` |

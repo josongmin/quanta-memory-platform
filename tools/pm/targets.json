@@ -95,7 +95,7 @@
       "max_lines": 100,
       "max_bytes": 12000,
       "frontmatter": {
-        "description": "Use when reviewing Rust changes for known QMP regression patterns or machine-enforced constraints.",
+        "description": "Use before implementing or reviewing behavioral Rust changes: invariant design questions, known QMP regressions, and enforcement boundaries.",
         "alwaysApply": false
       },
       "sections": [

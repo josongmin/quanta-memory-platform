@@ -8,7 +8,17 @@ impl RedbSpillBacking {
 #[cfg(test)]
 mod tests {
     fn legacy_fixture(meta: &mut Table) {
+        // nosemgrep: qmp-durable-no-watermark-resolution -- reason: obsolete fixture metadata proves recovery ignores the legacy watermark.
         meta.insert(FINALIZED_THROUGH, 10).unwrap();
-        assert!(meta.get(FINALIZED_THROUGH).unwrap().is_some());
+        // ruleid: qmp-durable-no-watermark-resolution
+        let watermark = meta.get(FINALIZED_THROUGH).unwrap();
+    }
+}
+mod production_named_tests {
+    mod tests {
+        fn resolve(meta: &Table) {
+            // ruleid: qmp-durable-no-watermark-resolution
+            meta.get(FINALIZED_THROUGH);
+        }
     }
 }

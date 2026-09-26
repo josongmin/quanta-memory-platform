@@ -18,10 +18,11 @@ adapter (`quanta-memory-host`) that lives **outside this repo**, and it is
 designed to be extracted into its own git repository with no rewrites. The crate
 graph is the architecture authority.
 
-Allowed workspace edges (strict, acyclic — `core <- facade <- testkit`):
+Allowed member-to-member edges (strict, acyclic — `core <- facade <- testkit`;
+external feature-gated dependencies follow the dependency policy):
 
 ```text
-quanta-memory-platform-core    -> (none — pure)
+quanta-memory-platform-core    -> (no other workspace member)
 quanta-memory-platform-facade  -> quanta-memory-platform-core
 quanta-memory-platform-testkit -> quanta-memory-platform-core, quanta-memory-platform-facade
 quanta-memory-host (Semantica) -> quanta-memory-platform-{core,facade}   # OUTSIDE this repo
@@ -66,9 +67,10 @@ Boundary rules (hexagonal direction is inward-only):
   backdoors stay `pub(crate)` / unexported.
 - **`facade`** composes core behind builders; production storage backings such
   as redb are feature-gated and confined to their `*/backings/` modules.
-- **`testkit`** is NEVER a mandatory production dependency. `alloc_tracking` (the
-  only `tracking-allocator` integration) is feature-gated so it can never enter a
-  production graph.
+- **`testkit`** must stay out of production dependency graphs. `alloc_tracking`
+  (the only `tracking-allocator` integration) is opt-in; a feature gate alone
+  does not prevent a consumer from enabling it. Check the resolved consumer
+  graph before claiming production exclusion.
 
 Enforcement: the root workspace lint policy, `cargo clippy --workspace
 --all-targets --all-features -- -D warnings`, `cargo deny --all-features check`,

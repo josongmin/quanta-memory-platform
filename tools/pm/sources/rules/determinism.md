@@ -6,13 +6,19 @@ broker wraps it behind a lock. Its behavior must be **deterministic and
 reproducible** for the same operation sequence — conformance suites and fault
 fixtures depend on it.
 
-Global invariants (must hold after every committed operation):
+Accounting invariants (including live pending authorities; owning definitions
+and full invariants are in
+`crates/quanta-memory-platform-core/src/domain/ledger.rs`):
 
 1. `sum(class usage) == sum(owner usage)`
 2. `sum(owner usage) == retained payload bytes + retained metadata bytes
    + live scratch reservations`  (the `ChargeKind` partition)
 3. `reserved <= soft <= hard`  (validated when the policy is installed)
-4. No live writes while `rebuild_in_progress`
+4. No committed/live writes while `rebuild_in_progress`; rollback of an
+   incomplete pending reservation remains allowed to prevent stranded bytes.
+5. Enforce global/headroom ceilings and the bounded shared-burst pool, including
+   existing resident usage when installing a new live policy.
+6. Ticket authority is single-use and ledger-bound, including zero-byte tickets.
 
 Rules:
 
@@ -28,8 +34,11 @@ Rules:
 - **Deterministic fixtures.** `testkit` fault/chaos scenarios are deterministic —
   no timing heuristics, no wall-clock, no RNG driving outcomes. A scenario that
   "sometimes" fails is a bug.
-- **Checked arithmetic on counters.** Byte/budget math uses `checked_*` /
-  `saturating_*` per the documented invariant — never silent wrap or lossy `as`.
+- **Exact accounting arithmetic.** Ledger/`UsageBreakdown`/`LedgerSnapshot`
+  mutations use checked arithmetic after full postimage validation. Saturation
+  is allowed only for a documented bounded/advisory calculation; it cannot
+  replace an overflow/underflow error in exact accounting. No silent wrap or
+  lossy `as`.
 
 ### No silent heuristics
 

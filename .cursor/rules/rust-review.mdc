@@ -1,5 +1,5 @@
 ---
-description: "Use when reviewing Rust changes for known QMP regression patterns or machine-enforced constraints."
+description: "Use before implementing or reviewing behavioral Rust changes: invariant design questions, known QMP regressions, and enforcement boundaries."
 alwaysApply: false
 ---
 <!--
@@ -17,6 +17,25 @@ rows are machine-enforced by `scripts/check-workspace.sh`; rows marked `review`
 are review contracts, not automated gates. Do not claim a review-only rule is
 fail-closed. A Semgrep exception requires a trailing
 `// nosemgrep: <rule-id> -- reason: <…>`.
+
+### Design Questions Before Writing Code
+
+Apply the rows relevant to the changed owner; do not add unrelated machinery.
+These are reasoning obligations, not additional automated enforcement.
+
+| Boundary | Decide before implementation | Distinguishing evidence |
+| --- | --- | --- |
+| Validation and execution | Can any field, selector or environment setting change after validation? Seal the validated state and consume its authority at use. | Constructor bypass or later configuration fails to compile; invalid runtime input is rejected before side effects; the actual selected child executes. |
+| Accounting and arithmetic | Which owner/class/context/kind and lifetime does each byte belong to? Is the value exact usage, an advisory estimate, or a peak? | Independent per-axis values, overflow/underflow rejection, decreasing observations and unchanged rejected postimages. |
+| User callbacks and `Drop` | Which lock or pending authority remains held at the callout? Transfer ownership and release guards where reentry is permitted; preserve cleanup authority on failure. | Bounded hostile-caller execution plus surviving identity/content/charge and later usability. |
+| Public dispatch and work | Does the real entry point execute and retain each required slice/result? Is cached reuse actually observed? | Broken-fake rejection, independent assertion inventory and metered nested work; equal outputs alone do not prove reuse. |
+| Static guard scope and exceptions | Does the rule follow the semantic operation rather than a local binding name or convenient module label? Scope exceptions to the specific justified operation. | Real engine findings at repository owner paths for wrong forms, and no findings for permitted forms. |
+
+Review the applicable patterns below before editing, then inspect the actual
+owner and its tests. Do not rename a binding, move work to a helper, suppress a
+finding or weaken a test merely to obtain a green gate. Repair the behavior, or
+prove the permitted behavior and update the guard contract without losing the
+original regression case.
 
 | Don't write this | Write this instead | Enforced by |
 | --- | --- | --- |
@@ -36,15 +55,15 @@ fail-closed. A Semgrep exception requires a trailing
 | whole-owner iteration or snapshot copy in release preflight | keyed owner reads; preserve metered work tests | regression-guards (`qmp-release-preflight-no-owner-scan`); indirect work remains runtime-tested |
 | fair-share precomputation inside scheduler admission | borrow the construction-time table | regression-guards (`qmp-admission-no-share-recompute`) |
 | semantic pressure update inside allocator observation | compare advisory telemetry to semantic usage | regression-guards (`qmp-allocator-observation-no-pressure-write`) |
-| direct scratch-peak replacement | `max(previous, observed)` | regression-guards (`qmp-scratch-peak-monotonic`) |
+| scratch-peak replacement or compound assignment | `max(previous, observed)` | regression-guards (`qmp-scratch-peak-monotonic`) |
 | public pressure-threshold fields | private fields and validated construction | regression-guards (`qmp-threshold-fields-private`); compile-fail contract |
 | persistent prepared-publication lease charged as payload | `RetainedMetadata` for identity/tombstone lifetime | regression-guards (`qmp-persistent-publication-metadata-kind`); independent axis oracle |
 | shared/fixed payload-store seed initialization | fresh `RandomState::new()` for each store | regression-guards (`qmp-store-digest-seed-construction`); real-store seed oracle |
 | unused `.ok()` on release/rollback/restore cleanup | handle the error and retain exact recovery authority | regression-guards (`qmp-cleanup-result-not-erased`); production `let _ =` also Clippy |
-| legacy finalized watermark read/write in production | exact record disposition and generation proof | regression-guards (`qmp-durable-no-watermark-resolution`); legacy fixtures permitted |
+| legacy finalized watermark read/write | exact record disposition and generation proof | regression-guards (`qmp-durable-no-watermark-resolution`); obsolete fixture writes require a reasoned suppression |
 | public kit dispatcher manufacturing Passed | return the real conformance fold | regression-guards (`qmp-kit-no-constant-pass`); public negative pole |
 | facade suite dropping a required store slice | compose all four slices | regression-guards (`qmp-facade-suite-required-slices`); runtime assertion-name inventory |
-| test-binary subprocess launch without selection guard | `require_one_test()` before launch | regression-guards (`qmp-isolated-child-requires-selection-guard`); actual selection verified at runtime |
+| test-binary subprocess launch without selection guard | launch the sealed handle returned by `require_one_test()` | regression-guards (`qmp-isolated-child-requires-selection-guard`); actual selection verified at runtime and later configuration rejected by the compiler |
 | other wrapping arithmetic on byte/budget counters | checked arithmetic per the documented invariant | review (ledger correctness) |
 | live reconfigure / policy swap that re-checks only future reserves, not the CURRENT resident usage (e.g. raising `headroom_bytes` over live non-Headroom bytes) | re-validate the live snapshot against the NEW policy and fail-closed before installing it | review (ledger invariant 5) |
 | byte-target sweep/reclaim loop that breaks only on `reclaimed >= target` | also handle zero-contribution entries / exhaustion so a positive target can't over-evict (skip zero-byte entries) | review |
@@ -59,4 +78,4 @@ fail-closed. A Semgrep exception requires a trailing
 | allocator telemetry mutating ledger counters | telemetry is **advisory** — never writes counters | review (ledger invariant) |
 | mutating the ledger partway then erroring | validate first; fail-closed BEFORE any mutation | review (all-or-nothing) |
 | `assert!(true)` / `assert_eq!(x, x)` placeholder test | assert the real behavior / invariant | review |
-| `#[ignore]` without a reason | `#[ignore = "<reason>"]` | review |
+| `#[ignore]`, even with a reason | feature-gate an optional test and execute it on its owned rail; repair a failing test instead of disabling it | full/in-memory gate rejects ignored Rust tests |

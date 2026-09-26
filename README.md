@@ -163,4 +163,3 @@ Extraction and host adoption are separate operations; see
 | Accepted architecture decisions | [docs/adr/README.md](docs/adr/README.md) |
 | Current plan status and remaining gates | [docs/plans/README.md](docs/plans/README.md) |
 | Executable verification contract | [docs/verification-scenarios.md](docs/verification-scenarios.md) |
-| Reusable test-oracle audit prompt | [docs/misc/fail-open-test-audit-prompt.md](docs/misc/fail-open-test-audit-prompt.md) |

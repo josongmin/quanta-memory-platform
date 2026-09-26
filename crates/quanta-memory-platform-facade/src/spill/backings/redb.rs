@@ -3886,6 +3886,7 @@ mod tests {
                 recovery.insert(3u64, b"three".as_slice()).expect("legacy recovery row");
                 let mut meta = txn.open_table(SPILL_META).expect("legacy meta");
                 meta.insert(NEXT_SEQUENCE, 6u64).expect("legacy next");
+                // nosemgrep: qmp-durable-no-watermark-resolution -- reason: obsolete fixture metadata proves recovery ignores the legacy watermark.
                 meta.insert(FINALIZED_THROUGH, 4u64).expect("legacy watermark");
             }
             txn.commit().expect("legacy commit");

@@ -21,6 +21,32 @@ FIXTURES = Path(__file__).parent / "fixtures/semgrep"
 
 
 class RegressionRuleContracts(unittest.TestCase):
+    def test_selected_child_handle_has_no_configuration_methods(self) -> None:
+        """Compile the real helper: a validated selector cannot be mutated."""
+        helper = ROOT / "crates/quanta-memory-platform-facade/src/test_support.rs"
+        prefix = f'#[path = {json.dumps(str(helper))}] mod test_support;\n'
+        prefix += 'use test_support::SingleTestCommand;\nfn main() {\n'
+        prefix += 'let mut command = std::process::Command::new("test-binary");\n'
+        prefix += 'let mut selected = command.require_one_test();\n'
+        with tempfile.TemporaryDirectory(prefix="qmp-sealed-child-") as directory:
+            source = Path(directory) / "contract.rs"
+            output = Path(directory) / "contract.rmeta"
+            def compile_shape(body: str) -> subprocess.CompletedProcess[str]:
+                source.write_text(prefix + body + '\n}\n')
+                return subprocess.run(
+                    ["rustc", "--edition=2021", "--emit=metadata", "-o", str(output), str(source)],
+                    cwd=ROOT, capture_output=True, text=True, timeout=60, check=False,
+                )
+            baseline = compile_shape('let _result = selected.output();')
+            self.assertEqual(baseline.returncode, 0, baseline.stderr)
+            for method, arguments in (("arg", '"missing"'), ("env", '"KEY", "VALUE"'),
+                                      ("current_dir", '"/tmp"')):
+                with self.subTest(method=method):
+                    rejected = compile_shape(f'selected.{method}({arguments});')
+                    self.assertNotEqual(rejected.returncode, 0, "sealed child accepted mutation")
+                    self.assertIn("error[E0599]", rejected.stderr)
+                    self.assertIn(f'no method named `{method}`', rejected.stderr)
+
     def test_every_rule_rejects_its_regression_and_accepts_permitted_shapes(self) -> None:
         self.assertIsNotNone(shutil.which("semgrep"), "Semgrep is required; do not skip rule contracts")
         ids = set(re.findall(r"(?m)^  - id: (qmp-[\w-]+)$", CONFIG.read_text()))

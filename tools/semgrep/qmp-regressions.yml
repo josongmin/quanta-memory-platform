@@ -123,8 +123,20 @@ rules:
     patterns:
       - pattern-inside: |
           pub fn grow_to_observed(...) -> $RET { ... }
-      - pattern: self.observed_bytes = $VALUE
-      - pattern-not: self.observed_bytes = self.observed_bytes.max($OBSERVED)
+      - pattern-either:
+          - patterns:
+              - pattern: self.observed_bytes = $VALUE
+              - pattern-not: self.observed_bytes = self.observed_bytes.max($OBSERVED)
+          - pattern: self.observed_bytes += $VALUE
+          - pattern: self.observed_bytes -= $VALUE
+          - pattern: self.observed_bytes *= $VALUE
+          - pattern: self.observed_bytes /= $VALUE
+          - pattern: self.observed_bytes %= $VALUE
+          - pattern: self.observed_bytes &= $VALUE
+          - pattern: self.observed_bytes |= $VALUE
+          - pattern: self.observed_bytes ^= $VALUE
+          - pattern: self.observed_bytes <<= $VALUE
+          - pattern: self.observed_bytes >>= $VALUE
 
   - id: qmp-threshold-fields-private
     languages: [rust]
@@ -143,7 +155,7 @@ rules:
     paths:
       include: [/crates/quanta-memory-platform-facade/src/publish_pipeline/prepared_publication.rs]
     patterns:
-      - pattern: let persistent_charge = $ACCOUNTING.charge($CLASS, $OWNER, $CONTEXT, $KIND, $BYTES).map_err(...);
+      - pattern: $ACCOUNTING.charge($CLASS, $OWNER, $CONTEXT, $KIND, persistent_bytes)
       - metavariable-pattern:
           metavariable: $KIND
           patterns:
@@ -180,8 +192,6 @@ rules:
       - pattern-either:
           - pattern: $TABLE.get(FINALIZED_THROUGH)
           - pattern: $TABLE.insert(FINALIZED_THROUGH, ...)
-      - pattern-not-inside: |
-          mod tests { ... }
 
   - id: qmp-kit-no-constant-pass
     languages: [rust]
@@ -217,7 +227,7 @@ rules:
   - id: qmp-isolated-child-requires-selection-guard
     languages: [rust]
     severity: ERROR
-    message: Test-binary subprocesses must require_one_test before launch. Exit zero alone also succeeds for stale filters.
+    message: Launch the sealed handle returned by require_one_test. The mutable builder remains unchecked; exit zero also succeeds for stale filters.
     paths:
       include: [/crates/quanta-memory-platform-facade/src/**/*.rs]
       exclude: [/crates/quanta-memory-platform-facade/src/test_support.rs]
@@ -225,10 +235,7 @@ rules:
     pattern-sources:
       - pattern: std::env::current_exe(...)
     pattern-sanitizers:
-      - patterns:
-          - pattern: $COMMAND.require_one_test()
-          - focus-metavariable: $COMMAND
-        by-side-effect: true
+      - pattern: $COMMAND.require_one_test()
     pattern-sinks:
       - pattern-either:
           - pattern: $COMMAND.output()

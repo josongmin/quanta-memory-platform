@@ -12,6 +12,10 @@ This repo is `quanta-memory-platform`: a **portable, host-independent** memory
 budgeting/accounting library designed for mechanical extraction. The Semantica
 host adapter lives outside this repository.
 
+Current product scope is in-memory accounting and reclaim. Optional durable
+spill/Redb code is maintenance scope, not an active release prerequisite;
+consult `README.md` before proposing capability or SDK work.
+
 Hard rules:
 
 - **Dependency direction is strict and acyclic:** `core <- facade <- testkit`.
@@ -37,16 +41,24 @@ the task enters that area:
 | Crate edges, layers, public surface | `tools/pm/sources/rules/architecture.md` |
 | Ledger, policy, reclaim, snapshots | `tools/pm/sources/rules/determinism.md` and the owning source |
 | Tests or conformance | `tools/pm/sources/rules/tests.md` |
+| Source qualification or historical receipts | `docs/adr/0003-source-bound-qualification.md` |
 | Fallible Rust paths | `tools/pm/sources/rules/error-handling.md` |
 | Cargo deps or features | `tools/pm/sources/rules/dependencies.md` |
-| Known regression review | `tools/pm/sources/rules/cheatsheet.md` |
+| Behavioral Rust changes or known regression review | `tools/pm/sources/rules/cheatsheet.md` |
 | Workspace gate or extraction | `tools/pm/sources/rules/build.md` |
 | Repository overview | `README.md`; extraction contract: `EXTRACTION.md` |
 
 ## Working Rules
 
+- Resolve the requested target before editing. If it remains ambiguous, ask
+  for the missing scope; do not substitute an adjacent task or deliverable.
+- Invoke named workflow skills only when explicitly requested in the current
+  user turn. Words such as review, audit, fix or SOTA do not invoke a skill;
+  an invocation from an earlier turn does not carry forward.
 - Preserve unrelated dirty work; inspect status before editing and verify only
   intended paths changed.
+- Recheck affected files before writing in a shared checkout. Do not restore
+  pre-existing changes from HEAD; run mutation experiments in disposable copies.
 - Make the smallest owner-level change that proves the behavior. Do not add a
   shim around a broken accounting or storage authority.
 - Couple behavior changes to the owning test: ledger invariants and fail-closed
@@ -54,6 +66,21 @@ the task enters that area:
 - Put new traits in `ports/` and implementations in adapters or facade backings.
   Keep production backings feature-gated and testkit out of production graphs.
 - For public API changes, update re-exports and the real public examples.
+
+### Before Behavioral Rust Changes
+
+1. Trace the real public entry point to the owning state and side effects.
+   Identify the invariant, charge axes/lifetimes, and unchanged state required
+   on rejection. Include callbacks, destructors and cleanup in failure paths.
+2. Choose a representation that preserves the invariant until use: private
+   validated fields, single-use authority, or an owned sealed execution handle.
+   A validation call on a builder that can still change is insufficient.
+3. Name a reachable wrong implementation and the independent observation that
+   distinguishes it. Reuse an adequate owner test; extend it when identity,
+   content, accounting axes, actual work or public dispatch is unobserved.
+4. Review the completed diff for alternate assignment forms, renamed bindings,
+   helper indirection and exceptions that bypass the intended boundary. A lint
+   pass proves only matched syntax; use compiler/runtime contracts for the rest.
 
 ## Closeout Playbook
 
@@ -65,6 +92,11 @@ python3 tools/pm/pm.py sync
 scripts/check-workspace.sh
 ```
 
+For guidance-only edits, run `python3 tools/pm/pm.py sync` and
+`python3 tools/pm/pm.py lint`. For all prose-only changes, check affected links
+and `git diff --check`; the full Rust rail is not required. Changes to generation
+or gate behavior still require their owning contracts and the canonical rail.
+
 If `Cargo.toml` or a cross-crate use path changed, run the extraction dry-run on
 a committed, clean candidate:
 
@@ -73,5 +105,7 @@ scripts/extract-to-standalone-repo.sh --dry-run /tmp/qmp-check
 ```
 
 Report changed paths, exact verification run, anything not run, and remaining
-risk. Do not treat focused checks as the canonical rail. If `pm lint` fails,
+risk. Bind verification claims to the tested source and configuration; historical
+receipts and successful zero-test runs do not prove current behavior.
+Do not treat focused checks as the canonical rail. If `pm lint` fails,
 sync from source; if tests fail, fix behavior rather than weaken assertions.
