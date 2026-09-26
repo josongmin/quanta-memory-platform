@@ -1319,6 +1319,7 @@ fn canonical_body_digest(key: &[u8]) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::SingleTestCommand;
     use crate::transcript_store::{
         TranscriptAppendIdentityV1, TranscriptAppendRequestV1, TranscriptRetentionPolicyV2,
     };
@@ -1464,7 +1465,8 @@ mod tests {
             .arg("--exact")
             .arg("transcript_store::service::tests::partial_snapshot_clone_and_drop_panics_cannot_abort")
             .env(CHILD, "1")
-            .output()
+            .require_one_test()
+.output()
             .expect("isolated snapshot child");
         assert!(
             output.status.success(),
@@ -1559,6 +1561,7 @@ mod tests {
                 "transcript_store::service::tests::partial_load_clone_and_drop_panics_cannot_abort",
             )
             .env(CHILD, "1")
+            .require_one_test()
             .output()
             .expect("isolated load child");
         assert!(
@@ -1634,6 +1637,7 @@ mod tests {
             .arg("--exact")
             .arg("transcript_store::service::tests::new_session_clone_and_drop_panics_cannot_abort")
             .env(CHILD, "1")
+            .require_one_test()
             .output()
             .expect("isolated append child");
         assert!(
@@ -1726,7 +1730,8 @@ mod tests {
         let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
             .arg("--exact")
             .arg("transcript_store::service::tests::owned_session_key_order_and_drop_panics_cannot_abort")
-            .env(CHILD, "1").output().expect("isolated owned-key child");
+            .env(CHILD, "1").require_one_test()
+.output().expect("isolated owned-key child");
         assert!(
             output.status.success(),
             "owned session key must not abort: {}",
@@ -1824,7 +1829,8 @@ mod tests {
             .arg("--exact")
             .arg("transcript_store::service::tests::partial_append_identity_clone_and_drop_panics_cannot_abort")
             .env(CHILD, "1")
-            .output()
+            .require_one_test()
+.output()
             .expect("isolated append child");
         assert!(
             output.status.success(),
@@ -3530,6 +3536,7 @@ mod tests {
                 )
                 .arg("--nocapture")
                 .env(CHILD, "1")
+                .require_one_test()
                 .output()
                 .expect("isolated compound-hostile append child");
             assert!(
@@ -3700,7 +3707,8 @@ mod tests {
                 .arg("--exact")
                 .arg("transcript_store::service::tests::accounting::drop_contains_multiple_client_destructor_panics_during_outer_unwind")
                 .env(CHILD_ENV, "1")
-                .output()
+                .require_one_test()
+.output()
                 .expect("subprocess test run");
             assert!(
                 output.status.success(),

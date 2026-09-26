@@ -1,0 +1,9 @@
+   Compiling quanta-memory-platform-core v0.2.0 (/private/tmp/qmp-sep26-candidate-aych53eb/crates/quanta-memory-platform-core)
+    Finished `test` profile [unoptimized] target(s) in 52.67s
+     Running unittests src/lib.rs (/tmp/qmp-sep26-candidate-y2s09ws1/target/debug/deps/quanta_memory_platform_core-37b056fcda520d3a)
+
+running 1 test
+test domain::ledger::tests::single_release_preflight_is_bounded_independent_of_owner_cardinality ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 273 filtered out; finished in 0.05s
+

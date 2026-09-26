@@ -1,0 +1,66 @@
+   Compiling quanta-memory-platform-testkit v0.2.0 (/private/tmp/qmp-sep26-candidate-aych53eb/crates/quanta-memory-platform-testkit)
+warning: function `session_transcript_budget` is never used
+   --> crates/quanta-memory-platform-testkit/src/conformance/suites.rs:630:4
+    |
+630 | fn session_transcript_budget(base: &MemoryTestKit, hard_cap_bytes: u64) -> MemoryTestKit {
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `class_capped_kit` is never used
+   --> crates/quanta-memory-platform-testkit/src/conformance/suites.rs:655:4
+    |
+655 | fn class_capped_kit(
+    |    ^^^^^^^^^^^^^^^^
+
+warning: function `run_payload_store_slice` is never used
+   --> crates/quanta-memory-platform-testkit/src/conformance/suites.rs:995:4
+    |
+995 | fn run_payload_store_slice(kit: &MemoryTestKit) -> Vec<AssertionVerdict> {
+    |    ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `run_retained_map_slice` is never used
+    --> crates/quanta-memory-platform-testkit/src/conformance/suites.rs:1087:4
+     |
+1087 | fn run_retained_map_slice(kit: &MemoryTestKit) -> Vec<AssertionVerdict> {
+     |    ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `run_retained_map_slice_with_platform` is never used
+    --> crates/quanta-memory-platform-testkit/src/conformance/suites.rs:1102:4
+     |
+1102 | fn run_retained_map_slice_with_platform(
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `run_transcript_slice` is never used
+    --> crates/quanta-memory-platform-testkit/src/conformance/suites.rs:1181:4
+     |
+1181 | fn run_transcript_slice(kit: &MemoryTestKit) -> Vec<AssertionVerdict> {
+     |    ^^^^^^^^^^^^^^^^^^^^
+
+warning: function `run_spill_slice` is never used
+    --> crates/quanta-memory-platform-testkit/src/conformance/suites.rs:1313:4
+     |
+1313 | fn run_spill_slice() -> Vec<AssertionVerdict> {
+     |    ^^^^^^^^^^^^^^^
+
+warning: `quanta-memory-platform-testkit` (lib test) generated 7 warnings
+    Finished `test` profile [unoptimized] target(s) in 22.03s
+     Running unittests src/lib.rs (/tmp/qmp-sep26-candidate-y2s09ws1/target/debug/deps/quanta_memory_platform_testkit-627a022eb8b8ad80)
+
+running 1 test
+
+thread 'fixtures::tests::testkit_runs_facade_store_suite_against_live_broker_and_passes' (3720704) panicked at crates/quanta-memory-platform-testkit/src/fixtures/mod.rs:231:9:
+assertion `left == right` failed: each required facade assertion must run exactly once
+  left: {"payload_close_exactly_once": 1, "payload_last_owner_drop_releases": 1, "payload_rebuild_close_fail_closed": 1, "payload_rebuild_drop_defers_until_finish": 1, "prepared_close_exactly_once": 1, "prepared_last_owner_drop_releases": 1, "prepared_rebuild_close_fail_closed": 1, "prepared_rebuild_drop_defers_until_finish": 1, "retained_close_exactly_once": 1, "retained_last_owner_drop_releases": 1, "retained_rebuild_close_fail_closed": 1, "retained_rebuild_drop_defers_until_finish": 1, "revocable_close_exactly_once": 1, "revocable_last_owner_drop_releases": 1, "revocable_rebuild_close_fail_closed": 1, "revocable_rebuild_drop_defers_until_finish": 1, "transcript_close_exactly_once": 1, "transcript_last_owner_drop_releases": 1, "transcript_rebuild_close_fail_closed": 1, "transcript_rebuild_drop_defers_until_finish": 1}
+ right: {"payload_close_exactly_once": 1, "payload_dedup_refund": 1, "payload_last_owner_drop_releases": 1, "payload_rebuild_close_fail_closed": 1, "payload_rebuild_drop_defers_until_finish": 1, "pin_safe_delete": 1, "prepared_close_exactly_once": 1, "prepared_last_owner_drop_releases": 1, "prepared_rebuild_close_fail_closed": 1, "prepared_rebuild_drop_defers_until_finish": 1, "retained_atomic_recharge_overwrite": 1, "retained_close_exactly_once": 1, "retained_last_owner_drop_releases": 1, "retained_map_refunds": 1, "retained_rebuild_close_fail_closed": 1, "retained_rebuild_drop_defers_until_finish": 1, "revocable_close_exactly_once": 1, "revocable_last_owner_drop_releases": 1, "revocable_rebuild_close_fail_closed": 1, "revocable_rebuild_drop_defers_until_finish": 1, "spill_round_trip": 1, "spill_unavailable_fail_closed": 1, "transcript_close_exactly_once": 1, "transcript_last_owner_drop_releases": 1, "transcript_over_cap_fail_closed": 1, "transcript_rebuild_close_fail_closed": 1, "transcript_rebuild_drop_defers_until_finish": 1, "transcript_truncate_refund": 1}
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test fixtures::tests::testkit_runs_facade_store_suite_against_live_broker_and_passes ... FAILED
+
+failures:
+
+failures:
+    fixtures::tests::testkit_runs_facade_store_suite_against_live_broker_and_passes
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 85 filtered out; finished in 0.06s
+
+error: test failed, to rerun pass `-p quanta-memory-platform-testkit --lib`

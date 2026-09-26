@@ -644,43 +644,46 @@ mod tests {
 
     #[test]
     fn routed_spill_after_target_goes_offline_fails_closed_leaving_inventory_unchanged() {
-        // scenario F (fail-closed): a routed controller that spilled successfully,
-        // then whose target goes offline, must reject the next spill and leave BOTH
-        // the target inventory byte-for-byte unchanged. Capture it before the
-        // denied op and assert the same authoritative value afterward.
         let controller = RoutedSpillController::new(InMemorySpillTarget::available());
-        let _receipt = controller.spill("first".to_string()).expect("first spill ok");
-        assert_eq!(controller.spilled_count(), Ok(1));
+        let _first = controller.spill("first".to_string()).expect("first spill ok");
+        let _second = controller.spill("second".to_string()).expect("second spill ok");
+        let count_before = controller.spilled_count().expect("seed inventory");
+        assert_eq!(count_before, 2);
 
-        // The controller owns the target by value; take availability offline by
-        // building a fresh offline controller representing the same transition path.
-        // (RoutedSpillController moves the target, so we model the offline state on a
-        // separate controller and assert the denied op is inert.)
-        let offline = RoutedSpillController::new(InMemorySpillTarget::unavailable());
-        let count_before = offline.spilled_count();
-        let denied = offline.spill("blocked".to_string());
-        assert!(
-            matches!(&denied, Err(failure) if matches!(failure.error(), MemoryError::Capacity(_))),
-            "got {denied:?}"
-        );
-        assert_eq!(denied.expect_err("offline").into_parts().1, "blocked");
+        controller.target.set_available(false);
+        let denied = controller.spill("blocked".to_string()).expect_err("offline target");
+        assert!(matches!(denied.error(), MemoryError::Capacity(_)));
+        assert_eq!(denied.into_parts().1, "blocked");
+        assert_eq!(controller.spilled_count(), Ok(count_before));
+
+        controller.target.set_available(true);
+        assert_eq!(controller.restore().expect("first survives denial"), Some("first".to_string()));
         assert_eq!(
-            offline.spilled_count(),
-            count_before,
-            "a denied spill must not advance target inventory"
+            controller.restore().expect("second survives denial"),
+            Some("second".to_string())
         );
+        assert_eq!(controller.restore().expect("drained"), None);
+        assert_eq!(controller.spilled_count(), Ok(0));
     }
 
     #[test]
     fn in_memory_target_accept_after_toggle_offline_is_rejected() {
         let target = InMemorySpillTarget::available();
-        let _receipt = SpillTarget::accept(&target, 1u32).expect("accept while available");
-        assert_eq!(target.accepted_count(), 1);
+        let _first = SpillTarget::accept(&target, 1u32).expect("accept first while available");
+        let _second = SpillTarget::accept(&target, 2u32).expect("accept second while available");
+        assert_eq!(target.accepted_count(), 2);
+        assert_eq!(target.retained_count(), Ok(2));
         target.set_available(false);
-        let err = SpillTarget::accept(&target, 2u32).expect_err("accept while offline must fail");
+        let err = SpillTarget::accept(&target, 3u32).expect_err("accept while offline must fail");
         assert!(matches!(err.error(), MemoryError::Capacity(_)), "got {err:?}");
-        assert_eq!(err.into_parts().1, 2);
-        assert_eq!(target.accepted_count(), 1, "rejected accept must not increment count");
+        assert_eq!(err.into_parts().1, 3);
+        assert_eq!(target.accepted_count(), 2, "rejected accept must not increment count");
+        assert_eq!(target.retained_count(), Ok(2), "rejected accept must preserve inventory");
+        target.set_available(true);
+        assert_eq!(target.restore().expect("first survives denial"), Some(1));
+        assert_eq!(target.restore().expect("second survives denial"), Some(2));
+        assert_eq!(target.restore().expect("drained"), None);
+        assert_eq!(target.retained_count(), Ok(0));
     }
 
     // ---- C: spill is a two-way tier — spilled handles can be restored ----
@@ -768,11 +771,21 @@ mod tests {
 
     #[test]
     fn retaining_target_offline_rejects_accept_but_state_unchanged() {
-        let target = RetainingSpillTarget::<u32>::unavailable();
-        let err = SpillTarget::accept(&target, 1u32).expect_err("offline accept rejected");
+        let target = RetainingSpillTarget::available();
+        let _first = SpillTarget::accept(&target, "first".to_string()).expect("seed first");
+        let _second = SpillTarget::accept(&target, "second".to_string()).expect("seed second");
+        assert_eq!(target.retained_count(), Ok(2));
+        target.set_available(false);
+        let err = SpillTarget::accept(&target, "blocked".to_string())
+            .expect_err("offline accept rejected");
         assert!(matches!(err.error(), MemoryError::Capacity(_)), "got {err:?}");
-        assert_eq!(err.into_parts().1, 1);
-        assert_eq!(target.retained_count(), Ok(0), "rejected accept retains nothing");
+        assert_eq!(err.into_parts().1, "blocked");
+        assert_eq!(target.retained_count(), Ok(2), "rejected accept preserves retained handles");
+        target.set_available(true);
+        assert_eq!(target.restore().expect("first survives denial"), Some("first".to_string()));
+        assert_eq!(target.restore().expect("second survives denial"), Some("second".to_string()));
+        assert_eq!(target.restore().expect("drained"), None);
+        assert_eq!(target.retained_count(), Ok(0));
     }
 
     // ---- LSP: both SpillTarget impls honor the SAME offline-restore contract ----

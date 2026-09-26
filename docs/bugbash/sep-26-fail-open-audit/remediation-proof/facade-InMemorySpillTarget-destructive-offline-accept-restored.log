@@ -1,0 +1,8 @@
+    Finished `test` profile [unoptimized] target(s) in 0.09s
+     Running unittests src/lib.rs (/tmp/qmp-sep26-candidate-y2s09ws1/target/debug/deps/quanta_memory_platform_facade-608c73b79af53532)
+
+running 1 test
+test spill::service::tests::in_memory_target_accept_after_toggle_offline_is_rejected ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 363 filtered out; finished in 0.01s
+

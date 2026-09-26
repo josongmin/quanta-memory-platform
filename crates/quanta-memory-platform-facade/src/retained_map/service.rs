@@ -780,6 +780,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::SingleTestCommand;
     use quanta_memory_platform_core::{MemoryClass, StoreBindingHandle};
     use std::hash::{Hash, Hasher};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -1211,6 +1212,7 @@ mod tests {
             .arg("retained_map::service::tests::compound_hostile_remove_panic_cannot_abort_process")
             .arg("--nocapture")
             .env(COMPOUND_CHILD, "remove")
+            .require_one_test()
             .output()
             .expect("isolated compound-hostile remove child");
         assert!(
@@ -1232,6 +1234,7 @@ mod tests {
             .arg("retained_map::service::tests::compound_hostile_insert_panic_cannot_abort_process")
             .arg("--nocapture")
             .env(COMPOUND_CHILD, "insert")
+            .require_one_test()
             .output()
             .expect("isolated compound-hostile insert child");
         assert!(
@@ -1501,7 +1504,8 @@ mod tests {
             .arg("--exact")
             .arg("retained_map::service::tests::partial_entry_read_clone_and_drop_panics_cannot_abort")
             .env(CHILD, "1")
-            .output()
+            .require_one_test()
+.output()
             .expect("isolated partial-read child");
         assert!(
             output.status.success(),
@@ -1776,6 +1780,7 @@ mod tests {
                 std::process::Command::new(std::env::current_exe().expect("test binary"))
                     .arg("overwrite_drop_reentry_is_bounded_and_other_store_sees_exact_ledger")
                     .env(CHILD, "1")
+                    .require_one_test()
                     .spawn()
                     .expect("spawn bounded reentry test");
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
@@ -3219,6 +3224,7 @@ mod tests {
                 .arg("remove_contains_panicking_key_and_returns_value_after_exact_refund")
                 .arg("--nocapture")
                 .env(CHILD, "1")
+                .require_one_test()
                 .output()
                 .expect("spawn child");
             assert!(

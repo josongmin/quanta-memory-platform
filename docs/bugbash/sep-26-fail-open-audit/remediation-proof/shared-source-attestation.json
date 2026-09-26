@@ -1,0 +1,17 @@
+{
+  "base_head": "61e9c7c47fa7294f9a926fd867e4af0b116c429b",
+  "source_hashes_match_private_candidate": true,
+  "rust_files": 85,
+  "mutation_runs": 57,
+  "rejected_mutants": 19,
+  "baseline_and_restored_green": 38,
+  "rust_source_digest_sha256": "b25da136cd839eb7e07e0165f5e6b9fbaada1ea6dcc6dda719598893f1cb29c6",
+  "canonical_gate": "PASS",
+  "canonical_gate_log": "workspace-gate.log",
+  "extraction_dry_run": "PASS",
+  "extraction_candidate_head": "df881232c3a7f4c4014b4468a84e2078a17c5635",
+  "extraction_candidate_tree": "f5f5158e71244c1c8c7d667cf47d559a019dd59c",
+  "extraction_manifest_sha256": "4caa4450ff0fb620aae46a247b7f366e1381ee758d7630c3880f72a6a1fb642a",
+  "extraction_runs_destination_gate": false,
+  "shared_checkout_committed": false
+}

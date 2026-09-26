@@ -386,6 +386,137 @@ impl LedgerSnapshot {
     }
 }
 
+/// Test-only interception of owner-key reads. Production keeps a plain map.
+#[cfg(all(test, feature = "live_control"))]
+#[derive(Debug, Default)]
+struct MeteredOwnerUsage {
+    entries: BTreeMap<OwnerKey, UsageBreakdown>,
+    probes_active: std::sync::atomic::AtomicBool,
+    key_visits: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(all(test, feature = "live_control"))]
+impl MeteredOwnerUsage {
+    fn visit_key(&self) {
+        if self.probes_active.load(Ordering::Relaxed) {
+            self.key_visits.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn start_probes(&self) -> OwnerUsageProbeGuard<'_> {
+        self.key_visits.store(0, Ordering::Relaxed);
+        self.probes_active.store(true, Ordering::Relaxed);
+        OwnerUsageProbeGuard(self)
+    }
+
+    fn get(&self, owner: &OwnerKey) -> Option<&UsageBreakdown> {
+        self.visit_key();
+        self.entries.get(owner)
+    }
+
+    fn get_mut(&mut self, owner: &OwnerKey) -> Option<&mut UsageBreakdown> {
+        self.entries.get_mut(owner)
+    }
+
+    fn entry(
+        &mut self,
+        owner: OwnerKey,
+    ) -> std::collections::btree_map::Entry<'_, OwnerKey, UsageBreakdown> {
+        self.entries.entry(owner)
+    }
+
+    fn remove(&mut self, owner: &OwnerKey) -> Option<UsageBreakdown> {
+        self.entries.remove(owner)
+    }
+
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn iter(&self) -> MeteredOwnerIter<'_> {
+        MeteredOwnerIter { entries: self.entries.iter(), meter: self }
+    }
+
+    fn values(&self) -> impl Iterator<Item = &UsageBreakdown> {
+        self.iter().map(|(_, usage)| usage)
+    }
+}
+
+#[cfg(all(test, feature = "live_control"))]
+struct MeteredOwnerIter<'a> {
+    entries: std::collections::btree_map::Iter<'a, OwnerKey, UsageBreakdown>,
+    meter: &'a MeteredOwnerUsage,
+}
+
+#[cfg(all(test, feature = "live_control"))]
+impl<'a> Iterator for MeteredOwnerIter<'a> {
+    type Item = (&'a OwnerKey, &'a UsageBreakdown);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let entry = self.entries.next()?;
+        self.meter.visit_key();
+        Some(entry)
+    }
+}
+
+#[cfg(all(test, feature = "live_control"))]
+impl<'a> IntoIterator for &'a MeteredOwnerUsage {
+    type Item = (&'a OwnerKey, &'a UsageBreakdown);
+    type IntoIter = MeteredOwnerIter<'a>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+#[cfg(all(test, feature = "live_control"))]
+struct OwnerUsageProbeGuard<'a>(&'a MeteredOwnerUsage);
+
+#[cfg(all(test, feature = "live_control"))]
+impl OwnerUsageProbeGuard<'_> {
+    fn key_visits(&self) -> usize {
+        self.0.key_visits.load(Ordering::Relaxed)
+    }
+}
+
+#[cfg(all(test, feature = "live_control"))]
+impl Drop for OwnerUsageProbeGuard<'_> {
+    fn drop(&mut self) {
+        self.0.probes_active.store(false, Ordering::Relaxed);
+    }
+}
+
+/// Keyed owner accounting view; consumers cannot scan or clone the backing map.
+#[cfg(feature = "live_control")]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct OwnerUsageRead<'a>(OwnerUsageReadData<'a>);
+
+#[cfg(feature = "live_control")]
+#[derive(Clone, Copy, Debug)]
+enum OwnerUsageReadData<'a> {
+    Plain(&'a BTreeMap<OwnerKey, UsageBreakdown>),
+    #[cfg(all(test, feature = "live_control"))]
+    Metered(&'a MeteredOwnerUsage),
+}
+
+#[cfg(feature = "live_control")]
+impl<'a> From<&'a BTreeMap<OwnerKey, UsageBreakdown>> for OwnerUsageRead<'a> {
+    fn from(usage: &'a BTreeMap<OwnerKey, UsageBreakdown>) -> Self {
+        Self(OwnerUsageReadData::Plain(usage))
+    }
+}
+
+#[cfg(feature = "live_control")]
+impl<'a> OwnerUsageRead<'a> {
+    pub(crate) fn get(&self, owner: &OwnerKey) -> Option<&'a UsageBreakdown> {
+        match self.0 {
+            OwnerUsageReadData::Plain(usage) => usage.get(owner),
+            #[cfg(all(test, feature = "live_control"))]
+            OwnerUsageReadData::Metered(usage) => usage.get(owner),
+        }
+    }
+}
+
 /// The accounting ledger. Owns class/owner/context counters and the active
 /// residency policy.
 ///
@@ -397,7 +528,10 @@ impl LedgerSnapshot {
 pub(crate) struct AccountingLedger {
     policy: ValidatedResidencyPolicy,
     class_usage: BTreeMap<MemoryClass, UsageBreakdown>,
+    #[cfg(not(test))]
     owner_usage: BTreeMap<OwnerKey, UsageBreakdown>,
+    #[cfg(test)]
+    owner_usage: MeteredOwnerUsage,
     context_usage: BTreeMap<MemoryContextKind, UsageBreakdown>,
     /// Exact O(1) aggregate used by admission. The three public accounting
     /// axes remain the reporting authority; every mutation updates all four
@@ -424,7 +558,7 @@ impl AccountingLedger {
         Self {
             policy,
             class_usage: BTreeMap::new(),
-            owner_usage: BTreeMap::new(),
+            owner_usage: Default::default(),
             context_usage: BTreeMap::new(),
             total_usage: UsageBreakdown::default(),
             non_headroom_bytes: 0,
@@ -448,7 +582,16 @@ impl AccountingLedger {
     pub(crate) fn usage_view(&self) -> crate::domain::admission::UsageView<'_> {
         crate::domain::admission::UsageView {
             class_usage: &self.class_usage,
-            owner_usage: &self.owner_usage,
+            owner_usage: {
+                #[cfg(test)]
+                {
+                    OwnerUsageRead(OwnerUsageReadData::Metered(&self.owner_usage))
+                }
+                #[cfg(not(test))]
+                {
+                    (&self.owner_usage).into()
+                }
+            },
             context_usage: &self.context_usage,
             total_usage: &self.total_usage,
         }
@@ -860,6 +1003,12 @@ impl AccountingLedger {
     }
 
     fn preflight_release_batch(&mut self, tickets: &[ReservationTicket]) -> MemoryResult<()> {
+        #[cfg(test)]
+        {
+            self.last_release_preflight_axis_probes = 0;
+        }
+        #[cfg(test)]
+        let owner_probes = self.owner_usage.start_probes();
         let mut class_refunds = BTreeMap::<(MemoryClass, ChargeKind), u64>::new();
         let mut owner_refunds = BTreeMap::<(OwnerKey, ChargeKind), u64>::new();
         let mut context_refunds = BTreeMap::<(MemoryContextKind, ChargeKind), u64>::new();
@@ -896,13 +1045,11 @@ impl AccountingLedger {
             }
         }
 
-        #[cfg(test)]
-        {
-            self.last_release_preflight_axis_probes =
-                class_refunds.len() + owner_refunds.len() + context_refunds.len();
-        }
-
         for ((class, kind), bytes) in &class_refunds {
+            #[cfg(test)]
+            {
+                self.last_release_preflight_axis_probes += 1;
+            }
             let usage = self
                 .class_usage
                 .get(class)
@@ -921,6 +1068,10 @@ impl AccountingLedger {
             })?;
         }
         for ((context, kind), bytes) in &context_refunds {
+            #[cfg(test)]
+            {
+                self.last_release_preflight_axis_probes += 1;
+            }
             let usage = self.context_usage.get(context).ok_or_else(|| {
                 MemoryError::InvalidState("release context axis is missing".into())
             })?;
@@ -938,6 +1089,10 @@ impl AccountingLedger {
         self.non_headroom_bytes.checked_sub(non_headroom_refund).ok_or_else(|| {
             MemoryError::InvalidState("release exceeds non-headroom aggregate".into())
         })?;
+        #[cfg(test)]
+        {
+            self.last_release_preflight_axis_probes += owner_probes.key_visits();
+        }
         Ok(())
     }
 
@@ -1045,7 +1200,16 @@ impl AccountingLedger {
     pub fn snapshot(&self) -> LedgerSnapshot {
         LedgerSnapshot {
             class_usage: self.class_usage.clone(),
-            owner_usage: self.owner_usage.clone(),
+            owner_usage: {
+                #[cfg(test)]
+                {
+                    self.owner_usage.iter().map(|(owner, usage)| (owner.clone(), *usage)).collect()
+                }
+                #[cfg(not(test))]
+                {
+                    self.owner_usage.clone()
+                }
+            },
             context_usage: self.context_usage.clone(),
             live_ticket_count: self.ticket_states.len(),
             rebuild_in_progress: self.rebuild_in_progress,
@@ -1660,6 +1824,31 @@ mod tests {
         assert_eq!(ledger.total_semantic_bytes(), 0);
         assert_eq!(ledger.non_headroom_bytes(), 0);
         assert_axes_balanced(&ledger.snapshot());
+    }
+
+    #[test]
+    fn owner_probe_meter_observes_keyed_reads_and_every_scanned_key() {
+        fn require_send<T: Send>() {}
+        require_send::<MeteredOwnerUsage>();
+        let mut owners = MeteredOwnerUsage::default();
+        for owner in ["a", "b", "c"] {
+            owners.entry(owner.to_string()).or_default();
+        }
+        let guard = owners.start_probes();
+        assert!(owners.get(&"c".to_string()).is_some());
+        assert_eq!(guard.key_visits(), 1);
+        assert!(owners.iter().any(|(owner, _)| owner.as_str() == "c"));
+        assert_eq!(guard.key_visits(), 4, "nested find visits every inspected owner");
+        assert_eq!(owners.values().count(), 3);
+        assert_eq!(guard.key_visits(), 7, "values iteration is also metered");
+        for _ in &owners {}
+        assert_eq!(guard.key_visits(), 10, "borrowed-map iteration is also metered");
+        let read = OwnerUsageRead(OwnerUsageReadData::Metered(&owners));
+        assert!(read.get(&"c".to_string()).is_some());
+        assert_eq!(guard.key_visits(), 11, "admission reads preserve metering");
+        drop(guard);
+        assert!(owners.get(&"c".to_string()).is_some());
+        assert_eq!(owners.key_visits.load(Ordering::Relaxed), 11, "inactive reads are unmetered");
     }
 
     #[test]

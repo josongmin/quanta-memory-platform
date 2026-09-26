@@ -522,7 +522,10 @@ mod tests {
         for index in 0..10_000 {
             groups.insert(format!("group-{index:05}"), group(1_000, 1));
         }
+        let precompute_before = admission::fair_share_precompute_calls();
         let mut scheduler = WeightedResourceGroupScheduler::new(groups, 10_000);
+        let precompute_after_build = admission::fair_share_precompute_calls();
+        assert_eq!(precompute_after_build - precompute_before, 1, "construction precomputes once");
         assert_eq!(scheduler.fair_burst_shares.len(), 10_000);
         assert_eq!(scheduler.fair_burst_shares.values().copied().sum::<u64>(), 10_000);
 
@@ -533,10 +536,20 @@ mod tests {
         for _ in 0..1_000 {
             assert!(scheduler.admits("group-05000", 1));
             assert!(!scheduler.admits("group-05000", 2));
+            assert_eq!(
+                admission::fair_share_precompute_calls(),
+                precompute_after_build,
+                "each live admission must reuse the precomputed table"
+            );
         }
         assert_eq!(
             scheduler.fair_burst_shares, allocation,
-            "live admission must not rebuild policy-static shares"
+            "live admission preserves policy-static share values"
+        );
+        assert_eq!(
+            admission::fair_share_precompute_calls(),
+            precompute_after_build,
+            "live admission must not recompute policy-static shares"
         );
     }
 

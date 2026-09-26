@@ -26,7 +26,9 @@ use quanta_memory_platform_core::{
 /// A tentative reservation handle issued by the fake broker. Holding one means
 /// bytes were provisioned against a class/owner; it must be released to return
 /// the bytes (the fake does not distinguish reserve-vs-commit beyond the real
-/// model's `commit` no-op, mirroring the core ledger).
+/// model's `commit` no-op, mirroring the core ledger). After partial reclaim,
+/// the original handle owns only the unreclaimed remainder. Full reclaim ends
+/// its authority, so subsequent commit/release rejects it as stale.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FakeReservation {
     id: u64,
@@ -188,7 +190,7 @@ pub struct FakeProcessBroker {
     group_owners: BTreeMap<String, Vec<OwnerKey>>,
     group_hard_caps: BTreeMap<String, u64>,
     next_id: u64,
-    ticket_states: BTreeMap<u64, FakeTicketState>,
+    tickets: BTreeMap<u64, FakeTicket>,
     rebuild_in_progress: bool,
     pressure: PressureState,
     /// Bytes a single reclaim attempt will free. `0` models reclaim-returns-zero.
@@ -200,6 +202,14 @@ pub struct FakeProcessBroker {
 enum FakeTicketState {
     Pending,
     Committed,
+}
+
+/// Reclaim and release share the same charge provenance and remaining authority.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FakeTicket {
+    reservation: FakeReservation,
+    state: FakeTicketState,
+    remaining_bytes: u64,
 }
 
 impl Default for FakeProcessBroker {
@@ -221,7 +231,7 @@ impl FakeProcessBroker {
             group_owners: BTreeMap::new(),
             group_hard_caps: BTreeMap::new(),
             next_id: 1,
-            ticket_states: BTreeMap::new(),
+            tickets: BTreeMap::new(),
             rebuild_in_progress: false,
             pressure: PressureState::Normal,
             reclaim_yield_bytes: u64::MAX,
@@ -342,9 +352,17 @@ impl FakeProcessBroker {
                 usage.checked_add(bytes).expect("fake group admission preflight checked postimage");
         }
         self.next_id = next_id;
-        self.ticket_states.insert(id, FakeTicketState::Pending);
+        let reservation = FakeReservation { id, class, owner, group, kind, bytes };
+        self.tickets.insert(
+            id,
+            FakeTicket {
+                reservation: reservation.clone(),
+                state: FakeTicketState::Pending,
+                remaining_bytes: bytes,
+            },
+        );
 
-        Ok(FakeReservation { id, class, owner, group, kind, bytes })
+        Ok(reservation)
     }
 
     /// Commit a reservation. Mirrors the core ledger: reserve already moved the
@@ -355,17 +373,23 @@ impl FakeProcessBroker {
                 "fake broker: rebuild in progress, live commit rejected".to_string(),
             ));
         }
-        match self.ticket_states.get_mut(&ticket.id) {
-            Some(state @ FakeTicketState::Pending) => {
-                *state = FakeTicketState::Committed;
-                Ok(ticket.bytes)
+        let authority = self
+            .tickets
+            .get_mut(&ticket.id)
+            .filter(|authority| authority.reservation == *ticket)
+            .ok_or_else(|| {
+                MemoryError::InvalidState(
+                    "fake broker: reservation is stale or already released".into(),
+                )
+            })?;
+        match authority.state {
+            FakeTicketState::Pending => {
+                authority.state = FakeTicketState::Committed;
+                Ok(authority.remaining_bytes)
             }
-            Some(FakeTicketState::Committed) => {
+            FakeTicketState::Committed => {
                 Err(MemoryError::InvalidState("fake broker: reservation already committed".into()))
             }
-            None => Err(MemoryError::InvalidState(
-                "fake broker: reservation is stale or already released".into(),
-            )),
         }
     }
 
@@ -376,11 +400,16 @@ impl FakeProcessBroker {
                 "fake broker: rebuild in progress, live release rejected".to_string(),
             ));
         }
-        if !self.ticket_states.contains_key(&ticket.id) {
-            return Err(MemoryError::InvalidState(
-                "fake broker: reservation is stale or already released".into(),
-            ));
-        }
+        let bytes = self
+            .tickets
+            .get(&ticket.id)
+            .filter(|authority| authority.reservation == *ticket)
+            .map(|authority| authority.remaining_bytes)
+            .ok_or_else(|| {
+                MemoryError::InvalidState(
+                    "fake broker: reservation is stale or already released".into(),
+                )
+            })?;
         for (axis, available) in [
             (
                 "class",
@@ -397,41 +426,45 @@ impl FakeProcessBroker {
                     .map_or(0, |usage| usage.amount(ticket.kind)),
             ),
         ] {
-            if available < ticket.bytes {
+            if available < bytes {
                 return Err(MemoryError::InvalidState(format!(
                     "fake broker: {axis} release exceeds usage"
                 )));
             }
         }
         if let Some(group) = ticket.group.as_ref() {
-            if self.group_usage.get(group).copied().unwrap_or(0) < ticket.bytes {
+            if self.group_usage.get(group).copied().unwrap_or(0) < bytes {
                 return Err(MemoryError::InvalidState(
                     "fake broker: group release exceeds usage".into(),
                 ));
             }
         }
 
-        self.ticket_states.remove(&ticket.id);
+        self.tickets.remove(&ticket.id);
         if let Some(usage) = self.class_usage.get_mut(&ticket.class) {
-            usage.sub(ticket.kind, ticket.bytes);
+            usage.sub(ticket.kind, bytes);
         }
         if let Some(usage) = self.owner_usage.get_mut(&ticket.owner) {
-            usage.sub(ticket.kind, ticket.bytes);
+            usage.sub(ticket.kind, bytes);
         }
         if let Some(usage) = self.context_usage.get_mut(&MemoryContextKind::Request) {
-            usage.sub(ticket.kind, ticket.bytes);
+            usage.sub(ticket.kind, bytes);
         }
         if let Some(group) = ticket.group.as_ref() {
             let usage = self.group_usage.get_mut(group).expect("release preflight checked group");
-            *usage = usage.checked_sub(ticket.bytes).expect("release preflight checked amount");
+            *usage = usage.checked_sub(bytes).expect("release preflight checked amount");
         }
         Ok(())
     }
 
-    /// Attempt one reclaim sweep. Returns the bytes freed; `0` models the
-    /// reclaim-returns-zero negative path. Reclaim frees from the largest owner.
+    /// Attempt one reclaim sweep, freeing at most the configured yield from the
+    /// largest owner. Charge-kind priority is payload, metadata, then scratch;
+    /// tickets within a kind are visited by increasing id. Partial reclaim keeps
+    /// the ticket live with a smaller release authority; full reclaim terminates
+    /// it. The original handle releases its remainder, never its original bytes.
+    /// During rebuild or a failed accounting preflight, nothing moves and 0 is returned.
     pub fn reclaim_once(&mut self) -> u64 {
-        if self.reclaim_yield_bytes == 0 {
+        if self.rebuild_in_progress || self.reclaim_yield_bytes == 0 {
             return 0;
         }
         let target = self
@@ -444,68 +477,99 @@ impl FakeProcessBroker {
             _ => return 0,
         };
         let freed = owner_total.min(self.reclaim_yield_bytes);
-        let group = self.group_of(&owner).cloned();
-        // Free proportionally from payload first, then metadata, then scratch.
         let mut remaining = freed;
-        if let Some(usage) = self.owner_usage.get_mut(&owner) {
-            for kind in
-                [ChargeKind::RetainedPayload, ChargeKind::RetainedMetadata, ChargeKind::LiveScratch]
-            {
-                let slot = match kind {
-                    ChargeKind::RetainedPayload => usage.retained_payload_bytes,
-                    ChargeKind::RetainedMetadata => usage.retained_metadata_bytes,
-                    ChargeKind::LiveScratch => usage.live_scratch_bytes,
-                };
-                let take = slot.min(remaining);
-                usage.sub(kind, take);
-                remaining = remaining.saturating_sub(take);
-            }
-        }
-        if let Some(usage) = self.context_usage.get_mut(&MemoryContextKind::Request) {
-            let mut remaining = freed;
-            for kind in
-                [ChargeKind::RetainedPayload, ChargeKind::RetainedMetadata, ChargeKind::LiveScratch]
-            {
-                let slot = match kind {
-                    ChargeKind::RetainedPayload => usage.retained_payload_bytes,
-                    ChargeKind::RetainedMetadata => usage.retained_metadata_bytes,
-                    ChargeKind::LiveScratch => usage.live_scratch_bytes,
-                };
-                let take = slot.min(remaining);
-                usage.sub(kind, take);
-                remaining = remaining.saturating_sub(take);
-            }
-        }
-        if let Some(group) = group {
-            if let Some(usage) = self.group_usage.get_mut(&group) {
-                *usage = usage.saturating_sub(freed);
-            }
-        }
-        // Mirror the same subtraction on the class axis so invariant 1 holds. We
-        // do not know the per-class split of the owner's bytes here, so reclaim
-        // is modeled at the granularity the conformance suite checks: the same
-        // total is removed from the class axis proportionally.
-        let mut to_remove = freed;
-        let classes: Vec<MemoryClass> = self.class_usage.keys().cloned().collect();
-        for class in classes {
-            if to_remove == 0 {
-                break;
-            }
-            if let Some(usage) = self.class_usage.get_mut(&class) {
-                for kind in [
-                    ChargeKind::RetainedPayload,
-                    ChargeKind::RetainedMetadata,
-                    ChargeKind::LiveScratch,
-                ] {
-                    let slot = match kind {
-                        ChargeKind::RetainedPayload => usage.retained_payload_bytes,
-                        ChargeKind::RetainedMetadata => usage.retained_metadata_bytes,
-                        ChargeKind::LiveScratch => usage.live_scratch_bytes,
-                    };
-                    let take = slot.min(to_remove);
-                    usage.sub(kind, take);
-                    to_remove = to_remove.saturating_sub(take);
+        let mut plan = Vec::new();
+        let mut owner_delta = FakeUsage::default();
+        let mut class_deltas = BTreeMap::<MemoryClass, FakeUsage>::new();
+        let mut group_deltas = BTreeMap::<String, u64>::new();
+        for kind in
+            [ChargeKind::RetainedPayload, ChargeKind::RetainedMetadata, ChargeKind::LiveScratch]
+        {
+            for (id, authority) in &self.tickets {
+                let reservation = &authority.reservation;
+                if remaining == 0 || reservation.owner != owner || reservation.kind != kind {
+                    continue;
                 }
+                let take = authority.remaining_bytes.min(remaining);
+                if take == 0 {
+                    continue;
+                }
+                plan.push((*id, take));
+                // Every delta is bounded by `freed`, so its slot cannot overflow.
+                owner_delta.add(kind, take);
+                class_deltas.entry(reservation.class.clone()).or_default().add(kind, take);
+                if let Some(group) = &reservation.group {
+                    let delta = group_deltas.entry(group.clone()).or_default();
+                    let Some(after) = delta.checked_add(take) else {
+                        return 0;
+                    };
+                    *delta = after;
+                }
+                remaining -= take;
+            }
+        }
+        let covers = |usage: &FakeUsage, delta: &FakeUsage| {
+            usage.retained_payload_bytes >= delta.retained_payload_bytes
+                && usage.retained_metadata_bytes >= delta.retained_metadata_bytes
+                && usage.live_scratch_bytes >= delta.live_scratch_bytes
+        };
+        if remaining != 0
+            || !self.owner_usage.get(&owner).is_some_and(|usage| covers(usage, &owner_delta))
+            || !self
+                .context_usage
+                .get(&MemoryContextKind::Request)
+                .is_some_and(|usage| covers(usage, &owner_delta))
+            || class_deltas.iter().any(|(class, delta)| {
+                !self.class_usage.get(class).is_some_and(|usage| covers(usage, delta))
+            })
+            || group_deltas
+                .iter()
+                .any(|(group, delta)| self.group_usage.get(group).is_none_or(|usage| usage < delta))
+        {
+            return 0;
+        }
+        let subtract = |usage: &mut FakeUsage, delta: &FakeUsage| {
+            usage.retained_payload_bytes = usage
+                .retained_payload_bytes
+                .checked_sub(delta.retained_payload_bytes)
+                .expect("reclaim preflight checked payload");
+            usage.retained_metadata_bytes = usage
+                .retained_metadata_bytes
+                .checked_sub(delta.retained_metadata_bytes)
+                .expect("reclaim preflight checked metadata");
+            usage.live_scratch_bytes = usage
+                .live_scratch_bytes
+                .checked_sub(delta.live_scratch_bytes)
+                .expect("reclaim preflight checked scratch");
+        };
+        subtract(
+            self.owner_usage.get_mut(&owner).expect("reclaim preflight checked owner"),
+            &owner_delta,
+        );
+        subtract(
+            self.context_usage
+                .get_mut(&MemoryContextKind::Request)
+                .expect("reclaim preflight checked context"),
+            &owner_delta,
+        );
+        for (class, delta) in class_deltas {
+            subtract(
+                self.class_usage.get_mut(&class).expect("reclaim preflight checked class"),
+                &delta,
+            );
+        }
+        for (group, delta) in group_deltas {
+            let usage = self.group_usage.get_mut(&group).expect("reclaim preflight checked group");
+            *usage = usage.checked_sub(delta).expect("reclaim preflight checked group amount");
+        }
+        for (id, take) in plan {
+            let authority = self.tickets.get_mut(&id).expect("planned ticket remains live");
+            authority.remaining_bytes = authority
+                .remaining_bytes
+                .checked_sub(take)
+                .expect("reclaim plan checked ticket amount");
+            if authority.remaining_bytes == 0 {
+                self.tickets.remove(&id);
             }
         }
         freed
@@ -570,7 +634,7 @@ impl FakeProcessBroker {
             owner_usage,
             context_usage: self.context_usage.clone(),
             group_usage: self.group_usage.clone(),
-            live_ticket_count: self.ticket_states.len(),
+            live_ticket_count: self.tickets.len(),
             rebuild_in_progress: self.rebuild_in_progress,
             pressure: self.pressure,
             total_override,
@@ -740,6 +804,131 @@ mod tests {
         let snap = b2.snapshot();
         assert_eq!(snap.total_owner_bytes(), 300);
         assert_eq!(snap.total_class_bytes(), snap.total_owner_bytes(), "reclaim keeps invariant 1");
+    }
+
+    #[test]
+    fn reclaim_preserves_ticket_provenance_kind_axes_and_group_refunds() {
+        let mut broker = FakeProcessBroker::honest()
+            .with_resource_group("group", 120, vec!["small".into(), "large".into()])
+            .with_reclaim_yield_bytes(50);
+        let unrelated = broker
+            .reserve(MemoryClass::ArtifactCache, "small".into(), ChargeKind::RetainedPayload, 20)
+            .expect("small payload");
+        let reclaimed = broker
+            .reserve(MemoryClass::EvidenceCache, "large".into(), ChargeKind::RetainedMetadata, 100)
+            .expect("large metadata");
+        broker.commit(&unrelated).expect("commit unrelated");
+        broker.commit(&reclaimed).expect("commit reclaimed");
+
+        assert_eq!(broker.reclaim_once(), 50);
+        let snapshot = broker.snapshot();
+        let payload = FakeUsage { retained_payload_bytes: 20, ..FakeUsage::default() };
+        let metadata = FakeUsage { retained_metadata_bytes: 50, ..FakeUsage::default() };
+        assert_eq!(snapshot.class_usage[&MemoryClass::ArtifactCache], payload);
+        assert_eq!(snapshot.class_usage[&MemoryClass::EvidenceCache], metadata);
+        assert_eq!(snapshot.owner_usage["small"], payload);
+        assert_eq!(snapshot.owner_usage["large"], metadata);
+        assert_eq!(
+            snapshot.context_usage[&MemoryContextKind::Request],
+            FakeUsage {
+                retained_payload_bytes: 20,
+                retained_metadata_bytes: 50,
+                live_scratch_bytes: 0,
+            }
+        );
+        assert_eq!(snapshot.group_usage["group"], 70);
+        assert_eq!(snapshot.live_ticket_count, 2);
+        assert_eq!(reclaimed.bytes(), 100, "immutable handle records its issued size");
+        broker.release(&unrelated).expect("reclaim must not corrupt unrelated ticket");
+        broker.release(&reclaimed).expect("original handle releases the remaining 50 bytes");
+        let empty = broker.snapshot();
+        assert_eq!(empty.total_class_bytes(), 0);
+        assert_eq!(empty.total_owner_bytes(), 0);
+        assert_eq!(empty.context_usage[&MemoryContextKind::Request], FakeUsage::default());
+        assert_eq!(empty.group_usage["group"], 0);
+        assert_eq!(empty.live_ticket_count, 0);
+        let before_stale_release = broker.snapshot();
+        assert!(matches!(broker.release(&reclaimed), Err(MemoryError::InvalidState(_))));
+        assert_eq!(broker.snapshot(), before_stale_release);
+    }
+
+    #[test]
+    fn reclaim_terminates_full_tickets_and_preserves_partial_commit_authority() {
+        let mut broker = FakeProcessBroker::honest()
+            .with_resource_group("group", 100, vec!["owner".into()])
+            .with_reclaim_yield_bytes(40);
+        let payload = broker
+            .reserve(MemoryClass::EvidenceCache, "owner".into(), ChargeKind::RetainedPayload, 30)
+            .expect("payload");
+        let metadata = broker
+            .reserve(MemoryClass::ArtifactCache, "owner".into(), ChargeKind::RetainedMetadata, 50)
+            .expect("metadata");
+        let scratch = broker
+            .reserve(MemoryClass::ArtifactCache, "owner".into(), ChargeKind::LiveScratch, 5)
+            .expect("scratch");
+        let zero = broker
+            .reserve(MemoryClass::ArtifactCache, "owner".into(), ChargeKind::LiveScratch, 0)
+            .expect("zero-byte reservation still carries authority");
+        assert_eq!(broker.reclaim_once(), 40, "payload-first reclaim spans both classes");
+        let snapshot = broker.snapshot();
+        assert_eq!(snapshot.class_usage[&MemoryClass::EvidenceCache], FakeUsage::default());
+        assert_eq!(snapshot.class_usage[&MemoryClass::ArtifactCache].retained_metadata_bytes, 40);
+        assert_eq!(snapshot.total_owner_bytes(), 45);
+        assert_eq!(snapshot.total_retained_payload_bytes(), 0);
+        assert_eq!(snapshot.total_retained_metadata_bytes(), 40);
+        assert_eq!(snapshot.live_ticket_count, 3);
+        assert_eq!(snapshot.group_usage["group"], 45);
+        assert_eq!(snapshot.total_live_scratch_bytes(), 5);
+        assert!(matches!(broker.commit(&payload), Err(MemoryError::InvalidState(_))));
+        assert!(matches!(broker.release(&payload), Err(MemoryError::InvalidState(_))));
+        assert_eq!(broker.snapshot(), snapshot, "fully reclaimed authority is stale and inert");
+        assert_eq!(broker.commit(&metadata).expect("commit remainder"), 40);
+        assert_eq!(broker.reclaim_once(), 40);
+        assert_eq!(broker.snapshot().live_ticket_count, 2);
+        assert_eq!(broker.snapshot().total_live_scratch_bytes(), 5);
+        assert_eq!(broker.snapshot().group_usage["group"], 5);
+        assert_eq!(broker.reclaim_once(), 5, "scratch is reclaimed after retained kinds");
+        assert!(matches!(broker.commit(&scratch), Err(MemoryError::InvalidState(_))));
+        assert!(matches!(broker.release(&scratch), Err(MemoryError::InvalidState(_))));
+        assert_eq!(broker.snapshot().live_ticket_count, 1, "zero-byte ticket is not reclaimed");
+        assert_eq!(broker.snapshot().total_class_bytes(), 0);
+        assert!(matches!(broker.release(&metadata), Err(MemoryError::InvalidState(_))));
+        assert_eq!(broker.snapshot().group_usage["group"], 0);
+        assert_eq!(broker.commit(&zero).expect("zero authority survives reclaim"), 0);
+        broker.release(&zero).expect("zero authority releases exactly once");
+        assert_eq!(broker.snapshot().live_ticket_count, 0);
+        assert!(matches!(broker.release(&zero), Err(MemoryError::InvalidState(_))));
+    }
+
+    #[test]
+    fn reclaim_rebuild_and_incomplete_group_preflight_leave_all_authority_untouched() {
+        let mut broker = FakeProcessBroker::honest()
+            .with_resource_group("group", 100, vec!["owner".into()])
+            .with_reclaim_yield_bytes(80);
+        let ticket = broker
+            .reserve(MemoryClass::ArtifactCache, "owner".into(), ChargeKind::RetainedPayload, 100)
+            .expect("reservation");
+        broker.commit(&ticket).expect("commit");
+        broker.begin_rebuild();
+        let before = broker.snapshot();
+        let tickets = broker.tickets.clone();
+        assert_eq!(broker.reclaim_once(), 0);
+        assert_eq!(broker.snapshot(), before);
+        assert_eq!(broker.tickets, tickets);
+        broker.finish_rebuild();
+
+        // A corrupt group cannot authorize a partial publish on the other axes.
+        broker.group_usage.insert("group".into(), 50);
+        let before = broker.snapshot();
+        let tickets = broker.tickets.clone();
+        assert_eq!(broker.reclaim_once(), 0);
+        assert_eq!(broker.snapshot(), before);
+        assert_eq!(broker.tickets, tickets);
+        broker.group_usage.insert("group".into(), 100);
+        assert_eq!(broker.reclaim_once(), 80);
+        broker.release(&ticket).expect("remaining 20-byte authority survives denial");
+        assert_eq!(broker.snapshot().total_owner_bytes(), 0);
+        assert_eq!(broker.snapshot().group_usage["group"], 0);
     }
 
     #[test]

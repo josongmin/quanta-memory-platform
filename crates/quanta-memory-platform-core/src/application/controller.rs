@@ -418,15 +418,27 @@ mod tests {
     }
 
     #[test]
-    fn tiny_non_zero_limit_saturates_percent_without_wrapping() {
+    fn extreme_limits_classify_percent_without_wrapping_or_saturating_product() {
         let c =
             LadderPressureController::new(1, PressureThresholds::default(), PressureState::Normal);
         assert_eq!(c.classify_semantic(1), PressureState::Fatal, "1/1 is already fatal");
         assert_eq!(
             c.classify_semantic(u64::MAX),
             PressureState::Fatal,
-            "used_bytes * 100 must saturate, never wrap below fatal"
+            "a tiny limit with maximal usage must remain fatal"
         );
+        let large = LadderPressureController::new(
+            u64::MAX,
+            PressureThresholds::default(),
+            PressureState::Normal,
+        );
+        assert_eq!(
+            large.classify_semantic(u64::MAX),
+            PressureState::Fatal,
+            "100% pressure must not become 0% after wrapping or 1% after saturation"
+        );
+        let soft_usage = u64::try_from(u128::from(u64::MAX) * 80 / 100).expect("80% fits u64");
+        assert_eq!(large.classify_semantic(soft_usage), PressureState::Soft);
     }
 
     // scenario E: the ladder transitions in BOTH directions. Driving usage up to

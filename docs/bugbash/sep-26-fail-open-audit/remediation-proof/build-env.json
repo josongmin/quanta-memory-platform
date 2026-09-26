@@ -1,0 +1,5 @@
+{
+  "CARGO_TARGET_DIR": "/tmp/qmp-sep26-candidate-y2s09ws1/target",
+  "CARGO_PROFILE_TEST_DEBUG": "0",
+  "CARGO_BUILD_JOBS": "4"
+}

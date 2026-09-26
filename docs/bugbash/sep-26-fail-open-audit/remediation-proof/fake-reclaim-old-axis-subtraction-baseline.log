@@ -1,0 +1,11 @@
+   Compiling quanta-memory-platform-core v0.2.0 (/private/tmp/qmp-sep26-candidate-aych53eb/crates/quanta-memory-platform-core)
+   Compiling quanta-memory-platform-facade v0.2.0 (/private/tmp/qmp-sep26-candidate-aych53eb/crates/quanta-memory-platform-facade)
+   Compiling quanta-memory-platform-testkit v0.2.0 (/private/tmp/qmp-sep26-candidate-aych53eb/crates/quanta-memory-platform-testkit)
+    Finished `test` profile [unoptimized] target(s) in 1m 04s
+     Running unittests src/lib.rs (/tmp/qmp-sep26-candidate-y2s09ws1/target/debug/deps/quanta_memory_platform_testkit-627a022eb8b8ad80)
+
+running 1 test
+test fake::broker::tests::reclaim_preserves_ticket_provenance_kind_axes_and_group_refunds ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 85 filtered out; finished in 0.03s
+
