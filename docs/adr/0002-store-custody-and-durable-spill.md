@@ -39,6 +39,40 @@ Status: Accepted for the 0.2 implementation; durable backing is opt-in.
   scope. Its configured record, logical payload, file and restore-staging
   limits are not filesystem reservation or power-loss guarantees. A future
   durable consumer needs an explicit failure model and its own qualification.
+- Physical power-loss qualification is not an open 0.2 defect or release
+  prerequisite. It becomes required only when a named consumer enables this
+  backing and owns a production guarantee for a fixed device/filesystem/mount
+  topology. Until then, maintenance receipts must retain an explicit
+  `power_loss_proven=false` boundary rather than creating an L3 backlog item.
+
+## Durable maintenance qualification boundary
+
+The optional backing has three deliberately separate evidence levels:
+
+- Owner tests and fault injection prove record disposition, claim generation,
+  single-owner recovery, exact custody transfer, bounded staging and fail-closed
+  ambiguous outcomes.
+- The L1 process-kill rail brackets the finalize commit with named pre-commit
+  and post-commit points, kills without destructors, cold-reopens the same
+  database and checks the public recovery state machine. It proves only the
+  exercised process-termination boundaries.
+- The opt-in Linux L2 rails inject `pwrite64`/`fdatasync` errors and a
+  disposable ext4 device-mapper error-table swap. They check whole-state
+  reopen outcomes and resource cleanup, but do not model loss of device power,
+  volatile controller caches or torn physical writes.
+
+L2 orchestration is fail-closed: the finalize-marker wait and complete run have
+positive bounded timeouts; `strace` and its worker share a process group so a
+timeout terminates the trace tree; invalid timeout input is rejected before
+worker spawn; cleanup continues after evidence-write failures; and receipts
+bind the result to the executable source digest. Historical or dirty-source
+receipts do not qualify a later candidate; ADR 0003 owns that rule.
+
+Physical L3 is activated only by a consumer decision that names all of the
+following: production device and firmware class, filesystem and mount/barrier
+configuration, external power-cut controller, recovery/fsck policy, cut-point
+matrix, iteration policy, acceptance criteria and evidence owner. Until that
+decision exists, L3 is a non-goal rather than residual implementation work.
 
 ## Why and consequences
 

@@ -413,6 +413,10 @@ check helpers that the control plane enforces (see group C/D).
 
 ### Optional durable maintenance (`spill-redb`, not active product support)
 
+Physical power-loss L3 is neither a 0.2 defect nor an in-memory release gate.
+[ADR 0002](adr/0002-store-custody-and-durable-spill.md) owns its conditional
+activation criteria. The optional L1/L2 evidence below does not prove L3.
+
 - ✅ **Ambiguous ACK with another active claim** —
   `ambiguous_finalize_probe_uses_own_record_proof_with_foreign_claim_live` and
   `lost_finalize_and_abort_acks_allow_a_new_claim_before_reconciliation`

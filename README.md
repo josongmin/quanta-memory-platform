@@ -25,6 +25,10 @@ scope decision does not remove its API or turn historical test results into a
 release claim.
 Reconsider it only with a named consumer, measured reuse benefit, and an owned
 disk-failure and invalidation contract.
+Physical power-loss qualification (L3) is therefore not a current defect,
+backlog item, or release gate. Open that work only if a named consumer adopts
+`spill-redb` and requires a production power-loss guarantee for a specified
+device, filesystem, mount configuration, and recovery policy.
 
 The host adapter is deliberately outside this repository:
 

@@ -11,7 +11,8 @@
 //!
 //! Boundary NOT proved here: anything inside dependency-owned `pwrite`/`fsync`
 //! (L2), and power loss (L3). A `SIGKILL` rail cannot fail the storage device
-//! mid-sector-write, so power-loss durability stays `UNVERIFIED`.
+//! mid-sector-write. L3 is intentionally not claimed or tracked as a 0.2
+//! release gap while `spill-redb` remains outside active product support.
 //!
 //! Every test drives recovery through the public
 //! [`ReconciledDurableSpillTarget`] / [`DurableRestoreTarget`] surface only.

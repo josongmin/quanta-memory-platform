@@ -8,8 +8,9 @@
 //! crash-point tests (faults at write boundaries, same address space).
 //!
 //! Boundary NOT proved here: power loss. A `SIGKILL` rail cannot fail the
-//! storage device mid-sector-write, so power-loss durability remains
-//! unverified by this rail.
+//! storage device mid-sector-write. L3 is intentionally not claimed or tracked
+//! as a 0.2 release gap while `spill-redb` remains outside active product
+//! support.
 //!
 //! Backing-only cases drive recovery through the public
 //! [`ReconciledDurableSpillTarget`] / [`DurableRestoreTarget`] surface. The

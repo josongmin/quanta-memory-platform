@@ -6,6 +6,8 @@
 //! two whole transaction outcomes: the exact committed recovery record remains
 //! recoverable, or the record is fully Finalized. This is syscall-error
 //! injection on the host filesystem, not block-device failure or power loss.
+//! Physical L3 is intentionally not a 0.2 release gap while `spill-redb`
+//! remains outside active product support.
 //!
 //! Run through `scripts/durability/run-emulated-linux.sh`; do not add this to
 //! normal PR test rails. The harness leaves its trace logs and Redb files in
