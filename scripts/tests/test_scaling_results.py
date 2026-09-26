@@ -212,6 +212,28 @@ class ScalingResultTests(unittest.TestCase):
             MODULE.validate(valid_records(["--profile=in-memory-pressure", "--smoke"])), 12,
         )
 
+    def test_phase_and_outcome_p99_cannot_exceed_whole_run(self) -> None:
+        for operation, field in (
+            ("revocable_fill_and_drain", "fill_p99_ns"),
+            ("scheduler_admission_group_cardinality", "denied_p99_ns"),
+        ):
+            with self.subTest(operation=operation, field=field):
+                records = valid_records(["--smoke"])
+                row = next(record for record in records if record.get("operation") == operation)
+                row[field] = int(row["elapsed_ns"]) + 1
+                with self.assertRaisesRegex(MODULE.ValidationError, "p99 exceeds measured wall time"):
+                    MODULE.validate(records)
+
+    def test_provenance_fields_require_full_git_ids_and_sha256_digests(self) -> None:
+        for field in (
+            "source_sha", "source_tree", "feature_graph_sha256", "dependency_lock_sha256",
+        ):
+            with self.subTest(field=field):
+                records = valid_records(["--smoke"])
+                records[0][field] = "not-a-digest"
+                with self.assertRaisesRegex(MODULE.ValidationError, field):
+                    MODULE.validate(records)
+
     def test_release_requires_independent_full_compatible_runs(self) -> None:
         candidates, baselines = release_receipts()
         self.assertEqual(MODULE.validate_release(candidates, baselines, RELEASE_POLICY), 220)

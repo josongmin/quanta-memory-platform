@@ -19,6 +19,22 @@ STEP_NAME = "Verify actual standalone extraction and full workspace gate"
 SCRIPT_COMMAND = "scripts/verify-extracted-examples.sh"
 
 
+def job_block(text: str, name: str) -> str:
+    """Select a direct child of jobs, never a step in another job."""
+    lines = text.splitlines()
+    starts = [i for i, line in enumerate(lines) if line == "jobs:"]
+    if len(starts) != 1:
+        raise AssertionError(f"expected one jobs section, got {len(starts)}")
+    section = starts[0] + 1
+    end = next((i for i in range(section, len(lines)) if lines[i] and not lines[i].startswith(" ")), len(lines))
+    matches = [i for i in range(section, end) if lines[i] == f"  {name}:"]
+    if len(matches) != 1:
+        raise AssertionError(f"expected one {name!r} job, got {len(matches)}")
+    start = matches[0]
+    job_end = next((i for i in range(start + 1, end) if re.fullmatch(r"  [A-Za-z][\w-]*:", lines[i])), end)
+    return "\n".join(lines[start:job_end])
+
+
 def named_step(text: str, name: str) -> list[str]:
     """Return one YAML step, bounded by the next step at the same indentation."""
     lines = text.splitlines()
@@ -44,11 +60,15 @@ def named_step(text: str, name: str) -> list[str]:
 
 def executable_step_errors(text: str, name: str, body_key: str) -> list[str]:
     try:
-        step = named_step(text, name)
+        step = named_step(job_block(text, "full-extraction"), name)
     except AssertionError as error:
         return [str(error)]
     stripped = [line.strip() for line in step if line.strip()]
     errors: list[str] = []
+    expected_indent = 10 if body_key == "command" else 6
+    actual_indent = len(step[0]) - len(step[0].lstrip())
+    if actual_indent != expected_indent:
+        errors.append("extraction step is nested below a conditional or other wrapper")
     if any(re.fullmatch(r"if:\s*(false|0|\$\{\{\s*false\s*\}\})", line) for line in stripped):
         errors.append("extraction step is disabled")
     if any(line.startswith(("when:", "continue-on-error:")) for line in stripped):
@@ -185,6 +205,38 @@ class CiEntryPointContracts(unittest.TestCase):
         self.assertTrue(circleci_push_workflow_errors(circle.replace("workflows:\n", "workflows:\n  when: false\n", 1)))
         github = GITHUB_WORKFLOW.read_text(encoding="utf-8")
         self.assertTrue(github_full_job_errors(github.replace("  full-extraction:\n", "  full-extraction:\n    needs: billing-probe\n", 1)))
+
+    def test_extraction_step_must_be_directly_in_the_scheduled_job(self) -> None:
+        circle = CIRCLECI_CONFIG.read_text(encoding="utf-8")
+        direct = (
+            "      - run:\n"
+            f"          name: {STEP_NAME}\n"
+            "          no_output_timeout: 20m\n"
+            "          command: |\n"
+            "            set -euo pipefail\n"
+            f"            {SCRIPT_COMMAND}\n"
+        )
+        self.assertEqual(circle.count(direct), 1)
+        conditional = (
+            "      - when:\n"
+            "          condition: false\n"
+            "          steps:\n"
+            "            - run:\n"
+            f"                name: {STEP_NAME}\n"
+            "                no_output_timeout: 20m\n"
+            "                command: |\n"
+            "                  set -euo pipefail\n"
+            f"                  {SCRIPT_COMMAND}\n"
+        )
+        self.assertTrue(executable_step_errors(circle.replace(direct, conditional), STEP_NAME, "command"))
+        unused_job = (
+            "  unused-verification:\n"
+            "    machine:\n"
+            "      image: ubuntu-2404:2026.05.1\n"
+            "    steps:\n" + direct
+        )
+        moved = circle.replace(direct, "").replace("workflows:\n", unused_job + "\nworkflows:\n")
+        self.assertTrue(executable_step_errors(moved, STEP_NAME, "command"))
 
     def test_benchmark_artifact_steps_cannot_disappear(self) -> None:
         text = BENCHMARK_CONFIG.read_text(encoding="utf-8")

@@ -96,8 +96,16 @@ PY
 
 set +e
 cargo bench --locked -p quanta-memory-platform-facade "${cargo_features[@]}" --bench scaling -- "$@" 2>&1 | tee -a "$result_file"
-bench_status=${PIPESTATUS[0]}
+# Capture both statuses before any other command resets PIPESTATUS. A failed
+# tee can otherwise leave an incomplete receipt while Cargo itself exits 0.
+bench_pipe_status=("${PIPESTATUS[@]}")
+bench_status=${bench_pipe_status[0]}
+tee_status=${bench_pipe_status[1]}
 set -e
+if (( tee_status != 0 )); then
+  echo "run-scaling-bench: could not retain complete benchmark output (tee exit ${tee_status}): ${result_file}" >&2
+  exit 2
+fi
 
 end_source_sha="$(git rev-parse HEAD)"
 end_source_tree="$(git rev-parse 'HEAD^{tree}')"

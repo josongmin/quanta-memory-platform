@@ -239,7 +239,13 @@ def run_metadata(records: list[dict[str, object]]) -> tuple[dict[str, object], B
     for field in ("source_sha", "source_tree", *COMPAT_FIELDS):
         if not isinstance(run.get(field), str) or not run[field]:
             raise ValidationError(f"run metadata field {field!r} is missing")
-    for field in (BENCHMARK_SOURCE_FIELD, BUILD_CONFIG_FIELD):
+    for field in ("source_sha", "source_tree"):
+        if re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", run[field]) is None:
+            raise ValidationError(f"run metadata field {field!r} is not a full Git object ID")
+    for field in (
+        "feature_graph_sha256", "dependency_lock_sha256",
+        BENCHMARK_SOURCE_FIELD, BUILD_CONFIG_FIELD,
+    ):
         digest = run.get(field)
         if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
             raise ValidationError(f"run metadata field {field!r} is missing or invalid")
@@ -289,12 +295,13 @@ def validate_samples(
         grouped[key[:-1]].append(sample)
         if integer(sample, "entries") <= 0 or integer(sample, "threads") <= 0:
             raise ValidationError(f"{key}: entries/threads must be positive")
-        if integer(sample, "elapsed_ns") <= 0:
+        elapsed_ns = integer(sample, "elapsed_ns")
+        if elapsed_ns <= 0:
             raise ValidationError(f"{key}: elapsed_ns must be positive")
         p50, p95, p99 = (integer(sample, field) for field in ("p50_ns", "p95_ns", "p99_ns"))
         if not (0 <= p50 <= p95 <= p99 <= max_p99_ns):
             raise ValidationError(f"{key}: invalid/over-limit latency distribution {p50}/{p95}/{p99}")
-        if p99 > integer(sample, "elapsed_ns"):
+        if p99 > elapsed_ns:
             raise ValidationError(f"{key}: operation p99 exceeds measured wall time")
         throughput = integer(sample, "throughput_ops_per_sec")
         if throughput <= 0:
@@ -334,6 +341,8 @@ def validate_samples(
                 values = tuple(integer(sample, field) for field in fields)
                 if not (0 <= values[0] <= values[1] <= values[2] <= max_p99_ns):
                     raise ValidationError(f"{key}: invalid/over-limit {outcome} latency distribution {values}")
+                if values[2] > elapsed_ns:
+                    raise ValidationError(f"{key}: {outcome} p99 exceeds measured wall time")
             if sample.get("operation") in FIXED_OUTCOME_OPERATIONS and p99 < max(
                 integer(sample, "admitted_p50_ns"), integer(sample, "denied_p50_ns")
             ):
@@ -350,6 +359,8 @@ def validate_samples(
                 values = tuple(integer(sample, field) for field in fields)
                 if not (0 <= values[0] <= values[1] <= values[2] <= max_p99_ns):
                     raise ValidationError(f"{key}: invalid/over-limit {phase} latency distribution {values}")
+                if values[2] > elapsed_ns:
+                    raise ValidationError(f"{key}: {phase} p99 exceeds measured wall time")
         if sample.get("operation") == PRESSURE_RECLAIM_OPERATION:
             reclaimed = integer(sample, "reclaimed_operations")
             if not 0 < reclaimed <= denied or reclaimed > succeeded + 2:

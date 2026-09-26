@@ -40,6 +40,8 @@ class DocTestSelectorTests(unittest.TestCase):
             )
             candidates = {"exact_test_selector": {"doc.md"}}
             self.assertEqual(REAL_OWNER_CONTRACT_ERRORS(candidates, root), [])
+            core.write_text("fn exact_test_selector() {}\n", encoding="utf-8")
+            self.assertTrue(REAL_OWNER_CONTRACT_ERRORS(candidates, root))
             core.write_text("// test removed\n", encoding="utf-8")
             self.assertTrue(REAL_OWNER_CONTRACT_ERRORS(candidates, root))
 
@@ -73,6 +75,7 @@ class DocTestSelectorTests(unittest.TestCase):
             document = Path(directory) / "doc.md"
             document.write_text(
                 "`exact_test_selector` `fixtures::tests::qualified_test_selector` "
+                "`fixtures::tests::short_test` "
                 "`Widget::non_test_method` `two_parts` `TypeName` `feature-name`\n",
                 encoding="utf-8",
             )
@@ -81,6 +84,9 @@ class DocTestSelectorTests(unittest.TestCase):
                 {
                     "exact_test_selector": {document.relative_to(MODULE.ROOT).as_posix()},
                     "fixtures::tests::qualified_test_selector": {
+                        document.relative_to(MODULE.ROOT).as_posix()
+                    },
+                    "fixtures::tests::short_test": {
                         document.relative_to(MODULE.ROOT).as_posix()
                     },
                 },

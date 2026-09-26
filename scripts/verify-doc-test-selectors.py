@@ -45,6 +45,23 @@ NON_TEST_IDENTIFIERS = {
 
 def owner_contract_errors(candidates: dict[str, set[str]], root: Path = ROOT) -> list[str]:
     """Pin each documented selector to the Rust source that owns its test."""
+    def defines_test(lines: list[str], leaf: str) -> bool:
+        function = re.compile(rf"^\s*(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?fn\s+{re.escape(leaf)}\s*\(")
+        for index, line in enumerate(lines):
+            if function.search(line) is None:
+                continue
+            cursor = index - 1
+            attributes: list[str] = []
+            while cursor >= 0:
+                preceding = lines[cursor].strip()
+                if preceding and not preceding.startswith("#["):
+                    break
+                attributes.append(preceding)
+                cursor -= 1
+            if any(re.fullmatch(r"#\[\s*(?:test|tokio::test)\s*\]", attr) for attr in attributes):
+                return True
+        return False
+
     def unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
         result: dict[str, object] = {}
         for key, value in pairs:
@@ -63,7 +80,7 @@ def owner_contract_errors(candidates: dict[str, set[str]], root: Path = ROOT) ->
     selectors = set(candidates) - NON_TEST_IDENTIFIERS
     errors = [f"selector owner inventory differs: missing={sorted(selectors - owners.keys())} "
               f"extra={sorted(owners.keys() - selectors)}"] if owners.keys() != selectors else []
-    source_contents: dict[Path, str] = {}
+    source_contents: dict[Path, list[str]] = {}
     for selector in sorted(selectors & owners.keys()):
         owner = owners[selector]
         if not isinstance(owner, str) or not owner.startswith("crates/") or ".." in Path(owner).parts or not owner.endswith(".rs"):
@@ -75,9 +92,9 @@ def owner_contract_errors(candidates: dict[str, set[str]], root: Path = ROOT) ->
             continue
         leaf = selector.rsplit("::", 1)[-1]
         if path not in source_contents:
-            source_contents[path] = path.read_text(encoding="utf-8")
-        if re.search(rf"\bfn\s+{re.escape(leaf)}\s*\(", source_contents[path]) is None:
-            errors.append(f"{selector}: owner source no longer defines test: {owner}")
+            source_contents[path] = path.read_text(encoding="utf-8").splitlines()
+        if not defines_test(source_contents[path], leaf):
+            errors.append(f"{selector}: owner source no longer defines an annotated test: {owner}")
     return errors
 
 
@@ -88,7 +105,7 @@ def documented_candidates(
     for path in documents:
         text = path.read_text(encoding="utf-8")
         for token in re.findall(r"`([A-Za-z][A-Za-z0-9_:-]{5,})`", text):
-            if token.count("_") < 2 or "-" in token:
+            if "-" in token or ("::tests::" not in token and token.count("_") < 2):
                 continue
             if "::" in token and "::tests::" not in token:
                 continue
