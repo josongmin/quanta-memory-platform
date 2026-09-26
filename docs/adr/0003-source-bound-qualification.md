@@ -40,3 +40,12 @@ promoting older receipts. The executable current gates are
 and the benchmark verifier documented in
 [verification scenarios](../verification-scenarios.md). This ADR contains no
 claim that the current HEAD passed those gates.
+
+## Review applicability
+
+Apply only the contracts of a supported capability. Unchecked generic review
+items are not defects or implementation backlog. Record source, tested
+transition, failure model and owner; keep type/compile proof, runtime tests,
+protocol models and consumer deployment evidence distinct. Do not require a
+named cache algorithm, async waiting, FFI or durable recovery merely because
+a generic substrate checklist mentions it.

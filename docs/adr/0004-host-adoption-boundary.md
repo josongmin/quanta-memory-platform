@@ -34,6 +34,8 @@ receipt or prepared token can outlive the visible table row, so its lease
 must follow actual custody, not merely lookup visibility.
 
 The 0.3 builder/DSL in [RFC 0001](../rfcs/0001-sdk-interface-contract.md)
-is an accepted design target, not implemented or qualified. Conditional
-Semantica verification obligations are kept in the
-[host integration reference](../plans/sep-24-semantica-memory-adoption/SMA-009-product-qualification.md).
+is an accepted design target, not implemented or qualified. Host integration, when requested, verifies the final Cargo-resolved source pair,
+public API/default policy compatibility, typed denial and retry after refund,
+memo custody through GC/cancel/close, and the real query and worker paths.
+Owner-local tests and process-local caps do not qualify a separate worker or
+aggregate RSS. These are consumer acceptance boundaries, not SDK work tickets.

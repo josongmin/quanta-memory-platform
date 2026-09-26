@@ -44,8 +44,9 @@ It did not establish a production core/facade failure for those audit items.
 Generic WEAK labels, protocol-model boundaries and assertion deletion alone
 are not additional runtime defects or automatic work tickets.
 
-The [compact historical receipt](../bugbash/sep-26-fail-open-audit/remediation-verification.md)
-links the retained raw gate, mutation and source-hash artifacts. These are
-source-specific evidence; this ADR is an implemented contract, not a new
-HEAD qualification. Original completed prompts, finding reports and census
-are recoverable with `git show 37b369a:docs/bugbash/sep-26-fail-open-audit/<path>`.
+The historical verification recorded 19 baseline GREEN / mutant RED / restored
+GREEN triples and a full workspace gate against its frozen Rust hashes. Its
+standalone proof was dry-run only. Those results do not qualify later HEADs.
+The complete snapshot receipt and raw evidence are recoverable from
+`8df9d54:docs/bugbash/sep-26-fail-open-audit/`; original prompts, findings and
+census are recoverable from `37b369a` at the same path.

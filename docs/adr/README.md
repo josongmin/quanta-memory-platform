@@ -18,20 +18,18 @@ target that is not implemented or qualified; it is not a shipped 0.2 decision. T
 [verification scenarios](../verification-scenarios.md) are a living test
 catalogue. Remaining work is in the [plan index](../plans/README.md).
 
-Superseded audit packets, tickets, snapshot scores, and the duplicate detailed
-guide were removed from the working documentation tree. The pre-cleanup
-commit `25d1b84` retains their original evidence (`git show 25d1b84:<path>`);
-these ADRs do not retroactively qualify a later source revision.
+## Historical material
 
-The completed Sep-26 fail-open prompts, finding tables and source census were
-consolidated into ADR 0001/0002/0005 and removed from the active documentation.
-Their original files are available at `37b369a`; the compact
-[historical verification receipt](../bugbash/sep-26-fail-open-audit/remediation-verification.md)
-and raw evidence remain. Completed work is not repeated in the plan index.
+Stale plans, audit snapshots, generic review checklists and raw historical
+receipts are removed from the current documentation tree. Retained contracts
+are consolidated here. Git preserves the original material:
 
-The recovered P08 hardening plan is also consolidated: grouped floors,
-terminal diagnostics and rebuild ownership in ADR 0001; guarded caller
-custody, root bounds, reclaim and ACK reconciliation in ADR 0002; shared
-CI/extraction proof in ADR 0003; fixture lifetime in ADR 0005. Its last
-working-tree copy is available at
-`627b24c:docs/plans/bugbash-sep-26-engine/POST-RR-HARDENING.md`.
+| Material | Recovery source |
+| --- | --- |
+| Earlier implementation plans and audit packets | `25d1b84:<original path>` |
+| Sep-26 completed findings, prompts and census | `37b369a:docs/bugbash/sep-26-fail-open-audit/<path>` |
+| Sep-26 historical receipts, raw logs, hashes and generic checklist | `8df9d54:docs/<original path under docs>` |
+| Recovered P08 hardening plan | `627b24c:docs/plans/bugbash-sep-26-engine/POST-RR-HARDENING.md` |
+
+Use `git show <commit>:<path>` to recover a file. These historical receipts
+qualify only their recorded source and failure model.

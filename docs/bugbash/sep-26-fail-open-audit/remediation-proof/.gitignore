@@ -1,2 +1,0 @@
-# Keep the source-bound audit receipts when this directory is committed.
-!*.log

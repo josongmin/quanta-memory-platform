@@ -1,8 +1,0 @@
-    Finished `test` profile [unoptimized] target(s) in 0.38s
-     Running unittests src/lib.rs (/tmp/qmp-sep26-candidate-y2s09ws1/target/debug/deps/quanta_memory_platform_testkit-627a022eb8b8ad80)
-
-running 1 test
-test faults::scenarios::tests::pinned_delete_failure_is_contained_and_bytes_survive ... ok
-
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 85 filtered out; finished in 0.00s
-

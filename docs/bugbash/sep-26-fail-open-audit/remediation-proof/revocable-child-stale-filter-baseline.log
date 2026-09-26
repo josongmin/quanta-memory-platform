@@ -1,8 +1,0 @@
-    Finished `test` profile [unoptimized] target(s) in 0.20s
-     Running unittests src/lib.rs (/tmp/qmp-sep26-candidate-y2s09ws1/target/debug/deps/quanta_memory_platform_facade-608c73b79af53532)
-
-running 1 test
-test revocable_store::service::tests::compound_measurement_and_drop_panic_does_not_abort_insert ... ok
-
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 363 filtered out; finished in 0.13s
-
