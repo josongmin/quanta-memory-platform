@@ -13,6 +13,15 @@ Status: Accepted for the 0.2 implementation; durable backing is opt-in.
   boundaries contain supported unwind/reentry cases; a same-store callback
   that enters its active mutation lane returns `OperationInProgress`. The
   broker invokes reclaimers outside its own mutex and verifies actual refunds.
+- Each caller-owned field remains individually guarded while caller Clone,
+  comparison or measurement code can panic. Partial read clones use the same
+  discipline. Transcript resolves owned-key map descents before publishing
+  rows/indexes/counters; key destructors are contained during unwind.
+- A payload reference must identify one canonical value; non-injective caller
+  reference conversion is rejected before charging. Prepared admission is
+  bounded by the complete GC-root input capacity, including unbudgeted mode.
+- FIFO reclaim partitions selected entries and merges rollback in linear
+  passes while preserving order and exact charge custody.
 - Prepared-publication roots and other unbudgeted management inputs are
   bounded. The host supplies a complete, stable root set; QMP does not infer
   host activation or garbage-collection truth.

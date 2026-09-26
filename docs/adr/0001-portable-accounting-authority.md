@@ -22,7 +22,19 @@ Status: Accepted for the 0.2 implementation.
 - Admission checks all applicable hard axes and protected group headroom
   before granting. A reclaim callback's reported bytes are advisory; the
   broker remeasures its ledger before retry. Permanent errors such as ticket
-  identity exhaustion do not trigger reclaim.
+  identity exhaustion do not trigger reclaim. Zero-usage feasibility probes
+  decide whether reclaim can help; they do not replace the live attempt's
+  first-breach diagnostic.
+- Protected group floors track non-Headroom usage independently from total
+  usage. Class reservations and group reservations are separate constraints;
+  they are not added into one joint reservation floor. Release and live
+  reconfiguration preserve each ticket's original group attribution.
+- Pressure and its cached classification follow semantic ledger usage.
+  Allocator observations are advisory and cannot change admission or the
+  semantic pressure cache. Percentage arithmetic uses overflow-safe widening.
+- Rebuild exclusion has one move-only epoch owner. Competing owners cannot
+  finish the fence or drain deferred cleanup; exhausted epochs fail before
+  changing fence state. Fence and cleanup receipts require explicit handling.
 - Live-ticket and other management state require explicit count/input bounds.
   Such bounds do not imply a bound on allocator overhead, temporary caller
   copies, RSS, or arbitrary host callbacks.
