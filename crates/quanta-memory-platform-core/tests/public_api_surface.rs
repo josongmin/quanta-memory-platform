@@ -74,6 +74,19 @@ use quanta_memory_platform_core::{
     ValidatedResidencyPolicy,
 };
 
+// Refactoring control.rs must preserve its public module path as well as the
+// crate-root re-exports checked below. The aliases force path resolution in
+// every feature-matrix compilation without creating a runtime-only assertion.
+#[cfg(feature = "live_control")]
+#[allow(unused_imports)] // -- reason: this module compiles public paths without runtime use.
+mod legacy_control_paths {
+    use quanta_memory_platform_core::api::control::{
+        LiveProcessMemoryBroker, ManagedCharge, ManagedChargeRechargeError,
+        ManagedChargeRechargeRecovery, PendingReservation, RebuildFence, RebuildFenceStatus,
+        RebuildReceipt,
+    };
+}
+
 #[cfg(feature = "unbudgeted_pin")]
 use quanta_memory_platform_core::{
     InvalidationOutcome, PayloadPinLease, PinRegistry, UnbudgetedPinRegistry,

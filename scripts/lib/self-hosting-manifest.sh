@@ -7,6 +7,7 @@
 SELF_HOSTING_COPY_PATHS=(
   "Cargo.toml"
   "Cargo.lock"
+  "Justfile"
   "rust-toolchain.toml"
   "README.md"
   "EXTRACTION.md"
@@ -30,6 +31,7 @@ SELF_HOSTING_COPY_PATHS=(
 SELF_HOSTING_REQUIRED_PATHS=(
   "Cargo.toml"
   "Cargo.lock"
+  "Justfile"
   "rust-toolchain.toml"
   "README.md"
   "EXTRACTION.md"
@@ -63,6 +65,8 @@ SELF_HOSTING_REQUIRED_PATHS=(
   "scripts/verify-doc-test-selectors.py"
   "scripts/test-selector-owners.json"
   "scripts/verify-workspace-policy.py"
+  "scripts/verify-source-shape.py"
+  "scripts/source-shape-baseline.json"
   "scripts/verify-hosted-ci-binding.py"
   "scripts/lib/run_python_contracts.py"
   "scripts/lib/verify_semgrep_suppressions.py"
@@ -80,6 +84,7 @@ SELF_HOSTING_REQUIRED_PATHS=(
   "scripts/tests/test_gate_failure_paths.py"
   "scripts/tests/test_run_cargo_test.py"
   "scripts/tests/test_workspace_policy.py"
+  "scripts/tests/test_source_shape.py"
   "scripts/tests/test_semgrep_suppressions.py"
   "scripts/tests/test_regression_rules.py"
   "scripts/tests/fixtures/semgrep"
@@ -94,6 +99,7 @@ SELF_HOSTING_REQUIRED_PATHS=(
   "tools/pm/tests/test_pm.py"
   "tools/semgrep/qmp-regressions.yml"
   "docs/verification-scenarios.md"
+  "docs/ssot/README.md"
 )
 
 self_hosting_assert_source_set() {

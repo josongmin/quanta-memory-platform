@@ -18,6 +18,19 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 CONFIG = ROOT / "tools/semgrep/qmp-regressions.yml"
 FIXTURES = Path(__file__).parent / "fixtures/semgrep"
+RELOCATED_OWNER_FIXTURES = {
+    "qmp-exact-ledger-no-saturation": "quanta-memory-platform-core/src/domain/accounting/aggregate.rs",
+    "qmp-release-preflight-no-owner-scan": "quanta-memory-platform-core/src/domain/accounting/release.rs",
+    "qmp-admission-no-share-recompute": "quanta-memory-platform-core/src/application/admission/helper.rs",
+    "qmp-allocator-observation-no-pressure-write": "quanta-memory-platform-core/src/api/observation/allocator.rs",
+    "qmp-scratch-peak-monotonic": "quanta-memory-platform-core/src/ports/scratch/peak.rs",
+    "qmp-threshold-fields-private": "quanta-memory-platform-core/src/application/pressure/thresholds.rs",
+    "qmp-persistent-publication-metadata-kind": "quanta-memory-platform-facade/src/publish_pipeline/metadata/charges.rs",
+    "qmp-store-digest-seed-construction": "quanta-memory-platform-facade/src/payload_store/construction.rs",
+    "qmp-durable-no-watermark-resolution": "quanta-memory-platform-facade/src/spill/schema/disposition.rs",
+    "qmp-kit-no-constant-pass": "quanta-memory-platform-testkit/src/fixtures/dispatcher.rs",
+    "qmp-facade-suite-required-slices": "quanta-memory-platform-testkit/src/conformance/facade/dispatch.rs",
+}
 
 
 class RegressionRuleContracts(unittest.TestCase):
@@ -60,6 +73,11 @@ class RegressionRuleContracts(unittest.TestCase):
                 if marker:
                     expected.append((marker.group(1), relative, line + 1))
         self.assertEqual({rule for rule, _, _ in expected}, ids, "every configured rule needs a rejecting fixture")
+        for rule, suffix in RELOCATED_OWNER_FIXTURES.items():
+            self.assertTrue(
+                any(found_rule == rule and path == f"crates/{suffix}" for found_rule, path, _ in expected),
+                f"owner-local relocation fixture missing for {rule}: {suffix}",
+            )
         with tempfile.TemporaryDirectory(prefix="qmp-rule-contract-") as directory:
             root = Path(directory)
             shutil.copytree(FIXTURES / "crates", root / "crates")

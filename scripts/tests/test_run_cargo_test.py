@@ -76,7 +76,7 @@ class CargoTestOutputTest(unittest.TestCase):
             environment.pop("BASH_ENV", None)
             environment["PATH"] = f"{temporary}:{environment['PATH']}"
             environment["QMP_TEST_CAPTURE"] = str(capture)
-            for arguments, expected_count in ((["--in-memory"], 8), ([], 10)):
+            for arguments, expected_count in ((["--in-memory"], 14), ([], 17)):
                 capture.write_text("", encoding="utf-8")
                 completed = subprocess.run(
                     [str(root / "scripts/verify-feature-capabilities.sh"), *arguments],
@@ -91,24 +91,31 @@ class CargoTestOutputTest(unittest.TestCase):
                 self.assertEqual(len(calls), expected_count)
                 for call in calls:
                     self.assertIn("-- --nocapture --exact", call)
-                    if " --lib " in call:
+                    if " -p quanta-memory-platform-facade " in call and " --lib " in call:
                         self.assertIn("::service::tests::", call)
                 lib_selectors = {
                     call.split(" --lib ", 1)[1].split(" -- ", 1)[0]
                     for call in calls if " --lib " in call
                 }
                 expected_lib_selectors = {
-                    "payload_store::service::tests::canonical_put_deduplicates_and_charges_once",
-                    "retained_map::service::tests::put_get_remove_get_none_round_trip_corrects_bytes",
-                    "revocable_store::service::tests::insert_tracks_reclaimable_bytes",
-                    "transcript_store::service::tests::exact_request_retried_n_times_applies_once",
+                    "application::controller::tests::classification_is_deterministic_across_the_ladder",
+                    "application::scheduler::tests::admission_reuses_policy_static_fair_share_table_at_high_group_cardinality",
+                    "adapters::metrics::tests::emitter_holds_no_accounting_state",
+                    "adapters::pin::tests::pin_invalidate_round_trip_tracks_dependent_count",
+                    "self_tests::conformance_suite_rejects_a_fake_that_under_reports_usage",
+                    "alloc_tracking::tests::recorded_signals_accumulate_and_net_live_is_correct",
+                    "payload_store::service::tests::cases_01::canonical_put_deduplicates_and_charges_once",
+                    "retained_map::service::tests::cases_01::put_get_remove_get_none_round_trip_corrects_bytes",
+                    "revocable_store::service::tests::cases_01::insert_tracks_reclaimable_bytes",
+                    "transcript_store::service::tests::cases_01::exact_request_retried_n_times_applies_once",
                     "publish_pipeline::service::tests::default_pipeline_runs_stage_then_commit_each_exactly_once_no_rollback",
                     "spill::service::tests::in_memory_target_write_then_restore_round_trips_the_payload",
                 }
                 if not arguments:
                     expected_lib_selectors.update({
-                        "revocable_store::service::tests::durable_redb_round_trip_transfers_charge_exactly_once",
-                        "revocable_store::service::tests::many_spills_share_large_binding_identity_without_unbilled_clones",
+                        "loom_models::loom_ticket_transition_has_single_terminal_owner",
+                        "revocable_store::service::tests::cases_02::durable_redb_round_trip_transfers_charge_exactly_once",
+                        "revocable_store::service::tests::cases_01::many_spills_share_large_binding_identity_without_unbilled_clones",
                     })
                 self.assertEqual(lib_selectors, expected_lib_selectors)
 

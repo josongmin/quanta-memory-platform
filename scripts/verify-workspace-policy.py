@@ -84,7 +84,7 @@ def lint_policy_errors(root: Path, metadata: dict | None = None) -> list[str]:
         exception = re.compile(
             r"#\s*!?\s*\[[^\]]*\b(?:allow|expect)\s*\([^)]*\bunsafe_code\b"
         )
-        allowed_exception = root / "crates/quanta-memory-platform-facade/benches/scaling.rs"
+        allowed_exception = root / "crates/quanta-memory-platform-facade/benches/scaling/mod.rs"
         for source in (root / member).rglob("*.rs"):
             if source != allowed_exception and exception.search(source.read_text()):
                 errors.append(f"unauthorized unsafe-code exception: {source.relative_to(root)}")

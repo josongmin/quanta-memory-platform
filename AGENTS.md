@@ -8,9 +8,10 @@ Hand edits are overwritten and will fail `pm lint`.
 
 ## Read First — Non-Negotiables
 
-This repo is `quanta-memory-platform`: a **portable, host-independent** memory
+This repo is `quanta-memory-platform`: a **portable** memory
 budgeting/accounting library designed for mechanical extraction. The Semantica
-host adapter lives outside this repository.
+host adapter lives outside this repository. `MemoryClass` labels may still
+look host-named; they are ledger keys, not host algorithms.
 
 Current product scope is in-memory accounting and reclaim. Optional durable
 spill/Redb code is maintenance scope, not an active release prerequisite;
@@ -23,8 +24,9 @@ Hard rules:
 - **`domain/` and `ports/` are pure:** no `std::fs`, `std::env`, `SystemTime::now`,
   `Instant::now`, and no `crate::adapters` import. I/O and clocks live behind
   ports/adapters.
-- **Public API stays host-independent and builder-first:** no Semantica nouns or
-  public raw-broker construction paths.
+- **Public API stays builder-first:** no host-crate imports and no public
+  raw-broker construction. Do not claim the `MemoryClass` enum is
+  Semantica-noun-free.
 - **Ledger is fail-closed:** every mutating accounting op fully succeeds or
   leaves it untouched. Allocator telemetry is advisory. Conformance must reject
   a broken fake, not only accept honest implementations.

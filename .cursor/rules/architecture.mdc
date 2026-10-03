@@ -12,8 +12,9 @@ Hand edits are overwritten and will fail `pm lint`.
 
 ## Architecture & Crate Boundaries
 
-`quanta-memory-platform` is a portable, host-independent memory budgeting /
-accounting workspace. It is consumed by the Semantica monorepo through a host
+`quanta-memory-platform` is a portable memory budgeting /
+accounting workspace (host crate stays outside; class labels may still be
+host-originated keys). It is consumed by the Semantica monorepo through a host
 adapter (`quanta-memory-host`) that lives **outside this repo**, and it is
 designed to be extracted into its own git repository with no rewrites. The crate
 graph is the architecture authority.
@@ -76,8 +77,9 @@ Enforcement: the root workspace lint policy, `cargo clippy --workspace
 --all-targets --all-features -- -D warnings`, `cargo deny --all-features check`,
 `scripts/check-workspace.sh`, and the extraction pre-flight in
 `scripts/extract-to-standalone-repo.sh`. The shared Cargo-metadata checker owns
-member presence, resolved dependency direction, host back-edges, and local path
-dependencies escaping the workspace; it catches renamed dependencies without
-treating comments as edges. The extractor also owns the self-hosting file set
+member presence, required local package-ID edges, resolved dependency direction,
+host back-edges, and local path dependencies escaping the workspace; it catches
+renamed, optional, dev, build, and target-gated dependencies without treating
+comments as edges. The extractor also owns the self-hosting file set
 and exact committed-tree export. If a change needs a NEW crate edge, stop and
 reconsider — do not add the import to make it compile.

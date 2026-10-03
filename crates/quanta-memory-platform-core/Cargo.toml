@@ -12,8 +12,11 @@ workspace = true
 [features]
 default = ["live_control"]
 pressure = []
-scheduler = []
-live_control = ["pressure", "scheduler"]
+# Alias for `live_control`. Weighted group admission lives under
+# `application/scheduler.rs` whenever live control is on; there is no
+# separate `cfg(feature = "scheduler")` implementation module.
+scheduler = ["live_control"]
+live_control = ["pressure"]
 unbudgeted_pin = []
 telemetry = ["dep:metrics", "dep:hdrhistogram"]
 full = ["live_control", "telemetry"]

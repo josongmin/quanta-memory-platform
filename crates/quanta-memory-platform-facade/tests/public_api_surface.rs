@@ -26,6 +26,32 @@ use quanta_memory_platform_facade::{
     PortableMemoryPresets,
 };
 
+// Root re-exports are checked below. These imports additionally pin the
+// public module paths that a store-file split could accidentally remove.
+#[allow(unused_imports)] // -- reason: this module compiles public paths without runtime use.
+mod legacy_store_paths {
+    #[cfg(feature = "payload_store")]
+    use quanta_memory_platform_facade::payload_store::service::SimplePayloadStore;
+    #[cfg(feature = "publish_pipeline")]
+    use quanta_memory_platform_facade::publish_pipeline::service::{
+        CommitTransition, DefaultCommitTransition, SimplePublishPipeline,
+    };
+    #[cfg(feature = "retained_map")]
+    use quanta_memory_platform_facade::retained_map::service::SimpleRetainedMapStore;
+    #[cfg(all(feature = "revocable_store", feature = "spill"))]
+    use quanta_memory_platform_facade::revocable_store::service::RevocableSpillHandle;
+    #[cfg(feature = "revocable_store")]
+    use quanta_memory_platform_facade::revocable_store::service::SimpleRevocableStore;
+    #[cfg(feature = "spill-redb")]
+    use quanta_memory_platform_facade::spill::backings::redb::{RedbSpillBacking, RedbSpillLimits};
+    #[cfg(feature = "spill")]
+    use quanta_memory_platform_facade::spill::service::{
+        InMemorySpillTarget, NoopSpillController, RoutedSpillController, SpillTarget,
+    };
+    #[cfg(feature = "transcript")]
+    use quanta_memory_platform_facade::transcript_store::service::SimpleSessionTranscriptStore;
+}
+
 #[cfg(any(
     feature = "payload_store",
     feature = "retained_map",

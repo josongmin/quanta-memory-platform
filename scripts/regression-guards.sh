@@ -23,11 +23,21 @@ fi
 echo "[regression-guards] semgrep ${config}"
 python3 scripts/lib/verify_semgrep_suppressions.py
 # --error makes any finding non-zero; --strict fails on rule/parse errors.
+# Explicit targets include test modules under src/: Semgrep's directory scan
+# can skip them even though the source-shape rail counts them as Rust source.
+rust_targets=()
+while IFS= read -r -d '' path; do
+  rust_targets+=("${path}")
+done < <(find crates -type f -name '*.rs' -print0)
+if [[ "${#rust_targets[@]}" -eq 0 ]]; then
+  echo "regression-guards: no Rust source targets" >&2
+  exit 1
+fi
 scan_output="$(mktemp /tmp/qmp-semgrep-scan.XXXXXX)"
 trap 'rm -f -- "${scan_output}"' EXIT
 scan_status=0
 semgrep --config "${config}" --error --strict --metrics=off \
-  --disable-version-check --jobs=1 --timeout=30 --include 'crates/**/*.rs' --json . \
+  --disable-version-check --jobs=1 --timeout=30 --json "${rust_targets[@]}" \
   >"${scan_output}" || scan_status=$?
 python3 - "${scan_output}" <<'PY'
 import json

@@ -40,7 +40,12 @@ Semantica quanta-memory-host  ->  quanta-memory-platform-facade  ->  core
 ```
 
 Dependency direction is strict: `core <- facade <- testkit`. No package here
-may depend on a host, and public APIs do not expose Semantica-specific nouns.
+may depend on a host. Public APIs do **not** import the Semantica host crate.
+`MemoryClass` still uses stable class labels that originated as host workload
+names (`MemoResidency`, `PtaResumeState`, `PtaAuthorityState`,
+`PtaPortableBundle`, `IdeWorkingSet`). Those variants are ledger keys and
+preset weights, not Memo/PTA/IDE algorithms. RFC 0001 remains the 0.3
+portable-taxonomy target.
 
 ## Start here
 
@@ -72,7 +77,7 @@ cargo run -p quanta-memory-platform-facade --example effective_budget_report
 
 | Area | Contract |
 | --- | --- |
-| Budget control | Global, class, owner, context, execution-scratch, headroom, reserved/soft/hard caps, resource groups, and bounded shared borrowing. |
+| Budget control | Global, class, owner, execution-scratch, headroom, reserved/soft/hard caps, resource groups, and bounded shared borrowing. `Context` is an accounting bucket with overflow guards, not a hard context cap. Reclaim rungs are host hints; the broker does not walk the ladder. |
 | Accounting | Every budgeted mutation is fail-closed; a charge is reserved, committed, released, recharged, or restored atomically. |
 | Retaining data | Canonical payloads, retained maps, FIFO revocable stores, prepared publication, and session transcripts all route bytes through the same broker. |
 | Pressure | Soft-cap reclaim requests run outside the broker lock; hard-cap admission retries at most once after remeasurement. |
@@ -128,6 +133,10 @@ deliberate non-accounted use. It is absent from `default`, `full`, and
 ## Repository checks
 
 ```bash
+# optional short command front door (delegates to the scripts below)
+just check
+just in-memory
+
 # authoritative repo-local static, contract, feature, test, and dependency rail
 scripts/check-workspace.sh
 
@@ -165,5 +174,6 @@ Extraction and host adoption are separate operations; see
 | Standalone-repository extraction procedure | [EXTRACTION.md](EXTRACTION.md) |
 | Consumer breaking changes | [MIGRATION.md](MIGRATION.md) |
 | Release inventory | [CHANGELOG.md](CHANGELOG.md) |
+| QMP and Semantica contract ownership | [docs/ssot/README.md](docs/ssot/README.md) |
 | Current plan status and remaining gates | [docs/plans/README.md](docs/plans/README.md) |
 | Executable verification contract | [docs/verification-scenarios.md](docs/verification-scenarios.md) |

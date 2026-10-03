@@ -96,7 +96,7 @@ Correctness is managed as **tests**; benchmarks answer a different question
   standard profile), then invoke `scripts/verify-scaling-results.py --release`
   with three `--baseline` and three `--input` paths. Supply every
   `--release-*` limit explicitly from the consumer's approved policy. The release
-  comparison requires the same `scaling.rs` benchmark-source SHA-256 and bench
+  comparison requires the same three-file scaling benchmark-source SHA-256 and bench
   build-configuration SHA-256 on both sides. The latter covers workspace
   manifests, Cargo config files visible from the checkout and Cargo home, and
   relevant Rust/Cargo/native-compiler environment overrides. It is checked
@@ -404,8 +404,8 @@ check helpers that the control plane enforces (see group C/D).
   count lookup), `checked_reads_propagate_client_clone_panics_without_poisoning_owner_mutex_v1`
   (map get/entries clones), `resolve_clone_panic_preserves_readability_and_charge`
   (prepared payload clone), and the
-  `payload_store::service::tests::counter_reads_show_open_busy_and_closed_images` and
-  `retained_map::service::tests::charged::counter_reads_show_open_busy_and_closed_images`
+  `payload_store::service::tests::cases_01::counter_reads_show_open_busy_and_closed_images` and
+  `retained_map::service::tests::charged::cases_01::counter_reads_show_open_busy_and_closed_images`
   tests (open/Busy/closed counter images for payload, retained map, and
   prepared publication).
 - ✅ charged facade mutators are fail-closed before store mutation — `charged_remove_during_rebuild_is_fail_closed`, `charged_sweep_during_rebuild_is_fail_closed`, `reclaim_one_during_rebuild_is_fail_closed`, `reclaim_until_during_rebuild_is_fail_closed`, `truncate_refund_failure_preserves_rows_indexes_and_accounting`.
