@@ -5,8 +5,11 @@ Status: Accepted for the 0.2 implementation.
 ## Decision
 
 - Keep the dependency graph `core <- facade <- testkit`. The host adapter lives
-  outside this repository. `domain/` and `ports/` remain independent of host
-  names, filesystem I/O, and wall-clock reads.
+  outside this repository. `domain/` and `ports/` remain independent of
+  filesystem I/O and wall-clock reads. `MemoryClass` / `RuntimeKind` still
+  carry host-originated labels as **keys** (Memo/PTA/IDE/session); they do not
+  embed host algorithms. A noun-free public taxonomy is RFC 0001 / 0.3 work,
+  not the 0.2 enum.
 - A `LiveProcessMemoryBroker` owns one semantic ledger for a budget domain.
   Facade stores and attached runtime scratch use that broker; no store or host
   shadow ledger may grant or refund the same residency independently.

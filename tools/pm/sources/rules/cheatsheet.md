@@ -76,7 +76,7 @@ original regression case.
 | `std::fs` / `std::env` / `SystemTime::now` / `Instant::now` in `domain/` or `ports/` | route through a port + adapter; keep domain pure | regression-guards (`qmp-pure-layer-no-fs-env`, `qmp-pure-layer-no-wall-clock`) |
 | `crate::adapters` imported from `domain/` or `ports/` | depend on the port trait only | regression-guards (`qmp-pure-layer-no-adapter-import`) |
 | resolved dependency from `core` to facade/testkit (or facade to testkit), including a renamed dependency | keep `core <- facade <- testkit` | Cargo-metadata graph contract in `check-workspace`, extraction pre-flight |
-| Semantica nouns (`Semantica*`, `quanta_runtime`, `codegraph`) in public API | keep the library host-independent | review |
+| New host crate paths or host algorithm types (`Semantica*`, `quanta_runtime`, `codegraph`) in the portable API | keep host implementation outside QMP; existing `MemoryClass` / `RuntimeKind` labels are 0.2 compatibility keys, with taxonomy migration targeted by RFC 0001 | review |
 | raw broker constructor backdoor in public code | go through the builder-first surface | public API compile-fail tests |
 | allocator telemetry mutating ledger counters | telemetry is **advisory** — never writes counters | review (ledger invariant) |
 | mutating the ledger partway then erroring | validate first; fail-closed BEFORE any mutation | review (all-or-nothing) |

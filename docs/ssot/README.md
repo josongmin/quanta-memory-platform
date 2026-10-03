@@ -1,5 +1,8 @@
 # QMP contract pointers
 
+Live broker vs deferred product surface:
+[engine status](engine-status-v1.md).
+
 QMP owns the portable package graph, public builder API, feature behavior, and
 standalone extraction. The executable local contract is
 [`scripts/check-workspace.sh`](../../scripts/check-workspace.sh); the package

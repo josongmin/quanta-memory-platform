@@ -1,7 +1,8 @@
 ## Architecture & Crate Boundaries
 
-`quanta-memory-platform` is a portable, host-independent memory budgeting /
-accounting workspace. It is consumed by the Semantica monorepo through a host
+`quanta-memory-platform` is a portable memory budgeting /
+accounting workspace (host crate stays outside; class labels may still be
+host-originated keys). It is consumed by the Semantica monorepo through a host
 adapter (`quanta-memory-host`) that lives **outside this repo**, and it is
 designed to be extracted into its own git repository with no rewrites. The crate
 graph is the architecture authority.

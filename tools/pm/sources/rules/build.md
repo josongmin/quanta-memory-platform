@@ -12,7 +12,8 @@ it does not define an independent check. CircleCI push is the required hosted
 extraction verifier. GitHub Actions full dispatch is an optional manual rerun.
 
 The source-shape check rejects Rust files over 1,000 physical lines; 600-line
-files are reported for review. The library-only Clippy pass reports
+files are reported for review. The `grandfathered` baseline is empty and any
+attempt to reintroduce an exception is rejected. The library-only Clippy pass reports
 `too_many_lines` without denying it. Clippy documents known problems with
 `cognitive_complexity` as a complexity measure, so it is not a release veto.
 

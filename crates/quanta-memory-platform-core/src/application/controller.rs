@@ -18,8 +18,9 @@ pub trait PressureController {
     fn observe_allocator_snapshot(&self, snapshot: &AllocatorSnapshot);
 }
 
-/// A rung of the reclaim ladder. The slow path walks rungs in order until the
-/// requested delta fits or the ladder is exhausted.
+/// A reclaim-ladder hint. `LadderPressureController::ladder_for` copies these
+/// into `ReclaimRequest.rungs`. The broker does **not** walk the ladder; the
+/// host `MemoryReclaimer` decides actual eviction/spill.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReclaimRung {
     /// Reclaim from the same class's most-recently-grown owner first.

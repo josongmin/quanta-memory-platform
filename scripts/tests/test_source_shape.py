@@ -7,7 +7,6 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -55,37 +54,19 @@ class SourceShapeContracts(unittest.TestCase):
         (self.root / NEW).rename(self.root / renamed)
         self.assertIn(f"{renamed}: 1001 lines exceeds 1000-line ceiling", self.check()[0])
 
-    def test_existing_large_file_can_only_shrink_with_exact_baseline_update(self) -> None:
-        with patch.dict(shape.INITIAL_OVERSIZED_CEILINGS, {LEGACY: 1_004}, clear=True):
-            self.write_source(LEGACY, 1_004)
-            self.write_baseline({LEGACY: 1_004})
-            self.assertEqual(self.check()[0], [])
-            self.write_source(LEGACY, 1_005)
-            self.assertIn("1005 lines exceeds 1004-line ceiling", "\n".join(self.check()[0]))
-            self.write_source(LEGACY, 1_003)
-            self.assertIn("stale 1004-line limit", "\n".join(self.check()[0]))
-            self.write_baseline({LEGACY: 1_003})
-            self.assertEqual(self.check()[0], [])
-            self.write_source(LEGACY, 1_000)
-            self.write_baseline({})
-            self.assertEqual(self.check()[0], [])
+    def test_old_path_cannot_regrow_by_reintroducing_its_exception(self) -> None:
+        self.write_source(LEGACY, 1_001)
+        self.write_baseline({LEGACY: 8_664})
+        errors, _ = self.check()
+        self.assertIn("grandfathered must remain empty", "\n".join(errors))
+        self.assertIn("1001 lines exceeds 1000-line ceiling", "\n".join(errors))
+        self.write_baseline({})
+        self.assertIn("1001 lines exceeds 1000-line ceiling", "\n".join(self.check()[0]))
 
-    def test_baseline_inflation_and_new_exception_are_rejected(self) -> None:
-        with patch.dict(shape.INITIAL_OVERSIZED_CEILINGS, {LEGACY: 1_004}, clear=True):
-            self.write_source(LEGACY, 1_004)
-            self.write_baseline({LEGACY: 1_005})
-            self.assertIn("exceeds frozen initial ceiling", "\n".join(self.check()[0]))
-            self.write_baseline({NEW: 1_005})
-            self.assertIn("cannot grandfather it", "\n".join(self.check()[0]))
-
-    def test_missing_or_removed_legacy_baseline_fails(self) -> None:
-        with patch.dict(shape.INITIAL_OVERSIZED_CEILINGS, {LEGACY: 1_004}, clear=True):
-            self.write_source(LEGACY, 1_004)
-            self.assertIn("1004 lines exceeds 1000-line ceiling", "\n".join(self.check()[0]))
-            self.write_baseline({LEGACY: 1_004})
-            (self.root / LEGACY).unlink()
-            self.write_source(NEW, 1)
-            self.assertIn("grandfathered source file is missing", "\n".join(self.check()[0]))
+    def test_new_file_exception_is_rejected_even_below_the_cap(self) -> None:
+        self.write_source(NEW, 1)
+        self.write_baseline({NEW: 1_005})
+        self.assertIn("grandfathered must remain empty", "\n".join(self.check()[0]))
 
     def test_symlinks_cannot_hide_rust_files_or_modules(self) -> None:
         self.write_source(NEW, 1)
@@ -118,7 +99,7 @@ class SourceShapeContracts(unittest.TestCase):
         self.baseline.write_text('{"version":1,"grandfathered":{},"grandfathered":{}}', encoding="utf-8")
         self.assertIn("duplicate JSON key", "\n".join(self.check()[0]))
         self.baseline.write_text('{"version":1,"grandfathered":{"' + LEGACY + '":true}}', encoding="utf-8")
-        self.assertIn("must be an integer", "\n".join(self.check()[0]))
+        self.assertIn("grandfathered must remain empty", "\n".join(self.check()[0]))
 
 if __name__ == "__main__":
     unittest.main()

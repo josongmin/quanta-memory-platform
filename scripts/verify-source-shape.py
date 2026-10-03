@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Keep oversized Rust files from growing or reappearing under new names."""
+"""Reject Rust source files above the post-split 1,000-line ceiling."""
 
 from __future__ import annotations
 
@@ -15,24 +15,6 @@ NEW_FILE_MAX_LINES = 1_000
 ADVISORY_LINES = 600
 RAW_LITERAL = re.compile(r"(?:br|rb|r)(#*)\"")
 CHAR_LITERAL = re.compile(r"(?:b)?'(?:\\.|[^\\'\n])'")
-# Initial exceptions at dd5b0bc1. No JSON limit may exceed its initial cap.
-# Comparing a later JSON revision to its previously accepted value requires a
-# trusted CI base; a single-commit extracted checkout has no such history.
-INITIAL_OVERSIZED_CEILINGS = {
-    "crates/quanta-memory-platform-core/src/api/control.rs": 8_664,
-    "crates/quanta-memory-platform-core/src/domain/config.rs": 1_043,
-    "crates/quanta-memory-platform-core/src/domain/ledger.rs": 2_416,
-    "crates/quanta-memory-platform-facade/benches/scaling.rs": 1_581,
-    "crates/quanta-memory-platform-facade/src/payload_store/service.rs": 1_703,
-    "crates/quanta-memory-platform-facade/src/publish_pipeline/prepared_publication.rs": 2_373,
-    "crates/quanta-memory-platform-facade/src/retained_map/service.rs": 3_239,
-    "crates/quanta-memory-platform-facade/src/revocable_store/service.rs": 4_520,
-    "crates/quanta-memory-platform-facade/src/spill/backings/redb.rs": 4_270,
-    "crates/quanta-memory-platform-facade/src/transcript_store/service.rs": 4_154,
-    "crates/quanta-memory-platform-testkit/src/conformance/suites.rs": 3_196,
-}
-
-
 def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
     result: dict[str, object] = {}
     for key, value in pairs:
@@ -165,18 +147,15 @@ def verify(root: Path, baseline_path: Path) -> tuple[list[str], list[str]]:
     limits = baseline["grandfathered"]
     if not isinstance(limits, dict):
         return [*errors, "grandfathered must be an object"], advisory
+    # The split at 14cf034 eliminated every oversized source file. Keep the
+    # baseline schema for old checkouts, but never let an old path regain an
+    # exception: a single-commit extracted checkout has no trusted base to
+    # compare against a lower historical limit.
+    if limits:
+        errors.append("grandfathered must remain empty after the source split")
 
     files, file_errors = _rust_files(root)
     errors.extend(file_errors)
-    for path, ceiling in sorted(limits.items()):
-        if path not in INITIAL_OVERSIZED_CEILINGS:
-            errors.append(f"{path}: not an initial oversized file; cannot grandfather it")
-        if type(ceiling) is not int or ceiling <= NEW_FILE_MAX_LINES:
-            errors.append(f"{path}: grandfathered limit must be an integer above {NEW_FILE_MAX_LINES}")
-        elif ceiling > INITIAL_OVERSIZED_CEILINGS.get(path, 0):
-            errors.append(f"{path}: grandfathered limit exceeds frozen initial ceiling")
-        if path not in files:
-            errors.append(f"{path}: grandfathered source file is missing")
 
     for path, source_path in sorted(files.items()):
         try:
@@ -186,13 +165,8 @@ def verify(root: Path, baseline_path: Path) -> tuple[list[str], list[str]]:
             errors.append(f"{path}: source cannot be read as UTF-8: {error}")
             continue
         lines = data.count(b"\n") + bool(data and not data.endswith(b"\n"))
-        ceiling = limits.get(path, NEW_FILE_MAX_LINES)
-        if type(ceiling) is not int:
-            ceiling = NEW_FILE_MAX_LINES
-        if lines > ceiling:
-            errors.append(f"{path}: {lines} lines exceeds {ceiling}-line ceiling")
-        if path in limits and lines < ceiling:
-            errors.append(f"{path}: stale {ceiling}-line limit; lower it to {lines} or remove at <= {NEW_FILE_MAX_LINES}")
+        if lines > NEW_FILE_MAX_LINES:
+            errors.append(f"{path}: {lines} lines exceeds {NEW_FILE_MAX_LINES}-line ceiling")
         if lines >= ADVISORY_LINES:
             advisory.append(f"{path}: {lines} lines (advisory at {ADVISORY_LINES})")
         errors.extend(_bypass_errors(source, path))
