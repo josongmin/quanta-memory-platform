@@ -1,7 +1,7 @@
-"""Fail-closed local contracts for the checked-in hosted CI entry points.
+"""Fail-closed shape checks for the hosted QMP verification entry point.
 
-These assertions prove configuration shape, not that a hosted runner executed.
-The actual standalone extraction and examples remain a separate release gate.
+These do not claim a CircleCI runner executed. The extracted full gate and
+examples remain the only normal job command.
 """
 
 from __future__ import annotations
@@ -11,304 +11,107 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-CIRCLECI_CONFIG = ROOT / ".circleci" / "config.yml"
-BENCHMARK_CONFIG = ROOT / ".circleci" / "benchmark.yml"
-GITHUB_WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
-EXAMPLE_SCRIPT = ROOT / "scripts" / "verify-extracted-examples.sh"
-STEP_NAME = "Verify actual standalone extraction and full workspace gate"
-SCRIPT_COMMAND = "scripts/verify-extracted-examples.sh"
+CONFIG = ROOT / ".circleci/config.yml"
+EXAMPLES = ROOT / "scripts/verify-extracted-examples.sh"
+FULL_STEP = "Verify actual standalone extraction and full workspace gate"
+FULL_COMMAND = "scripts/verify-extracted-examples.sh"
 
 
-def job_block(text: str, name: str) -> str:
-    """Select a direct child of jobs, never a step in another job."""
+def section(text: str, heading: str, indent: int) -> str:
     lines = text.splitlines()
-    starts = [i for i, line in enumerate(lines) if line == "jobs:"]
-    if len(starts) != 1:
-        raise AssertionError(f"expected one jobs section, got {len(starts)}")
-    section = starts[0] + 1
-    end = next((i for i in range(section, len(lines)) if lines[i] and not lines[i].startswith(" ")), len(lines))
-    matches = [i for i in range(section, end) if lines[i] == f"  {name}:"]
+    marker = " " * indent + heading + ":"
+    matches = [i for i, line in enumerate(lines) if line == marker]
     if len(matches) != 1:
-        raise AssertionError(f"expected one {name!r} job, got {len(matches)}")
+        raise AssertionError(f"expected one {marker!r}, found {len(matches)}")
     start = matches[0]
-    job_end = next((i for i in range(start + 1, end) if re.fullmatch(r"  [A-Za-z][\w-]*:", lines[i])), end)
-    return "\n".join(lines[start:job_end])
+    end = next(
+        (i for i in range(start + 1, len(lines))
+         if lines[i].strip() and not lines[i].startswith(" " * (indent + 1))),
+        len(lines),
+    )
+    return "\n".join(lines[start:end])
 
 
-def named_step(text: str, name: str) -> list[str]:
-    """Return one YAML step, bounded by the next step at the same indentation."""
-    lines = text.splitlines()
-    matches = [i for i, line in enumerate(lines) if line.strip() == f"- name: {name}"]
-    # CircleCI spells `- run:` followed by `name:` one level deeper.
-    if not matches:
-        matches = [i for i, line in enumerate(lines) if line.strip() == f"name: {name}"]
-    if len(matches) != 1:
-        raise AssertionError(f"expected one {name!r} step, got {len(matches)}")
-    start = matches[0]
-    indent = len(lines[start]) - len(lines[start].lstrip())
-    if lines[start].strip().startswith("name:"):
-        previous = next((line for line in reversed(lines[:start]) if line.strip() and not line.lstrip().startswith("#")), "")
-        if previous.strip() != "- run:" or len(previous) - len(previous.lstrip()) != indent - 4:
-            raise AssertionError("extraction name must be the first property of its run step")
-    end = len(lines)
-    for i in range(start + 1, len(lines)):
-        line = lines[i]
-        if not line.strip():
-            continue
-        level = len(line) - len(line.lstrip())
-        if level < indent or (level == indent and line.lstrip().startswith("- ")):
-            end = i
-            break
-    return lines[start:end]
-
-
-def executable_step_errors(text: str, name: str, body_key: str) -> list[str]:
+def config_errors(text: str) -> list[str]:
+    errors: list[str] = []
     try:
-        job = job_block(text, "full-extraction")
-        step = named_step(job, name)
+        params = section(text, "parameters", 0)
+        normal = section(section(text, "workflows", 0), "normal", 2)
+        heavy_flow = section(section(text, "workflows", 0), "heavy", 2)
+        full = section(section(text, "jobs", 0), "full-extraction", 2)
+        heavy = section(section(text, "jobs", 0), "heavy-benchmarks", 2)
     except AssertionError as error:
         return [str(error)]
-    stripped = [line.strip() for line in step if line.strip()]
-    errors: list[str] = []
-    job_keys = {"machine", "resource_class", "steps"} if body_key == "command" else {
-        "if", "runs-on", "timeout-minutes", "steps",
-    }
-    root_keys = {"version", "jobs", "workflows"} if body_key == "command" else {
-        "name", "on", "permissions", "jobs",
-    }
-    # Reject inherited defaults/environment and YAML merge keys too. Quoted
-    # keys cannot evade a blacklist because the owned envelopes are explicit.
-    for container, indent, allowed_keys in ((job, 4, job_keys), (text, 0, root_keys)):
-        for line in container.splitlines():
-            if not line.strip() or line.lstrip().startswith("#"):
-                continue
-            if len(line) - len(line.lstrip()) == indent:
-                key = line.strip().split(":", 1)[0]
-                if key not in allowed_keys:
-                    errors.append(f"extraction execution envelope has unapproved property: {key}")
-    expected_indent = 10 if body_key == "command" else 6
-    actual_indent = len(step[0]) - len(step[0].lstrip())
-    if actual_indent != expected_indent:
-        errors.append("extraction step is nested below a conditional or other wrapper")
-    if any(re.fullmatch(r"if:\s*(false|0|\$\{\{\s*false\s*\}\})", line) for line in stripped):
-        errors.append("extraction step is disabled")
-    if any(line.startswith(("when:", "continue-on-error:")) for line in stripped):
-        errors.append("extraction step has conditional or ignored failure")
-    # Only the owned execution envelope may surround the command. A custom
-    # shell such as /bin/true can accept the script filename without running
-    # it; background execution can report success before the gate finishes.
-    property_indent = expected_indent if body_key == "command" else expected_indent + 2
-    allowed = {"name", body_key} | ({"no_output_timeout"} if body_key == "command" else set())
-    for line in step[1:]:
-        level = len(line) - len(line.lstrip())
-        if level == property_indent and line.strip():
-            key = line.strip().split(":", 1)[0]
-            if key not in allowed:
-                errors.append(f"extraction step has unapproved execution property: {key}")
-    if f"{body_key}: |" not in stripped:
-        errors.append("extraction step has no executable command block")
-    else:
-        body = stripped[stripped.index(f"{body_key}: |") + 1 :]
-        if body != ["set -euo pipefail", SCRIPT_COMMAND]:
-            errors.append("extraction step must execute only the strict script entry point")
+    if params.strip() != "parameters:\n  run_heavy:\n    type: boolean\n    default: false":
+        errors.append("heavy parameter must be boolean and default false")
+    if normal != "  normal:\n    unless: << pipeline.parameters.run_heavy >>\n    jobs:\n      - full-extraction":
+        errors.append("normal workflow must run the full gate only when heavy is false")
+    if heavy_flow != "  heavy:\n    when: << pipeline.parameters.run_heavy >>\n    jobs:\n      - heavy-benchmarks":
+        errors.append("heavy workflow must require explicit true")
+    if "resource_class: medium" not in full or 'CARGO_BUILD_JOBS: "2"' not in full:
+        errors.append("normal job must match two CPUs")
+    if "resource_class: large" not in heavy or 'CARGO_BUILD_JOBS: "4"' not in heavy:
+        errors.append("benchmark job must match four CPUs")
+    if text.count(FULL_STEP) != 1 or not re.search(
+        rf"(?m)^      - run:\n"
+        rf"          name: {re.escape(FULL_STEP)}\n"
+        rf"          no_output_timeout: 20m\n"
+        rf"          command: \|\n"
+        rf"            set -euo pipefail\n"
+        rf"            {re.escape(FULL_COMMAND)}(?:\n|$)",
+        full,
+    ):
+        errors.append("full gate must be a direct, strict, executable job step")
+    if full.count(FULL_COMMAND) != 1 or "continue-on-error" in text or "when: on_fail" in text:
+        errors.append("full gate may not be skipped or have ignored failures")
+    if "- store_artifacts:\n          path: /tmp/qmp-benchmark\n          destination: qmp-scaling" not in heavy:
+        errors.append("source-bound benchmark artifacts must be retained")
+    if "for run in 1 2 3; do" not in heavy or "scripts/run-scaling-bench.sh --profile=in-memory-pressure" not in heavy:
+        errors.append("three pressure receipts missing")
+    if "scripts/run-scaling-bench.sh\n" not in heavy or "standard-full.jsonl" not in heavy:
+        errors.append("standard full receipt missing")
+    if any(token in text for token in ("schedule:", "cron:", "- target/", "store_test_results:")):
+        errors.append("unexpected schedule or compiled-output cache")
+    if text.count("cargo fetch --locked") != 2:
+        errors.append("both jobs must fetch exact lock dependencies before saving")
+    if text.count("{{ checksum \"Cargo.lock\" }}") != 4:
+        errors.append("cache keys must include the lockfile")
+    if text.count("- save_cache:") != 3 or text.count("- restore_cache:") != 3:
+        errors.append("cache read/write shape changed")
+    for match in re.finditer(r"(?m)^          command: \|\n((?:^            .*\n|^\n)*)", text):
+        body = match.group(1)
+        if not body.startswith("            set -euo pipefail\n"):
+            errors.append("run step lacks strict shell failure handling")
+    if "|| true" in text or "set +e" in text:
+        errors.append("failure swallowing is forbidden")
+    if (ROOT / ".github/workflows/ci.yml").exists() or (ROOT / ".circleci/benchmark.yml").exists():
+        errors.append("legacy CI entry points remain")
     return errors
 
 
-def github_event_errors(text: str) -> list[str]:
-    events: list[str] = []
-    in_events = False
-    for line in text.splitlines():
-        if re.fullmatch(r"on:\s*", line):
-            in_events = True
-            continue
-        if not in_events or not line.strip():
-            continue
-        if not line.startswith(" "):
-            break
-        if re.match(r"^  [A-Za-z_]+:\s*", line):
-            events.append(line.strip().split(":", 1)[0])
-    if events != ["workflow_dispatch"]:
-        return [f"expected dispatch-only events, got {events}"]
-    sentinel = re.search(
-        r"(?ms)^  reject-unexpected-trigger:\n"
-        r"    if: github\.event_name != 'workflow_dispatch'\n"
-        r"    runs-on: ubuntu-24\.04\n"
-        r"    steps:\n"
-        r"      - name: Reject CI configuration bound to a push trigger\n"
-        r"        run: \|\n"
-        r"          echo [^\n]+\n"
-        r"          exit 1\n",
-        text,
-    )
-    return [] if sentinel else ["dispatch config must fail closed when bound to a push trigger"]
-
-
-def github_full_job_errors(text: str) -> list[str]:
-    jobs = text.split("\njobs:\n", 1)
-    if len(jobs) != 2:
-        return ["missing GitHub jobs"]
-    match = re.search(r"(?m)^  full-extraction:\s*\n    if: (.+)$", jobs[1])
-    expected = "github.event_name == 'workflow_dispatch' && inputs.verification == 'full'"
-    if not match or match.group(1) != expected:
-        return ["full extraction must require explicit full dispatch"]
-    job = re.split(r"(?m)^  [A-Za-z][\w-]*:\s*$", jobs[1][match.end():], maxsplit=1)[0]
-    if re.search(r"(?m)^    (?:needs|continue-on-error):", job):
-        return ["full extraction must not depend on a skipped job or ignore failures"]
-    return []
-
-
-def circleci_push_workflow_errors(text: str) -> list[str]:
-    workflow = text.split("\nworkflows:\n", 1)
-    if len(workflow) != 2:
-        return ["missing CircleCI workflows"]
-    lines = [line.strip() for line in workflow[1].splitlines() if line.strip()]
-    return [] if lines == ["push-verification:", "jobs:", "- full-extraction"] else [
-        "every push must schedule exactly one unconditional full-extraction job"
-    ]
-
-
-def benchmark_artifact_errors(text: str) -> list[str]:
-    required = (
-        "path: /tmp/qmp-benchmark\n          destination: qmp-in-memory-pressure",
-        "path: /tmp/qmp-benchmark/results.jsonl\n          destination: qmp-standard-full/results.jsonl",
-    )
-    return ["benchmark receipt artifact is not retained"] if (
-        text.count("- store_artifacts:") != 2 or any(item not in text for item in required)
-    ) else []
-
-
-def example_script_errors(text: str) -> list[str]:
-    # The short owned script is the executable SSOT. Exact shape disallows an
-    # early subshell close, a no-op example, or source-checkout execution.
-    lines = [line.strip() for line in text.splitlines() if line.strip() and not line.startswith("#")]
-    expected = [
-        "set -euo pipefail",
-        'repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"',
-        'cd "${repo_root}"',
-        'qmp_extract_dir="$(mktemp -d /tmp/qmp-ci-extraction.XXXXXX)"',
-        'echo "Source SHA: $(git rev-parse --verify HEAD)"',
-        'scripts/extract-to-standalone-repo.sh "${qmp_extract_dir}"',
-        'cargo run --locked --manifest-path "${qmp_extract_dir}/Cargo.toml" -p quanta-memory-platform-facade --example hello_world',
-        'cargo run --locked --manifest-path "${qmp_extract_dir}/Cargo.toml" -p quanta-memory-platform-facade --example effective_budget_report',
-        'extracted_status="$(git -C "${qmp_extract_dir}" status --porcelain)" || {',
-        'echo "Failed to inspect extracted checkout: ${qmp_extract_dir}" >&2',
-        'exit 1',
-        '}',
-        'test -z "${extracted_status}"',
-        'echo "Verified extracted checkout: ${qmp_extract_dir}"',
-    ]
-    return [] if lines == expected else ["extraction/example/clean command sequence drifted"]
-
-
 class CiEntryPointContracts(unittest.TestCase):
-    def test_current_configs_and_script(self) -> None:
-        circle = CIRCLECI_CONFIG.read_text(encoding="utf-8")
-        github = GITHUB_WORKFLOW.read_text(encoding="utf-8")
-        script = EXAMPLE_SCRIPT.read_text(encoding="utf-8")
-        self.assertEqual(executable_step_errors(circle, STEP_NAME, "command"), [])
-        self.assertEqual(executable_step_errors(github, STEP_NAME, "run"), [])
-        self.assertEqual(circleci_push_workflow_errors(circle), [])
-        self.assertEqual(benchmark_artifact_errors(BENCHMARK_CONFIG.read_text(encoding="utf-8")), [])
-        self.assertEqual(github_event_errors(github), [])
-        self.assertEqual(github_full_job_errors(github), [])
-        self.assertEqual(example_script_errors(script), [])
-        self.assertTrue(EXAMPLE_SCRIPT.stat().st_mode & 0o111)
+    def test_current_config_and_executable(self) -> None:
+        self.assertEqual(config_errors(CONFIG.read_text()), [])
+        script = EXAMPLES.read_text()
+        self.assertIn("set -euo pipefail", script)
+        self.assertIn('scripts/extract-to-standalone-repo.sh "${qmp_extract_dir}"', script)
+        self.assertIn('scripts/check-workspace.sh', (ROOT / "scripts/extract-to-standalone-repo.sh").read_text())
+        self.assertEqual(script.count('--manifest-path "${qmp_extract_dir}/Cargo.toml"'), 2)
+        self.assertTrue(EXAMPLES.stat().st_mode & 0o111)
 
-    def test_schedule_trigger_and_missing_main_filter_are_rejected(self) -> None:
-        github = GITHUB_WORKFLOW.read_text(encoding="utf-8")
-        mutated = github.replace("on:\n", "on:\n  schedule:\n    - cron: '0 0 * * *'\n", 1)
-        self.assertTrue(github_event_errors(mutated))
-        self.assertTrue(github_event_errors(github.replace("          exit 1\n", "          exit 0\n", 1)))
-        self.assertTrue(github_full_job_errors(github.replace("github.event_name == 'workflow_dispatch' && inputs.verification == 'full'", "github.event_name != 'workflow_dispatch' || inputs.verification == 'full'")))
-        circle = CIRCLECI_CONFIG.read_text(encoding="utf-8")
-        self.assertTrue(circleci_push_workflow_errors(circle.replace("- full-extraction", "- full-extraction:\n          filters: pipeline.git.branch == \"main\"")))
-
-    def test_disabled_step_and_missing_command_are_rejected(self) -> None:
-        github = GITHUB_WORKFLOW.read_text(encoding="utf-8")
-        self.assertTrue(executable_step_errors(github.replace(f"- name: {STEP_NAME}", f"- name: {STEP_NAME}\n        if: false"), STEP_NAME, "run"))
-        self.assertTrue(executable_step_errors(github.replace(SCRIPT_COMMAND, "echo skipped"), STEP_NAME, "run"))
-        self.assertTrue(executable_step_errors(github.replace(SCRIPT_COMMAND, "exit 0\n          " + SCRIPT_COMMAND), STEP_NAME, "run"))
-        self.assertTrue(executable_step_errors(github.replace(f"- name: {STEP_NAME}", f"- name: {STEP_NAME}\n        continue-on-error: true"), STEP_NAME, "run"))
-        circle = CIRCLECI_CONFIG.read_text(encoding="utf-8")
-        self.assertTrue(executable_step_errors(circle.replace(f"name: {STEP_NAME}", f"name: {STEP_NAME}\n          when: on_fail"), STEP_NAME, "command"))
-
-    def test_workflow_and_job_skip_paths_are_rejected(self) -> None:
-        circle = CIRCLECI_CONFIG.read_text(encoding="utf-8")
-        self.assertTrue(circleci_push_workflow_errors(circle.replace("workflows:\n", "workflows:\n  when: false\n", 1)))
-        github = GITHUB_WORKFLOW.read_text(encoding="utf-8")
-        self.assertTrue(github_full_job_errors(github.replace("  full-extraction:\n", "  full-extraction:\n    needs: billing-probe\n", 1)))
-
-    def test_extraction_step_must_be_directly_in_the_scheduled_job(self) -> None:
-        circle = CIRCLECI_CONFIG.read_text(encoding="utf-8")
-        direct = (
-            "      - run:\n"
-            f"          name: {STEP_NAME}\n"
-            "          no_output_timeout: 20m\n"
-            "          command: |\n"
-            "            set -euo pipefail\n"
-            f"            {SCRIPT_COMMAND}\n"
-        )
-        self.assertEqual(circle.count(direct), 1)
-        conditional = (
-            "      - when:\n"
-            "          condition: false\n"
-            "          steps:\n"
-            "            - run:\n"
-            f"                name: {STEP_NAME}\n"
-            "                no_output_timeout: 20m\n"
-            "                command: |\n"
-            "                  set -euo pipefail\n"
-            f"                  {SCRIPT_COMMAND}\n"
-        )
-        self.assertTrue(executable_step_errors(circle.replace(direct, conditional), STEP_NAME, "command"))
-        unused_job = (
-            "  unused-verification:\n"
-            "    machine:\n"
-            "      image: ubuntu-2404:2026.05.1\n"
-            "    steps:\n" + direct
-        )
-        moved = circle.replace(direct, "").replace("workflows:\n", unused_job + "\nworkflows:\n")
-        self.assertTrue(executable_step_errors(moved, STEP_NAME, "command"))
-
-    def test_extraction_execution_envelope_cannot_skip_the_command(self) -> None:
-        circle = CIRCLECI_CONFIG.read_text(encoding="utf-8")
-        quoted_environment = circle.replace(
-            "  full-extraction:\n", '  full-extraction:\n    "environment": {BASH_ENV: /tmp/skip}\n',
-        )
-        self.assertTrue(executable_step_errors(quoted_environment, STEP_NAME, "command"))
-        for property_line in ("shell: /bin/true", "background: true", "environment: {BASH_ENV: /tmp/skip}"):
-            mutated = circle.replace(
-                f"          name: {STEP_NAME}\n", f"          name: {STEP_NAME}\n          {property_line}\n",
-            )
-            with self.subTest(property_line=property_line):
-                self.assertTrue(executable_step_errors(mutated, STEP_NAME, "command"))
-        before_name = circle.replace(
-            f"          name: {STEP_NAME}\n", f"          shell: /bin/true\n          name: {STEP_NAME}\n",
-        )
-        self.assertTrue(executable_step_errors(before_name, STEP_NAME, "command"))
-        self.assertTrue(executable_step_errors(
-            circle.replace("  full-extraction:\n", "  full-extraction:\n    environment: {BASH_ENV: /tmp/skip}\n"),
-            STEP_NAME, "command",
-        ))
-        github = GITHUB_WORKFLOW.read_text(encoding="utf-8")
-        self.assertTrue(executable_step_errors(
-            github.replace("jobs:\n", "defaults:\n  run:\n    shell: true {0}\njobs:\n"), STEP_NAME, "run",
-        ))
-        for property_line in ("shell: true {0}", "working-directory: /tmp/stale", "env: {BASH_ENV: /tmp/skip}"):
-            mutated = github.replace(
-                f"      - name: {STEP_NAME}\n", f"      - name: {STEP_NAME}\n        {property_line}\n",
-            )
-            with self.subTest(property_line=property_line):
-                self.assertTrue(executable_step_errors(mutated, STEP_NAME, "run"))
-
-    def test_benchmark_artifact_steps_cannot_disappear(self) -> None:
-        text = BENCHMARK_CONFIG.read_text(encoding="utf-8")
-        self.assertTrue(benchmark_artifact_errors(text.replace("- store_artifacts:", "- ignored_artifact:", 1)))
-
-    def test_early_close_and_source_checkout_examples_are_rejected(self) -> None:
-        script = EXAMPLE_SCRIPT.read_text(encoding="utf-8")
-        self.assertTrue(example_script_errors(script.replace('cd "${repo_root}"', 'cd "${repo_root}"\n)')))
-        self.assertTrue(example_script_errors(script.replace('--manifest-path "${qmp_extract_dir}/Cargo.toml" ', '')))
+    def test_heavy_and_full_gate_tampering_fail(self) -> None:
+        text = CONFIG.read_text()
+        for before, after in (
+            ("default: false", "default: true"),
+            ("unless: << pipeline.parameters.run_heavy >>", "when: << pipeline.parameters.run_heavy >>"),
+            ("- full-extraction", "- heavy-benchmarks"),
+            (FULL_COMMAND, "echo skipped"),
+            ("set -euo pipefail", "set +e"),
+            ("- store_artifacts:", "- ignored_artifacts:"),
+            ("cargo fetch --locked", "cargo fetch"),
+        ):
+            with self.subTest(before=before):
+                self.assertTrue(config_errors(text.replace(before, after, 1)))
 
 
 if __name__ == "__main__":

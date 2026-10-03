@@ -152,12 +152,11 @@ scripts/extract-to-standalone-repo.sh --dry-run /path/to/qmp-extracted
 ```
 
 The scaling results are same-host signals, not portable latency guarantees.
-The intended push CI entry point is `.circleci/config.yml`, which verifies a
+The main-push and PR-update CI entry point is `.circleci/config.yml`, which verifies a
 clean standalone extraction, its full workspace rail, and both public examples.
 Check the live trigger with `python3 scripts/verify-hosted-ci-binding.py` before
 accepting a hosted green; also confirm the exact SHA's extraction step ran.
-The separate, manually run
-CircleCI benchmark collects three independent full 60-row `in-memory-pressure`
+The explicit `run_heavy=true` CircleCI workflow collects three independent full 60-row `in-memory-pressure`
 v4 process receipts and one 220-row standard scaling receipt at one pinned commit,
 retaining each raw JSONL artifact. Passing those receipts establishes only the
 profiles' absolute/structural guards; release regression or SLO claims still

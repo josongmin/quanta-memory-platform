@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check the live CircleCI push trigger against the checked-in full gate."""
+"""Check the live personal CircleCI trigger set against the checked-in full gate."""
 
 from __future__ import annotations
 
@@ -9,12 +9,11 @@ import sys
 
 
 PROJECT_ID = "0869ae14-9b92-436d-9bba-8ac4b4cfafb5"
+PROJECT_SLUG = "circleci/Q3G2VbitoZmaQSKihvptcF/23Fh6MNDBV4PLARDMMvDJc"
 EXPECTED_REPO_ID = "1362792313"
+EXPECTED_REPO = "josongmin/quanta-memory-platform"
 EXPECTED_CONFIG = ".circleci/config.yml"
-PUSH_PRESETS = {
-    "all-pushes", "default-branch-pushes", "only-build-pushes-to-non-draft-prs",
-    "pushes-to-merge-queues",
-}
+REQUIRED_PRESETS = {"default-branch-pushes", "only-open-prs", "only-build-prs"}
 
 
 def circleci(*arguments: str) -> object:
@@ -26,11 +25,11 @@ def circleci(*arguments: str) -> object:
     return json.loads(result.stdout)
 
 
-def binding_errors(definitions: object, triggers: dict[str, object]) -> list[str]:
+def binding_errors(definitions: object, triggers: dict[str, object], settings: object) -> list[str]:
     if not isinstance(definitions, list) or not definitions:
         return ["no CircleCI pipeline definitions returned"]
     errors: list[str] = []
-    canonical = 0
+    seen: list[str] = []
     for definition in definitions:
         if not isinstance(definition, dict) or not isinstance(definition.get("id"), str):
             return ["invalid CircleCI pipeline definition response"]
@@ -48,9 +47,7 @@ def binding_errors(definitions: object, triggers: dict[str, object]) -> list[str
         for event in events:
             if not isinstance(event, dict):
                 return ["invalid CircleCI trigger response"]
-            if event.get("disabled") is True or (
-                event.get("event_preset") not in PUSH_PRESETS and event.get("event_name") != "push"
-            ):
+            if event.get("disabled") is True:
                 continue
             if (
                 config.get("file_path") != EXPECTED_CONFIG
@@ -58,12 +55,16 @@ def binding_errors(definitions: object, triggers: dict[str, object]) -> list[str
                 or config_repo.get("external_id") != EXPECTED_REPO_ID
                 or checkout_repo.get("external_id") != EXPECTED_REPO_ID
                 or event.get("repo_external_id") != EXPECTED_REPO_ID
+                or config_repo.get("full_name") != EXPECTED_REPO
+                or checkout_repo.get("full_name") != EXPECTED_REPO
+                or event.get("repo_full_name") != EXPECTED_REPO
             ):
-                errors.append(f"enabled push trigger {event.get('id')} uses the wrong full-gate config or repo")
-            elif event.get("event_preset") == "all-pushes":
-                canonical += 1
-    if canonical != 1:
-        errors.append(f"expected exactly one canonical full-gate push trigger, found {canonical}")
+                errors.append(f"enabled trigger {event.get('id')} uses the wrong full-gate config or repo")
+            seen.append(event.get("event_preset"))
+    if len(seen) != len(REQUIRED_PRESETS) or set(seen) != REQUIRED_PRESETS:
+        errors.append(f"expected only main-push and PR-open/update triggers, found {seen}")
+    if not isinstance(settings, dict) or settings.get("enable_auto_cancel_redundant_workflows") is not True:
+        errors.append("auto-cancel redundant workflows is disabled or unavailable")
     return errors
 
 
@@ -79,14 +80,15 @@ def main() -> int:
             )
             for item in definitions
         }
-        errors = binding_errors(definitions, triggers)
+        settings = circleci("project", "setting", "list", "--project", PROJECT_SLUG)
+        errors = binding_errors(definitions, triggers, settings)
     except (OSError, ValueError, KeyError, TypeError, RuntimeError) as error:
         errors = [str(error)]
     for error in errors:
         print(f"hosted CI binding: FAIL: {error}", file=sys.stderr)
     if errors:
         return 1
-    print("hosted CI binding: OK (one full-gate push trigger)")
+    print("hosted CI binding: OK (main push, PR open/update, auto-cancel)")
     return 0
 
 

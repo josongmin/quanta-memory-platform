@@ -1,18 +1,37 @@
 version: 2.1
 
+parameters:
+  run_heavy:
+    type: boolean
+    default: false
+
+# GitHub App trigger scope is managed outside this file. See
+# scripts/verify-hosted-ci-binding.py: main pushes and PR open/update only.
+# Cache downloads, not target/: the full gate builds several feature sets.
 jobs:
   full-extraction:
     machine:
       image: ubuntu-2404:2026.05.1
-    resource_class: large
+    resource_class: medium
+    environment:
+      CARGO_BUILD_JOBS: "2"
     steps:
       - checkout
+      - restore_cache:
+          name: Restore pinned cargo-deny binary
+          keys:
+            - qmp-v1-ubuntu2404-{{ arch }}-rust1.92.0-full-cargo-deny0.19.7
+      - restore_cache:
+          name: Restore locked Cargo downloads
+          keys:
+            - qmp-v1-ubuntu2404-{{ arch }}-rust1.92.0-full-registry-{{ checksum "Cargo.lock" }}
+            - qmp-v1-ubuntu2404-{{ arch }}-rust1.92.0-full-registry-
       - run:
           name: Install pinned verification tools
           command: |
             set -euo pipefail
             sudo apt-get update
-            sudo apt-get install -y ripgrep shellcheck python3-venv
+            sudo apt-get install -y ripgrep=14.1.0-1 shellcheck=0.9.0-1 python3-venv
             if ! command -v rustup >/dev/null 2>&1; then
               curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs |
                 sh -s -- -y --profile minimal --default-toolchain none
@@ -21,16 +40,34 @@ jobs:
             rustup toolchain install 1.92.0 --profile minimal --component clippy --component rustfmt
             python3 -m venv /tmp/qmp-semgrep-venv
             /tmp/qmp-semgrep-venv/bin/pip install semgrep==1.157.0
-            cargo install cargo-deny --version 0.19.7 --locked
+            if ! test -x "$HOME/.cargo/bin/cargo-deny" ||
+               ! "$HOME/.cargo/bin/cargo-deny" --version | grep -Eq '^cargo-deny 0\.19\.7$'; then
+              cargo install cargo-deny --version 0.19.7 --locked --force
+            fi
             printf 'export PATH="%s:/tmp/qmp-semgrep-venv/bin:$PATH"\n' "$HOME/.cargo/bin" >> "$BASH_ENV"
       - run:
-          name: Verify tool versions
+          name: Verify tool versions and locked downloads
           command: |
             set -euo pipefail
-            rustc --version
-            cargo-deny --version
-            semgrep --version
-            shellcheck --version
+            rustc --version | grep -F 'rustc 1.92.0 '
+            cargo-deny --version | grep -Fx 'cargo-deny 0.19.7'
+            test -x "$HOME/.cargo/bin/cargo-deny"
+            semgrep --version | grep -Fx '1.157.0'
+            shellcheck --version | grep -Fx 'version: 0.9.0'
+            rg --version | grep -E '^ripgrep 14\.1\.0( |$)'
+            python3 --version | grep -E '^Python 3\.12\.'
+            cargo fetch --locked
+            test -d "$HOME/.cargo/registry"
+            test -n "$(find "$HOME/.cargo/registry" -type f -print -quit)"
+      - save_cache:
+          key: qmp-v1-ubuntu2404-{{ arch }}-rust1.92.0-full-cargo-deny0.19.7
+          paths:
+            - ~/.cargo/bin/cargo-deny
+      - save_cache:
+          key: qmp-v1-ubuntu2404-{{ arch }}-rust1.92.0-full-registry-{{ checksum "Cargo.lock" }}
+          paths:
+            - ~/.cargo/registry
+            - ~/.cargo/git
       - run:
           name: Verify actual standalone extraction and full workspace gate
           no_output_timeout: 20m
@@ -38,7 +75,66 @@ jobs:
             set -euo pipefail
             scripts/verify-extracted-examples.sh
 
+  heavy-benchmarks:
+    machine:
+      image: ubuntu-2404:2026.05.1
+    resource_class: large
+    environment:
+      CARGO_BUILD_JOBS: "4"
+    steps:
+      - checkout
+      - restore_cache:
+          name: Restore locked benchmark Cargo downloads
+          keys:
+            - qmp-v1-ubuntu2404-{{ arch }}-rust1.92.0-benchmark-registry-{{ checksum "Cargo.lock" }}
+            - qmp-v1-ubuntu2404-{{ arch }}-rust1.92.0-benchmark-registry-
+      - run:
+          name: Install pinned benchmark toolchain
+          command: |
+            set -euo pipefail
+            if ! command -v rustup >/dev/null 2>&1; then
+              curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs |
+                sh -s -- -y --profile minimal --default-toolchain none
+            fi
+            . "$HOME/.cargo/env"
+            rustup toolchain install 1.92.0 --profile minimal
+            printf 'export PATH="%s:$PATH"\n' "$HOME/.cargo/bin" >> "$BASH_ENV"
+            rustc --version | grep -F 'rustc 1.92.0 '
+            cargo fetch --locked
+            test -n "$(find "$HOME/.cargo/registry" -type f -print -quit)"
+      - save_cache:
+          key: qmp-v1-ubuntu2404-{{ arch }}-rust1.92.0-benchmark-registry-{{ checksum "Cargo.lock" }}
+          paths:
+            - ~/.cargo/registry
+            - ~/.cargo/git
+      - run:
+          name: Collect source-bound scaling receipts
+          no_output_timeout: 20m
+          command: |
+            set -euo pipefail
+            test "$(git rev-parse HEAD)" = "$CIRCLE_SHA1"
+            mkdir -p /tmp/qmp-benchmark
+            echo "Source SHA: $CIRCLE_SHA1"
+            for run in 1 2 3; do
+              result="/tmp/qmp-benchmark/pressure-${run}.jsonl"
+              QMP_SCALING_ARTIFACT="$result" \
+                scripts/run-scaling-bench.sh --profile=in-memory-pressure
+              sha256sum "$result"
+            done
+            QMP_SCALING_ARTIFACT=/tmp/qmp-benchmark/standard-full.jsonl \
+              scripts/run-scaling-bench.sh
+            sha256sum /tmp/qmp-benchmark/standard-full.jsonl
+            test "$(git rev-parse HEAD)" = "$CIRCLE_SHA1"
+      - store_artifacts:
+          path: /tmp/qmp-benchmark
+          destination: qmp-scaling
+
 workflows:
-  push-verification:
+  normal:
+    unless: << pipeline.parameters.run_heavy >>
     jobs:
       - full-extraction
+  heavy:
+    when: << pipeline.parameters.run_heavy >>
+    jobs:
+      - heavy-benchmarks
