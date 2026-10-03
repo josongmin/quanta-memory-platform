@@ -32,8 +32,10 @@ success commit; a successful destination has a clean worktree.
 scripts/verify-extracted-examples.sh
 ```
 
-Both checked-in CI providers use that verifier. A CI configuration or dry-run
-pass does not prove that extraction, examples or a hosted job executed. Record
+CircleCI's push workflow is the required hosted verifier. GitHub Actions has
+only explicit manual dispatch and is a diagnostic rerun, not push authority.
+A CI configuration or dry-run pass does not prove that extraction, examples or a
+hosted job executed. Record
 the exact source and actual result as specified by
 [ADR 0003](docs/adr/0003-source-bound-qualification.md).
 

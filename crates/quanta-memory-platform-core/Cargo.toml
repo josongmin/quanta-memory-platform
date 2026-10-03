@@ -12,8 +12,10 @@ workspace = true
 [features]
 default = ["live_control"]
 pressure = []
-scheduler = []
-live_control = ["pressure", "scheduler"]
+# Scheduler admission consumes the broker's live ledger view. The public
+# scheduler feature therefore selects the complete live-control authority.
+scheduler = ["live_control"]
+live_control = ["pressure"]
 unbudgeted_pin = []
 telemetry = ["dep:metrics", "dep:hdrhistogram"]
 full = ["live_control", "telemetry"]

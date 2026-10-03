@@ -94,7 +94,7 @@ pub use api::control::{
     ManagedChargeRechargeRecovery, PendingReservation, RebuildFence, RebuildFenceStatus,
     RebuildReceipt,
 };
-#[cfg(feature = "live_control")]
+#[cfg(feature = "pressure")]
 pub use application::controller::{
     LadderPressureController, PressureController, PressureThresholds, ReclaimRung,
 };

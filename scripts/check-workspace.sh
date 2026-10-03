@@ -77,6 +77,9 @@ fi
 echo "[check-workspace] workspace policy"
 python3 scripts/verify-workspace-policy.py --metadata-stdin <<<"${workspace_metadata}"
 
+echo "[check-workspace] Rust source shape"
+python3 scripts/verify-source-shape.py
+
 if [[ "${mode}" == "full" ]]; then
   # Crash tests build child examples with --offline to prove binary freshness.
   # Fetch host dependencies before those tests so a cold cache fails here
@@ -112,6 +115,10 @@ if [[ "${regression_status}" -ne 0 ]]; then
 fi
 
 if [[ "${mode}" == "full" ]]; then
+  echo "[check-workspace] library complexity (long functions advisory)"
+  cargo clippy --locked --workspace --lib --all-features -- \
+    -W clippy::too_many_lines
+
   echo "[check-workspace] feature-matrix"
   scripts/verify-feature-matrix.sh
 
@@ -126,6 +133,11 @@ if [[ "${mode}" == "full" ]]; then
   echo "[check-workspace] documented test selectors"
   scripts/verify-doc-test-selectors.py --test-output "${workspace_test_output}"
 else
+  echo "[check-workspace] in-memory library complexity (long functions advisory)"
+  cargo clippy --locked --workspace --lib --no-default-features \
+    --features "${in_memory_features}" -- \
+    -W clippy::too_many_lines
+
   echo "[check-workspace] in-memory workspace Clippy"
   cargo clippy --locked --workspace --all-targets --no-default-features \
     --features "${in_memory_features}" -- -D warnings

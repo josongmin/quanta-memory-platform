@@ -2,10 +2,19 @@
 
 Plain `cargo` is the build front door. `scripts/check-workspace.sh` is the only
 repository-wide verification front door. It owns formatting, ShellCheck,
-resolved workspace-graph and safety policy, Python and extraction contracts,
+resolved workspace-graph, Rust source-shape and safety policy, Python and extraction contracts,
 Semgrep regression guards, the Cargo feature matrix, workspace tests, isolated
 feature capability tests, documented selector validation, generated-guidance
 drift, and dependency policy.
+
+`Justfile` provides short local commands that delegate to the owning scripts;
+it does not define an independent check. CircleCI push is the required hosted
+extraction verifier. GitHub Actions full dispatch is an optional manual rerun.
+
+The source-shape check rejects Rust files over 1,000 physical lines; 600-line
+files are reported for review. The library-only Clippy pass reports
+`too_many_lines` without denying it. Clippy documents known problems with
+`cognitive_complexity` as a complexity measure, so it is not a release veto.
 
 Semgrep contracts execute the actual engine against repository-shaped rejecting
 and permitted fixtures for every rule. Missing rule fixtures, skipped source
@@ -20,7 +29,7 @@ For a shorter local check of the in-memory feature set, run
 `scripts/check-workspace.sh --in-memory`. It runs the same static and contract
 checks, then checks that the selected dependency graph contains no Redb, runs
 workspace Clippy and tests with `core/full`, `facade/full`, and `testkit/full`,
-and executes eight in-memory/fixture feature capability selectors. It does not
+and executes fourteen in-memory/fixture feature capability selectors. It does not
 run the per-feature Clippy matrix, Redb-backed tests, or documented selector
 validation. Its success is explicitly scoped and is not extraction or full
 workspace qualification.
@@ -30,6 +39,10 @@ the canonical rail. The feature matrix discovers feature names from Cargo
 metadata and covers default, bare, every feature other than the `default`/`full`
 aliases, explicit `full`, and workspace all-features; adding a manifest feature
 therefore adds it to the matrix without editing a shell list.
+An optional `cargo-hack --feature-powerset --depth 2` run can diagnose pairwise
+feature interactions, but it is not the release gate: the runtime capability
+rail owns representative behavior, and a new pair becomes mandatory when its
+contract and selected test are specified.
 
 Examples use the real public APIs:
 

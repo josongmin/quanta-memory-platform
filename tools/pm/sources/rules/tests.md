@@ -7,13 +7,13 @@ Placement:
 
 | If it proves… | Put it in… |
 | --- | --- |
-| Ledger reserve/commit/release + its declared invariants | `crates/quanta-memory-platform-core/src/domain/ledger.rs` `#[cfg(test)]` |
-| Policy / manifest / preset / residency validation | `crates/quanta-memory-platform-core/src/domain/{policy,config}.rs` `#[cfg(test)]` |
-| Pressure controller / scheduler behavior | `crates/quanta-memory-platform-core/src/application/{controller,scheduler}.rs` `#[cfg(test)]` |
-| Public broker surface end-to-end (reserve→commit→snapshot→release→rebuild) | `crates/quanta-memory-platform-core/src/api/control.rs` `#[cfg(test)]` |
+| Ledger reserve/commit/release + its declared invariants | The `domain::ledger` test module, inline or in adjacent `ledger/tests/` files |
+| Policy / manifest / preset / residency validation | The owning `domain::{policy,config}` test module, inline or adjacent |
+| Pressure controller / scheduler behavior | The owning `application::{controller,scheduler}` test module, inline or adjacent |
+| Public broker surface end-to-end (reserve→commit→snapshot→release→rebuild) | The `api::control` test module, inline or in adjacent `control/tests/` files |
 | Cross-cutting policy contracts | `crates/quanta-memory-platform-core/tests/policy_contracts.rs` |
-| A facade store / pipeline behavior | that feature's `service.rs` `#[cfg(test)]` |
-| A storage backing (redb) round-trip | the backing module under its feature |
+| A facade store / pipeline behavior | That feature's `service` test module, inline or in adjacent `service/tests/` files |
+| A storage backing (redb) round-trip | The backing test module under its feature, inline or adjacent |
 | "the conformance suite actually bites" | `testkit/src/conformance/{mod,suites}.rs` tests and `testkit/tests/facade_conformance_bite.rs` |
 | Deterministic fault/chaos scenarios | `crates/quanta-memory-platform-testkit/src/faults/` |
 
@@ -21,6 +21,10 @@ Conventions:
 
 - **Feature-gate tests** with the feature they exercise; `--all-features` must be
   green and each feature must build alone.
+- Keep private-state tests in their owning Rust module. An adjacent test file or
+  subtree may use ordinary `mod tests;`; do not move a large inline test block
+  into one equally large file. Update documented selectors, their source-owner
+  map, and capability selectors whenever a nested module changes test names.
 - Observe the claimed authority: exact identity/content/accounting postimages,
   independent expected values and actual measured work for complexity claims.
   Follow `docs/adr/0005-regression-oracle-acceptance.md` for regression oracles.

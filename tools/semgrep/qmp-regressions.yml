@@ -1,7 +1,7 @@
 # Regression guards for accounting and Sep-26 bugbash regressions.
 #
 # Each rule pins a SPECIFIC defect this codebase already hit, so the same shape
-# cannot silently come back. They are intentionally narrow (the broad clippy cast
+# cannot silently come back after owner-local module moves. They are intentionally narrow (the broad clippy cast
 # lints are too noisy for this byte-accounting code); if a flagged use is provably
 # safe, justify it with a trailing `// nosemgrep: <rule-id> -- reason: <why>`.
 #
@@ -62,7 +62,7 @@ rules:
     severity: ERROR
     message: Exact ledger slots and totals must reject overflow/underflow rather than hide it with saturation. Use checked arithmetic after preflight.
     paths:
-      include: [/crates/quanta-memory-platform-core/src/domain/ledger.rs]
+      include: [/crates/quanta-memory-platform-core/src/domain/**/*.rs]
     patterns:
       - pattern-either:
           - pattern-inside: |
@@ -80,7 +80,7 @@ rules:
     severity: ERROR
     message: Release preflight must use keyed owner reads, not whole-owner iteration or snapshot copying. Keep the metered complexity oracle too.
     paths:
-      include: [/crates/quanta-memory-platform-core/src/domain/ledger.rs]
+      include: [/crates/quanta-memory-platform-core/src/domain/**/*.rs]
     patterns:
       - pattern-inside: |
           fn preflight_release_batch(...) -> $RET { ... }
@@ -97,7 +97,7 @@ rules:
     severity: ERROR
     message: Admission must borrow the cached fair-share table. Precompute shares when constructing the scheduler.
     paths:
-      include: [/crates/quanta-memory-platform-core/src/application/scheduler.rs]
+      include: [/crates/quanta-memory-platform-core/src/application/**/*.rs]
     patterns:
       - pattern-inside: |
           fn admits(...) -> $RET { ... }
@@ -108,7 +108,7 @@ rules:
     severity: ERROR
     message: Allocator observation is advisory and cannot update semantic pressure. Keep ledger/cache postimage tests.
     paths:
-      include: [/crates/quanta-memory-platform-core/src/api/control.rs]
+      include: [/crates/quanta-memory-platform-core/src/api/**/*.rs]
     patterns:
       - pattern-inside: |
           pub fn observe_allocator(...) -> $RET { ... }
@@ -119,7 +119,7 @@ rules:
     severity: ERROR
     message: Scratch observation is a high-water mark. Update it with max(previous, observed).
     paths:
-      include: [/crates/quanta-memory-platform-core/src/ports/scratch.rs]
+      include: [/crates/quanta-memory-platform-core/src/ports/**/*.rs]
     patterns:
       - pattern-inside: |
           pub fn grow_to_observed(...) -> $RET { ... }
@@ -143,7 +143,7 @@ rules:
     severity: ERROR
     message: Pressure thresholds must remain sealed behind validated constructors; public fields bypass validation.
     paths:
-      include: [/crates/quanta-memory-platform-core/src/application/controller.rs]
+      include: [/crates/quanta-memory-platform-core/src/application/**/*.rs]
     pattern-either:
       - pattern: 'pub struct PressureThresholds { ..., pub $FIELD: $TYPE, ... }'
       - pattern: 'pub struct PressureThresholds { ..., pub(crate) $FIELD: $TYPE, ... }'
@@ -153,7 +153,7 @@ rules:
     severity: ERROR
     message: The persistent identity/tombstone lease must be RetainedMetadata, independently of the active payload lease.
     paths:
-      include: [/crates/quanta-memory-platform-facade/src/publish_pipeline/prepared_publication.rs]
+      include: [/crates/quanta-memory-platform-facade/src/publish_pipeline/**/*.rs]
     patterns:
       - pattern: $ACCOUNTING.charge($CLASS, $OWNER, $CONTEXT, $KIND, persistent_bytes)
       - metavariable-pattern:
@@ -166,7 +166,7 @@ rules:
     severity: ERROR
     message: Construct a fresh RandomState for each payload store. A shared or deterministic seed permits cross-store bucket grinding.
     paths:
-      include: [/crates/quanta-memory-platform-facade/src/payload_store/service.rs]
+      include: [/crates/quanta-memory-platform-facade/src/payload_store/**/*.rs]
     patterns:
       - pattern-inside: |
           fn with_accounting(...) -> $RET { ... }
@@ -187,7 +187,7 @@ rules:
     severity: ERROR
     message: The legacy finalized watermark cannot distinguish reserved holes. Resolve records from exact disposition/proof rows.
     paths:
-      include: [/crates/quanta-memory-platform-facade/src/spill/backings/redb.rs]
+      include: [/crates/quanta-memory-platform-facade/src/spill/**/*.rs]
     patterns:
       - pattern-either:
           - pattern: $TABLE.get(FINALIZED_THROUGH)
@@ -198,7 +198,7 @@ rules:
     severity: ERROR
     message: The public kit dispatcher must fold the actual conformance suite, never manufacture a Passed verdict.
     paths:
-      include: [/crates/quanta-memory-platform-testkit/src/fixtures/mod.rs]
+      include: [/crates/quanta-memory-platform-testkit/src/fixtures/**/*.rs]
     patterns:
       - pattern-inside: |
           pub fn run_conformance(...) -> $RET { ... }
@@ -209,20 +209,20 @@ rules:
     severity: ERROR
     message: The facade suite must compose payload, retained-map, transcript and spill slices. Runtime assertion-name inventory remains authoritative for completeness.
     paths:
-      include: [/crates/quanta-memory-platform-testkit/src/conformance/suites.rs]
+      include: [/crates/quanta-memory-platform-testkit/src/conformance/**/*.rs]
     pattern-either:
       - patterns:
-          - pattern: pub fn run_facade_store_suite(...) -> $RET { ... }
-          - pattern-not: pub fn run_facade_store_suite(...) -> $RET { ... run_payload_store_slice(...); ... }
+          - pattern: pub fn run_facade_store_suite(...) -> Vec<$VERDICT> { ... }
+          - pattern-not: pub fn run_facade_store_suite(...) -> Vec<$VERDICT> { ... run_payload_store_slice(...); ... }
       - patterns:
-          - pattern: pub fn run_facade_store_suite(...) -> $RET { ... }
-          - pattern-not: pub fn run_facade_store_suite(...) -> $RET { ... run_retained_map_slice(...); ... }
+          - pattern: pub fn run_facade_store_suite(...) -> Vec<$VERDICT> { ... }
+          - pattern-not: pub fn run_facade_store_suite(...) -> Vec<$VERDICT> { ... run_retained_map_slice(...); ... }
       - patterns:
-          - pattern: pub fn run_facade_store_suite(...) -> $RET { ... }
-          - pattern-not: pub fn run_facade_store_suite(...) -> $RET { ... run_transcript_slice(...); ... }
+          - pattern: pub fn run_facade_store_suite(...) -> Vec<$VERDICT> { ... }
+          - pattern-not: pub fn run_facade_store_suite(...) -> Vec<$VERDICT> { ... run_transcript_slice(...); ... }
       - patterns:
-          - pattern: pub fn run_facade_store_suite(...) -> $RET { ... }
-          - pattern-not: pub fn run_facade_store_suite(...) -> $RET { ... run_spill_slice(...); ... }
+          - pattern: pub fn run_facade_store_suite(...) -> Vec<$VERDICT> { ... }
+          - pattern-not: pub fn run_facade_store_suite(...) -> Vec<$VERDICT> { ... run_spill_slice(...); ... }
 
   - id: qmp-isolated-child-requires-selection-guard
     languages: [rust]

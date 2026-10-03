@@ -78,6 +78,7 @@ required-features = ["spill-redb", "durability-l2"]
 
 [[bench]]
 name = "scaling"
+path = "benches/scaling/mod.rs"
 harness = false
 required-features = ["payload_store", "retained_map", "revocable_store"]
 

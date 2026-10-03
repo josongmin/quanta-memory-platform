@@ -128,6 +128,10 @@ deliberate non-accounted use. It is absent from `default`, `full`, and
 ## Repository checks
 
 ```bash
+# optional short command front door (delegates to the scripts below)
+just check
+just in-memory
+
 # authoritative repo-local static, contract, feature, test, and dependency rail
 scripts/check-workspace.sh
 
@@ -165,5 +169,6 @@ Extraction and host adoption are separate operations; see
 | Standalone-repository extraction procedure | [EXTRACTION.md](EXTRACTION.md) |
 | Consumer breaking changes | [MIGRATION.md](MIGRATION.md) |
 | Release inventory | [CHANGELOG.md](CHANGELOG.md) |
+| QMP and Semantica contract ownership | [docs/ssot/README.md](docs/ssot/README.md) |
 | Current plan status and remaining gates | [docs/plans/README.md](docs/plans/README.md) |
 | Executable verification contract | [docs/verification-scenarios.md](docs/verification-scenarios.md) |

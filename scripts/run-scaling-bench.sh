@@ -40,7 +40,13 @@ graph = sorted(
 print(hashlib.sha256(json.dumps(graph, sort_keys=True, separators=(",", ":")).encode()).hexdigest())
 ')"
 dependency_lock_sha256="$(shasum -a 256 Cargo.lock | awk '{print $1}')"
-benchmark_source_sha256="$(shasum -a 256 crates/quanta-memory-platform-facade/benches/scaling.rs | awk '{print $1}')"
+benchmark_source_sha256="$(
+  shasum -a 256 \
+    crates/quanta-memory-platform-facade/benches/scaling/mod.rs \
+    crates/quanta-memory-platform-facade/benches/scaling/pressure.rs \
+    crates/quanta-memory-platform-facade/benches/scaling/throughput.rs \
+    | shasum -a 256 | awk '{print $1}'
+)"
 bench_build_config_sha256="$(python3 scripts/lib/scaling_build_config.py)"
 
 if [[ -n "${QMP_SCALING_ARTIFACT:-}" ]]; then
