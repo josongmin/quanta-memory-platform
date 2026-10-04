@@ -1,6 +1,8 @@
 # QMP 구조적 수정 계획
 
-계획 재감사일: 2026-10-04. 상태: oct-4 전용 worktree에서 구현 진행; 체크포인트마다 통합 source를 고정하고 일괄 검증.
+계획 재감사일: 2026-10-04. 상태: oct-4 전용 worktree에서 선택한 구현과 local qualification 완료.
+최종 코드 검증 기준은 clean commit `435b2ab08be656b59c51b2a086b9d57ef04201f9`이며,
+이후 계획의 상태 갱신을 그 SHA의 실행 증거로 간주하지 않는다.
 
 **확정 순서:** 재현된 accounting/identity/evidence/guard 수리 → local source qualification →
 선택한 큰 인터페이스 확장과 API 축소의 별도 qualification → 조건부 소비자/운영 후속.
@@ -44,8 +46,20 @@
 - 최종 canonical/extraction rail은 모든 구현을 통합한 clean candidate에 묶는다.
   중간 checkpoint receipt는 그 commit만 증명하며 이후 변경을 포함하지 않는다.
 - 필수 수리 checkpoint `0b2fb29`에서 full canonical `scripts/check-workspace.sh`가 통과했다.
-  실행 root는 별도 detached checkout이며 extraction와 hosted receipt는 아직 없다.
+  실행 root는 별도 detached checkout이며 그 checkpoint의 extraction와 hosted receipt는 없다.
   이후 D/API/feature/example 변경은 이 pass에 포함되지 않는다.
+- 최종 코드 candidate `435b2ab`에서 full canonical, clean extraction dry-run,
+  실제 standalone extraction의 full gate와 공개 예제 3개가 통과했다.
+  Scaling smoke 48 samples도 source/종료/결과 계약 검사를 통과했다. 이는 SLO 증거가 아니다.
+  Live hosted binding은 확인했으나 같은 SHA의 hosted job은 `NOT_RUN`이다.
+
+| 최종 코드 candidate의 실행 | 증거 파일 / 실행 root | 결과 |
+| --- | --- | --- |
+| `scripts/check-workspace.sh` | `/tmp/qmp-oct-4-checkpoint-2-qualified.log`; oct-4 worktree | PASS, full repository gate |
+| `scripts/extract-to-standalone-repo.sh --dry-run /tmp/qmp-oct-4-qualified-dry-run` | `/tmp/qmp-oct-4-qualified-dry-run.log` | PASS |
+| `scripts/verify-extracted-examples.sh` | `/tmp/qmp-oct-4-extraction-examples.log`; `/tmp/qmp-ci-extraction.1bnPOE` | PASS, extracted full gate + hello_world / effective_budget_report / transcript_session |
+| `scripts/run-scaling-bench.sh --smoke` | `/tmp/qmp-oct-4-scaling-435b2ab.jsonl`; `/tmp/qmp-oct-4-scaling-smoke.log` | PASS, 48 samples; performance SLO 미측정 |
+| `python3 scripts/verify-hosted-ci-binding.py` | `/tmp/qmp-oct-4-hosted-binding.log` | PASS, binding only; exact-SHA hosted job `NOT_RUN` |
 
 ## 최종 계획 감사에서 보완한 사항
 
@@ -57,6 +71,9 @@
   Version 비교는 concurrent mutation만 검출하며 selector 완전성을 보장하지 않는다.
 - **수명 conformance의 독립 음성:** append/replay/cost가 정상이고 retire만 성공으로 삼키는
   fake를 suite가 거부해야 한다. 기존 replay-broken fake의 실패만으로 retirement를 증명하지 않는다.
+- **0행과 읽기 중 수명:** session count/key-byte 한도는 row/evidence 한도와 독립이다.
+  Read가 잡은 내부 Arc가 남아 있으면 retire/eviction/close는 charge 반환 전에 busy로 거부한다.
+  Read-first와 close-first 양쪽 순서 및 거부의 ledger/stats 원상보존을 검증한다.
 - **삭제 후 통합 경로:** legacy API 제거 시 public exports뿐 아니라 feature rail의 실제 selector,
   source-owner map, guidance와 examples도 이행한다. Zero-test 성공으로 capability를 판정하지 않는다.
 - **검증 경계:** local canonical + clean extraction/examples는 QMP source qualification이다.
@@ -64,7 +81,7 @@
 - **결정적 token:** prepared token은 같은 identity/key에서 store나 restart 경계를 넘어 같은 값이다.
   임의의 foreign-store 거부나 nonce/epoch를 붙이면 기존 replay 계약을 깨뜨린다.
 
-현재 진행 중인 D 및 API 축소는 사용자가 선택한 별도 확장 candidate다. 아래 우선순위는
+완료한 D 및 API 축소는 사용자가 선택한 별도 확장 candidate다. 아래 우선순위는
 원 결함 수리의 필수 조건과 확장 계약을 구분하며, 이미 있는 구현을 다시 만드는 작업 목록이 아니다.
 
 ## 원칙과 우선순위
@@ -133,25 +150,34 @@ prepared unknown/aborted/conflict, retention saturation, storage closed/busy와 
 
 ## 현재 구현과 원 감사 항목 대조
 
-이는 움직이는 candidate의 소스 상태다. "구현"은 검증 통과를 뜻하지 않는다.
-최종 canonical/extraction receipt는 별도의 clean commit에 고정한다.
+아래 구현/검증 완료는 위의 clean 코드 candidate `435b2ab`에 한정한다.
+Host adoption, SLO와 hosted job 실행은 이 receipt의 범위 밖이다.
 
-| 원 항목 | 현재 고정본 | 남은 작업 |
+| 원 항목 | 최종 코드 candidate | 남은 작업 |
 | --- | --- | --- |
-| 0바이트 class 제거 / zero-cap borrowing victim / Headroom wrong release | 패치·owning tests 있음; scheduler 내부화 별도 candidate에 있음 | A 필수 통합 검증 + 내부화의 public/benchmark 검증 |
-| Payload reference 재사용 | String seal + checked store nonce/sequence 패치·회귀 있음 | B 공개 거부/수명 계약 검증 |
-| Prepared retirement 포화 | Fresh prepare가 전체 evidence 공간 예약 | C 불변식·retirement·공개 evidence 의미·독립 root-limit oracle |
-| Raw C / benchmark unsafe / adapter 타입·값·별칭 | 패치·actual-engine fixtures 있음 | E canonical 검증 |
-| CI 조기 종료·pin | 동적 추가 step·checkout·pin 우회 재현 | E 허용 실행 경로·exact pin 보강 |
-| Python 발견·실행 누락 | Recursive/source-origin/duplicate 검사와 `load_tests` hook 거부 구현 | Inherited contract 유지, actual mutation + canonical 검증 |
-| Transcript 수명·snapshot 비용 | 별도 candidate에 handle/page/CAS/retire 구현 및 owning caller 이행 중 | Public port·고갈/race/rollback/독립 retirement oracle 통합 검증 |
-| Durable maintenance / legacy API / 책임별 모듈 | Feature 경계와 legacy 제거 별도 candidate에 있음 | 실제 public/feature 경로 검증; 전면 파일 재편은 후속 |
-| Spill default restore | Target offline 거부 패치 있음 | F1 retaining read 불가와 정상 empty 구분; no-op 기본값 허용 |
+| 0바이트 class 제거 / zero-cap borrowing victim / Headroom wrong release | A 수리와 owning tests, scheduler 내부화의 external negative fixture 및 broker benchmark 검증 완료 | SLO 필요 시 호환 workload의 반복 측정 |
+| Payload reference 재사용 | String seal + checked store nonce/sequence, 공개 거부/수명 계약 검증 완료 | 실제 host 채택 시 reference 파싱/restart 사용 확인 |
+| Prepared retirement 포화 | 전체 evidence upfront 예약, abort/GC rollback, 공개 이름과 독립 root-limit oracle 검증 완료 | Host root/outstanding fence의 실행 qualification은 adoption 때 |
+| Raw C / benchmark unsafe / adapter 타입·값·별칭 | Actual-engine bad/allowed fixtures와 canonical 검증 완료 | 재현된 새 우회가 있을 때 추가 |
+| CI 조기 종료·pin | 허용 step/checkout/run 경로와 exact pin의 계약 검사 완료 | Exact-SHA hosted job 운영 증거 |
+| Python 발견·실행 누락 | Source origin/duplicate/누락/`load_tests` hook 거부와 inherited contract 검증 완료 | 재현된 새 우회가 있을 때 추가 |
+| Transcript 수명·snapshot 비용 | 기존 port의 handle/page/CAS/retire, 0행 고갈/race/rollback/독립 retirement oracle 및 공개 예제 검증 완료 | 실제 host producer/end adoption; RSS/SLO는 별도 |
+| Durable maintenance / legacy API / 책임별 모듈 | Feature 경계/legacy 제거, 실제 public 경로와 18개 capability 경로 검증 완료 | 전면 파일 재편·durable 제품화는 필요 근거가 있을 때 |
+| Spill default restore | Offline 거부, readable/write-full, 정상 empty와 no-op 기본값의 독립 conformance 검증 완료 | Named durable consumer의 저장장치 failure model은 별도 |
 | 정책 산술 중복 | Reserve/preflight는 이미 공통 판정 | 동작 불일치 증거 없음; A dead branch 정리는 후속 |
-| CircleCI 실행 완료 | 이전 runner 시작 전 실패 기록 | G exact SHA hosted 증거 별도 확보 |
+| CircleCI 실행 완료 | Live binding 확인; 이전 job 실패는 과거 기록 | G exact SHA hosted job `NOT_RUN`; 현재 실행 가능 여부와 성공 별도 확인 |
 
 Metrics recorder·allocation probe 등 함께 존재하는 overlay도 최종 통합 source의 owning rail로
-확인한다. 이 계획이 그 변경을 새 결함으로 추가하거나 이미 검증됐다고 주장하지 않는다.
+확인했다. 이 계획이 그 변경을 새 결함으로 추가하거나 SLO/host qualification을 주장하지 않는다.
+
+### 이후에 실행할 작업과 시작 조건
+
+| 후속 | 시작 조건 | 필요한 증거 |
+| --- | --- | --- |
+| Hosted CI 운영 확인 | 이 candidate를 게시해 CI 실행을 요구할 때 | 새 exact SHA의 job, extraction/example step 성공; local pass와 분리 |
+| Semantica/다른 host 채택 | 명명된 consumer가 이 revision을 채택할 때 | Handle 전파/end 경로, root/outstanding fence, 한 revision의 manifest/lockfile 및 QBC |
+| 성능/SLO | 실제 workload와 사전 threshold가 정해질 때 | 같은 계약의 반복 baseline/candidate; smoke를 SLO로 사용하지 않음 |
+| 추가 모듈 재편·SDK taxonomy·durable 제품화 | 책임 경계의 결함 또는 consumer 요구가 확인될 때 | 해당 owner 회귀, API 이행 또는 저장장치 failure model의 별도 qualification |
 
 ## A. Core accounting 수리, 이후 공개 권한 축소
 

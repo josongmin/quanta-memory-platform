@@ -4,14 +4,15 @@ Scope: portable 0.2 in-memory SDK. Use the public facade builder API directly;
 Semantica adoption is optional. Completed contracts are in
 [the ADR index](../adr/README.md).
 
-The active [audit remediation plan](audit-remediation.md) first closes confirmed
+The audited [remediation plan](audit-remediation.md) first closes confirmed
 accounting, payload identity, prepared evidence and guard repairs, then qualifies
 that source. The separately selected candidate extends the existing Transcript
 port with handle/page/CAS/retire and reduces scheduler/spill/legacy public APIs.
 Its contract matrix fixes the
 existing IR, attribution, lease, token/root and error boundaries; it introduces
-no parallel IR generation. Implementation, source-bound qualification and
-optional host adoption remain separate. Add further work only for a reachable
+no parallel IR generation. The selected implementation and local qualification
+are complete at the plan's recorded code candidate. Optional host adoption and
+hosted CI execution remain separate. Add further work only for a reachable
 defect, valid surviving mutation or explicit consumer requirement.
 
 The final plan audit keeps local canonical/extraction evidence separate from
