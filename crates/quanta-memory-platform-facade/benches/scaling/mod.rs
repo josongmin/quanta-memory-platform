@@ -380,9 +380,11 @@ fn emit(
     let throughput = (timed_operations as f64 / elapsed.as_secs_f64()).round() as u64;
     let successful_throughput =
         (operations.successful as f64 / elapsed.as_secs_f64()).round() as u64;
-    let group_cardinality_field = (operation == "broker_group_admission_cardinality")
-        .then(|| format!(",\"group_cardinality\":{}", broker_group_cardinality(entries)))
-        .unwrap_or_default();
+    let group_cardinality_field = if operation == "broker_group_admission_cardinality" {
+        format!(",\"group_cardinality\":{}", broker_group_cardinality(entries))
+    } else {
+        String::new()
+    };
     let outcome_latency_fields = operations.outcome_latencies.map_or_else(String::new, |(admitted, denied)| {
         format!(
             ",\"admitted_p50_ns\":{},\"admitted_p95_ns\":{},\"admitted_p99_ns\":{},\"denied_p50_ns\":{},\"denied_p95_ns\":{},\"denied_p99_ns\":{}",

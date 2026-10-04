@@ -20,16 +20,6 @@ impl ComparisonTrap {
     fn new() -> Arc<Self> {
         Arc::new(Self { calls: AtomicUsize::new(0), panic_at: AtomicUsize::new(usize::MAX) })
     }
-
-    fn arm_after_one_more_comparison(&self) -> usize {
-        let before = self.calls.load(AtomicOrdering::SeqCst);
-        self.panic_at.store(before + 2, AtomicOrdering::SeqCst);
-        before
-    }
-
-    fn disarm(&self) {
-        self.panic_at.store(usize::MAX, AtomicOrdering::SeqCst);
-    }
 }
 
 #[derive(Clone, Debug)]

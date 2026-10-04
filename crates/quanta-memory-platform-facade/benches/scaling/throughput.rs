@@ -394,7 +394,7 @@ pub(super) fn broker_group_admission_cardinality(
                 reclaim_priority: ReclaimPriority::Normal,
             },
         )
-        .with_owner_group(owner.clone(), target.clone());
+        .with_owner_group(owner.clone(), target);
     for index in 0..group_count {
         policy = policy.with_resource_group(
             format!("group-{index:08}"),
