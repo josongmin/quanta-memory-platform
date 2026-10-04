@@ -279,11 +279,16 @@ fn detached_slow_clone_allows_other_append_and_pins_target_charge_until_read_end
             body(2),
         ))
         .expect("other session append during clone");
+    let before_busy_ledger = broker.ledger_snapshot().expect("read pin preimage");
+    let before_busy_stats = store.retention_stats().expect("read pin stats preimage");
+    // Two 41-byte session keys, two 43-byte active rows, two 148-byte identities.
+    assert_eq!(before_busy_ledger.total_owner_bytes(), 464);
+    assert_eq!(before_busy_stats.total_retained_bytes, 464);
     assert!(matches!(store.retain_sequences(&a, &[]), Err(MemoryError::OperationInProgress(_))));
     assert!(matches!(store.retire_session(&a), Err(MemoryError::OperationInProgress(_))));
     assert!(matches!(store.close(), Err(MemoryError::OperationInProgress(_))));
-    let pinned_ledger = broker.ledger_snapshot().expect("both rows remain charged");
-    assert!(pinned_ledger.total_owner_bytes() > 0);
+    assert_eq!(broker.ledger_snapshot().expect("both rows remain charged"), before_busy_ledger);
+    assert_eq!(store.retention_stats().expect("busy operations preserve rows"), before_busy_stats);
     armed.store(false, Ordering::SeqCst);
     release.wait();
     assert_eq!(reader.join().expect("reader join").expect("reader result").len(), 1);

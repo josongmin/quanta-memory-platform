@@ -267,6 +267,7 @@ fn names_spill_reexports() {
     type _Targets =
         (Box<dyn SpillTarget<u64>>, InMemorySpillTarget<u64>, RetainingSpillTarget<u64>);
     type _Inventory = Box<dyn SpillInventory>;
+    type _Receipt = SpillReceipt;
     type _InProcess = (Box<dyn InProcessSpillController<u64>>, Box<dyn InProcessSpillTarget<u64>>);
 }
 
