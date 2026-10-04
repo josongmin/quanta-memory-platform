@@ -427,9 +427,9 @@ fn retain_rollback_and_commit_do_not_compare_caller_metadata() {
             ))
             .expect("seed");
     }
-    let before = broker.ledger_snapshot().expect("before");
     trap.panic_at.store(1, AtomicOrdering::SeqCst);
     let fence = broker.begin_rebuild().expect("fence");
+    let before = broker.ledger_snapshot().expect("denied-operation preimage includes fence");
     assert!(matches!(store.retain_sequences(&handle, &[0]), Err(MemoryError::InvalidState(_))));
     assert_eq!(broker.ledger_snapshot().expect("rollback"), before);
     assert_eq!(store.load(&handle).expect("rows").len(), 2);

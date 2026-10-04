@@ -179,8 +179,8 @@ fn failed_retire_restores_all_charges_and_handle_then_success_ends_replay() {
     let handle = store.open_session("s".to_string()).expect("open");
     store.append(request(handle, 0, "m", "body")).expect("append");
     let before_stats = store.retention_stats().expect("before");
-    let before_ledger = broker.ledger_snapshot().expect("before ledger");
     let fence = broker.begin_rebuild().expect("fence release");
+    let before_ledger = broker.ledger_snapshot().expect("denied-operation preimage includes fence");
     assert!(matches!(store.retire_session(&handle), Err(MemoryError::InvalidState(_))));
     assert_eq!(store.retention_stats().expect("restored stats"), before_stats);
     assert_eq!(broker.ledger_snapshot().expect("restored ledger"), before_ledger);
