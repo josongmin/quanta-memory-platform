@@ -50,6 +50,8 @@ def binding_errors(definitions: object, triggers: object, settings: object) -> l
     for definition in definitions:
         if not isinstance(definition, dict) or not isinstance(definition.get("id"), str):
             return ["invalid CircleCI pipeline definition response"]
+        if definition["id"] in by_id:
+            return ["duplicate CircleCI pipeline definition id"]
         by_id[definition["id"]] = definition
     seen: list[tuple] = []
     for trigger in triggers["data"]:
@@ -59,6 +61,8 @@ def binding_errors(definitions: object, triggers: object, settings: object) -> l
         refs = trigger.get("references")
         if not isinstance(attrs, dict) or not isinstance(refs, dict):
             return ["trigger is missing attributes or references"]
+        if not isinstance(attrs.get("is_disabled"), bool):
+            return ["trigger disabled state is missing or invalid"]
         if attrs.get("is_disabled") is True:
             continue
         project = refs.get("project")
@@ -83,6 +87,12 @@ def binding_errors(definitions: object, triggers: object, settings: object) -> l
         if (
             config.get("file_path") != EXPECTED_CONFIG
             or config.get("provider") != "github_app"
+            or checkout.get("provider") != "github_app"
+            # Event-ref rules must select both config and checkout revisions.
+            # Live GitHub App definitions expose no fixed-ref fields; reject
+            # unknown overrides rather than accepting a different checkout.
+            or set(config) != {"provider", "repo", "file_path"}
+            or set(checkout) != {"provider", "repo"}
             or config_repo.get("external_id") != EXPECTED_REPO_ID
             or checkout_repo.get("external_id") != EXPECTED_REPO_ID
             or config_repo.get("full_name") != EXPECTED_REPO

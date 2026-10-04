@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import importlib.util
 import unittest
 from pathlib import Path
@@ -40,7 +41,7 @@ class HostedCiBindingTests(unittest.TestCase):
             "config_source": {"provider": "github_app", "repo": {
                 "external_id": MODULE.EXPECTED_REPO_ID, "full_name": MODULE.EXPECTED_REPO,
             }, "file_path": MODULE.EXPECTED_CONFIG},
-            "checkout_source": {"repo": {
+            "checkout_source": {"provider": "github_app", "repo": {
                 "external_id": MODULE.EXPECTED_REPO_ID, "full_name": MODULE.EXPECTED_REPO,
             }},
         }
@@ -63,6 +64,20 @@ class HostedCiBindingTests(unittest.TestCase):
         self.assertTrue(MODULE.binding_errors([definition], response, {
             "enable_auto_cancel_redundant_workflows": False,
         }))
+        for source, key, value in (
+            ("checkout_source", "provider", "github"),
+            ("checkout_source", "ref", "main"),
+            ("checkout_source", "revision", "stale-sha"),
+            ("config_source", "ref", "main"),
+        ):
+            altered = copy.deepcopy(definition)
+            altered[source][key] = value
+            with self.subTest(source=source, key=key):
+                self.assertTrue(MODULE.binding_errors([altered], response, settings))
+        missing_provider = copy.deepcopy(definition)
+        del missing_provider["checkout_source"]["provider"]
+        self.assertTrue(MODULE.binding_errors([missing_provider], response, settings))
+        self.assertTrue(MODULE.binding_errors([definition, definition], response, settings))
         definition["config_source"]["file_path"] = ".github/workflows/ci.yml"
         self.assertTrue(MODULE.binding_errors([definition], response, settings))
 
