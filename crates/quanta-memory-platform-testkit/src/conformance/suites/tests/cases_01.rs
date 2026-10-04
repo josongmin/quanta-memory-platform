@@ -368,6 +368,33 @@ fn transcript_suite_rejects_correct_replay_with_unbilled_identity() {
     }));
 }
 #[test]
+fn transcript_suite_rejects_swallowed_session_retirement() {
+    let platform = MemoryPlatformBuilder::new()
+        .with_preset(MemoryPreset::Development)
+        .build()
+        .expect("platform");
+    let store = platform
+        .transcript_store_builder::<Vec<u8>, Vec<u8>, Vec<u8>>()
+        .bind(StoreBindingHandle::new(
+            MemoryClass::SessionTranscript,
+            "swallowed-retirement-transcript".to_string(),
+            None,
+        ))
+        .with_retention_policy(TranscriptRetentionPolicyV2::fail_closed(2, u64::MAX))
+        .build()
+        .expect("bound transcript builder");
+    let verdicts = run_transcript_append_suite(&SwallowedRetirementTranscriptTarget(&store));
+    assert_eq!(
+        verdicts
+            .iter()
+            .filter(|verdict| !verdict.held())
+            .map(|verdict| verdict.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["transcript_retirement_invalidates_issued_handle"],
+        "only the swallowed retirement contract should fail: {verdicts:?}"
+    );
+}
+#[test]
 fn honest_fake_passes_every_accounting_invariant() {
     let mut fake = FakeProcessBroker::honest();
     let verdicts = run_broker_accounting_suite(&mut fake);

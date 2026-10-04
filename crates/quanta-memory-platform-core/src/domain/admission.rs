@@ -493,8 +493,8 @@ pub(crate) fn group_admission_ceiling(
 /// exact denial facts — WITHOUT formatting the message. The denial message
 /// is built only by [`GroupAdmission::into_breach`], so boolean probes
 /// (`admits`, and the preflight's zero-state evaluation) never allocate on
-/// the deny path. The scaling bench pins this: scheduler admission must not
-/// allocate after policy construction.
+/// the deny path. The internal scheduler cardinality test pins reuse of the
+/// policy's cached fair-share table after construction.
 pub(crate) enum GroupAdmission {
     Admitted,
     Denied { limit: u64, after: Option<u64> },

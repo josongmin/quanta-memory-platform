@@ -4,12 +4,13 @@ use std::sync::Mutex;
 
 use quanta_memory_platform_core::{MemoryError, MemoryResult};
 
+#[cfg(feature = "spill-durable")]
 use crate::spill::{
     DurableCommitFailure, DurableRecordId, DurableRecordResolution, DurableRestoreCandidate,
     DurableRestoreClaim, DurableRestoreController, DurableRestoreRecovery, DurableSpillController,
-    DurableWriteFailure, InProcessSpillController, ReconciledDurableSpillController,
-    SpillController,
+    DurableWriteFailure, ReconciledDurableSpillController,
 };
+use crate::spill::{InProcessSpillController, SpillController};
 
 /// Capability seals for accounting-bearing transfer paths. Generic
 /// `SpillTarget` remains externally implementable for non-accounting use, but a
@@ -17,8 +18,10 @@ use crate::spill::{
 /// is panic-safe or durably committed.
 pub(crate) mod sealed {
     pub trait InProcessSpillTarget<Handle> {}
+    #[cfg(feature = "spill-durable")]
     pub trait DurableSpillTarget<Handle> {}
     pub trait InProcessSpillController<Handle> {}
+    #[cfg(feature = "spill-durable")]
     pub trait DurableSpillController<Handle> {}
 }
 
@@ -29,6 +32,7 @@ pub enum SpillReceipt {
     /// The handle remains process-resident and must retain its memory charge.
     InProcess { inventory_after: u64 },
     /// The opaque bytes committed to durable storage under a stable sequence.
+    #[cfg(feature = "spill-durable")]
     Durable { sequence: u64, inventory_after: u64 },
 }
 
@@ -36,9 +40,9 @@ impl SpillReceipt {
     #[must_use]
     pub fn inventory_after(self) -> u64 {
         match self {
-            Self::InProcess { inventory_after } | Self::Durable { inventory_after, .. } => {
-                inventory_after
-            }
+            Self::InProcess { inventory_after } => inventory_after,
+            #[cfg(feature = "spill-durable")]
+            Self::Durable { inventory_after, .. } => inventory_after,
         }
     }
 }
@@ -130,6 +134,7 @@ pub trait InProcessSpillTarget<Handle>:
 
 /// Marker for targets that durably commit an encoded handle before returning
 /// [`SpillReceipt::Durable`].
+#[cfg(feature = "spill-durable")]
 pub trait DurableSpillTarget<Handle>:
     SpillTarget<Handle> + sealed::DurableSpillTarget<Handle>
 {
@@ -137,6 +142,7 @@ pub trait DurableSpillTarget<Handle>:
 
 /// Durable byte targets expose a non-destructive prepare and exact commit so a
 /// source can establish charge authority before deleting the durable record.
+#[cfg(feature = "spill-durable")]
 pub trait DurableRestoreTarget: DurableSpillTarget<Vec<u8>> {
     /// Claim and read the oldest record without removing it. Implementations
     /// must persist the claim before returning the candidate.
@@ -222,15 +228,18 @@ impl<Handle, T> sealed::InProcessSpillController<Handle> for RoutedSpillControll
 {
 }
 
+#[cfg(feature = "spill-durable")]
 impl<Handle, T> DurableSpillController<Handle> for RoutedSpillController<T> where
     T: DurableSpillTarget<Handle>
 {
 }
+#[cfg(feature = "spill-durable")]
 impl<Handle, T> sealed::DurableSpillController<Handle> for RoutedSpillController<T> where
     T: DurableSpillTarget<Handle>
 {
 }
 
+#[cfg(feature = "spill-durable")]
 impl<T> ReconciledDurableSpillController for RoutedSpillController<T>
 where
     T: ReconciledDurableSpillTarget + DurableSpillTarget<Vec<u8>>,
@@ -258,6 +267,7 @@ where
 
 /// Target half of [`ReconciledDurableSpillController`]. Implementations are
 /// sealed because this trait carries accounting authority claims.
+#[cfg(feature = "spill-durable")]
 pub trait ReconciledDurableSpillTarget:
     SpillInventory + sealed::DurableSpillTarget<Vec<u8>>
 {
@@ -275,6 +285,7 @@ pub trait ReconciledDurableSpillTarget:
     fn resolve_record(&self, record_id: DurableRecordId) -> MemoryResult<DurableRecordResolution>;
 }
 
+#[cfg(feature = "spill-durable")]
 impl<T> DurableRestoreController for RoutedSpillController<T>
 where
     T: DurableRestoreTarget,

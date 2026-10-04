@@ -27,6 +27,8 @@ faults = [
     "quanta-memory-platform-facade/payload_store",
     "quanta-memory-platform-facade/spill",
 ]
+# Maintenance-only durable protocol; no Redb backing is linked by this feature.
+spill-durable = ["quanta-memory-platform-facade/spill-durable"]
 alloc_tracking = ["dep:tracking-allocator"]
 loom = ["dep:loom"]
 full = ["fixtures", "doctor", "conformance", "faults", "alloc_tracking"]

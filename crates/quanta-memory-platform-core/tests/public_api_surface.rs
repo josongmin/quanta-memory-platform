@@ -47,7 +47,6 @@ use quanta_memory_platform_core::{
     PressureState,
     ProcessMemoryBroker,
     ProcessMemoryBrokerBuilder,
-    PublishError,
     // ports::store
     PublishedPayload,
     ReclaimPriority,
@@ -62,7 +61,6 @@ use quanta_memory_platform_core::{
     ScratchAllocator,
     ScratchRequest,
     ScratchReservation,
-    StagedHandle,
     StaticAllocatorTelemetry,
     StoreBindingHandle,
     StoreDeleteError,
@@ -97,7 +95,7 @@ use quanta_memory_platform_core::{
     LadderPressureController, LiveProcessMemoryBroker, ManagedCharge, MemoryReclaimer,
     PendingReservation, PressureController, PressureThresholds, RebuildFence, RebuildFenceStatus,
     RebuildReceipt, ReclaimCandidate, ReclaimGroupCandidate, ReclaimOutcome, ReclaimRequest,
-    ReclaimRung, ReclaimTrigger, ResourceGroupScheduler, WeightedResourceGroupScheduler,
+    ReclaimRung, ReclaimTrigger,
 };
 
 /// Names EVERY public re-export from the crate root in type position. Never
@@ -121,8 +119,6 @@ fn names_every_public_reexport() {
         RebuildFenceStatus,
         RebuildReceipt,
         ReclaimRung,
-        WeightedResourceGroupScheduler,
-        Box<dyn ResourceGroupScheduler>,
     );
     type _Config = (
         BudgetOverrideLayer,
@@ -133,15 +129,8 @@ fn names_every_public_reexport() {
         ValidatedResidencyPolicy,
     );
     type _Context = (MemoryContextHandle, MemoryContextKind, OwnerKey, RuntimeId, RuntimeKind);
-    type _Errors = (
-        CapacityError,
-        MemoryError,
-        MemoryResult<()>,
-        PinError,
-        PublishError,
-        StoreDeleteError,
-        StoreWriteError,
-    );
+    type _Errors =
+        (CapacityError, MemoryError, MemoryResult<()>, PinError, StoreDeleteError, StoreWriteError);
     type _Ledger = (ChargeKind, LedgerSnapshot, UsageBreakdown);
     #[cfg(feature = "live_control")]
     type _OwnedAuthority = (PendingReservation, ManagedCharge);
@@ -178,7 +167,6 @@ fn names_every_public_reexport() {
     type _Store = (
         PublishedPayload<String>,
         RetainedEnvelope<Vec<u8>>,
-        StagedHandle<String>,
         StoreBindingHandle,
         StoreStats,
         SweepHint,

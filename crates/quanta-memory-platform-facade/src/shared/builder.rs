@@ -34,9 +34,7 @@ use crate::payload_store::service::SimplePayloadStore;
 #[cfg(feature = "payload_store")]
 use crate::payload_store::PayloadReference;
 #[cfg(feature = "publish_pipeline")]
-use crate::publish_pipeline::{
-    prepared_publication::PreparedPublicationService, service::SimplePublishPipeline,
-};
+use crate::publish_pipeline::prepared_publication::PreparedPublicationService;
 #[cfg(feature = "retained_map")]
 use crate::retained_map::service::SimpleRetainedMapStore;
 #[cfg(feature = "revocable_store")]
@@ -496,48 +494,6 @@ impl<Key, Value, Mode> RevocableStoreBuilder<Key, Value, Mode> {
 
 #[cfg(feature = "publish_pipeline")]
 #[derive(Clone, Debug)]
-pub struct PublishPipelineBuilder<Stage, Commit, Published> {
-    binding: Option<StoreBindingHandle>,
-    _marker: PhantomData<(Stage, Commit, Published)>,
-}
-
-#[cfg(feature = "publish_pipeline")]
-impl<Stage, Commit, Published> Default for PublishPipelineBuilder<Stage, Commit, Published> {
-    fn default() -> Self {
-        Self { binding: None, _marker: PhantomData }
-    }
-}
-
-#[cfg(feature = "publish_pipeline")]
-impl<Stage, Commit, Published> PublishPipelineBuilder<Stage, Commit, Published> {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn bind(mut self, binding: StoreBindingHandle) -> Self {
-        self.binding = Some(binding);
-        self
-    }
-
-    /// Build the builder-first happy-path pipeline, which uses the infallible
-    /// identity commit transition (`Published: From<Stage>`). Callers that need a
-    /// fallible commit transition construct the pipeline via
-    /// [`SimplePublishPipeline::with_transition`] directly.
-    pub fn build(self) -> MemoryResult<SimplePublishPipeline<Stage, Commit, Published>>
-    where
-        Published: From<Stage>,
-    {
-        let binding = self.binding.ok_or_else(missing_binding)?;
-        #[allow(
-            deprecated,
-            reason = "legacy convenience kept until the transition trait is removed"
-        )]
-        Ok(SimplePublishPipeline::new(binding))
-    }
-}
-
-#[cfg(feature = "publish_pipeline")]
-#[derive(Clone, Debug)]
 pub struct PreparedPublicationServiceBuilder<Payload, Mode> {
     binding: Option<StoreBindingHandle>,
     capacity_bytes: Option<u64>,
@@ -705,11 +661,11 @@ impl<SessionId, MessageId, Message>
         MessageId: ByteSized,
     {
         let binding = self.binding.ok_or_else(missing_binding)?;
-        Ok(SimpleSessionTranscriptStore::new_budgeted(
+        SimpleSessionTranscriptStore::new_budgeted(
             binding,
             self.retention,
             self.accounting.into_broker(),
-        ))
+        )
     }
 }
 
@@ -725,7 +681,7 @@ impl<SessionId, MessageId, Message>
         MessageId: ByteSized,
     {
         let binding = self.binding.ok_or_else(missing_binding)?;
-        Ok(SimpleSessionTranscriptStore::new_unbudgeted(binding, self.retention))
+        SimpleSessionTranscriptStore::new_unbudgeted(binding, self.retention)
     }
 }
 
@@ -807,14 +763,6 @@ mod tests {
     }
 
     #[test]
-    fn publish_pipeline_builder_without_binding_fails_with_build_error() {
-        let err = PublishPipelineBuilder::<String, (), String>::new()
-            .build()
-            .expect_err("missing binding");
-        assert!(matches!(err, MemoryError::Build(_)), "got {err:?}");
-    }
-
-    #[test]
     fn transcript_builder_without_binding_fails_with_build_error() {
         let err = platform()
             .transcript_store_builder::<String, String, String>()
@@ -835,10 +783,11 @@ mod tests {
             .bind(binding())
             .build()
             .expect("builder charged transcript store");
+        let handle = store.open_session("s".to_string()).expect("open session");
 
         store
             .append(TranscriptAppendRequestV1::new(
-                TranscriptAppendIdentityV1::new("s".to_string(), 0, "m0".to_string()),
+                TranscriptAppendIdentityV1::new(handle, 0, "m0".to_string()),
                 "hello".to_string(),
             ))
             .expect("append");

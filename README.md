@@ -71,6 +71,7 @@ Runnable public examples:
 ```bash
 cargo run -p quanta-memory-platform-facade --example hello_world
 cargo run -p quanta-memory-platform-facade --example effective_budget_report
+cargo run -p quanta-memory-platform-facade --features transcript --example transcript_session
 ```
 
 ## What it covers
@@ -115,10 +116,11 @@ store slices a consumer needs:
 | `payload_store` | Canonical retained payload store. |
 | `retained_map` | Typed retained key/value map. |
 | `revocable_store` | FIFO reclaimable store. |
-| `transcript` | Idempotent session transcript with bounded replay evidence. |
-| `publish_pipeline` | Publication staging/commit and prepared-publication lifecycle. |
-| `spill` | Portable in-process/durable spill contracts. |
-| `spill-redb` | Existing opt-in Redb backing; not production-qualified or supported as a current product capability. |
+| `transcript` | Session-handle transcript with bounded pages, replay evidence, and explicit retirement. |
+| `publish_pipeline` | Prepared-publication lifecycle with caller-owned canonical-root visibility. |
+| `spill` | Portable in-process spill contracts. |
+| `spill-durable` | Opt-in durable protocol and restore API, without a disk backing; maintenance scope. |
+| `spill-redb` | Existing opt-in Redb backing; enables `spill-durable` and is not production-qualified or supported as a current product capability. |
 | `full` | All in-memory facade slices; no durable backing dependency. |
 | `full-backings` | Existing aggregate feature that adds `spill-redb`; not a current release target or production qualification claim. |
 
@@ -153,7 +155,7 @@ scripts/extract-to-standalone-repo.sh --dry-run /path/to/qmp-extracted
 
 The scaling results are same-host signals, not portable latency guarantees.
 The main-push and PR-update CI entry point is `.circleci/config.yml`, which verifies a
-clean standalone extraction, its full workspace rail, and both public examples.
+clean standalone extraction, its full workspace rail, and all three public examples.
 Check the live trigger with `python3 scripts/verify-hosted-ci-binding.py` before
 accepting a hosted green; also confirm the exact SHA's extraction step ran.
 The explicit `run_heavy=true` CircleCI workflow collects three independent full 60-row `in-memory-pressure`

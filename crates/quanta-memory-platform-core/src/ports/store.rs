@@ -61,14 +61,3 @@ pub struct SweepStats {
     pub reclaimed_items: usize,
     pub reclaimed_bytes: u64,
 }
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct StagedHandle<Stage> {
-    pub staged: Stage,
-}
-
-impl<Stage> StagedHandle<Stage> {
-    pub fn new(staged: Stage) -> Self {
-        Self { staged }
-    }
-}

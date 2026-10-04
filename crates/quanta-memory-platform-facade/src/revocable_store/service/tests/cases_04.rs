@@ -1,6 +1,6 @@
 use super::*;
 
-#[cfg(feature = "spill")]
+#[cfg(feature = "spill-durable")]
 #[test]
 fn failed_durable_delete_rolls_back_provisional_source_charge() {
     struct DeleteFailTarget;
@@ -76,7 +76,7 @@ fn failed_durable_delete_rolls_back_provisional_source_charge() {
     assert_eq!(store.stats().expect("not published"), StoreStats::default());
     assert_eq!(broker.ledger_snapshot().expect("charge rolled back").total_owner_bytes(), 0);
 }
-#[cfg(feature = "spill")]
+#[cfg(feature = "spill-durable")]
 #[test]
 fn ambiguous_durable_delete_fences_source_until_absence_is_reconciled() {
     struct AmbiguousDeleteTarget {
@@ -198,7 +198,7 @@ fn ambiguous_durable_delete_fences_source_until_absence_is_reconciled() {
     assert_eq!(store.reclaim_one().expect("published source").expect("entry").0, "restored");
     assert_eq!(broker.ledger_snapshot().expect("released source").total_owner_bytes(), 0);
 }
-#[cfg(feature = "spill")]
+#[cfg(feature = "spill-durable")]
 #[test]
 fn panicking_finalize_fences_published_source_until_reconciliation() {
     struct PanickingFinalizeTarget {

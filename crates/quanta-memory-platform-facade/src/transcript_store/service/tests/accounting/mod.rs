@@ -163,6 +163,7 @@ fn callback_store(
         TranscriptRetentionPolicyV2::default(),
         broker.clone(),
     )
+    .expect("transcript store nonce")
 }
 
 type ReentrantIdStore = SimpleSessionTranscriptStore<String, ReentrantMessageId, String, Budgeted>;
@@ -226,8 +227,8 @@ fn assert_seed_only_after_append_panic(
     broker: &LiveProcessMemoryBroker,
 ) {
     let state = store.state.lock().unwrap_or_else(PoisonError::into_inner);
-    let session_id = String::from("s");
-    let session = state.sessions.get(&session_id).expect("seed session remains");
+    let session = state.sessions.values().next().expect("seed session remains");
+    assert_eq!(session.session_id, "s");
     assert_eq!(session.version, 1, "failed append advanced version");
     assert_eq!(session.rows.len(), 1, "failed append published a row");
     assert_eq!(session.sequence_evidence.len(), 1, "failed append published sequence evidence");
@@ -328,6 +329,7 @@ fn charged_with_policy(
         retention,
         broker.clone(),
     )
+    .expect("transcript store nonce")
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]

@@ -18,7 +18,7 @@ RUN_SCHEMA = "qmp-scaling-run-v4"
 END_SCHEMA = "qmp-scaling-run-end-v4"
 SINGLE = {
     "payload_unique_fill", "payload_dedup_put", "revocable_fill_and_drain",
-    "broker_release_owner_cardinality", "scheduler_admission_group_cardinality",
+    "broker_release_owner_cardinality", "broker_group_admission_cardinality",
 }
 READ_MODES = {"hit", "miss"}
 CONTENTION_MODES = {"metadata-stats-heavy", "write-heavy", "mixed-stats-put"}
@@ -28,7 +28,7 @@ PAIRWISE_MODES = {
 PRESSURE_OUTCOME_OPERATION = "broker_pressure_cycle"
 PRESSURE_CONTENTION_OPERATION = "dual_store_write_contention"
 PRESSURE_RECLAIM_OPERATION = "contended_pressure_reclaim"
-FIXED_OUTCOME_OPERATIONS = {"scheduler_admission_group_cardinality", PRESSURE_OUTCOME_OPERATION}
+FIXED_OUTCOME_OPERATIONS = {"broker_group_admission_cardinality", PRESSURE_OUTCOME_OPERATION}
 OUTCOME_OPERATIONS = FIXED_OUTCOME_OPERATIONS | {PRESSURE_RECLAIM_OPERATION}
 OUTCOME_LATENCY_FIELDS = {
     outcome: tuple(f"{outcome}_{percentile}_ns" for percentile in ("p50", "p95", "p99"))
@@ -381,11 +381,16 @@ def validate_samples(
         elif sample.get("operation") == PRESSURE_RECLAIM_OPERATION:
             if semantic_peak != 96:
                 raise ValidationError(f"{key}: contended pressure must start at its 96-byte hard cap")
-        elif sample.get("operation") == "scheduler_admission_group_cardinality":
-            if semantic_peak != 0:
-                raise ValidationError(f"{key}: scheduler admission must not retain semantic bytes")
+        elif sample.get("operation") == "broker_group_admission_cardinality":
+            if semantic_peak != 1_001:
+                raise ValidationError(f"{key}: broker group admission must peak at 1001 semantic bytes")
+            expected_groups = min((integer(sample, "entries") + 39) // 40, 256)
+            if integer(sample, "group_cardinality") != expected_groups:
+                raise ValidationError(f"{key}: broker group cardinality does not match workload geometry")
         elif semantic_peak <= 0:
             raise ValidationError(f"{key}: retained workload has no semantic peak")
+        if sample.get("operation") != "broker_group_admission_cardinality" and "group_cardinality" in sample:
+            raise ValidationError(f"{key}: group cardinality is unexpected for this workload")
         if integer(sample, "semantic_after_close_bytes") != 0:
             raise ValidationError(f"{key}: semantic accounting did not drain to zero")
         allocated, deallocated, live = (
@@ -401,7 +406,7 @@ def validate_samples(
         high_water = integer(sample, "allocator_high_water_bytes")
         if high_water < live or high_water > allocated or (allocated > 0 and high_water == 0):
             raise ValidationError(f"{key}: allocator high-water is inconsistent with allocated/live bytes")
-        if sample.get("operation") != "scheduler_admission_group_cardinality" and allocated == 0:
+        if allocated == 0:
             raise ValidationError(f"{key}: missing allocator telemetry for retained workload")
         if integer(sample, "busy_retries") < 0:
             raise ValidationError(f"{key}: busy retry count is negative")

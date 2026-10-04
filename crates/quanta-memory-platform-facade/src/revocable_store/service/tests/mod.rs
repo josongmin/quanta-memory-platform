@@ -1,16 +1,17 @@
 mod cases_01;
-#[cfg(feature = "spill")]
+#[cfg(feature = "spill-durable")]
 mod cases_02;
 #[cfg(feature = "spill-redb")]
 mod cases_03;
 mod cases_04;
 
 use super::*;
+#[cfg(feature = "spill-durable")]
+use crate::spill::{DurableRestoreCandidate, DurableRestoreTarget, DurableSpillTarget};
 #[cfg(feature = "spill")]
 use crate::spill::{
-    DurableRestoreCandidate, DurableRestoreTarget, DurableSpillTarget, InMemorySpillTarget,
-    InProcessSpillTarget, NoopSpillController, RoutedSpillController, SpillController,
-    SpillInventory, SpillReceipt, SpillTarget,
+    InMemorySpillTarget, InProcessSpillTarget, NoopSpillController, RoutedSpillController,
+    SpillController, SpillInventory, SpillReceipt, SpillTarget,
 };
 use crate::test_support::SingleTestCommand;
 #[cfg(feature = "spill")]

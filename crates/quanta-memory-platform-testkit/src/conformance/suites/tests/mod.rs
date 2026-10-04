@@ -365,12 +365,19 @@ impl PreparedPublicationConformanceTarget for RootBlindPreparedTarget {
 #[derive(Debug, Default)]
 struct BrokenTranscriptTarget {
     rows: std::sync::Mutex<Vec<TranscriptRow>>,
+    next_handle: std::sync::atomic::AtomicU64,
 }
 
 impl TranscriptAppendConformanceTarget for BrokenTranscriptTarget {
+    type Handle = u64;
+
+    fn open_session(&self, _session_id: &[u8]) -> Result<Self::Handle, MemoryError> {
+        Ok(self.next_handle.fetch_add(1, Ordering::Relaxed))
+    }
+
     fn append(
         &self,
-        _session_id: &[u8],
+        _handle: Self::Handle,
         sequence: u64,
         message_id: &[u8],
         body: &[u8],
@@ -384,17 +391,24 @@ impl TranscriptAppendConformanceTarget for BrokenTranscriptTarget {
         Ok(TranscriptAppendDispositionV1::Applied)
     }
 
-    fn load(&self, _session_id: &[u8]) -> Result<Vec<TranscriptRow>, MemoryError> {
+    fn load(&self, _handle: &Self::Handle) -> Result<Vec<TranscriptRow>, MemoryError> {
         self.rows
             .lock()
             .map(|rows| rows.clone())
             .map_err(|_| MemoryError::InvalidState("poisoned".to_string()))
     }
 
-    fn truncate_to(&self, _session_id: &[u8], max_messages: usize) -> Result<(), MemoryError> {
+    fn truncate_to(&self, _handle: &Self::Handle, max_messages: usize) -> Result<(), MemoryError> {
         self.rows
             .lock()
             .map(|mut rows| rows.truncate(max_messages))
+            .map_err(|_| MemoryError::InvalidState("poisoned".to_string()))
+    }
+
+    fn retire_session(&self, _handle: &Self::Handle) -> Result<(), MemoryError> {
+        self.rows
+            .lock()
+            .map(|mut rows| rows.clear())
             .map_err(|_| MemoryError::InvalidState("poisoned".to_string()))
     }
 
@@ -411,26 +425,76 @@ struct UnderbillingTranscriptTarget<'a, T>(&'a T);
 impl<T: TranscriptAppendConformanceTarget> TranscriptAppendConformanceTarget
     for UnderbillingTranscriptTarget<'_, T>
 {
+    type Handle = T::Handle;
+
+    fn open_session(&self, session_id: &[u8]) -> Result<Self::Handle, MemoryError> {
+        self.0.open_session(session_id)
+    }
+
     fn append(
         &self,
-        session_id: &[u8],
+        handle: Self::Handle,
         sequence: u64,
         message_id: &[u8],
         body: &[u8],
     ) -> Result<TranscriptAppendDispositionV1, TranscriptAppendErrorV1> {
-        self.0.append(session_id, sequence, message_id, body)
+        self.0.append(handle, sequence, message_id, body)
     }
 
-    fn load(&self, session_id: &[u8]) -> Result<Vec<TranscriptRow>, MemoryError> {
-        self.0.load(session_id)
+    fn load(&self, handle: &Self::Handle) -> Result<Vec<TranscriptRow>, MemoryError> {
+        self.0.load(handle)
     }
 
-    fn truncate_to(&self, session_id: &[u8], max_messages: usize) -> Result<(), MemoryError> {
-        self.0.truncate_to(session_id, max_messages)
+    fn truncate_to(&self, handle: &Self::Handle, max_messages: usize) -> Result<(), MemoryError> {
+        self.0.truncate_to(handle, max_messages)
+    }
+
+    fn retire_session(&self, handle: &Self::Handle) -> Result<(), MemoryError> {
+        self.0.retire_session(handle)
     }
 
     fn retained_bytes(&self) -> Result<u64, MemoryError> {
         Ok(0)
+    }
+}
+
+/// Keeps the real store's append, replay, retention, and accounting behavior;
+/// only the terminal per-session transition is dishonestly acknowledged.
+struct SwallowedRetirementTranscriptTarget<'a, T>(&'a T);
+
+impl<T: TranscriptAppendConformanceTarget> TranscriptAppendConformanceTarget
+    for SwallowedRetirementTranscriptTarget<'_, T>
+{
+    type Handle = T::Handle;
+
+    fn open_session(&self, session_id: &[u8]) -> Result<Self::Handle, MemoryError> {
+        self.0.open_session(session_id)
+    }
+
+    fn append(
+        &self,
+        handle: Self::Handle,
+        sequence: u64,
+        message_id: &[u8],
+        body: &[u8],
+    ) -> Result<TranscriptAppendDispositionV1, TranscriptAppendErrorV1> {
+        self.0.append(handle, sequence, message_id, body)
+    }
+
+    fn load(&self, handle: &Self::Handle) -> Result<Vec<TranscriptRow>, MemoryError> {
+        self.0.load(handle)
+    }
+
+    fn truncate_to(&self, handle: &Self::Handle, max_messages: usize) -> Result<(), MemoryError> {
+        self.0.truncate_to(handle, max_messages)
+    }
+
+    fn retire_session(&self, _handle: &Self::Handle) -> Result<(), MemoryError> {
+        Ok(())
+    }
+
+    fn retained_bytes(&self) -> Result<u64, MemoryError> {
+        self.0.retained_bytes()
     }
 }
 

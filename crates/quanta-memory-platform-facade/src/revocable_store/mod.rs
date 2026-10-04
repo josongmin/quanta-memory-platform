@@ -1,5 +1,5 @@
 mod cost;
-#[cfg(feature = "spill")]
+#[cfg(feature = "spill-durable")]
 mod durable_codec;
 pub mod service;
 

@@ -370,17 +370,33 @@ pub(super) fn retained_map_point_read(
     );
 }
 
-pub(super) fn scheduler_admission_group_cardinality(
+pub(super) fn broker_group_admission_cardinality(
     entries: usize,
     repetition: usize,
     allocations: &AllocationCounters,
 ) {
-    // Phase 1: fixture construction with tracking disabled. Everything
-    // allocated here (groups, target, scheduler, latency buffer) must be
-    // dropped after the epoch closes, never while tracked.
-    let mut groups = BTreeMap::new();
-    for index in 0..entries {
-        groups.insert(
+    // The broker owns the scheduler's usage. Every timed admission passes
+    // through its ticket and ledger path, with construction outside the epoch.
+    let group_count = broker_group_cardinality(entries);
+    let shared_pool = u64::try_from(group_count).expect("group cardinality fits u64");
+    let global_limit = shared_pool.checked_add(2_000).expect("benchmark budget fits u64");
+    let owner = "bench:group-admission".to_string();
+    let target = format!("group-{:08}", group_count / 2);
+    let mut policy = ResidencyPolicy::new(global_limit)
+        .with_shared_burst_pool_bytes(shared_pool)
+        .with_class_budget(
+            MemoryClass::ArtifactCache,
+            MemoryClassBudget {
+                reserved_bytes: 0,
+                soft_cap_bytes: global_limit,
+                hard_cap_bytes: global_limit,
+                borrow_from_shared_pool: false,
+                reclaim_priority: ReclaimPriority::Normal,
+            },
+        )
+        .with_owner_group(owner.clone(), target.clone());
+    for index in 0..group_count {
+        policy = policy.with_resource_group(
             format!("group-{index:08}"),
             ResourceGroup {
                 reserved_bytes: 0,
@@ -392,15 +408,39 @@ pub(super) fn scheduler_admission_group_cardinality(
             },
         );
     }
-    let target = format!("group-{:08}", entries / 2);
-    let mut scheduler = WeightedResourceGroupScheduler::new(groups, entries as u64);
-    scheduler
-        .record_usage(&target, &MemoryClass::ArtifactCache, 1_000)
-        .expect("record target hard-cap usage");
+    let platform = MemoryPlatformBuilder::new()
+        .with_manifest(MemoryBudgetManifest::new(
+            MemoryPreset::Production,
+            ExecutionBudget::default(),
+            policy,
+        ))
+        .build()
+        .expect("group admission platform");
+    let broker = platform.broker();
+    let mut seed = broker
+        .reserve_managed_charge(
+            MemoryClass::ArtifactCache,
+            owner.clone(),
+            MemoryContextKind::Request,
+            ChargeKind::RetainedPayload,
+            1_000,
+        )
+        .expect("seed target group hard cap");
+    let mut probe = broker
+        .reserve_managed_charge(
+            MemoryClass::ArtifactCache,
+            owner.clone(),
+            MemoryContextKind::Request,
+            ChargeKind::RetainedPayload,
+            1,
+        )
+        .expect("one-byte weighted share admits");
+    let semantic_peak = broker.ledger_snapshot().expect("probe peak").total_owner_bytes();
+    assert_eq!(semantic_peak, 1_001);
+    probe.release().expect("return probe capacity");
     let mut latencies = Vec::with_capacity(entries.checked_mul(2).expect("operation count"));
 
-    // Phase 2: open the epoch immediately before the admission loop and
-    // require a clean precondition.
+    // Start the allocation epoch after policy, broker, seed, and samples exist.
     let epoch = AllocationEpochGuard::begin(allocations);
     assert_eq!(
         allocations.allocated.load(Ordering::Relaxed),
@@ -418,57 +458,72 @@ pub(super) fn scheduler_admission_group_cardinality(
         "allocation epoch must start with zero tracked live bytes"
     );
 
-    // Phase 3: admission loop only.
+    // An admitted ticket is released before the next probe, so each operation
+    // starts at the same 1,000-byte group usage. A two-byte request exceeds
+    // that group's one-byte weighted share.
     let started = Instant::now();
     for _ in 0..entries {
         let operation = Instant::now();
-        assert!(scheduler.admits(&target, 1), "cached one-byte fair share must admit");
+        let mut admitted = broker
+            .reserve_managed_charge(
+                MemoryClass::ArtifactCache,
+                owner.clone(),
+                MemoryContextKind::Request,
+                ChargeKind::RetainedPayload,
+                1,
+            )
+            .expect("one-byte group admission");
+        admitted.release().expect("return one-byte group capacity");
         let latency = operation.elapsed().as_nanos() as u64;
         latencies.push(latency);
         let operation = Instant::now();
-        assert!(!scheduler.admits(&target, 2), "request beyond cached share must deny");
+        assert!(matches!(
+            broker.reserve_managed_charge(
+                MemoryClass::ArtifactCache,
+                owner.clone(),
+                MemoryContextKind::Request,
+                ChargeKind::RetainedPayload,
+                2,
+            ),
+            Err(MemoryError::Capacity(message)) if message.contains("resource group")
+        ));
         let latency = operation.elapsed().as_nanos() as u64;
         latencies.push(latency);
     }
     let elapsed = started.elapsed();
-    assert_eq!(
-        allocations.allocated.load(Ordering::Relaxed),
-        0,
-        "scheduler admission must not allocate after policy construction"
-    );
-    assert_eq!(
-        allocations.deallocated.load(Ordering::Relaxed),
-        0,
-        "scheduler admission must not deallocate policy state"
-    );
 
-    // Phase 4: stop tracking before touching fixture memory again.
+    // Stop tracking before dropping the seed that predates the measured epoch.
     let allocation = epoch.finish(allocations);
     assert!(
         !ALLOCATION_TRACKING_ENABLED.load(Ordering::Relaxed),
         "tracker must be inactive after the admission measurement"
     );
 
-    // Phase 5: summarize and drop with tracking disabled.
-    // Split the existing alternating samples only after the timed loop and
-    // allocation epoch. This keeps throughput comparable to prior v3 runs.
+    assert!(allocation.allocated > 0, "broker admission must record allocator activity");
+    assert_eq!(allocation.allocated, allocation.deallocated);
+    assert_eq!(allocation.live, 0);
+    assert!(!allocation.underflowed);
+    assert_eq!(broker.ledger_snapshot().expect("seed remains").total_owner_bytes(), 1_000);
+
+    // Split the alternating samples only after the timed loop.
     let admitted_latencies: Vec<u64> = latencies.iter().step_by(2).copied().collect();
     let denied_latencies: Vec<u64> = latencies.iter().skip(1).step_by(2).copied().collect();
     let latency = summarize_latencies(latencies);
     let outcome_latencies =
         (summarize_latencies(admitted_latencies), summarize_latencies(denied_latencies));
-    drop(scheduler);
-    drop(target);
+    seed.release().expect("release seed charge");
+    let semantic_after = broker.ledger_snapshot().expect("drained broker").total_owner_bytes();
+    drop(platform);
     emit(
-        "scheduler_admission_group_cardinality",
+        "broker_group_admission_cardinality",
         "single-thread",
         entries,
         1,
         repetition,
         elapsed,
         latency,
-        0,
-        0,
+        semantic_peak,
+        semantic_after,
         allocation,
         OperationCounts {
             successful: entries,

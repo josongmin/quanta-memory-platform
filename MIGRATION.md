@@ -9,6 +9,89 @@ unbudgeted or unbounded path.
 
 ## Post-0.2 authority and durable API changes
 
+### Transcript sessions use issued handles (breaking)
+
+Call `open_session(caller_session_id)` before appending. Keep its opaque
+`SessionHandle` and use it in the existing `TranscriptAppendIdentityV1` session
+axis and every load/page/retain/CAS/retire call. Caller SessionId is retained,
+charged metadata; two opens with the same value create independent sessions.
+Do not route a late request by looking up the newest handle for its string ID.
+Handles are process/store-local lookup identities, not durable IDs or
+authorization tokens. Constructors remain builder-first and can fail.
+
+`retire_session` releases that handle's session key, active rows and identity
+evidence together. On failure they remain intact. After success, every old
+handle operation, including an exact append retry, rejects with `InvalidState`.
+Retiring it twice also rejects. `close` remains terminal and idempotent. A
+caller may reopen the same metadata with a fresh handle without accepting old
+requests into the new session.
+
+The existing `TranscriptRetentionPolicyV2` adds `with_session_limits(count,
+key_bytes)` for store-wide open-session bounds. Defaults are 65,536 sessions
+and 64 MiB of semantic key cost. Zero-row sessions consume these limits and a
+metadata lease. Existing evidence limits apply across all open handles;
+truncation preserves replay evidence until that handle is retired or the
+store closes. Stats report session count/key bytes as well as active/evidence
+components. This changes the replay horizon without introducing a new IR.
+
+### Transcript pages and conditional retention
+
+The existing `SessionTranscriptStore` trait now exposes `read_page` and
+`retain_sequences_if_version`. `TranscriptSnapshotV1` carries the handle,
+version and optional opaque `TranscriptCursor`. Page limits count rows and
+their captured active semantic retained costs; they do not bound caller-owned
+clones, arbitrary callback latency or RSS. Zero limits and an oversized first
+row return `Capacity`. A cursor from another handle/version returns
+`InvalidState`; sequence exhaustion ends without wrapping.
+
+A page is only part of a session. Retention selectors describe the entire
+session, so passing just one page's sequences evicts other pages' active rows.
+CAS detects concurrent mutation, not incomplete selectors. Gather all pages
+of one version when a complete selector is required, and restart after a
+stale cursor. Stale CAS returns `StaleSnapshot` without changing state.
+Versions advance only on a fresh append or actual row eviction, not on replay,
+no-op retention or rejected operations. The full snapshot remains available
+as a concrete-store convenience.
+
+Reads clone internal pinned rows after releasing the mutex. Evicting pinned
+rows, retiring their session or closing the store returns
+`OperationInProgress` before releasing any charge. Retry after the read
+finishes. Using shared `Arc` row data means cross-thread store use also
+requires message IDs/bodies to satisfy the corresponding `Send`/`Sync`
+auto-trait bounds; single-thread use remains available.
+
+### Scheduler is internal (breaking)
+
+The scheduler root exports and nested `application::scheduler` path are no
+longer public. Use the broker builder and its admission/release APIs; the
+scheduler is a derived policy cache, not an independent accounting authority.
+The scaling operation is now `broker_group_admission_cardinality` and records
+its actual bounded group cardinality. Old standalone scheduler receipts are
+not compatible baselines for this broker workload.
+
+### Durable spill protocol is opt-in (breaking)
+
+`spill` and `full` expose process-local transfer contracts. Enable
+`spill-durable` explicitly for durable protocol/restore types and methods;
+`spill-redb` enables it automatically. `full` includes neither durable API nor
+Redb. This feature boundary does not qualify optional durable code for product
+use or require host activation.
+
+### Legacy non-retaining publish transitions removed (breaking)
+
+`PublishPipeline`, `SimplePublishPipeline`, `PublishPipelineBuilder`,
+`CommitTransition`, `DefaultCommitTransition`, `StagedHandle` and `PublishError`
+are removed. The checked QMP examples and Semantica memory integration source
+contain no product caller of this transition wrapper. External consumers must
+migrate explicitly: a non-retaining value transformation calls its own fallible
+transition and owns its result and counter. Do not replace that operation with
+`PreparedPublicationService` unless retaining payload and replay evidence is
+actually required; its accounting and lifetime contract is different.
+
+Canonical-root activation remains caller-owned. A prepare receipt proves
+process-resident prepared state, not publication visibility. `PublishedPayload`
+remains the payload store's independent result type.
+
 ### Prepared identity evidence limits (breaking)
 
 Replace `with_tombstone_limits(count, bytes)` with

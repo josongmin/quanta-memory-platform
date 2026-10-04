@@ -284,23 +284,34 @@ pub(super) fn run_transcript_slice(kit: &MemoryTestKit) -> Vec<AssertionVerdict>
         .bind(binding(MemoryClass::SessionTranscript, "conformance:transcript"))
         .build()
         .expect("bound transcript builder");
+    let handle = match store.open_session("s".to_string()) {
+        Ok(handle) => handle,
+        Err(error) => {
+            return vec![
+                accounting.assert_that(false, format!("transcript open failed: {error}")),
+                fail_closed.assert_that(false, "transcript over-cap check skipped: open failed"),
+            ];
+        }
+    };
     let truncate = store
         .append(TranscriptAppendRequestV1::new(
-            TranscriptAppendIdentityV1::new("s".to_string(), 0, "m0".to_string()),
+            TranscriptAppendIdentityV1::new(handle, 0, "m0".to_string()),
             "aa".to_string(),
         ))
         .and_then(|_| {
             store.append(TranscriptAppendRequestV1::new(
-                TranscriptAppendIdentityV1::new("s".to_string(), 1, "m1".to_string()),
+                TranscriptAppendIdentityV1::new(handle, 1, "m1".to_string()),
                 "bbbbbbbb".to_string(),
             ))
         });
     let before_truncate = broker_bytes(&broker);
-    let truncate_result = store.truncate_to(&"s".to_string(), 1);
+    let truncate_result = store.truncate_to(&handle, 1);
     let after_truncate = broker_bytes(&broker);
     let retained_after_truncate = store.retained_bytes().map_err(|e| e.to_string());
 
-    let tiny_kit = session_transcript_budget(kit, 4);
+    // Opening the zero-row session itself retains 1 + 24 + 16 = 41 bytes.
+    // Admit that key, then force append to fail without changing its preimage.
+    let tiny_kit = session_transcript_budget(kit, session);
     let tiny_platform = match make_platform(&tiny_kit) {
         Ok(platform) => platform,
         Err(err) => {
@@ -325,12 +336,34 @@ pub(super) fn run_transcript_slice(kit: &MemoryTestKit) -> Vec<AssertionVerdict>
         .bind(binding(MemoryClass::SessionTranscript, "conformance:transcript-tight"))
         .build()
         .expect("bound transcript builder");
+    let tiny_handle = match tiny_store.open_session("s".to_string()) {
+        Ok(handle) => handle,
+        Err(error) => {
+            return vec![
+                accounting.assert_that(
+                    truncate.is_ok()
+                        && matches!(&before_truncate, Ok(bytes) if *bytes == before_expected)
+                        && truncate_result.is_ok()
+                        && matches!(&after_truncate, Ok(bytes) if *bytes == after_expected)
+                        && matches!(&retained_after_truncate, Ok(bytes) if *bytes == after_expected),
+                    format!(
+                        "truncate={truncate:?} before_truncate={before_truncate:?} truncate_result={truncate_result:?} after_truncate={after_truncate:?} retained_after_truncate={retained_after_truncate:?}",
+                    ),
+                ),
+                fail_closed.assert_that(false, format!("tiny transcript open failed: {error}")),
+            ];
+        }
+    };
+    let tiny_ledger_before = broker_bytes(&tiny_broker);
+    let tiny_retained_before = tiny_store.retained_bytes().map_err(|e| e.to_string());
+    let tiny_stats_before = tiny_store.retention_stats().map_err(|e| e.to_string());
     let over_cap = tiny_store.append(TranscriptAppendRequestV1::new(
-        TranscriptAppendIdentityV1::new("s".to_string(), 0, "m0".to_string()),
+        TranscriptAppendIdentityV1::new(tiny_handle, 0, "m0".to_string()),
         "toolong".to_string(),
     ));
     let tiny_ledger_after = broker_bytes(&tiny_broker);
     let tiny_retained_after = tiny_store.retained_bytes().map_err(|e| e.to_string());
+    let tiny_stats_after = tiny_store.retention_stats().map_err(|e| e.to_string());
 
     vec![
         accounting.assert_that(
@@ -348,12 +381,14 @@ pub(super) fn run_transcript_slice(kit: &MemoryTestKit) -> Vec<AssertionVerdict>
                 &over_cap,
                 Err(TranscriptAppendErrorV1::Accounting(MemoryError::Capacity(_)))
             )
-                && matches!(&tiny_ledger_after, Ok(bytes) if *bytes == 0)
-                && matches!(&tiny_retained_after, Ok(bytes) if *bytes == 0)
-                && matches!(tiny_store.stats(), Ok(stats) if stats.item_count == 0),
+                && matches!(&tiny_ledger_before, Ok(bytes) if *bytes == session)
+                && tiny_ledger_after == tiny_ledger_before
+                && matches!(&tiny_retained_before, Ok(bytes) if *bytes == session)
+                && tiny_retained_after == tiny_retained_before
+                && matches!(&tiny_stats_before, Ok(stats) if stats.session_count == 1 && stats.session_key_bytes == session && stats.active_row_count == 0 && stats.evidence_count == 0 && stats.total_retained_bytes == session)
+                && tiny_stats_after == tiny_stats_before,
             format!(
-                "over_cap={over_cap:?} tiny_ledger_after={tiny_ledger_after:?} tiny_retained_after={tiny_retained_after:?} tiny_stats={:?}",
-                tiny_store.stats()
+                "over_cap={over_cap:?} tiny_ledger_before={tiny_ledger_before:?} tiny_ledger_after={tiny_ledger_after:?} tiny_retained_before={tiny_retained_before:?} tiny_retained_after={tiny_retained_after:?} tiny_stats_before={tiny_stats_before:?} tiny_stats_after={tiny_stats_after:?}",
             ),
         ),
     ]

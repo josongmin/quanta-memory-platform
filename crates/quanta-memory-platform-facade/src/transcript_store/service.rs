@@ -2,7 +2,8 @@ use std::borrow::Borrow;
 use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet};
 use std::marker::PhantomData;
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use quanta_memory_platform_core::{
     ChargeKind, LiveProcessMemoryBroker, ManagedCharge, MemoryContextKind, MemoryError,
@@ -18,11 +19,19 @@ use crate::shared::lifecycle::{
 };
 use crate::shared::measure::{semantic_cost_v1, ByteSized, CanonicalKey, RetainedCostV1};
 use crate::transcript_store::{
-    SessionTranscriptStore, TranscriptAppendDispositionV1, TranscriptAppendErrorV1,
-    TranscriptAppendRequestV1, TranscriptRecordV1, TranscriptRetainDispositionV1,
+    SessionHandle, SessionTranscriptStore, TranscriptAppendDispositionV1, TranscriptAppendErrorV1,
+    TranscriptAppendRequestV1, TranscriptCursor, TranscriptRecordV1, TranscriptRetainDispositionV1,
     TranscriptRetentionPolicyV2, TranscriptRetentionReconfigureErrorV2, TranscriptRetentionStatsV2,
     TranscriptSnapshotV1,
 };
+
+static NEXT_TRANSCRIPT_STORE_NONCE: AtomicU64 = AtomicU64::new(0);
+
+fn allocate_store_nonce(counter: &AtomicU64) -> MemoryResult<u64> {
+    counter
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| next.checked_add(1))
+        .map_err(|_| MemoryError::capacity("transcript store identity exhausted"))
+}
 
 const BODY_DIGEST_DOMAIN: &[u8] = b"qmp.transcript-body.v1\0";
 
@@ -65,25 +74,49 @@ fn session_key_cost(session_id_bytes: u64) -> MemoryResult<u64> {
 
 #[derive(Debug)]
 struct TranscriptEntry<MessageId, Message> {
-    sequence: u64,
-    message_id: MessageId,
-    body: Message,
+    data: Arc<TranscriptRowData<MessageId, Message>>,
     active_bytes: u64,
     active_charge: Option<ManagedCharge>,
 }
 
+#[derive(Debug)]
+struct TranscriptRowData<MessageId, Message> {
+    message_id: Option<MessageId>,
+    body: Option<Message>,
+}
+
+impl<MessageId, Message> TranscriptRowData<MessageId, Message> {
+    fn message_id(&self) -> &MessageId {
+        self.message_id.as_ref().expect("row message id remains live")
+    }
+    fn body(&self) -> &Message {
+        self.body.as_ref().expect("row body remains live")
+    }
+}
+
+impl<MessageId, Message> Drop for TranscriptRowData<MessageId, Message> {
+    fn drop(&mut self) {
+        if let Some(message_id) = self.message_id.take() {
+            retire_client_value(message_id);
+        }
+        if let Some(body) = self.body.take() {
+            retire_client_value(body);
+        }
+    }
+}
+
 fn clone_records<MessageId: Clone, Message: Clone>(
-    rows: &BTreeMap<u64, TranscriptEntry<MessageId, Message>>,
+    rows: &[(u64, Arc<TranscriptRowData<MessageId, Message>>)],
 ) -> Vec<TranscriptRecordV1<MessageId, Message>> {
     // Complete every client Clone while earlier copies still have guarded
     // destructors. Only plain moves remain after the last Clone succeeds.
     let mut guarded: Vec<_> = rows
-        .values()
-        .map(|entry| {
+        .iter()
+        .map(|(sequence, data)| {
             (
-                entry.sequence,
-                InFlight::new(entry.message_id.clone()),
-                InFlight::new(entry.body.clone()),
+                *sequence,
+                InFlight::new(data.message_id().clone()),
+                InFlight::new(data.body().clone()),
             )
         })
         .collect();
@@ -155,7 +188,8 @@ struct MessageEvidence {
 }
 
 #[derive(Debug)]
-struct SessionState<MessageId, Message> {
+struct SessionState<SessionId, MessageId, Message> {
+    session_id: SessionId,
     version: u64,
     key_bytes: u64,
     key_charge: Option<ManagedCharge>,
@@ -165,23 +199,10 @@ struct SessionState<MessageId, Message> {
     message_evidence: BTreeMap<ClientKey<MessageId>, MessageEvidence>,
 }
 
-impl<MessageId, Message> Default for SessionState<MessageId, Message> {
-    fn default() -> Self {
-        Self {
-            version: 0,
-            key_bytes: 0,
-            key_charge: None,
-            retained_bytes: 0,
-            rows: BTreeMap::new(),
-            sequence_evidence: BTreeMap::new(),
-            message_evidence: BTreeMap::new(),
-        }
-    }
-}
-
 #[derive(Debug)]
 struct TranscriptState<SessionId, MessageId, Message> {
-    sessions: BTreeMap<ClientKey<SessionId>, SessionState<MessageId, Message>>,
+    sessions: BTreeMap<SessionHandle, SessionState<SessionId, MessageId, Message>>,
+    next_session_sequence: u64,
     retention: TranscriptRetentionPolicyV2,
     active_row_count: usize,
     active_bytes: u64,
@@ -191,8 +212,8 @@ struct TranscriptState<SessionId, MessageId, Message> {
     retained_bytes: u64,
 }
 
-fn semantic_session_bytes<MessageId, Message>(
-    session: &SessionState<MessageId, Message>,
+fn semantic_session_bytes<SessionId, MessageId, Message>(
+    session: &SessionState<SessionId, MessageId, Message>,
 ) -> MemoryResult<u64> {
     let with_rows = session.rows.values().try_fold(session.key_bytes, |total, row| {
         total
@@ -275,14 +296,16 @@ fn validate_component_counters<SessionId, MessageId, Message>(
     }
 }
 
-/// Portable bounded transcript store with caller-owned append identity.
+/// Portable bounded transcript store with store-issued session handles and
+/// caller-selected append sequence/message identity.
 ///
 /// One mutex owns rows, both identity indexes, body evidence, retained-byte
 /// accounting, and non-clone charge leases. Every append either commits all of
 /// them or none. Truncation evicts active rows and refunds only their leases;
-/// admitted identity evidence and the session key remain charged until close/Drop.
-/// This in-memory implementation makes no
-/// restart-durability claim.
+/// admitted identity evidence and the session key remain charged until that
+/// session is retired, or all sessions close/Drop. Equal caller metadata can
+/// have independent open handles; there is no latest-string routing.
+/// This in-memory implementation makes no restart-durability claim.
 ///
 /// The accounting mode is fixed before construction and has no default. Raw
 /// construction and late attachment cannot bypass the platform builder:
@@ -305,9 +328,32 @@ fn validate_component_counters<SessionId, MessageId, Message>(
 /// # use quanta_memory_platform_facade::{Budgeted, SimpleSessionTranscriptStore};
 /// let _ = SimpleSessionTranscriptStore::<String, String, String, Budgeted>::charged_against;
 /// ```
+///
+/// Immutable row pins use `Arc`; cross-thread store sharing therefore requires
+/// both `Send` and `Sync` for caller row fields:
+///
+/// ```
+/// use quanta_memory_platform_facade::{Budgeted, SimpleSessionTranscriptStore};
+/// fn require_send_sync<T: Send + Sync>() {}
+/// require_send_sync::<SimpleSessionTranscriptStore<String, String, String, Budgeted>>();
+/// ```
+///
+/// ```compile_fail
+/// use std::cell::Cell;
+/// use quanta_memory_platform_facade::{Budgeted, ByteSized, CanonicalKey, SimpleSessionTranscriptStore};
+/// #[derive(Clone)]
+/// struct NotSync(Cell<u64>);
+/// impl ByteSized for NotSync { fn byte_size(&self) -> u64 { 8 } }
+/// impl CanonicalKey for NotSync {
+///     fn canonical_key(&self) -> Vec<u8> { self.0.get().to_le_bytes().to_vec() }
+/// }
+/// fn require_send_sync<T: Send + Sync>() {}
+/// require_send_sync::<SimpleSessionTranscriptStore<String, String, NotSync, Budgeted>>();
+/// ```
 #[derive(Debug)]
 pub struct SimpleSessionTranscriptStore<SessionId, MessageId, Message, Mode> {
     binding: StoreBindingHandle,
+    store_nonce: u64,
     accounting: StoreAccounting,
     lifecycle: StoreLifecycle,
     state: Mutex<TranscriptState<SessionId, MessageId, Message>>,
@@ -321,7 +367,7 @@ impl<SessionId, MessageId, Message>
         binding: StoreBindingHandle,
         retention: TranscriptRetentionPolicyV2,
         broker: LiveProcessMemoryBroker,
-    ) -> Self {
+    ) -> MemoryResult<Self> {
         Self::with_accounting(binding, retention, StoreAccounting::Budgeted(broker))
     }
 }
@@ -333,7 +379,7 @@ impl<SessionId, MessageId, Message>
     pub(crate) fn new_unbudgeted(
         binding: StoreBindingHandle,
         retention: TranscriptRetentionPolicyV2,
-    ) -> Self {
+    ) -> MemoryResult<Self> {
         Self::with_accounting(binding, retention, StoreAccounting::Unbudgeted)
     }
 }
@@ -345,13 +391,16 @@ impl<SessionId, MessageId, Message, Mode>
         binding: StoreBindingHandle,
         retention: TranscriptRetentionPolicyV2,
         accounting: StoreAccounting,
-    ) -> Self {
-        Self {
+    ) -> MemoryResult<Self> {
+        let store_nonce = allocate_store_nonce(&NEXT_TRANSCRIPT_STORE_NONCE)?;
+        Ok(Self {
             binding,
+            store_nonce,
             accounting,
             lifecycle: StoreLifecycle::new("transcript store"),
             state: Mutex::new(TranscriptState {
                 sessions: BTreeMap::new(),
+                next_session_sequence: 0,
                 retention,
                 active_row_count: 0,
                 active_bytes: 0,
@@ -361,7 +410,7 @@ impl<SessionId, MessageId, Message, Mode>
                 retained_bytes: 0,
             }),
             _mode: PhantomData,
-        }
+        })
     }
 
     pub fn retention_policy(&self) -> MemoryResult<TranscriptRetentionPolicyV2> {
@@ -413,6 +462,16 @@ impl<SessionId, MessageId, Message, Mode>
                 requested_max_evidence_bytes: retention.max_evidence_bytes(),
             });
         }
+        if state.sessions.len() > retention.max_session_count()
+            || state.session_key_bytes > retention.max_session_key_bytes()
+        {
+            return Err(TranscriptRetentionReconfigureErrorV2::BelowLiveSessions {
+                live_session_count: state.sessions.len(),
+                requested_max_session_count: retention.max_session_count(),
+                live_session_key_bytes: state.session_key_bytes,
+                requested_max_session_key_bytes: retention.max_session_key_bytes(),
+            });
+        }
         state.retention = retention;
         Ok(())
     }
@@ -458,6 +517,9 @@ impl<SessionId, MessageId, Message, Mode>
                 self.require_charge_shape(&session.key_charge, "close session key")?;
                 for entry in session.rows.values() {
                     self.require_charge_shape(&entry.active_charge, "close active row")?;
+                    if Arc::strong_count(&entry.data) != 1 {
+                        return Err(MemoryError::operation_in_progress("transcript read"));
+                    }
                 }
                 for evidence in session.sequence_evidence.values() {
                     self.require_charge_shape(
@@ -507,7 +569,7 @@ impl<SessionId, MessageId, Message>
     fn new_test_unbudgeted(
         binding: StoreBindingHandle,
         retention: TranscriptRetentionPolicyV2,
-    ) -> Self {
+    ) -> MemoryResult<Self> {
         Self::with_accounting(binding, retention, StoreAccounting::Unbudgeted)
     }
 }
@@ -517,20 +579,29 @@ impl<SessionId, MessageId, Message, Mode>
 where
     SessionId: Clone + Ord + ByteSized,
 {
-    pub fn session_bytes(&self, session_id: &SessionId) -> MemoryResult<u64> {
+    pub fn session_bytes(&self, handle: &SessionHandle) -> MemoryResult<u64> {
         // The caller-implemented Ord probe runs inside the owned read
         // boundary: a comparison panic cannot poison the state mutex, and a
         // missing session still reports zero rather than an error.
         self.lifecycle.with_read_state(&self.state, |state| {
-            state.sessions.get(session_id).map_or(Ok(0), |session| {
-                let checked = semantic_session_bytes(session)?;
-                if checked != session.retained_bytes {
-                    return Err(MemoryError::InvalidState(
-                        "transcript session cost counter disagrees with owned leases".to_string(),
-                    ));
-                }
-                Ok(checked)
-            })
+            state
+                .sessions
+                .get(handle)
+                .ok_or_else(|| {
+                    MemoryError::InvalidState(
+                        "transcript session handle is not open in this store".to_string(),
+                    )
+                })
+                .and_then(|session| {
+                    let checked = semantic_session_bytes(session)?;
+                    if checked != session.retained_bytes {
+                        return Err(MemoryError::InvalidState(
+                            "transcript session cost counter disagrees with owned leases"
+                                .to_string(),
+                        ));
+                    }
+                    Ok(checked)
+                })
         })?
     }
 
@@ -546,9 +617,25 @@ where
 
     fn retain_sequences_owned(
         &self,
-        session_id: &SessionId,
+        handle: &SessionHandle,
         retained_sequences: &[u64],
     ) -> MemoryResult<()> {
+        let max_selector_len = self
+            .lock_state()?
+            .sessions
+            .get(handle)
+            .ok_or_else(|| {
+                MemoryError::InvalidState(
+                    "transcript session handle is not open in this store".to_string(),
+                )
+            })?
+            .rows
+            .len();
+        if retained_sequences.len() > max_selector_len {
+            return Err(MemoryError::capacity(
+                "transcript retain selector exceeds active row count",
+            ));
+        }
         let retained: BTreeSet<_> = retained_sequences.iter().copied().collect();
         if retained.len() != retained_sequences.len() {
             return Err(MemoryError::InvalidState(
@@ -556,22 +643,12 @@ where
             ));
         }
 
-        // Resolve caller-controlled Ord before the state-mutation lock; the
-        // positional ordinal keeps every later block caller-trait-free while
-        // the plan is detached (pinned by the no-Ord-after-detach contract).
-        // The scan runs inside the containment helper, and session count is
-        // budget-bounded because every session owns a positive key charge.
-        let session_ordinal = invoke_client_read_while_locked(self.lock_state()?, |state| {
-            state.sessions.keys().position(|candidate| candidate.get().cmp(session_id).is_eq())
-        });
+        let session_ordinal =
+            self.lock_state()?.sessions.keys().position(|candidate| candidate == handle);
         let Some(session_ordinal) = session_ordinal else {
-            return if retained.is_empty() {
-                Ok(())
-            } else {
-                Err(MemoryError::InvalidState(
-                    "transcript retain selector references a missing session".to_string(),
-                ))
-            };
+            return Err(MemoryError::InvalidState(
+                "transcript session handle is not open in this store".to_string(),
+            ));
         };
 
         let (
@@ -618,6 +695,9 @@ where
                     )
                 })?;
                 self.require_charge_shape(&entry.active_charge, "retain")?;
+                if Arc::strong_count(&entry.data) != 1 {
+                    return Err(MemoryError::operation_in_progress("transcript read"));
+                }
                 dropped_bytes = dropped_bytes.checked_add(entry.active_bytes).ok_or_else(|| {
                     MemoryError::capacity("transcript dropped-byte counter overflow")
                 })?;
@@ -693,54 +773,7 @@ where
     }
 }
 
-impl<SessionId, MessageId, Message, Mode>
-    SimpleSessionTranscriptStore<SessionId, MessageId, Message, Mode>
-where
-    SessionId: Clone + Ord + ByteSized,
-    MessageId: Clone + Ord + ByteSized,
-    Message: Clone + ByteSized + CanonicalKey,
-{
-    /// Copy active rows and their mutation version under the store mutex.
-    /// Caller policy executes after this method releases the mutex.
-    pub fn load_versioned_snapshot(
-        &self,
-        session_id: &SessionId,
-    ) -> MemoryResult<TranscriptSnapshotV1<MessageId, Message>> {
-        self.lifecycle.with_read_state(&self.state, |state| {
-            let version = state.sessions.get(session_id).map_or(0, |session| session.version);
-            let records = state
-                .sessions
-                .get(session_id)
-                .map_or_else(Vec::new, |session| clone_records(&session.rows));
-            TranscriptSnapshotV1 { version, records }
-        })
-    }
-
-    /// Retain rows only if no append or retention mutation occurred after the
-    /// supplied snapshot. Stale snapshots are reported without mutation.
-    pub fn retain_sequences_if_version(
-        &self,
-        session_id: &SessionId,
-        expected_version: u64,
-        retained_sequences: &[u64],
-    ) -> MemoryResult<TranscriptRetainDispositionV1> {
-        let _mutation = self.lifecycle.begin_mutation()?;
-        let actual_version = invoke_client_read_while_locked(self.lock_state()?, |state| {
-            state.sessions.get(session_id).map_or(0, |session| session.version)
-        });
-        if actual_version != expected_version {
-            return Ok(TranscriptRetainDispositionV1::StaleSnapshot {
-                expected_version,
-                actual_version,
-            });
-        }
-        self.retain_sequences_owned(session_id, retained_sequences)?;
-        let version = invoke_client_read_while_locked(self.lock_state()?, |state| {
-            state.sessions.get(session_id).map_or(0, |session| session.version)
-        });
-        Ok(TranscriptRetainDispositionV1::Applied { version })
-    }
-}
+mod read;
 
 mod operations;
 
@@ -779,7 +812,7 @@ enum SessionLeaseSlot {
 }
 
 fn take_session_charges<SessionId, MessageId, Message>(
-    sessions: &mut BTreeMap<ClientKey<SessionId>, SessionState<MessageId, Message>>,
+    sessions: &mut BTreeMap<SessionHandle, SessionState<SessionId, MessageId, Message>>,
 ) -> (Vec<SessionLeaseSlot>, Vec<ManagedCharge>) {
     let mut slots = Vec::new();
     let mut charges = Vec::new();
@@ -805,7 +838,7 @@ fn take_session_charges<SessionId, MessageId, Message>(
 }
 
 fn restore_session_charges<SessionId, MessageId, Message>(
-    sessions: &mut BTreeMap<ClientKey<SessionId>, SessionState<MessageId, Message>>,
+    sessions: &mut BTreeMap<SessionHandle, SessionState<SessionId, MessageId, Message>>,
     slots: &[SessionLeaseSlot],
     charges: Vec<ManagedCharge>,
 ) {
@@ -851,15 +884,14 @@ fn retire_rows<MessageId, Message>(
     rows: impl IntoIterator<Item = TranscriptEntry<MessageId, Message>>,
 ) {
     for row in rows {
-        let TranscriptEntry { message_id, body, active_charge, .. } = row;
+        let TranscriptEntry { data, active_charge, .. } = row;
         drop(active_charge);
-        retire_client_value(message_id);
-        retire_client_value(body);
+        drop(data);
     }
 }
 
 fn retire_sessions<SessionId, MessageId, Message>(
-    mut sessions: BTreeMap<ClientKey<SessionId>, SessionState<MessageId, Message>>,
+    mut sessions: BTreeMap<SessionHandle, SessionState<SessionId, MessageId, Message>>,
 ) {
     for session in sessions.values_mut() {
         drop(session.key_charge.take());
@@ -870,7 +902,7 @@ fn retire_sessions<SessionId, MessageId, Message>(
             drop(evidence.evidence_charge.take());
         }
     }
-    for (mut session_id, session) in sessions {
+    for (_, session) in sessions {
         retire_rows(session.rows.into_values());
         for (_, evidence) in session.sequence_evidence {
             drop(evidence.evidence_charge);
@@ -879,7 +911,7 @@ fn retire_sessions<SessionId, MessageId, Message>(
         for (mut message_id, _) in session.message_evidence {
             retire_client_value(message_id.take());
         }
-        retire_client_value(session_id.take());
+        retire_client_value(session.session_id);
     }
 }
 
