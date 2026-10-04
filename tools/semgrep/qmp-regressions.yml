@@ -288,4 +288,5 @@ rules:
     pattern-either:
       - pattern-regex: '(?m)^\s*(?:pub(?:\([^)]*\))?\s+)?use\s+crate::adapters\b'
       - pattern-regex: '(?ms)^\s*(?:pub(?:\([^)]*\))?\s+)?use\s+crate::\{[^;]*\badapters\b'
+      - pattern: crate::adapters::$VALUE
       - pattern: crate::adapters::$FUNC(...)

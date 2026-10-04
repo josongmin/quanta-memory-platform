@@ -187,10 +187,12 @@ where
                         stats_after_cleanup,
                         Ok(PreparedPublicationStatsV1 {
                             prepared_count: 0,
+                            identity_evidence_count: 3,
+                            identity_evidence_bytes,
                             charged_bytes,
                             tombstone_count: 3,
                             tombstone_bytes,
-                        }) if charged_bytes == final_evidence && tombstone_bytes == final_evidence
+                        }) if charged_bytes == final_evidence && identity_evidence_bytes == final_evidence && tombstone_bytes == final_evidence
                     ),
                 format!(
                     "orphan={orphan:?} referenced={referenced:?} enumerated={enumerated:?} collected={collected:?} orphan_after={orphan_after:?} referenced_after={referenced_after:?} cleanup={cleanup:?} final={stats_after_cleanup:?}"
@@ -207,8 +209,8 @@ where
             matches!((&first, &replayed, &before_conflict),
                 (Ok((first_token, PrepareDispositionV1::Applied)),
                  Ok((replay_token, PrepareDispositionV1::Replayed)),
-                 Ok(PreparedPublicationStatsV1 { prepared_count: 1, charged_bytes, tombstone_count: 0, tombstone_bytes: 0 }))
-                 if first_token == replay_token && *charged_bytes == initial_prepared),
+                 Ok(PreparedPublicationStatsV1 { prepared_count: 1, identity_evidence_count: 1, identity_evidence_bytes, charged_bytes, tombstone_count: 0, tombstone_bytes: 0 }))
+                 if first_token == replay_token && *charged_bytes == initial_prepared && *identity_evidence_bytes == first_evidence),
             format!("first={first:?} replay={replayed:?} stats={before_conflict:?}"),
         ),
         conflict.assert_that(
@@ -226,10 +228,12 @@ where
                     final_stats,
                     Ok(PreparedPublicationStatsV1 {
                         prepared_count: 0,
+                        identity_evidence_count: 1,
+                        identity_evidence_bytes,
                         charged_bytes,
                         tombstone_count: 1,
                         tombstone_bytes,
-                    }) if charged_bytes == first_evidence && tombstone_bytes == first_evidence
+                    }) if charged_bytes == first_evidence && identity_evidence_bytes == first_evidence && tombstone_bytes == first_evidence
                 ),
             format!(
                 "resolution={resolution:?} abort={abort_first:?} replay={abort_replay:?} final={final_stats:?}"

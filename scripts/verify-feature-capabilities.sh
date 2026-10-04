@@ -55,7 +55,7 @@ run_member_lib "quanta-memory-platform-core" "pressure" \
 run_member_lib "quanta-memory-platform-core" "scheduler" \
   "application::scheduler::tests::admission_reuses_policy_static_fair_share_table_at_high_group_cardinality"
 run_member_lib "quanta-memory-platform-core" "telemetry" \
-  "adapters::metrics::tests::emitter_holds_no_accounting_state"
+  "adapters::metrics::recording_tests::emitter_records_exact_counter_labels_and_optional_byte_samples"
 run_member_lib "quanta-memory-platform-core" "unbudgeted_pin" \
   "adapters::pin::tests::pin_invalidate_round_trip_tracks_dependent_count"
 run_member_lib "quanta-memory-platform-testkit" "conformance" \

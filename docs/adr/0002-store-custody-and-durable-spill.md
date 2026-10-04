@@ -17,9 +17,11 @@ Status: Accepted for the 0.2 implementation; durable backing is opt-in.
   comparison or measurement code can panic. Partial read clones use the same
   discipline. Transcript resolves owned-key map descents before publishing
   rows/indexes/counters; key destructors are contained during unwind.
-- A payload reference must identify one canonical value; non-injective caller
-  reference conversion is rejected before charging. Prepared admission is
-  bounded by the complete GC-root input capacity, including unbudgeted mode.
+- A payload reference identifies one canonical value in its issuing process.
+  A sealed injective String codec and checked store namespace prevent lossy
+  caller conversion and cross-store aliasing; refs do not survive process
+  restart. Prepared admission reserves eventual retirement evidence and is
+  also bounded by the complete GC-root input capacity, including unbudgeted mode.
 - FIFO reclaim partitions selected entries and merges rollback in linear
   passes while preserving order and exact charge custody.
 - Prepared-publication roots and other unbudgeted management inputs are

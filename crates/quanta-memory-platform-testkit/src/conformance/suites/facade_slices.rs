@@ -68,10 +68,9 @@ pub(super) fn class_capped_kit(
 
 #[cfg(feature = "fixtures")]
 pub(super) fn run_payload_store_slice(kit: &MemoryTestKit) -> Vec<AssertionVerdict> {
-    // 32 body + the retained "payload-0" reference (9) + two semantic index
-    // slots (canonical digest and reference lookup, 32 each) + entry state
-    // (16). This is independent of the store's calculator.
-    let expected_entry_bytes = 32 + 9 + 64 + 16;
+    // The returned reference is part of the retained charge. Use its observed
+    // wire length, then independently add the body and semantic index/state
+    // components rather than calling the store's cost calculator.
     let accounting =
         InvariantAssertion::new(ContractFamily::ReclaimAccounting, "payload_dedup_refund");
     let pin_discipline = InvariantAssertion::new(ContractFamily::PinDiscipline, "pin_safe_delete");
@@ -104,6 +103,8 @@ pub(super) fn run_payload_store_slice(kit: &MemoryTestKit) -> Vec<AssertionVerdi
             ];
         }
     };
+    let expected_entry_bytes =
+        32 + u64::try_from(first.payload_ref().len()).expect("reference length fits u64") + 64 + 16;
     let ledger_after_first = broker_bytes(&broker);
     let second = store.put_canonical(quanta_memory_platform_core::RetainedEnvelope::new(payload));
     let ledger_after_dedup = broker_bytes(&broker);
@@ -385,6 +386,21 @@ pub(super) fn spill_round_trip_verdict<T: SpillTarget<String>>(
 }
 
 #[cfg(feature = "fixtures")]
+pub(super) fn spill_offline_restore_verdict<T: SpillTarget<String>>(
+    offline: &RoutedSpillController<T>,
+) -> AssertionVerdict {
+    let assertion =
+        InvariantAssertion::new(ContractFamily::SpillRouting, "spill_offline_restore_fail_closed");
+    let before = offline.spilled_count();
+    let restored = offline.restore();
+    let after = offline.spilled_count();
+    assertion.assert_that(
+        before == Ok(1) && matches!(&restored, Err(MemoryError::Capacity(_))) && after == before,
+        format!("before={before:?} restore={restored:?} after={after:?}"),
+    )
+}
+
+#[cfg(feature = "fixtures")]
 pub(super) fn run_spill_slice() -> Vec<AssertionVerdict> {
     let fail_closed =
         InvariantAssertion::new(ContractFamily::SpillRouting, "spill_unavailable_fail_closed");
@@ -398,8 +414,19 @@ pub(super) fn run_spill_slice() -> Vec<AssertionVerdict> {
     let spill_denied = offline.spill("handle-b".to_string());
     let offline_spilled_after = offline.spilled_count();
 
+    let retained = InMemorySpillTarget::available();
+    let seeded = retained.accept("retained-through-offline".to_string());
+    retained.set_available(false);
+    let offline_restore = if seeded.is_ok() {
+        spill_offline_restore_verdict(&RoutedSpillController::new(retained))
+    } else {
+        InvariantAssertion::new(ContractFamily::SpillRouting, "spill_offline_restore_fail_closed")
+            .assert_that(false, format!("failed to seed offline restore: {seeded:?}"))
+    };
+
     vec![
         round_trip,
+        offline_restore,
         fail_closed.assert_that(
             matches!(&spill_denied, Err(failure) if matches!(failure.error(), MemoryError::Capacity(_)) && failure.handle() == "handle-b")
                 && offline_spilled_after == Ok(0),

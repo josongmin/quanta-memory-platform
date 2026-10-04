@@ -106,8 +106,7 @@ impl AllocationTracker for AllocationProbe {
         _wrapped_size: usize,
         _group_id: AllocationGroupId,
     ) {
-        self.inner.alloc_calls.fetch_add(1, Ordering::Relaxed);
-        self.inner.bytes_allocated.fetch_add(object_size as u64, Ordering::Relaxed);
+        self.record_alloc(object_size as u64);
     }
 
     fn deallocated(
@@ -118,8 +117,7 @@ impl AllocationTracker for AllocationProbe {
         _source_group_id: AllocationGroupId,
         _current_group_id: AllocationGroupId,
     ) {
-        self.inner.dealloc_calls.fetch_add(1, Ordering::Relaxed);
-        self.inner.bytes_deallocated.fetch_add(object_size as u64, Ordering::Relaxed);
+        self.record_dealloc(object_size as u64);
     }
 }
 
@@ -185,6 +183,30 @@ mod tests {
             assertion.assert_eq_bytes("alloc_vs_dealloc", s2.bytes_allocated, s2.bytes_deallocated);
         assert!(!v2.held());
         assert!(v2.evidence.contains("drift=2048"));
+    }
+
+    #[test]
+    fn callback_and_direct_byte_totals_saturate_identically() {
+        let direct = AllocationProbe::install();
+        let callback = AllocationProbe::install();
+        direct.record_alloc(u64::MAX);
+        direct.record_dealloc(u64::MAX);
+        callback.record_alloc(u64::MAX);
+        callback.record_dealloc(u64::MAX);
+        direct.record_alloc(1);
+        direct.record_dealloc(1);
+        callback.allocated(0, 1, 1, AllocationGroupId::ROOT);
+        callback.deallocated(0, 1, 1, AllocationGroupId::ROOT, AllocationGroupId::ROOT);
+        assert_eq!(direct.signals(), callback.signals());
+        assert_eq!(
+            callback.signals(),
+            AllocationSignals {
+                alloc_calls: 2,
+                dealloc_calls: 2,
+                bytes_allocated: u64::MAX,
+                bytes_deallocated: u64::MAX,
+            }
+        );
     }
 
     #[test]

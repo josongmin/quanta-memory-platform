@@ -103,15 +103,20 @@ pub trait SpillTarget<Handle>: SpillInventory {
     ///
     /// Contract (uniform across all impls so the trait is Liskov-substitutable):
     /// - `Ok(Some(handle))` — a retained handle was brought back (FIFO).
-    /// - `Ok(None)` — the target is AVAILABLE but has nothing retained to restore.
+    /// - `Ok(None)` — the target is readable but has nothing retained to restore.
     /// - `Err(MemoryError::Capacity(_))` — the target is OFFLINE: a vanished
     ///   backend cannot be read, which is distinct from "nothing to restore". An
-    ///   impl that can go offline MUST fail closed here rather than return `None`,
+    ///   retaining impl that can go offline MUST fail closed here rather than return `None`,
     ///   so a caller can tell "drained" from "unreachable".
     ///
-    /// The default is a discard / eviction target that has no offline state and
-    /// retains nothing: always `Ok(None)`.
+    /// The default is a discard / eviction target: unavailable targets fail
+    /// closed and available targets retain nothing. Retaining implementations
+    /// must override this method and distinguish read availability themselves
+    /// when it differs from write admission.
     fn restore(&self) -> MemoryResult<Option<Handle>> {
+        if !self.is_available() {
+            return Err(MemoryError::capacity("spill target unavailable during restore"));
+        }
         Ok(None)
     }
 }
@@ -508,6 +513,7 @@ impl<Handle> SpillInventory for RetainingSpillTarget<Handle> {
 
 #[cfg(test)]
 mod tests {
+    mod restore_contract;
     use super::*;
 
     #[test]
@@ -882,5 +888,29 @@ mod tests {
     fn noop_controller_restore_is_none() {
         let controller = NoopSpillController;
         assert_eq!(SpillController::<u32>::restore(&controller).expect("noop restore"), None);
+    }
+
+    #[test]
+    fn default_restore_distinguishes_offline_from_available_empty_target() {
+        struct EvictingTarget(bool);
+        impl SpillInventory for EvictingTarget {
+            fn retained_count(&self) -> MemoryResult<u64> {
+                Ok(0)
+            }
+        }
+        impl SpillTarget<u32> for EvictingTarget {
+            fn is_available(&self) -> bool {
+                self.0
+            }
+            fn accept(&self, handle: u32) -> Result<SpillReceipt, SpillFailure<u32>> {
+                Err(SpillFailure::new(MemoryError::capacity("fixture rejects writes"), handle))
+            }
+        }
+        let online = RoutedSpillController::new(EvictingTarget(true));
+        let offline = RoutedSpillController::new(EvictingTarget(false));
+        assert_eq!(online.restore().expect("available discard target"), None);
+        assert!(matches!(offline.restore(), Err(MemoryError::Capacity(_))));
+        assert_eq!(online.spilled_count().expect("online inventory"), 0);
+        assert_eq!(offline.spilled_count().expect("offline inventory"), 0);
     }
 }

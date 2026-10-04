@@ -1,14 +1,160 @@
 use super::*;
 
 #[test]
+fn public_budgeted_stores_issue_distinct_refs_and_reject_foreign_mutations() {
+    use crate::MemoryPlatformBuilder;
+
+    let platform = MemoryPlatformBuilder::new()
+        .with_preset(MemoryPreset::Development)
+        .build()
+        .expect("live platform");
+    let a = platform
+        .payload_store_builder::<String, Vec<u8>>()
+        .bind(StoreBindingHandle::new(MemoryClass::ArtifactCache, "owner-a".to_string(), None))
+        .build()
+        .expect("first store");
+    let b = platform
+        .payload_store_builder::<String, Vec<u8>>()
+        .bind(StoreBindingHandle::new(MemoryClass::ArtifactCache, "owner-b".to_string(), None))
+        .build()
+        .expect("second store");
+    let same_binding = platform
+        .payload_store_builder::<String, Vec<u8>>()
+        .bind(StoreBindingHandle::new(MemoryClass::ArtifactCache, "owner-a".to_string(), None))
+        .build()
+        .expect("third store with first binding");
+
+    let a_ref = a.put_canonical(envelope(b"a")).expect("a put").payload_ref().clone();
+    let b_ref = b.put_canonical(envelope(b"b")).expect("b put").payload_ref().clone();
+    let same_binding_ref =
+        same_binding.put_canonical(envelope(b"c")).expect("same binding put").payload_ref().clone();
+    assert_ne!(a_ref, b_ref, "distinct owners must not share reference identity");
+    assert_ne!(a_ref, same_binding_ref, "the store instance owns reference identity");
+    assert_ne!(b_ref, same_binding_ref);
+
+    let before_ledger = platform.broker().ledger_snapshot().expect("ledger before probes");
+    let before_b = b.stats().expect("b stats before probes");
+    let before_same_binding = same_binding.stats().expect("same binding stats before probes");
+    for foreign in [&b, &same_binding] {
+        assert!(matches!(foreign.pin(&a_ref), Err(MemoryError::InvalidState(_))));
+        assert!(matches!(foreign.unpin(&a_ref), Err(MemoryError::InvalidState(_))));
+        assert!(matches!(foreign.delete_if_unpinned(&a_ref), Err(MemoryError::InvalidState(_))));
+        assert_eq!(foreign.pin_count(&a_ref).expect("absent ref pin count"), 0);
+    }
+    assert_eq!(b.stats().expect("b stats after probes"), before_b);
+    assert_eq!(same_binding.stats().expect("same binding stats after probes"), before_same_binding);
+    assert_eq!(platform.broker().ledger_snapshot().expect("ledger after probes"), before_ledger);
+
+    a.delete_if_unpinned(&a_ref).expect("a delete");
+    b.delete_if_unpinned(&b_ref).expect("b delete");
+    same_binding.delete_if_unpinned(&same_binding_ref).expect("third delete");
+    assert_eq!(platform.broker().ledger_snapshot().expect("drained").total_owner_bytes(), 0);
+}
+
+#[test]
+fn deleted_public_reference_never_addresses_later_payload() {
+    use crate::MemoryPlatformBuilder;
+
+    let platform = MemoryPlatformBuilder::new()
+        .with_preset(MemoryPreset::Development)
+        .build()
+        .expect("live platform");
+    let store = platform
+        .payload_store_builder::<String, Vec<u8>>()
+        .bind(binding())
+        .build()
+        .expect("payload store");
+    let stale = store.put_canonical(envelope(b"old")).expect("old put").payload_ref().clone();
+    store.delete_if_unpinned(&stale).expect("old delete");
+    let current = store.put_canonical(envelope(b"new")).expect("new put").payload_ref().clone();
+    assert_ne!(stale, current);
+    let before_ledger = platform.broker().ledger_snapshot().expect("before stale probes");
+    let before_stats = store.stats().expect("before stats");
+    assert!(matches!(store.pin(&stale), Err(MemoryError::InvalidState(_))));
+    assert!(matches!(store.unpin(&stale), Err(MemoryError::InvalidState(_))));
+    assert!(matches!(store.delete_if_unpinned(&stale), Err(MemoryError::InvalidState(_))));
+    assert_eq!(store.pin_count(&stale).expect("absent ref pin count"), 0);
+    assert_eq!(store.stats().expect("after stats"), before_stats);
+    assert_eq!(platform.broker().ledger_snapshot().expect("after stale probes"), before_ledger);
+    store.delete_if_unpinned(&current).expect("current delete");
+    assert_eq!(platform.broker().ledger_snapshot().expect("drained").total_owner_bytes(), 0);
+}
+
+#[test]
+fn store_identity_counter_exhaustion_is_fail_closed() {
+    let counter = AtomicU64::new(u64::MAX - 1);
+    assert_eq!(allocate_store_nonce(&counter).expect("last available nonce"), u64::MAX - 1);
+    assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
+    assert!(matches!(allocate_store_nonce(&counter), Err(MemoryError::Capacity(_))));
+    assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
+}
+
+#[test]
+fn payload_sequence_exhaustion_preserves_store_and_ledger() {
+    let (broker, store) = store();
+    store.state.lock().expect("state").next_ref = u64::MAX;
+    let before = broker.ledger_snapshot().expect("before ledger");
+    assert!(matches!(store.put_canonical(envelope(b"new")), Err(MemoryError::Capacity(_))));
+    assert_eq!(store.stats().expect("stats"), StoreStats::default());
+    assert_eq!(broker.ledger_snapshot().expect("after ledger"), before);
+    assert_eq!(store.state.lock().expect("state after").next_ref, u64::MAX);
+}
+
+#[test]
+fn delete_counter_corruption_preserves_entry_and_charge_authority() {
+    let (broker, store) = store();
+    let published = store.put_canonical(envelope(b"payload")).expect("publish");
+    let payload_ref = published.payload_ref().clone();
+    let charged = store.charged_bytes().expect("charged bytes");
+    let before_ledger = broker.ledger_snapshot().expect("ledger before corrupt delete");
+    let before_entry = {
+        let state = store.state.lock().expect("state before corrupt delete");
+        let entry = state.entries.iter().flatten().next().expect("one entry");
+        (
+            entry.payload_ref.clone(),
+            entry.bytes.clone(),
+            entry.pin_count,
+            entry.charge.as_ref().and_then(ManagedCharge::id),
+        )
+    };
+
+    store.state.lock().expect("inject counter corruption").charged_total = 0;
+    assert!(matches!(store.delete_if_unpinned(&payload_ref), Err(MemoryError::InvalidState(_))));
+    let state = store.state.lock().expect("state after rejection");
+    let entry = state.entries.iter().flatten().next().expect("entry survives");
+    assert_eq!(state.live_entries, 1);
+    assert_eq!(state.canonical_index.values().map(Vec::len).sum::<usize>(), 1);
+    assert_eq!(state.reference_index.values().map(Vec::len).sum::<usize>(), 1);
+    assert_eq!(
+        (
+            &entry.payload_ref,
+            &entry.bytes,
+            entry.pin_count,
+            entry.charge.as_ref().and_then(ManagedCharge::id)
+        ),
+        (&before_entry.0, &before_entry.1, before_entry.2, before_entry.3)
+    );
+    assert!(entry.charge.as_ref().is_some_and(ManagedCharge::is_active));
+    drop(state);
+    assert_eq!(broker.ledger_snapshot().expect("ledger after rejection"), before_ledger);
+
+    store.state.lock().expect("restore test corruption").charged_total = charged;
+    store.delete_if_unpinned(&payload_ref).expect("retry after counter repair");
+    assert_eq!(broker.ledger_snapshot().expect("drained").total_owner_bytes(), 0);
+}
+
+#[test]
 fn canonical_put_deduplicates_and_charges_once() {
     let (broker, store) = store();
     let first = store.put_canonical(envelope(b"same")).expect("first");
     let second = store.put_canonical(envelope(b"same")).expect("dedup");
     assert_eq!(first.payload_ref(), second.payload_ref());
     assert_eq!(store.stats().expect("stats").item_count, 1);
-    assert_eq!(store.charged_bytes().expect("bytes"), retained_cost(4, 0));
-    assert_eq!(broker.ledger_snapshot().expect("ledger").total_owner_bytes(), retained_cost(4, 0));
+    assert_eq!(store.charged_bytes().expect("bytes"), retained_cost(4, 0, store.store_nonce));
+    assert_eq!(
+        broker.ledger_snapshot().expect("ledger").total_owner_bytes(),
+        retained_cost(4, 0, store.store_nonce)
+    );
 }
 #[test]
 fn payload_lookup_probe_count_is_n_independent() {
@@ -33,7 +179,8 @@ fn payload_lookup_probe_count_is_n_independent() {
 
     let broker = live_broker(1_000_000, 600_000);
     let store =
-        SimplePayloadStore::<String, ProbeBytes, Budgeted>::new_budgeted(binding(), None, broker);
+        SimplePayloadStore::<String, ProbeBytes, Budgeted>::new_budgeted(binding(), None, broker)
+            .expect("payload store nonce");
     let probes = Arc::new(AtomicUsize::new(0));
     for value in 0u32..2_048 {
         store
@@ -51,7 +198,7 @@ fn payload_lookup_probe_count_is_n_independent() {
             probes: Arc::clone(&probes),
         }))
         .expect("indexed duplicate lookup");
-    assert_eq!(duplicate.payload_ref(), "payload-1024");
+    assert_eq!(duplicate.payload_ref(), &format!("payload-{}-1024", store.store_nonce));
     assert_eq!(
         probes.load(Ordering::SeqCst),
         2,
@@ -102,15 +249,19 @@ fn transient_canonical_key_is_not_charged_but_retained_identity_is() {
         binding(),
         None,
         broker.clone(),
-    );
+    )
+    .expect("payload store nonce");
     let first = store
         .put_canonical(RetainedEnvelope::new(ZeroMeasuredHugeCanonicalKey))
         .expect("semantic cost fits");
     let second =
         store.put_canonical(RetainedEnvelope::new(ZeroMeasuredHugeCanonicalKey)).expect("dedup");
     assert_eq!(first.payload_ref(), second.payload_ref());
-    assert_eq!(store.charged_bytes().expect("bytes"), retained_cost(0, 0));
-    assert_eq!(broker.ledger_snapshot().expect("ledger").total_owner_bytes(), retained_cost(0, 0));
+    assert_eq!(store.charged_bytes().expect("bytes"), retained_cost(0, 0, store.store_nonce));
+    assert_eq!(
+        broker.ledger_snapshot().expect("ledger").total_owner_bytes(),
+        retained_cost(0, 0, store.store_nonce)
+    );
 }
 #[test]
 fn cost_component_sum_overflow_denies_without_publishing_or_charging() {
@@ -119,7 +270,8 @@ fn cost_component_sum_overflow_denies_without_publishing_or_charging() {
         binding(),
         None,
         broker.clone(),
-    );
+    )
+    .expect("payload store nonce");
     assert!(matches!(
         store.put_canonical(RetainedEnvelope::new(MaxMeasuredPayload)),
         Err(MemoryError::Capacity(_))
@@ -134,7 +286,8 @@ fn composite_entry_charges_one_payload_bucket() {
         binding(),
         None,
         broker.clone(),
-    );
+    )
+    .expect("payload store nonce");
     store.put_canonical(envelope(b"payload")).expect("put");
     let charged = store.charged_bytes().expect("charged total");
     assert!(charged > 0, "a published payload holds a live charge");
@@ -178,7 +331,8 @@ fn counter_reads_show_open_busy_and_closed_images() {
         binding(),
         None,
         broker.clone(),
-    );
+    )
+    .expect("payload store nonce");
     store.put_canonical(envelope(b"payload")).expect("put");
     // Open image: the plain counters mirror the authoritative ledger charge.
     let charged = broker.ledger_snapshot().expect("open ledger").total_owner_bytes();
@@ -209,7 +363,8 @@ fn measurement_panic_precedes_accounting_and_does_not_poison_state() {
         binding(),
         None,
         broker.clone(),
-    );
+    )
+    .expect("payload store nonce");
     let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let _ = store.put_canonical(RetainedEnvelope::new(PanicMeasuredPayload));
     }));
@@ -220,12 +375,14 @@ fn measurement_panic_precedes_accounting_and_does_not_poison_state() {
 #[test]
 fn metadata_equality_reentry_under_read_lock_is_typed_busy_and_preserves_charge() {
     let broker = live_broker(1_000_000, 600_000);
-    let store =
-        Arc::new(SimplePayloadStore::<ReentrantPayloadRef, Vec<u8>, Budgeted>::new_budgeted(
+    let store = Arc::new(
+        SimplePayloadStore::<ReentrantPayloadRef, Vec<u8>, Budgeted>::new_budgeted(
             binding(),
             None,
             broker.clone(),
-        ));
+        )
+        .expect("payload store nonce"),
+    );
     let published = store.put_canonical(envelope(b"metadata")).expect("put");
     REF_REENTRY_STORE.with(|slot| *slot.borrow_mut() = Some(Arc::downgrade(&store)));
     REF_REENTRY_HITS.with(|hits| hits.set(0));
@@ -234,19 +391,24 @@ fn metadata_equality_reentry_under_read_lock_is_typed_busy_and_preserves_charge(
     REF_REENTRY_HITS.with(|hits| assert_eq!(hits.get(), 1));
     REF_REENTRY_STORE.with(|slot| *slot.borrow_mut() = None);
     assert_eq!(store.stats().expect("complete state").item_count, 1);
-    assert_eq!(broker.ledger_snapshot().expect("ledger").total_owner_bytes(), retained_cost(8, 0));
+    assert_eq!(
+        broker.ledger_snapshot().expect("ledger").total_owner_bytes(),
+        retained_cost(8, 0, store.store_nonce)
+    );
     store.close().expect("close");
     assert_eq!(broker.ledger_snapshot().expect("refunded").total_owner_bytes(), 0);
 }
 #[test]
 fn duplicate_canonical_callback_reentry_under_lock_is_typed_busy_and_charges_once() {
     let broker = live_broker(1_000_000, 600_000);
-    let store =
-        Arc::new(SimplePayloadStore::<String, ReentrantCanonicalBytes, Budgeted>::new_budgeted(
+    let store = Arc::new(
+        SimplePayloadStore::<String, ReentrantCanonicalBytes, Budgeted>::new_budgeted(
             binding(),
             None,
             broker.clone(),
-        ));
+        )
+        .expect("payload store nonce"),
+    );
     let probe = Arc::new(OnceLock::new());
     let hits = Arc::new(AtomicUsize::new(0));
     let first = store
@@ -270,7 +432,7 @@ fn duplicate_canonical_callback_reentry_under_lock_is_typed_busy_and_charges_onc
     assert_eq!(store.stats().expect("complete state").item_count, 1);
     assert_eq!(
         broker.ledger_snapshot().expect("charged once").total_owner_bytes(),
-        retained_cost(4, 0)
+        retained_cost(4, 0, store.store_nonce)
     );
     store.close().expect("close");
     assert_eq!(broker.ledger_snapshot().expect("refunded").total_owner_bytes(), 0);
@@ -309,21 +471,25 @@ fn distinct_payloads_each_charge_once() {
     let (broker, store) = store();
     store.put_canonical(envelope(b"aa")).expect("a");
     store.put_canonical(envelope(b"bbbb")).expect("b");
-    assert_eq!(store.charged_bytes().expect("bytes"), retained_cost(2, 0) + retained_cost(4, 1));
+    assert_eq!(
+        store.charged_bytes().expect("bytes"),
+        retained_cost(2, 0, store.store_nonce) + retained_cost(4, 1, store.store_nonce)
+    );
     assert_eq!(store.stats().expect("stats").item_count, 2);
     assert_eq!(
         broker.ledger_snapshot().expect("ledger").total_owner_bytes(),
-        retained_cost(2, 0) + retained_cost(4, 1)
+        retained_cost(2, 0, store.store_nonce) + retained_cost(4, 1, store.store_nonce)
     );
 }
 #[test]
-fn non_injective_public_reference_conversion_is_rejected_before_charge() {
+fn non_injective_test_reference_conversion_is_rejected_before_charge() {
     let broker = live_broker(1_000_000, 600_000);
     let store = SimplePayloadStore::<ConstantRef, Vec<u8>, Budgeted>::new_budgeted(
         binding(),
         None,
         broker.clone(),
-    );
+    )
+    .expect("payload store nonce");
     let first = store.put_canonical(envelope(b"one")).expect("first identity");
     let before_stats = store.stats().expect("before stats");
     let before_ledger = broker.ledger_snapshot().expect("before ledger");
@@ -355,8 +521,11 @@ fn over_cap_put_is_fail_closed_and_does_not_consume_ref() {
     assert!(matches!(store.put_canonical(envelope(&[0; 100])), Err(MemoryError::Capacity(_))));
     assert_eq!(store.stats().expect("stats").item_count, 0);
     let published = store.put_canonical(envelope(&[0; 40])).expect("within cap");
-    assert_eq!(published.payload_ref(), &"payload-0".to_string());
-    assert_eq!(broker.ledger_snapshot().expect("ledger").total_owner_bytes(), retained_cost(40, 0));
+    assert_eq!(published.payload_ref(), &format!("payload-{}-0", store.store_nonce));
+    assert_eq!(
+        broker.ledger_snapshot().expect("ledger").total_owner_bytes(),
+        retained_cost(40, 0, store.store_nonce)
+    );
 }
 #[test]
 fn pin_is_metadata_only_and_pinned_delete_is_rejected() {
@@ -369,7 +538,10 @@ fn pin_is_metadata_only_and_pinned_delete_is_rejected() {
         store.delete_if_unpinned(published.payload_ref()),
         Err(MemoryError::InvalidState(_))
     ));
-    assert_eq!(broker.ledger_snapshot().expect("ledger").total_owner_bytes(), retained_cost(7, 0));
+    assert_eq!(
+        broker.ledger_snapshot().expect("ledger").total_owner_bytes(),
+        retained_cost(7, 0, store.store_nonce)
+    );
     store.unpin(published.payload_ref()).expect("unpin");
     store.unpin(published.payload_ref()).expect("unpin again");
     store.delete_if_unpinned(published.payload_ref()).expect("delete");
@@ -414,7 +586,8 @@ fn reference_eq_panic_before_mutation_keeps_public_store_available() {
             binding(),
             None,
             broker.clone(),
-        );
+        )
+        .expect("payload store nonce");
         let published = store.put_canonical(envelope(b"payload")).expect("put");
         if operation == "unpin" {
             store.pin(published.payload_ref()).expect("seed pin");
@@ -480,7 +653,8 @@ fn reference_clone_panic_before_publication_keeps_public_store_available() {
 
     let broker = live_broker(1_000_000, 600_000);
     let store =
-        SimplePayloadStore::<Ref, Vec<u8>, Budgeted>::new_budgeted(binding(), None, broker.clone());
+        SimplePayloadStore::<Ref, Vec<u8>, Budgeted>::new_budgeted(binding(), None, broker.clone())
+            .expect("payload store nonce");
     PANIC_NEXT_CLONE.store(true, Ordering::SeqCst);
     let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let _ = store.put_canonical(envelope(b"payload"));
@@ -516,10 +690,13 @@ fn put_and_delete_during_rebuild_are_fail_closed_then_resume() {
         Err(MemoryError::InvalidState(_))
     ));
     assert_eq!(store.stats().expect("preserved stats").item_count, 1);
-    assert_eq!(store.charged_bytes().expect("preserved bytes"), retained_cost(80, 0));
+    assert_eq!(
+        store.charged_bytes().expect("preserved bytes"),
+        retained_cost(80, 0, store.store_nonce)
+    );
     assert_eq!(
         broker.ledger_snapshot().expect("preserved ledger").total_owner_bytes(),
-        retained_cost(80, 0)
+        retained_cost(80, 0, store.store_nonce)
     );
 
     assert!(rebuild_fence1.finish().expect("finish rebuild").drain_error.is_none());
@@ -529,9 +706,10 @@ fn put_and_delete_during_rebuild_are_fail_closed_then_resume() {
 #[cfg(feature = "unbudgeted-stores")]
 #[test]
 fn explicit_unbudgeted_store_is_a_distinct_non_ledger_mode() {
-    let store = SimplePayloadStore::<String, Vec<u8>, Unbudgeted>::new_unbudgeted(binding(), None);
+    let store = SimplePayloadStore::<String, Vec<u8>, Unbudgeted>::new_unbudgeted(binding(), None)
+        .expect("payload store nonce");
     store.put_canonical(envelope(b"free")).expect("put");
-    assert_eq!(store.charged_bytes().expect("bytes"), retained_cost(4, 0));
+    assert_eq!(store.charged_bytes().expect("bytes"), retained_cost(4, 0, store.store_nonce));
     assert_eq!(store.stats().expect("stats").item_count, 1);
     store.close().expect("close unbudgeted");
 }
@@ -542,7 +720,7 @@ fn close_refunds_every_live_entry_exactly_once() {
     store.put_canonical(envelope(b"bbbb")).expect("b");
     assert_eq!(
         broker.ledger_snapshot().expect("before").total_owner_bytes(),
-        retained_cost(2, 0) + retained_cost(4, 1)
+        retained_cost(2, 0, store.store_nonce) + retained_cost(4, 1, store.store_nonce)
     );
     store.close().expect("close");
     assert_eq!(broker.ledger_snapshot().expect("after").total_owner_bytes(), 0);
@@ -555,10 +733,13 @@ fn close_refund_failure_preserves_entries_and_charge_ownership() {
     let rebuild_fence2 = broker.begin_rebuild().expect("begin rebuild");
     assert!(matches!(store.close(), Err(MemoryError::InvalidState(_))));
     assert_eq!(store.stats().expect("preserved stats").item_count, 1);
-    assert_eq!(store.charged_bytes().expect("preserved bytes"), retained_cost(5, 0));
+    assert_eq!(
+        store.charged_bytes().expect("preserved bytes"),
+        retained_cost(5, 0, store.store_nonce)
+    );
     assert_eq!(
         broker.ledger_snapshot().expect("preserved ledger").total_owner_bytes(),
-        retained_cost(5, 0)
+        retained_cost(5, 0, store.store_nonce)
     );
     assert!(rebuild_fence2.finish().expect("finish rebuild").drain_error.is_none());
     store.close().expect("retry close");
@@ -568,12 +749,10 @@ fn close_refund_failure_preserves_entries_and_charge_ownership() {
 fn drop_during_rebuild_defers_then_finish_drains_capacity() {
     let (broker, store) = store();
     store.put_canonical(envelope(b"owned")).expect("put");
+    let expected_retained = retained_cost(5, 0, store.store_nonce);
     let rebuild_fence3 = broker.begin_rebuild().expect("begin rebuild");
     drop(store);
-    assert_eq!(
-        broker.ledger_snapshot().expect("deferred").total_owner_bytes(),
-        retained_cost(5, 0)
-    );
+    assert_eq!(broker.ledger_snapshot().expect("deferred").total_owner_bytes(), expected_retained);
     assert!(rebuild_fence3.finish().expect("finish drains").drain_error.is_none());
     assert_eq!(broker.ledger_snapshot().expect("drained").total_owner_bytes(), 0);
 }
@@ -585,7 +764,8 @@ fn drop_during_outer_unwind_contains_two_client_panics_and_refunds_all_charges()
         binding(),
         None,
         broker.clone(),
-    );
+    )
+    .expect("payload store nonce");
     for bytes in [b"four".as_slice(), b"sixsix".as_slice()] {
         store
             .put_canonical(RetainedEnvelope::new(PanickingBytes {
@@ -596,7 +776,7 @@ fn drop_during_outer_unwind_contains_two_client_panics_and_refunds_all_charges()
     }
     assert_eq!(
         broker.ledger_snapshot().expect("before").total_owner_bytes(),
-        retained_cost(4, 0) + retained_cost(6, 1)
+        retained_cost(4, 0, store.store_nonce) + retained_cost(6, 1, store.store_nonce)
     );
 
     let outer = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
