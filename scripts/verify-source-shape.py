@@ -13,7 +13,7 @@ from pathlib import Path
 
 NEW_FILE_MAX_LINES = 1_000
 ADVISORY_LINES = 600
-RAW_LITERAL = re.compile(r"(?:br|rb|r)(#*)\"")
+RAW_LITERAL = re.compile(r"(?:br|rb|cr|r)(#*)\"")
 CHAR_LITERAL = re.compile(r"(?:b)?'(?:\\.|[^\\'\n])'")
 def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
     result: dict[str, object] = {}
@@ -57,7 +57,7 @@ def _code_only(source: str) -> str:
             mask(start, offset)
             continue
 
-        raw = RAW_LITERAL.match(source, offset) if source[offset] in "br" else None
+        raw = RAW_LITERAL.match(source, offset) if source[offset] in "bcr" else None
         if raw and (offset == 0 or not (source[offset - 1].isalnum() or source[offset - 1] == "_")):
             start = offset
             terminator = '"' + raw.group(1)

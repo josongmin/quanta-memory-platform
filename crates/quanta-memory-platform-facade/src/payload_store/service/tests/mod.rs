@@ -5,7 +5,7 @@ use super::*;
 use crate::test_support::SingleTestCommand;
 use std::cell::{Cell, RefCell};
 use std::hash::Hasher;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, OnceLock, Weak};
 
 use quanta_memory_platform_core::{
@@ -39,7 +39,7 @@ fn live_broker(global: u64, class_hard: u64) -> LiveProcessMemoryBroker {
 }
 
 fn store_with(broker: &LiveProcessMemoryBroker) -> SimplePayloadStore<String, Vec<u8>, Budgeted> {
-    SimplePayloadStore::new_budgeted(binding(), None, broker.clone())
+    SimplePayloadStore::new_budgeted(binding(), None, broker.clone()).expect("payload store nonce")
 }
 
 fn store() -> (LiveProcessMemoryBroker, SimplePayloadStore<String, Vec<u8>, Budgeted>) {
@@ -52,9 +52,9 @@ fn envelope(bytes: &[u8]) -> RetainedEnvelope<Vec<u8>> {
     RetainedEnvelope::new(bytes.to_vec())
 }
 
-fn retained_cost(payload_bytes: u64, sequence: u64) -> u64 {
-    // Independent oracle: do not call the production formula or constants.
-    payload_bytes + format!("payload-{sequence}").len() as u64 + 64 + 16
+fn retained_cost(payload_bytes: u64, sequence: u64, store_nonce: u64) -> u64 {
+    // Independent oracle: only wire text length and public semantic components.
+    payload_bytes + format!("payload-{store_nonce}-{sequence}").len() as u64 + 64 + 16
 }
 
 #[derive(Clone)]

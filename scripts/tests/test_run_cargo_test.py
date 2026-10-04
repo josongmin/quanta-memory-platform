@@ -100,7 +100,7 @@ class CargoTestOutputTest(unittest.TestCase):
                 expected_lib_selectors = {
                     "application::controller::tests::classification_is_deterministic_across_the_ladder",
                     "application::scheduler::tests::admission_reuses_policy_static_fair_share_table_at_high_group_cardinality",
-                    "adapters::metrics::tests::emitter_holds_no_accounting_state",
+                    "adapters::metrics::recording_tests::emitter_records_exact_counter_labels_and_optional_byte_samples",
                     "adapters::pin::tests::pin_invalidate_round_trip_tracks_dependent_count",
                     "self_tests::conformance_suite_rejects_a_fake_that_under_reports_usage",
                     "alloc_tracking::tests::recorded_signals_accumulate_and_net_live_is_correct",

@@ -26,12 +26,18 @@ fn delete_drop_reentry_is_bounded_and_peer_publication_retains_exact_charge() {
     }
 
     let broker = live_broker(1_000_000, 600_000);
-    let home = Arc::new(DropReentryPayloadStore::new_budgeted(binding(), None, broker.clone()));
-    let peer = Arc::new(DropReentryPayloadStore::new_budgeted(
-        StoreBindingHandle::new(MemoryClass::ArtifactCache, "drop-peer".into(), None),
-        None,
-        broker.clone(),
-    ));
+    let home = Arc::new(
+        DropReentryPayloadStore::new_budgeted(binding(), None, broker.clone())
+            .expect("payload store nonce"),
+    );
+    let peer = Arc::new(
+        DropReentryPayloadStore::new_budgeted(
+            StoreBindingHandle::new(MemoryClass::ArtifactCache, "drop-peer".into(), None),
+            None,
+            broker.clone(),
+        )
+        .expect("payload store nonce"),
+    );
     let home_slot = Arc::new(OnceLock::new());
     let peer_slot = Arc::new(OnceLock::new());
     home_slot.set(Arc::downgrade(&home)).expect("install home");
@@ -49,7 +55,7 @@ fn delete_drop_reentry_is_bounded_and_peer_publication_retains_exact_charge() {
         .expect("seed");
     assert_eq!(
         broker.ledger_snapshot().expect("seed ledger").total_owner_bytes(),
-        retained_cost(1, 0)
+        retained_cost(1, 0, home.store_nonce)
     );
     armed.store(true, Ordering::SeqCst);
     home.delete_if_unpinned(&published.payload_ref).expect("delete and retire body");
@@ -59,7 +65,7 @@ fn delete_drop_reentry_is_bounded_and_peer_publication_retains_exact_charge() {
     assert_eq!(peer.stats().expect("peer postimage").item_count, 1);
     assert_eq!(
         broker.ledger_snapshot().expect("peer ledger").total_owner_bytes(),
-        retained_cost(1, 0)
+        retained_cost(1, 0, peer.store_nonce)
     );
     home.close().expect("close home");
     peer.close().expect("close peer");
@@ -148,7 +154,8 @@ fn delete_contains_two_panicking_client_destructors_after_exact_refund() {
             binding(),
             None,
             broker.clone(),
-        );
+        )
+        .expect("payload store nonce");
         let published =
             store.put_canonical(RetainedEnvelope::new(Body(vec![1, 2, 3]))).expect("seed");
         PANIC_REF.store(true, Ordering::SeqCst);

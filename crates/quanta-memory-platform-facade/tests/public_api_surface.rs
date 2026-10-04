@@ -219,7 +219,7 @@ fn prepared_publication_builder_exposes_root_bound_resolution_contract() {
             None,
         ))
         .with_capacity_bytes(1024)
-        .with_tombstone_limits(16, 4096)
+        .with_identity_evidence_limits(16, 4096)
         .build()
         .expect("prepared publication builder");
     let identity = PreparedPublicationIdentityV1::new(b"root-owned-id".to_vec()).expect("identity");
@@ -228,6 +228,11 @@ fn prepared_publication_builder_exposes_root_bound_resolution_contract() {
         .expect("prepare");
 
     assert_eq!(receipt.disposition(), PrepareDispositionV1::Applied);
+    let stats = service.stats().expect("identity evidence stats");
+    assert_eq!(stats.identity_evidence_count, 1);
+    assert_eq!(stats.identity_evidence_bytes, 141);
+    assert_eq!(stats.prepared_count, 1);
+    assert_eq!(stats.tombstone_count, 0);
     assert_eq!(service.resolve(receipt.token()).expect("root-bound resolve"), b"payload".to_vec());
     assert!(
         service

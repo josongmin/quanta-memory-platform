@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::hash::{BuildHasher, Hash, RandomState};
 use std::marker::PhantomData;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, PoisonError};
 
 use quanta_memory_platform_core::{
@@ -9,7 +10,7 @@ use quanta_memory_platform_core::{
     StoreDeleteError, StoreStats, StoreWriteError,
 };
 
-use crate::payload_store::PayloadStore;
+use crate::payload_store::{PayloadReference, PayloadStore};
 #[cfg(feature = "unbudgeted-stores")]
 use crate::shared::accounting::Unbudgeted;
 use crate::shared::accounting::{Budgeted, StoreAccounting};
@@ -30,6 +31,14 @@ fn canonical_digest(seed: &RandomState, key: &[u8]) -> u64 {
 
 fn reference_digest<PayloadRef: Hash>(seed: &RandomState, payload_ref: &PayloadRef) -> u64 {
     seed.hash_one(payload_ref)
+}
+
+static NEXT_STORE_NONCE: AtomicU64 = AtomicU64::new(0);
+
+fn allocate_store_nonce(counter: &AtomicU64) -> MemoryResult<u64> {
+    counter
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| next.checked_add(1))
+        .map_err(|_| MemoryError::capacity("payload store identity counter exhausted"))
 }
 
 #[derive(Debug)]
@@ -100,6 +109,7 @@ fn find_reference_slot<PayloadRef: Eq, Bytes>(
 #[derive(Debug)]
 pub struct SimplePayloadStore<PayloadRef, Bytes, Mode> {
     binding: StoreBindingHandle,
+    store_nonce: u64,
     context: Option<MemoryContextHandle>,
     accounting: StoreAccounting,
     lifecycle: StoreLifecycle,
@@ -113,7 +123,7 @@ impl<PayloadRef, Bytes> SimplePayloadStore<PayloadRef, Bytes, Budgeted> {
         binding: StoreBindingHandle,
         context: Option<MemoryContextHandle>,
         broker: LiveProcessMemoryBroker,
-    ) -> Self {
+    ) -> MemoryResult<Self> {
         Self::with_accounting(binding, context, StoreAccounting::Budgeted(broker))
     }
 }
@@ -123,7 +133,7 @@ impl<PayloadRef, Bytes> SimplePayloadStore<PayloadRef, Bytes, Unbudgeted> {
     pub(crate) fn new_unbudgeted(
         binding: StoreBindingHandle,
         context: Option<MemoryContextHandle>,
-    ) -> Self {
+    ) -> MemoryResult<Self> {
         Self::with_accounting(binding, context, StoreAccounting::Unbudgeted)
     }
 }
@@ -133,9 +143,11 @@ impl<PayloadRef, Bytes, Mode> SimplePayloadStore<PayloadRef, Bytes, Mode> {
         binding: StoreBindingHandle,
         context: Option<MemoryContextHandle>,
         accounting: StoreAccounting,
-    ) -> Self {
-        Self {
+    ) -> MemoryResult<Self> {
+        let store_nonce = allocate_store_nonce(&NEXT_STORE_NONCE)?;
+        Ok(Self {
             binding,
+            store_nonce,
             context,
             accounting,
             lifecycle: StoreLifecycle::new("payload store"),
@@ -150,7 +162,7 @@ impl<PayloadRef, Bytes, Mode> SimplePayloadStore<PayloadRef, Bytes, Mode> {
                 charged_total: 0,
             }),
             _mode: PhantomData,
-        }
+        })
     }
 
     fn lock(&self) -> MemoryResult<std::sync::MutexGuard<'_, PayloadState<PayloadRef, Bytes>>> {
@@ -222,7 +234,7 @@ impl<PayloadRef, Bytes, Mode> SimplePayloadStore<PayloadRef, Bytes, Mode> {
 
 impl<PayloadRef, Bytes, Mode> SimplePayloadStore<PayloadRef, Bytes, Mode>
 where
-    PayloadRef: Clone + From<String> + Eq + Hash + ByteSized,
+    PayloadRef: PayloadReference,
     Bytes: Clone + ByteSized + CanonicalKey,
 {
     pub fn pin(&self, payload_ref: &PayloadRef) -> MemoryResult<()> {
@@ -271,7 +283,7 @@ where
 impl<PayloadRef, Bytes, Mode> PayloadStore<PayloadRef, Bytes>
     for SimplePayloadStore<PayloadRef, Bytes, Mode>
 where
-    PayloadRef: Clone + From<String> + Eq + Hash + ByteSized,
+    PayloadRef: PayloadReference,
     Bytes: Clone + ByteSized + CanonicalKey,
 {
     fn binding(&self) -> &StoreBindingHandle {
@@ -317,16 +329,16 @@ where
                 .next_ref
                 .checked_add(1)
                 .ok_or_else(|| MemoryError::capacity("payload reference counter overflow"))?;
-            (format!("payload-{}", state.next_ref), next_ref)
+            (format!("payload-{}-{}", self.store_nonce, state.next_ref), next_ref)
         };
         // Client measurement callbacks run with no store state lock held. A
         // panic or reentry cannot poison the authoritative state or charge the
         // broker before the complete semantic cost is known.
         let mut payload_ref = InFlight::new(PayloadRef::from(payload_ref_text));
         let payload_ref_digest = reference_digest(&self.digest_seed, payload_ref.get());
-        // `From<String>` does not promise an injective conversion. The
-        // mutation permit keeps this check stable until publication; perform
-        // caller equality before charging or entering the publication lock.
+        // Production supports only String. Keep this live-collision check for
+        // hostile reference conversions exercised by unit tests; the mutation
+        // permit keeps it stable until publication, before any charge.
         let reference_exists = {
             let state = self.lock()?;
             invoke_client_read_while_locked(state, |state| {
@@ -421,10 +433,14 @@ where
             }
             let canonical_digest = entry.canonical_digest;
             let charged_bytes = entry.charged_bytes;
-            let charge = entry.charge.take();
             let next_total = state.charged_total.checked_sub(charged_bytes).ok_or_else(|| {
                 MemoryError::InvalidState("payload byte counter underflow".to_string())
             })?;
+            // Validate the complete local postimage before detaching the only
+            // release authority. A corrupt counter must leave the entry and
+            // its managed charge available for inspection and retry.
+            let charge =
+                state.entries[index].as_mut().expect("delete slot remains live").charge.take();
             (index, canonical_digest, next_total, charge)
         };
 

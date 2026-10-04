@@ -143,6 +143,14 @@ impl WeightedResourceGroupScheduler {
         let before = self.usage.get(group_name).copied().unwrap_or_default();
         let after_total = self.usage_after_release(group_name, delta)?;
         let after_non_headroom = if *class == MemoryClass::Headroom {
+            let live_headroom = before.total.checked_sub(before.non_headroom).ok_or_else(|| {
+                MemoryError::InvalidState("resource-group usage axes are inconsistent".into())
+            })?;
+            if delta > live_headroom {
+                return Err(MemoryError::InvalidState(
+                    "resource-group headroom release exceeds live headroom usage".into(),
+                ));
+            }
             before.non_headroom
         } else {
             before.non_headroom.checked_sub(delta).ok_or_else(|| {
@@ -269,6 +277,9 @@ impl ResourceGroupScheduler for WeightedResourceGroupScheduler {
         .admitted()
     }
 }
+
+#[cfg(test)]
+mod axis_release;
 
 #[cfg(test)]
 mod tests {

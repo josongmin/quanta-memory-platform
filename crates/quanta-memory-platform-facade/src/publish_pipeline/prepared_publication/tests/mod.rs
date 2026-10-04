@@ -1,4 +1,5 @@
 mod cases_01;
+mod tombstone_reservation;
 
 use super::*;
 use quanta_memory_platform_core::{MemoryClass, StoreBindingHandle};
@@ -51,6 +52,22 @@ fn live_cost(identity: &str, payload: &[u8]) -> u64 {
         + u64::try_from(identity.len()).expect("test identity fits u64")
         + 2 * u64::try_from(payload.len()).expect("test payload fits u64")
         + 16
+}
+
+fn assert_identity_evidence_invariant(service: &TestService) {
+    let state = service.state.lock().expect("invariant state");
+    let evidence_bytes: u64 = state.identity_index.values().map(|item| item.retained_bytes).sum();
+    let active_bytes: u64 = state.entries.values().map(|item| item.active_bytes).sum();
+    let aborted_bytes: u64 = state
+        .identity_index
+        .values()
+        .filter(|item| matches!(&item.state, IdentityState::Aborted(_)))
+        .map(|item| item.retained_bytes)
+        .sum();
+    assert_eq!(state.persistent_bytes, evidence_bytes);
+    assert_eq!(state.charged_bytes, evidence_bytes + active_bytes);
+    assert_eq!(state.identity_index.len(), state.entries.len() + state.aborted_tokens.len());
+    assert_eq!(state.tombstone_bytes, aborted_bytes);
 }
 
 fn prepare_after_busy(

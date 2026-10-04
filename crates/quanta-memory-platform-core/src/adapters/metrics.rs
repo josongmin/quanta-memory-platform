@@ -37,17 +37,10 @@ impl MemoryEventSink for MetricsEmitter {
 mod tests {
     use super::*;
 
-    // scenario L: the metrics emitter is advisory and emit-only. Its surface
-    // takes (&self, name, value) and returns `()` — there is no method that hands
-    // back, accumulates, or mutates an accounting counter through the emitter. We
-    // prove emission is a side-effect-free-to-the-caller observation: it never
-    // borrows mutably and never yields a value the caller could fold into the
-    // ledger. Driving it repeatedly must not require &mut self.
+    // API smoke check; emission is observed by the recorder contract below.
     #[test]
     fn emitter_surface_is_emit_only_and_takes_shared_ref() {
         let emitter = MetricsEmitter;
-        // &self (shared) calls only: if emit could mutate accounting it would need
-        // &mut self. Many emits via one shared reference is the proof of advisory.
         let by_ref: &MetricsEmitter = &emitter;
         let returned: () = by_ref.emit(MemoryEvent::new(
             crate::MemoryOperation::ObserveBroker,
@@ -62,9 +55,7 @@ mod tests {
         ));
     }
 
-    // scenario L: the emitter is freely cloneable and Default-constructible
-    // without any handle to accounting state, confirming it holds no semantic
-    // counter and cannot be a write path into the ledger.
+    // Construction does not require a broker or ledger handle.
     #[test]
     fn emitter_holds_no_accounting_state() {
         let emitter = MetricsEmitter;
@@ -83,3 +74,6 @@ mod tests {
         ));
     }
 }
+
+#[cfg(all(test, feature = "telemetry"))]
+mod recording_tests;

@@ -1,3 +1,4 @@
+mod borrowed_zero_cap_reclaim;
 mod cases_01;
 mod cases_02;
 mod cases_03;
@@ -6,6 +7,7 @@ mod cases_05;
 mod cases_06;
 mod cases_07;
 mod cases_08;
+mod live_class_authority;
 
 use super::*;
 use crate::api::broker::ProcessMemoryBroker;

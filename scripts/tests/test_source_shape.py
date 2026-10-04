@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -89,10 +90,27 @@ class SourceShapeContracts(unittest.TestCase):
             '/* #[path = "ignored.rs"] */\n'
             'const A: &str = "include!(\\\"ignored.rs\\\")";\n'
             'const B: &str = r#"#[path = \"ignored.rs\"]"#;\n'
+            'const C: &std::ffi::CStr = cr#"include!(\"ignored.rs\") #[path = \"ignored.rs\"]"#;\n'
             'mod normal;\n'
             '#[cfg(test)] mod tests;\n',
         )
         self.assertEqual(self.check()[0], [])
+
+    def test_raw_c_literal_cannot_mask_real_include_or_path_module(self) -> None:
+        hidden = self.root / "crates/quanta-memory-platform-core/src/api/hidden.inc"
+        hidden.write_text("// hidden code\n" * 1_002 + "pub fn hidden() {}\n", encoding="utf-8")
+        source = self.root / NEW
+        for declaration in ('include!("hidden.inc");', '#[path = "hidden.inc"] mod hidden;'):
+            with self.subTest(declaration=declaration):
+                source.write_text('const C: &std::ffi::CStr = cr#"masked"#;\n' + declaration + "\n")
+                compiled = subprocess.run(
+                    ["rustc", "--crate-type=lib", "--edition=2021", "--emit=metadata",
+                     "-o", str(self.root / "fixture.rmeta"), str(source)],
+                    capture_output=True, text=True, check=False,
+                )
+                self.assertEqual(compiled.returncode, 0, compiled.stderr)
+                errors, _ = self.check()
+                self.assertIn("bypasses", "\n".join(errors))
 
     def test_invalid_baseline_and_duplicate_keys_fail_closed(self) -> None:
         self.write_source(NEW, 1)

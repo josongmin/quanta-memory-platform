@@ -46,9 +46,9 @@ impl LiveProcessMemoryBroker {
     ///
     /// Deny rules, evaluated against LIVE usage (not just the new policy's keys):
     /// a new global hard limit below current usage; any class that currently
-    /// holds bytes whose new hard cap is below its usage OR that is dropped from
-    /// the new policy entirely (which would silently uncap it); any owner quota
-    /// in the new policy whose hard cap is below that owner's current usage; any
+    /// holds bytes whose new hard cap is below its usage, or any class with a
+    /// live ticket (including a zero-byte ticket) dropped from the new policy;
+    /// any owner quota in the new policy below live owner usage; any
     /// owner→resource-group remap/removal while that owner still holds live
     /// bytes OR any live ticket (a zero-byte ticket carries release authority
     /// without positive usage, so usage alone cannot authorize the remap).
@@ -87,7 +87,13 @@ impl LiveProcessMemoryBroker {
         // is O(live tickets) on the slow control path only; reserve/release hot
         // paths do not scan.
         let mut live_ticket_owners: BTreeMap<&OwnerKey, usize> = BTreeMap::new();
-        for attribution in core.ticket_attribution.values() {
+        for (ticket_id, attribution) in &core.ticket_attribution {
+            if !new_policy.classes.contains_key(&attribution.class) {
+                return Err(MemoryError::InvalidState(format!(
+                    "live reconfig denied: class {:?} still owns live ticket {ticket_id}",
+                    attribution.class
+                )));
+            }
             *live_ticket_owners.entry(&attribution.owner).or_insert(0) += 1;
         }
         let current_owner_groups = &core.ledger.policy().owner_groups;

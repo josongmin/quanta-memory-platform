@@ -1,4 +1,6 @@
 mod cases_01;
+#[cfg(feature = "fixtures")]
+mod spill_restore;
 
 use super::*;
 use crate::conformance::target::{AccountingView, AllocatorAdvisoryView};

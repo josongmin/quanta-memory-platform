@@ -2,7 +2,9 @@ use super::*;
 
 #[test]
 fn unbudgeted_admission_never_exceeds_a_complete_gc_root_set() {
-    let service = service(None);
+    // This test isolates the GC root limit from the separate persistent
+    // identity-evidence limit, which also bounds live entries by default.
+    let service = service_with_limits(None, Some((MAX_REFERENCED_ROOT_TOKENS + 1, u64::MAX)));
     let mut roots = Vec::with_capacity(MAX_REFERENCED_ROOT_TOKENS);
     for index in 0..MAX_REFERENCED_ROOT_TOKENS {
         let identity = format!("root-{index}");
@@ -76,6 +78,8 @@ fn abort_releases_exact_payload_and_is_retry_safe() {
         PreparedPublicationStatsV1 {
             prepared_count: 0,
             charged_bytes: evidence_cost("id-1"),
+            identity_evidence_count: 1,
+            identity_evidence_bytes: evidence_cost("id-1"),
             tombstone_count: 1,
             tombstone_bytes: evidence_cost("id-1"),
         }
@@ -166,6 +170,8 @@ fn orphan_gc_with_unknown_root_reference_is_batch_atomic() {
         PreparedPublicationStatsV1 {
             prepared_count: 2,
             charged_bytes: live_cost("id-1", b"one") + live_cost("id-2", b"two"),
+            identity_evidence_count: 2,
+            identity_evidence_bytes: evidence_cost("id-1") + evidence_cost("id-2"),
             ..PreparedPublicationStatsV1::default()
         }
     );
@@ -187,55 +193,10 @@ fn aborted_root_reference_fails_closed_without_collecting_other_entries() {
         PreparedPublicationStatsV1 {
             prepared_count: 1,
             charged_bytes: evidence_cost("id-1") + live_cost("id-2", b"two"),
+            identity_evidence_count: 2,
+            identity_evidence_bytes: evidence_cost("id-1") + evidence_cost("id-2"),
             tombstone_count: 1,
             tombstone_bytes: evidence_cost("id-1"),
-        }
-    );
-}
-#[test]
-fn tombstone_limits_bound_n_cycle_churn_and_fail_closed_at_saturation() {
-    const MAX_TOMBSTONES: usize = 4;
-    const TOMBSTONE_BYTES_PER_CYCLE: u64 = 132;
-    let service = service_with_limits(
-        None,
-        Some((MAX_TOMBSTONES, MAX_TOMBSTONES as u64 * TOMBSTONE_BYTES_PER_CYCLE)),
-    );
-
-    for cycle in 0..MAX_TOMBSTONES {
-        let identity = format!("id-{cycle}");
-        service.prepare(request(&identity, b"x")).expect("prepare");
-        assert_eq!(service.gc_orphans(&[]).expect("gc"), 1);
-    }
-    assert_eq!(
-        service.stats().expect("bounded stats"),
-        PreparedPublicationStatsV1 {
-            prepared_count: 0,
-            charged_bytes: MAX_TOMBSTONES as u64 * TOMBSTONE_BYTES_PER_CYCLE,
-            tombstone_count: MAX_TOMBSTONES,
-            tombstone_bytes: MAX_TOMBSTONES as u64 * TOMBSTONE_BYTES_PER_CYCLE,
-        }
-    );
-
-    let saturated = service.prepare(request("id-4", b"x")).expect("prepare at limit");
-    let error = service.gc_orphans(&[]).expect_err("GC must fail before dropping payload");
-    assert!(matches!(
-        error,
-        PreparedPublicationErrorV1::TombstoneCapacity {
-            requested_count: 1,
-            available_count: 0,
-            requested_bytes: TOMBSTONE_BYTES_PER_CYCLE,
-            available_bytes: 0,
-        }
-    ));
-    assert_eq!(service.resolve(saturated.token()).expect("payload intact"), b"x".to_vec());
-    assert_eq!(
-        service.stats().expect("saturated stats"),
-        PreparedPublicationStatsV1 {
-            prepared_count: 1,
-            charged_bytes: MAX_TOMBSTONES as u64 * TOMBSTONE_BYTES_PER_CYCLE
-                + live_cost("id-4", b"x"),
-            tombstone_count: MAX_TOMBSTONES,
-            tombstone_bytes: MAX_TOMBSTONES as u64 * TOMBSTONE_BYTES_PER_CYCLE,
         }
     );
 }

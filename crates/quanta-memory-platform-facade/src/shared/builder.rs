@@ -31,6 +31,8 @@ use std::marker::PhantomData;
 
 #[cfg(feature = "payload_store")]
 use crate::payload_store::service::SimplePayloadStore;
+#[cfg(feature = "payload_store")]
+use crate::payload_store::PayloadReference;
 #[cfg(feature = "publish_pipeline")]
 use crate::publish_pipeline::{
     prepared_publication::PreparedPublicationService, service::SimplePublishPipeline,
@@ -58,12 +60,7 @@ use crate::shared::accounting::Unbudgeted;
     feature = "transcript"
 ))]
 use crate::shared::accounting::{AccountingUnset, Budgeted};
-#[cfg(any(
-    feature = "payload_store",
-    feature = "retained_map",
-    feature = "revocable_store",
-    feature = "transcript"
-))]
+#[cfg(any(feature = "retained_map", feature = "revocable_store", feature = "transcript"))]
 use crate::shared::measure::ByteSized;
 #[cfg(feature = "transcript")]
 use crate::transcript_store::{service::SimpleSessionTranscriptStore, TranscriptRetentionPolicyV2};
@@ -306,10 +303,10 @@ impl<PayloadRef, Bytes> PayloadStoreBuilder<PayloadRef, Bytes, Budgeted> {
 
     pub fn build(self) -> MemoryResult<SimplePayloadStore<PayloadRef, Bytes, Budgeted>>
     where
-        PayloadRef: ByteSized,
+        PayloadRef: PayloadReference,
     {
         let binding = self.binding.ok_or_else(missing_binding)?;
-        Ok(SimplePayloadStore::new_budgeted(binding, self.context, self.accounting.into_broker()))
+        SimplePayloadStore::new_budgeted(binding, self.context, self.accounting.into_broker())
     }
 }
 
@@ -317,10 +314,10 @@ impl<PayloadRef, Bytes> PayloadStoreBuilder<PayloadRef, Bytes, Budgeted> {
 impl<PayloadRef, Bytes> PayloadStoreBuilder<PayloadRef, Bytes, Unbudgeted> {
     pub fn build(self) -> MemoryResult<SimplePayloadStore<PayloadRef, Bytes, Unbudgeted>>
     where
-        PayloadRef: ByteSized,
+        PayloadRef: PayloadReference,
     {
         let binding = self.binding.ok_or_else(missing_binding)?;
-        Ok(SimplePayloadStore::new_unbudgeted(binding, self.context))
+        SimplePayloadStore::new_unbudgeted(binding, self.context)
     }
 }
 
@@ -544,7 +541,7 @@ impl<Stage, Commit, Published> PublishPipelineBuilder<Stage, Commit, Published> 
 pub struct PreparedPublicationServiceBuilder<Payload, Mode> {
     binding: Option<StoreBindingHandle>,
     capacity_bytes: Option<u64>,
-    tombstone_limits: Option<(usize, u64)>,
+    identity_evidence_limits: Option<(usize, u64)>,
     accounting: Mode,
     _marker: PhantomData<fn() -> Payload>,
 }
@@ -555,7 +552,7 @@ impl<Payload> Default for PreparedPublicationServiceBuilder<Payload, AccountingU
         Self {
             binding: None,
             capacity_bytes: None,
-            tombstone_limits: None,
+            identity_evidence_limits: None,
             accounting: AccountingUnset::default(),
             _marker: PhantomData,
         }
@@ -573,7 +570,7 @@ impl<Payload> PreparedPublicationServiceBuilder<Payload, AccountingUnset> {
         PreparedPublicationServiceBuilder {
             binding: self.binding,
             capacity_bytes: self.capacity_bytes,
-            tombstone_limits: self.tombstone_limits,
+            identity_evidence_limits: self.identity_evidence_limits,
             accounting: Unbudgeted::new(),
             _marker: PhantomData,
         }
@@ -586,7 +583,7 @@ impl<Payload> PreparedPublicationServiceBuilder<Payload, Budgeted> {
         Self {
             binding: None,
             capacity_bytes: None,
-            tombstone_limits: None,
+            identity_evidence_limits: None,
             accounting: Budgeted::new(broker),
             _marker: PhantomData,
         }
@@ -597,7 +594,7 @@ impl<Payload> PreparedPublicationServiceBuilder<Payload, Budgeted> {
         Ok(PreparedPublicationService::new_budgeted(
             binding,
             self.capacity_bytes,
-            self.tombstone_limits,
+            self.identity_evidence_limits,
             self.accounting.into_broker(),
         ))
     }
@@ -610,7 +607,7 @@ impl<Payload> PreparedPublicationServiceBuilder<Payload, Unbudgeted> {
         Ok(PreparedPublicationService::new_unbudgeted(
             binding,
             self.capacity_bytes,
-            self.tombstone_limits,
+            self.identity_evidence_limits,
         ))
     }
 }
@@ -628,11 +625,13 @@ impl<Payload, Mode> PreparedPublicationServiceBuilder<Payload, Mode> {
         self
     }
 
-    /// Bound process-lifetime retry tombstones retained after abort or orphan
-    /// collection. Saturation fails the transition before any payload change.
+    /// Bound all process-lifetime identity evidence: live prepared entries and
+    /// aborted tombstones. Fresh prepare reserves its retirement evidence;
+    /// saturation rejects a new identity before charging or retaining payload.
+    /// Abort and orphan collection consume the already reserved space.
     #[must_use]
-    pub fn with_tombstone_limits(mut self, max_count: usize, max_bytes: u64) -> Self {
-        self.tombstone_limits = Some((max_count, max_bytes));
+    pub fn with_identity_evidence_limits(mut self, max_count: usize, max_bytes: u64) -> Self {
+        self.identity_evidence_limits = Some((max_count, max_bytes));
         self
     }
 }
@@ -777,7 +776,11 @@ mod tests {
         let published =
             store.put_canonical(RetainedEnvelope::new(b"x".to_vec())).expect("put via built store");
         assert_eq!(store.stats().expect("stats").item_count, 1);
-        assert_eq!(published.payload_ref(), &"payload-0".to_string());
+        let parts = published.payload_ref().split('-').collect::<Vec<_>>();
+        assert_eq!(parts.len(), 3);
+        assert_eq!(parts[0], "payload");
+        assert!(parts[1].parse::<u64>().is_ok(), "store nonce is numeric");
+        assert_eq!(parts[2], "0");
     }
 
     #[test]

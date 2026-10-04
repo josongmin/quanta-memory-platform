@@ -73,7 +73,9 @@ jobs:
           no_output_timeout: 20m
           command: |
             set -euo pipefail
+            test "$(git rev-parse HEAD)" = "$CIRCLE_SHA1"
             scripts/verify-extracted-examples.sh
+            test "$(git rev-parse HEAD)" = "$CIRCLE_SHA1"
 
   heavy-benchmarks:
     machine:

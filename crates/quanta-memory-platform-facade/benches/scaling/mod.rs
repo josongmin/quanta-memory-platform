@@ -1,6 +1,5 @@
 // This benchmark alone instruments GlobalAlloc. Product crates forbid unsafe
-// code; the workspace deny policy requires this explicit target-local exception.
-#![allow(unsafe_code)]
+// code; the workspace deny policy permits only the delegated GlobalAlloc item.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::collections::BTreeMap;
@@ -30,6 +29,7 @@ struct BenchAllocator;
 // SAFETY: every operation delegates to `System` with the exact layout supplied
 // by the caller. Accounting is allocation-free atomic bookkeeping and does not
 // alter the returned pointer or allocation lifetime.
+#[allow(unsafe_code, reason = "GlobalAlloc instrumentation delegates to System")]
 unsafe impl GlobalAlloc for BenchAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         // SAFETY: delegated with the caller-provided valid layout.
