@@ -26,7 +26,8 @@ impl SpillTarget<String> for EmptyInsteadOfOffline {
 #[test]
 fn offline_restore_conformance_rejects_empty_masking_and_accepts_preserved_inventory() {
     let retained = InMemorySpillTarget::available();
-    retained.accept("kept".to_string()).expect("seed retained handle");
+    let receipt = retained.accept("kept".to_string()).expect("seed retained handle");
+    assert_eq!(receipt, SpillReceipt::InProcess { inventory_after: 1 });
     retained.set_available(false);
     let honest = RoutedSpillController::new(retained);
     assert!(spill_offline_restore_verdict(&honest).held());
