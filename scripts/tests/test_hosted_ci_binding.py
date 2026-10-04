@@ -35,6 +35,13 @@ def trigger(rule: tuple[str, str, str]) -> dict:
 
 
 class HostedCiBindingTests(unittest.TestCase):
+    def test_checked_in_project_and_repository_binding(self) -> None:
+        self.assertEqual(MODULE.PROJECT_ID, "0869ae14-9b92-436d-9bba-8ac4b4cfafb5")
+        self.assertEqual(MODULE.PROJECT_SLUG, "circleci/Q3G2VbitoZmaQSKihvptcF/23Fh6MNDBV4PLARDMMvDJc")
+        self.assertEqual(MODULE.EXPECTED_REPO_ID, "1362792313")
+        self.assertEqual(MODULE.EXPECTED_REPO, "josongmin/quanta-memory-platform")
+        self.assertEqual(MODULE.EXPECTED_CONFIG, ".circleci/config.yml")
+
     def test_exact_main_and_pr_rules_and_auto_cancel(self) -> None:
         definition = {
             "id": "pipeline",

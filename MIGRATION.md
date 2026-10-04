@@ -9,6 +9,33 @@ unbudgeted or unbounded path.
 
 ## Post-0.2 authority and durable API changes
 
+### Prepared identity evidence limits (breaking)
+
+Replace `with_tombstone_limits(count, bytes)` with
+`with_identity_evidence_limits(count, bytes)`. The limit covers every admitted
+logical identity, both live prepared entries and aborted tombstones. Fresh
+prepare reserves its eventual retirement evidence before charging the payload;
+abort and orphan GC require no additional capacity admission. Default limits
+remain 4,096 identities and 4 MiB of semantic evidence. Evidence survives until
+store close; abort does not free an identity slot.
+
+Match `PreparedPublicationErrorV1::IdentityEvidenceCapacity` in place of
+`TombstoneCapacity`. `PreparedPublicationStatsV1` now exposes
+`identity_evidence_count` and `identity_evidence_bytes` alongside the existing
+live prepared and aborted-only counts. Update struct literals and exhaustive
+error matches in the same consumer change. Identity bytes, canonical payload
+key encoding and the deterministic 32-byte token remain unchanged.
+
+### Payload references are store-issued Strings (breaking for custom references)
+
+Production payload builders accept only `String` references. Custom
+`From<String>` implementations can collapse distinct references, so they can no
+longer implement the sealed `PayloadReference` contract. References include a
+store nonce and checked entry sequence; retain the returned String verbatim.
+They are process-local lookup identities, not durable IDs or authorization
+tokens. Pin, unpin and deletion of stale or foreign references fail without
+changing another entry. `pin_count` of a missing reference remains zero.
+
 ### Durable restore calls now take a claim (BREAKING for external implementers)
 
 `commit_restore`, `finalize_restore`, `abort_restore`, and
@@ -201,11 +228,15 @@ references keep their previous typed semantics under the cap.
   not public.
 - Treat `build_report_only()` as configuration data only. It cannot create a
   runtime view, scratch reservation, or budgeted store.
-- Change payload reference types to implement `Eq + Hash`. Collision-safe
-  canonical/reference digest buckets now retain two digest-index slots.
-- Rebaseline semantic retained cost. The 32-byte payload conformance fixture is
-  121 bytes in `RetainedCostV1`, not 89 bytes. This is a portable semantic-cost
-  model, not allocator RSS.
+- Use `String` payload references through the sealed store-issued codec.
+  Arbitrary `From<String>` reference types can no longer construct a payload
+  store: a non-injective conversion could alias an earlier deleted entry.
+  Refs include an issuing-store namespace and monotonic sequence; do not parse
+  their wire spelling or reuse them across processes. Collision-safe lookup
+  buckets still compare complete canonical/reference identity.
+- Rebaseline semantic retained cost using the actual issued reference length.
+  Payload namespace bytes are retained reference identity and are charged.
+  This is a portable semantic-cost model, not allocator RSS.
 - Replace `TranscriptRetentionPolicyV1` with bounded
   `TranscriptRetentionPolicyV2`. Saturation is a typed denial; no unbounded
   compatibility alias is provided.
@@ -243,3 +274,22 @@ references keep their previous typed semantics under the cap.
 Direct SDK use does not require a particular host integration. When a host
 is adopted, qualify its actual dependency resolution and product path according
 to [ADR 0004](docs/adr/0004-host-adoption-boundary.md).
+
+## Audit behavior repairs
+
+- Optional class removal now rejects any live ticket in that class, including
+  zero-byte pending and committed tickets. Release the authorities before
+  removing the class; legal cap changes remain available.
+- A borrowing class with a zero hard cap remains a reclaim victim when it has
+  positive resident usage. Recovery observes actual ticket release.
+- Standalone scheduler Headroom release rejects a delta greater than its
+  recorded Headroom usage before changing any counters.
+- Prepared publication reserves count and metadata capacity for its eventual
+  tombstone at fresh prepare. Defaults still bound 4,096 identities / 4 MiB,
+  now including live prepared identities. Increase explicit limits if your
+  previous live workload exceeded these defaults. Existing replay/conflict
+  checks remain available at capacity; abort/GC no longer strand an entry
+  merely because other admitted identities consume retirement capacity.
+- The generic SpillTarget default restore rejects unavailable targets with
+  Capacity; available discard targets still return None. Retaining targets
+  must implement their own read availability and FIFO restoration.

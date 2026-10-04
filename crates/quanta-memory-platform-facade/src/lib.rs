@@ -97,7 +97,7 @@ pub use shared::measure::{
 };
 
 #[cfg(feature = "payload_store")]
-pub use payload_store::{PayloadStore, PayloadStoreBuilder, SimplePayloadStore};
+pub use payload_store::{PayloadReference, PayloadStore, PayloadStoreBuilder, SimplePayloadStore};
 #[cfg(feature = "publish_pipeline")]
 pub use publish_pipeline::{
     AbortDispositionV1, CommitTransition, DefaultCommitTransition, PrepareDispositionV1,

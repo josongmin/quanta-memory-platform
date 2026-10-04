@@ -300,11 +300,12 @@ check helpers that the control plane enforces (see group C/D).
 ## F. Facade stores — ✅ (`facade/src/*`)
 
 - ✅ **Reference identity and real seed construction** —
-  `non_injective_public_reference_conversion_is_rejected_before_charge` and
+  `non_injective_test_reference_conversion_is_rejected_before_charge` and
   `canonical_digests_are_randomized_per_store_seed`
-  (`facade/src/payload_store/service.rs`) reject a generated reference alias
-  without losing the first payload or changing charge, and check actual
-  store seed independence. A hash bucket is not an equality authority.
+  (`facade/src/payload_store/service.rs`) reject an internal hostile test
+  reference alias without losing the first payload or changing charge, and
+  check actual store seed independence. Production codec sealing is checked
+  by the PayloadReference compile-fail contract. A hash bucket is not an equality authority.
 - ✅ **Compound caller panic and partial-copy retirement** —
   `compound_hostile_remove_panic_cannot_abort_process`,
   `compound_hostile_insert_panic_cannot_abort_process`, and
@@ -690,7 +691,7 @@ The retaining prepared-publication service is separately charged.
 ## L. Telemetry adapters — ✅ (`core/src/adapters/*`, `core/src/ports/telemetry.rs`)
 
 - ✅ advisory correctness — `compare_reports_signed_drift_and_mismatch_boundary`, `compare_semantic_bytes_is_ssot_not_allocator`, `missing_allocator_data_is_not_treated_as_mismatch`.
-- ✅ observation-only invariant — `allocator_telemetry_trait_surface_is_observation_only`, `trait_path_absent_allocator_data_never_contradicts_ssot`, `emitter_holds_no_accounting_state`.
+- ✅ observation-only invariant — `allocator_telemetry_trait_surface_is_observation_only`, `trait_path_absent_allocator_data_never_contradicts_ssot`, `emitter_records_exact_counter_labels_and_optional_byte_samples`.
 - ✅ hdrhistogram adapter — `records_deterministic_set_and_reads_back_count_and_percentiles`, `invalid_bounds_return_error_not_panic`, `out_of_range_record_is_rejected_and_does_not_mutate_count`.
 
 ## M. Experimental unbudgeted pin registry — ✅ (`core/src/{ports,adapters}/pin.rs`)
@@ -754,3 +755,19 @@ scripts/check-workspace.sh
 # inspect the evidence test names per file:
 rg -n '^\s*fn [a-z0-9_]+\(' crates --glob '*.rs'
 ```
+
+
+## Audit remediation owner regressions
+
+These selectors prove repaired boundaries on the current source; hosted runner
+and host adoption evidence remains separate.
+
+- Live optional class authority: `pending_zero_byte_optional_class_blocks_removal_until_commit_and_drop`, `committed_zero_byte_optional_class_blocks_removal_until_explicit_release`, `zero_byte_class_ticket_allows_cap_change_while_class_remains_configured`.
+- Actual borrowed victim recovery: `positive_borrow_from_zero_hard_cap_is_a_victim_for_other_class_reclaim`.
+- Scheduler axis rejection and valid release: `headroom_release_rejects_wrong_axis_without_reopening_admission`, `headroom_release_accepts_only_the_recorded_headroom_axis`.
+- Prepared retirement admission: `count_limit_rejects_fresh_identity_before_stranding_live_payload`, `byte_limit_counts_live_and_aborted_identity_evidence_independently`, `full_live_reservation_allows_atomic_mixed_batch_gc`.
+- Recorded observations: `emitter_records_exact_counter_labels_and_optional_byte_samples`, `callback_and_direct_byte_totals_saturate_identically`.
+- Default spill read disposition: `default_restore_distinguishes_offline_from_available_empty_target`.
+
+- Payload reference scope and reuse: `public_budgeted_stores_issue_distinct_refs_and_reject_foreign_mutations`, `deleted_public_reference_never_addresses_later_payload`, `store_identity_counter_exhaustion_is_fail_closed`, `payload_sequence_exhaustion_preserves_store_and_ledger`. Public custom reference rejection is also a compile-fail doctest on PayloadReference.
+- Budgeted retirement denial: `full_identity_reservation_denies_before_broker_charge_and_still_aborts`.

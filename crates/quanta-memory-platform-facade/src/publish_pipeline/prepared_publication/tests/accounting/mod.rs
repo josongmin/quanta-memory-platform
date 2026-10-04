@@ -6,6 +6,8 @@ use quanta_memory_platform_core::{
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{OnceLock, Weak};
 
+mod tombstone_reservation;
+
 #[derive(Clone, Debug)]
 struct PanicOnDropPayload {
     bytes: Vec<u8>,
@@ -673,6 +675,8 @@ fn failed_orphan_gc_preserves_every_payload_index_and_charge() {
         PreparedPublicationStatsV1 {
             prepared_count: 2,
             charged_bytes: live_cost("id-1", b"one") + live_cost("id-2", b"two"),
+            identity_evidence_count: 2,
+            identity_evidence_bytes: evidence_cost("id-1") + evidence_cost("id-2"),
             ..PreparedPublicationStatsV1::default()
         }
     );

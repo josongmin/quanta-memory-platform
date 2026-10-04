@@ -1,5 +1,7 @@
 // ruleid: qmp-pure-layer-no-adapter-import
 use crate::adapters::Allocator;
+// ruleid: qmp-pure-layer-no-adapter-import
+fn concrete_value() { let _ = crate::adapters::Allocator; }
 fn forbidden() {
     // ruleid: qmp-pure-layer-no-fs-env
     let _ = std::env::var("QMP");

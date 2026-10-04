@@ -4,11 +4,150 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import re
 import subprocess
 import sys
 from pathlib import Path
+
+
+SHAPE_SPEC = importlib.util.spec_from_file_location(
+    "qmp_source_shape", Path(__file__).with_name("verify-source-shape.py")
+)
+if SHAPE_SPEC is None or SHAPE_SPEC.loader is None:
+    raise RuntimeError("Rust source masker is unavailable")
+SHAPE = importlib.util.module_from_spec(SHAPE_SPEC)
+SHAPE_SPEC.loader.exec_module(SHAPE)
+
+UNSAFE_EXCEPTION = re.compile(r"#\s*!?\s*\[[^\]]*\b(?:allow|expect)\s*\([^)]*\bunsafe_code\b")
+BENCH_EXCEPTION = re.compile(
+    r'#\s*\[\s*allow\s*\(\s*unsafe_code\s*,\s*reason\s*=\s*"[^"\n]+"\s*\)\s*\]'
+)
+BENCH_IMPL = re.compile(r"\s*unsafe\s+impl\s+GlobalAlloc\s+for\s+BenchAllocator\s*\{")
+ADAPTER_NAME = r"(?:r#)?adapters\b"
+BARE_ADAPTER_PATH = re.compile(r"\b(?:r#)?adapters\s*::")
+BARE_ADAPTER_IMPORT = re.compile(r"\buse\s+(?:r#)?adapters\b")
+IDENT = r"(?:r#)?[A-Za-z_]\w*"
+ROOT_ALIAS = re.compile(rf"\buse\s+({IDENT})\s+as\s+({IDENT})\s*;")
+EXTERN_ROOT_ALIAS = re.compile(rf"\bextern\s+crate\s+self\s+as\s+({IDENT})\s*;")
+USE_TREE = re.compile(rf"\buse\s+({IDENT})\s*::\s*(\*|\{{)")
+ANON_USE = re.compile(r"\buse\s*\{")
+USE_TREE_ITEM = re.compile(rf"({IDENT})\s*::\s*(\*|\{{)")
+SIMPLE_ALIAS_ITEM = re.compile(rf"({IDENT})\s+as\s+({IDENT})\s*")
+GROUP_SELF_ALIAS = re.compile(rf"self\s+as\s+({IDENT})\s*")
+
+
+def _top_level_use_items(code: str, opening: int) -> list[str]:
+    """Split one Rust use group without treating nested groups as root items."""
+    items: list[str] = []
+    depth = 1
+    start = opening + 1
+    for cursor in range(start, len(code)):
+        if code[cursor] == "{":
+            depth += 1
+        elif code[cursor] == "}":
+            depth -= 1
+            if depth == 0:
+                items.append(code[start:cursor].strip())
+                flattened: list[str] = []
+                for item in items:
+                    # Anonymous braces preserve the same import root. A named
+                    # subtree (foo::{...}) has a different root and stays local.
+                    if item.startswith("{") and item.endswith("}"):
+                        flattened.extend(_top_level_use_items(item, 0))
+                    else:
+                        flattened.append(item)
+                return flattened
+        elif code[cursor] == "," and depth == 1:
+            items.append(code[start:cursor].strip())
+            start = cursor + 1
+    return []
+
+
+def unsafe_exception_errors(source: str, relative: Path, allowed_exception: Path) -> list[str]:
+    code = SHAPE._code_only(source)
+    exceptions = list(UNSAFE_EXCEPTION.finditer(code))
+    if not exceptions:
+        return []
+    if relative != allowed_exception or len(exceptions) != 1:
+        return [f"unauthorized unsafe-code exception: {relative}"]
+    match = BENCH_EXCEPTION.match(source, exceptions[0].start())
+    if match is None or not BENCH_IMPL.match(code, match.end()):
+        return [f"unauthorized unsafe-code exception: {relative}"]
+    return []
+
+
+def pure_layer_adapter_errors(source: str, relative: Path) -> list[str]:
+    """Guard direct and locally aliased adapter paths after masking comments/literals.
+
+    Rust name resolution remains the compiler's authority; this lexical guard
+    rejects source-level layer edges without interpreting arbitrary macros.
+    """
+    code = SHAPE._code_only(source)
+    aliases = {"crate", "self", "super"}
+    crate_roots = {"crate"}
+    crate_roots.update(EXTERN_ROOT_ALIAS.findall(code))
+    aliases.update(crate_roots)
+    simple_aliases = ROOT_ALIAS.findall(code)
+    use_trees = [
+        (match.group(1), ["*"] if match.group(2) == "*" else _top_level_use_items(code, match.end() - 1))
+        for match in USE_TREE.finditer(code)
+    ]
+    anonymous_items = [
+        item
+        for match in ANON_USE.finditer(code)
+        for item in _top_level_use_items(code, match.end() - 1)
+    ]
+    for item in anonymous_items:
+        alias = SIMPLE_ALIAS_ITEM.fullmatch(item)
+        if alias:
+            simple_aliases.append((alias.group(1), alias.group(2)))
+        tree = USE_TREE_ITEM.match(item)
+        if tree:
+            use_trees.append((
+                tree.group(1), ["*"] if tree.group(2) == "*"
+                else _top_level_use_items(item, tree.end() - 1),
+            ))
+    while True:
+        extended = aliases.copy()
+        extended_roots = crate_roots.copy()
+        for origin, target in simple_aliases:
+            if origin in aliases:
+                extended.add(target)
+            if origin in crate_roots:
+                extended_roots.add(target)
+        for origin, items in use_trees:
+            if origin not in aliases:
+                continue
+            for item in items:
+                match = GROUP_SELF_ALIAS.fullmatch(item)
+                if match:
+                    extended.add(match.group(1))
+                    if origin in crate_roots:
+                        extended_roots.add(match.group(1))
+        if extended == aliases and extended_roots == crate_roots:
+            break
+        aliases = extended
+        crate_roots = extended_roots
+    qualified = re.compile(
+        r"\b(?:" + "|".join(re.escape(alias) for alias in sorted(aliases))
+        + r")\s*::\s*" + ADAPTER_NAME
+    )
+    root_glob = any(origin in crate_roots and "*" in items for origin, items in use_trees)
+    grouped_adapter = any(
+        origin in aliases and any(re.match(ADAPTER_NAME, item) for item in items)
+        for origin, items in use_trees
+    )
+    anonymous_adapter = any(re.match(ADAPTER_NAME, item) for item in anonymous_items)
+    bare_adapter_path = any(
+        not code[:match.start()].rstrip().endswith("::")
+        for match in BARE_ADAPTER_PATH.finditer(code)
+    )
+    if (qualified.search(code) or grouped_adapter or anonymous_adapter or root_glob
+            or bare_adapter_path or BARE_ADAPTER_IMPORT.search(code)):
+        return [f"pure layer depends on adapters: {relative}"]
+    return []
 
 try:
     import tomllib  # type: ignore[import-not-found]
@@ -81,13 +220,14 @@ def lint_policy_errors(root: Path, metadata: dict | None = None) -> list[str]:
             errors.append(f"library root does not forbid unsafe code: {member}")
         # Include cfg_attr(...) wrappers and lint lists. A crate-level
         # unsafe_code=deny can otherwise be lowered by an attribute in tests.
-        exception = re.compile(
-            r"#\s*!?\s*\[[^\]]*\b(?:allow|expect)\s*\([^)]*\bunsafe_code\b"
-        )
-        allowed_exception = root / "crates/quanta-memory-platform-facade/benches/scaling/mod.rs"
+        allowed_exception = Path("crates/quanta-memory-platform-facade/benches/scaling/mod.rs")
         for source in (root / member).rglob("*.rs"):
-            if source != allowed_exception and exception.search(source.read_text()):
-                errors.append(f"unauthorized unsafe-code exception: {source.relative_to(root)}")
+            relative = source.relative_to(root)
+            text = source.read_text(encoding="utf-8")
+            errors.extend(unsafe_exception_errors(text, relative, allowed_exception))
+            if (relative.parts[:4] == ("crates", "quanta-memory-platform-core", "src", "domain")
+                    or relative.parts[:4] == ("crates", "quanta-memory-platform-core", "src", "ports")):
+                errors.extend(pure_layer_adapter_errors(text, relative))
     return errors
 
 

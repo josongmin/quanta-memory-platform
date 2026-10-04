@@ -29,6 +29,8 @@ NON_TEST_IDENTIFIERS = {
     "allocator_observation_is_inert",
     "grow_to_observed",
     "hard_cap_bytes",
+    "identity_evidence_bytes",
+    "identity_evidence_count",
     "payload_dedup_refund",
     "pin_safe_delete",
     "release_managed_many",

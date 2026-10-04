@@ -374,11 +374,15 @@ impl LiveProcessMemoryBroker {
             .policy()
             .classes
             .iter()
-            // A zero-byte charge can occupy a live ticket even in a class
-            // with a zero byte cap. At the ticket-count ceiling the host may
-            // need to evict that authority, so do not hide such classes from
-            // the one bounded reclaim attempt.
-            .filter(|(_, budget)| budget.hard_cap_bytes > 0 || ticket_count_full)
+            // A class with a zero hard cap may still hold positive borrowed
+            // bytes from the shared pool. Include that live victim even when
+            // a different class requests the capacity. At the ticket-count
+            // ceiling, zero-byte authorities may also need eviction.
+            .filter(|(candidate, budget)| {
+                budget.hard_cap_bytes > 0
+                    || snapshot.class_usage.get(candidate).is_some_and(|usage| usage.total() > 0)
+                    || ticket_count_full
+            })
             .map(|(candidate, budget)| ReclaimCandidate {
                 class: candidate.clone(),
                 priority: budget.reclaim_priority,

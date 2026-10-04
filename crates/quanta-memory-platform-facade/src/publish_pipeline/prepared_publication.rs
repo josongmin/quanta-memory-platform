@@ -17,8 +17,8 @@ use crate::shared::lifecycle::{
 use crate::shared::measure::{semantic_cost_v1, ByteSized, CanonicalKey, RetainedCostV1};
 
 const TOKEN_DOMAIN: &[u8] = b"qmp.prepared-publication.v1\0";
-const DEFAULT_TOMBSTONE_COUNT_CAPACITY: usize = 4_096;
-const DEFAULT_TOMBSTONE_BYTES_CAPACITY: u64 = 4 * 1024 * 1024;
+const DEFAULT_IDENTITY_EVIDENCE_COUNT_CAPACITY: usize = 4_096;
+const DEFAULT_IDENTITY_EVIDENCE_BYTES_CAPACITY: u64 = 4 * 1024 * 1024;
 /// Upper bound on the raw caller-supplied reference-root slice accepted by
 /// orphan enumeration and GC. Duplicates count toward the raw length. This is
 /// a conservative management bound aligned with the broker's live-ticket cap,
@@ -141,6 +141,9 @@ impl PreparedPublicationReceiptV1 {
 pub struct PreparedPublicationStatsV1 {
     pub prepared_count: usize,
     pub charged_bytes: u64,
+    /// Both live prepared identities and aborted identity evidence.
+    pub identity_evidence_count: usize,
+    pub identity_evidence_bytes: u64,
     pub tombstone_count: usize,
     pub tombstone_bytes: u64,
 }
@@ -154,7 +157,7 @@ pub enum PreparedPublicationErrorV1 {
         requested_bytes: u64,
         available_bytes: u64,
     },
-    TombstoneCapacity {
+    IdentityEvidenceCapacity {
         requested_count: usize,
         available_count: usize,
         requested_bytes: u64,
@@ -184,14 +187,14 @@ impl Display for PreparedPublicationErrorV1 {
                 f,
                 "prepared publication capacity exceeded: requested {requested_bytes}, available {available_bytes}"
             ),
-            Self::TombstoneCapacity {
+            Self::IdentityEvidenceCapacity {
                 requested_count,
                 available_count,
                 requested_bytes,
                 available_bytes,
             } => write!(
                 f,
-                "prepared publication tombstone capacity exceeded: requested {requested_count} entries/{requested_bytes} bytes, available {available_count} entries/{available_bytes} bytes"
+                "prepared publication identity evidence capacity exceeded: requested {requested_count} entries/{requested_bytes} bytes, available {available_count} entries/{available_bytes} bytes"
             ),
             Self::IdentityConflict { identity } => {
                 write!(f, "prepared publication identity conflict: {identity:?}")
@@ -250,6 +253,9 @@ struct PreparedState<Payload> {
     aborted_tokens: BTreeSet<PreparedPublicationTokenV1>,
     charged_bytes: u64,
     tombstone_bytes: u64,
+    /// Persistent identity evidence reserved for both live and aborted entries.
+    /// This is a capacity reservation, not a second accounting charge.
+    persistent_bytes: u64,
 }
 
 impl<Payload> PreparedState<Payload> {
@@ -260,6 +266,7 @@ impl<Payload> PreparedState<Payload> {
             aborted_tokens: BTreeSet::new(),
             charged_bytes: 0,
             tombstone_bytes: 0,
+            persistent_bytes: 0,
         }
     }
 }
@@ -324,8 +331,8 @@ fn active_cost(
 pub struct PreparedPublicationService<Payload, Mode> {
     binding: StoreBindingHandle,
     capacity_bytes: Option<u64>,
-    tombstone_count_capacity: usize,
-    tombstone_bytes_capacity: u64,
+    identity_evidence_count_capacity: usize,
+    identity_evidence_bytes_capacity: u64,
     accounting: StoreAccounting,
     lifecycle: StoreLifecycle,
     state: Mutex<PreparedState<Payload>>,
@@ -336,13 +343,13 @@ impl<Payload> PreparedPublicationService<Payload, Budgeted> {
     pub(crate) fn new_budgeted(
         binding: StoreBindingHandle,
         capacity_bytes: Option<u64>,
-        tombstone_limits: Option<(usize, u64)>,
+        identity_evidence_limits: Option<(usize, u64)>,
         broker: LiveProcessMemoryBroker,
     ) -> Self {
         Self::with_accounting(
             binding,
             capacity_bytes,
-            tombstone_limits,
+            identity_evidence_limits,
             StoreAccounting::Budgeted(broker),
         )
     }
@@ -353,12 +360,12 @@ impl<Payload> PreparedPublicationService<Payload, Unbudgeted> {
     pub(crate) fn new_unbudgeted(
         binding: StoreBindingHandle,
         capacity_bytes: Option<u64>,
-        tombstone_limits: Option<(usize, u64)>,
+        identity_evidence_limits: Option<(usize, u64)>,
     ) -> Self {
         Self::with_accounting(
             binding,
             capacity_bytes,
-            tombstone_limits,
+            identity_evidence_limits,
             StoreAccounting::Unbudgeted,
         )
     }
@@ -368,16 +375,19 @@ impl<Payload, Mode> PreparedPublicationService<Payload, Mode> {
     fn with_accounting(
         binding: StoreBindingHandle,
         capacity_bytes: Option<u64>,
-        tombstone_limits: Option<(usize, u64)>,
+        identity_evidence_limits: Option<(usize, u64)>,
         accounting: StoreAccounting,
     ) -> Self {
-        let (tombstone_count_capacity, tombstone_bytes_capacity) = tombstone_limits
-            .unwrap_or((DEFAULT_TOMBSTONE_COUNT_CAPACITY, DEFAULT_TOMBSTONE_BYTES_CAPACITY));
+        let (identity_evidence_count_capacity, identity_evidence_bytes_capacity) =
+            identity_evidence_limits.unwrap_or((
+                DEFAULT_IDENTITY_EVIDENCE_COUNT_CAPACITY,
+                DEFAULT_IDENTITY_EVIDENCE_BYTES_CAPACITY,
+            ));
         Self {
             binding,
             capacity_bytes,
-            tombstone_count_capacity,
-            tombstone_bytes_capacity,
+            identity_evidence_count_capacity,
+            identity_evidence_bytes_capacity,
             accounting,
             lifecycle: StoreLifecycle::new("prepared publication service"),
             state: Mutex::new(PreparedState::empty()),
@@ -535,6 +545,7 @@ impl<Payload, Mode> Drop for PreparedPublicationService<Payload, Mode> {
         let evidence = std::mem::take(&mut state.identity_index);
         state.charged_bytes = 0;
         state.tombstone_bytes = 0;
+        state.persistent_bytes = 0;
         drop(evidence);
         retire_entries(entries);
     }
@@ -544,155 +555,6 @@ impl<Payload, Mode> PreparedPublicationService<Payload, Mode>
 where
     Payload: Clone + ByteSized + CanonicalKey,
 {
-    pub fn prepare(
-        &self,
-        request: PreparedPublicationRequestV1<Payload>,
-    ) -> Result<PreparedPublicationReceiptV1, PreparedPublicationErrorV1> {
-        let _permit =
-            self.lifecycle.begin_mutation().map_err(PreparedPublicationErrorV1::Storage)?;
-        // Caller-trait code (CanonicalKey/ByteSized) runs while the owned
-        // payload is guarded, so a trait panic can never unwind through a
-        // caller destructor (compound-hostile containment).
-        let mut payload_in_flight = InFlight::new(request.payload);
-        let payload_key = payload_in_flight.get().canonical_key();
-        let token = derive_token(&request.identity, &payload_key)?;
-        let state = self.lock_state()?;
-
-        if let Some(identity_evidence) = state.identity_index.get(&request.identity) {
-            return match &identity_evidence.state {
-                IdentityState::Prepared(existing_token) => {
-                    let existing = state.entries.get(existing_token).ok_or_else(|| {
-                        PreparedPublicationErrorV1::Storage(MemoryError::InvalidState(
-                            "prepared identity index points to a missing token".to_string(),
-                        ))
-                    })?;
-                    if existing.canonical_key == payload_key {
-                        Ok(PreparedPublicationReceiptV1::new(
-                            existing_token.clone(),
-                            PrepareDispositionV1::Replayed,
-                        ))
-                    } else {
-                        Err(PreparedPublicationErrorV1::IdentityConflict {
-                            identity: request.identity,
-                        })
-                    }
-                }
-                IdentityState::Aborted(existing_token) if existing_token == &token => {
-                    Err(PreparedPublicationErrorV1::AbortedToken { token })
-                }
-                IdentityState::Aborted(_) => {
-                    Err(PreparedPublicationErrorV1::IdentityConflict { identity: request.identity })
-                }
-            };
-        }
-
-        if state.entries.contains_key(&token) || state.aborted_tokens.contains(&token) {
-            return Err(PreparedPublicationErrorV1::TokenCollision { token });
-        }
-
-        // Every live prepared entry can be a GC root. Never admit a state
-        // whose complete root set cannot be supplied to the bounded GC API,
-        // including when unbudgeted accounting has no byte ceiling.
-        if state.entries.len() >= MAX_REFERENCED_ROOT_TOKENS {
-            return Err(PreparedPublicationErrorV1::Storage(MemoryError::capacity(format!(
-                "prepared publication live entry count reached the GC root limit of {MAX_REFERENCED_ROOT_TOKENS}"
-            ))));
-        }
-
-        let persistent_bytes = persistent_cost(request.identity.as_bytes().len())?;
-        // Only fresh tokens need measurement. Catch a client panic, release
-        // the state guard, then resume unwinding so the intact state is not
-        // poisoned; the in-flight guard retires the payload before that
-        // resumed unwind drops it, so a compound hostile payload cannot
-        // abort the process.
-        let payload_bytes = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            payload_in_flight.get().byte_size()
-        })) {
-            Ok(bytes) => bytes,
-            Err(payload) => {
-                drop(state);
-                std::panic::resume_unwind(payload);
-            }
-        };
-        let active_bytes =
-            active_cost(payload_bytes, request.identity.as_bytes().len(), payload_key.len())?;
-        let requested_bytes = persistent_bytes.checked_add(active_bytes).ok_or_else(|| {
-            PreparedPublicationErrorV1::Accounting(MemoryError::capacity(
-                "prepared publication combined retained cost overflow",
-            ))
-        })?;
-        let next_total = state
-            .charged_bytes
-            .checked_add(requested_bytes)
-            .ok_or(PreparedPublicationErrorV1::Capacity { requested_bytes, available_bytes: 0 })?;
-        if let Some(capacity_bytes) = self.capacity_bytes {
-            if next_total > capacity_bytes {
-                return Err(PreparedPublicationErrorV1::Capacity {
-                    requested_bytes,
-                    available_bytes: capacity_bytes.saturating_sub(state.charged_bytes),
-                });
-            }
-        }
-
-        drop(state);
-        // The persistent lease is the identity/index/tombstone lifetime
-        // component: a semantic metadata bucket that survives abort as the
-        // tombstone. Only the active lease covers the payload component.
-        let persistent_charge = self
-            .accounting
-            .charge(
-                self.binding.class.clone(),
-                self.binding.owner.clone(),
-                MemoryContextKind::Request,
-                ChargeKind::RetainedMetadata,
-                persistent_bytes,
-            )
-            .map_err(PreparedPublicationErrorV1::Accounting)?;
-        let active_charge = match self.accounting.charge(
-            self.binding.class.clone(),
-            self.binding.owner.clone(),
-            MemoryContextKind::Request,
-            ChargeKind::RetainedPayload,
-            active_bytes,
-        ) {
-            Ok(charge) => charge,
-            Err(error) => {
-                drop(persistent_charge);
-                return Err(PreparedPublicationErrorV1::Accounting(error));
-            }
-        };
-
-        let mut state = match self.lock_state() {
-            Ok(state) => state,
-            Err(error) => {
-                drop(active_charge);
-                drop(persistent_charge);
-                return Err(error);
-            }
-        };
-        let identity = request.identity;
-        state.entries.insert(
-            token.clone(),
-            PreparedEntry {
-                identity: identity.clone(),
-                canonical_key: payload_key,
-                payload: payload_in_flight.take(),
-                active_bytes,
-                active_charge,
-            },
-        );
-        state.identity_index.insert(
-            identity,
-            IdentityEvidence {
-                state: IdentityState::Prepared(token.clone()),
-                retained_bytes: persistent_bytes,
-                charge: persistent_charge,
-            },
-        );
-        state.charged_bytes = next_total;
-        Ok(PreparedPublicationReceiptV1::new(token, PrepareDispositionV1::Applied))
-    }
-
     pub fn resolve(
         &self,
         token: &PreparedPublicationTokenV1,
@@ -745,7 +607,7 @@ where
                 evidence.retained_bytes,
                 "abort identity evidence",
             )?;
-            let tombstone_bytes = self.ensure_tombstone_capacity(&state, [entry])?;
+            let tombstone_bytes = self.reserved_retirement_bytes(&state, [entry])?;
             let next_total =
                 state.charged_bytes.checked_sub(entry.active_bytes).ok_or_else(|| {
                     PreparedPublicationErrorV1::Storage(MemoryError::InvalidState(
@@ -850,7 +712,7 @@ where
                 )?;
             }
             let tombstone_bytes =
-                self.ensure_tombstone_capacity(&state, tombstone_entries.iter().copied())?;
+                self.reserved_retirement_bytes(&state, tombstone_entries.iter().copied())?;
             let reclaimed_bytes = tombstone_entries.iter().try_fold(0u64, |total, entry| {
                 total.checked_add(entry.active_bytes).ok_or_else(|| {
                     PreparedPublicationErrorV1::Storage(MemoryError::InvalidState(
@@ -921,12 +783,16 @@ where
         self.with_read(|state| PreparedPublicationStatsV1 {
             prepared_count: state.entries.len(),
             charged_bytes: state.charged_bytes,
+            identity_evidence_count: state.identity_index.len(),
+            identity_evidence_bytes: state.persistent_bytes,
             tombstone_count: state.aborted_tokens.len(),
             tombstone_bytes: state.tombstone_bytes,
         })
     }
 
-    fn ensure_tombstone_capacity<'a>(
+    /// Retirement consumes space reserved by fresh prepare. Check local
+    /// accounting consistency without making another capacity decision.
+    fn reserved_retirement_bytes<'a>(
         &self,
         state: &PreparedState<Payload>,
         entries: impl IntoIterator<Item = &'a PreparedEntry<Payload>>,
@@ -955,16 +821,24 @@ where
                 })?;
         }
 
-        let available_count =
-            self.tombstone_count_capacity.saturating_sub(state.aborted_tokens.len());
-        let available_bytes = self.tombstone_bytes_capacity.saturating_sub(state.tombstone_bytes);
-        if requested_count > available_count || requested_bytes > available_bytes {
-            return Err(PreparedPublicationErrorV1::TombstoneCapacity {
-                requested_count,
-                available_count,
-                requested_bytes,
-                available_bytes,
-            });
+        let next_aborted_count =
+            state.aborted_tokens.len().checked_add(requested_count).ok_or_else(|| {
+                PreparedPublicationErrorV1::Storage(MemoryError::InvalidState(
+                    "prepared publication aborted-count overflow".to_string(),
+                ))
+            })?;
+        let next_tombstone_bytes =
+            state.tombstone_bytes.checked_add(requested_bytes).ok_or_else(|| {
+                PreparedPublicationErrorV1::Storage(MemoryError::InvalidState(
+                    "prepared publication tombstone-byte overflow".to_string(),
+                ))
+            })?;
+        if next_aborted_count > state.identity_index.len()
+            || next_tombstone_bytes > state.persistent_bytes
+        {
+            return Err(PreparedPublicationErrorV1::Storage(MemoryError::InvalidState(
+                "prepared publication retirement exceeds admitted identity evidence".to_string(),
+            )));
         }
         Ok(requested_bytes)
     }
@@ -978,6 +852,7 @@ where
 /// hold the state lock. The fixed-size tokens are then cloned and
 /// deduplicated into the set the state validation consumes.
 mod helpers;
+mod prepare;
 use helpers::{classify_orphan_tokens, derive_token, normalize_referenced_tokens};
 
 #[cfg(test)]
