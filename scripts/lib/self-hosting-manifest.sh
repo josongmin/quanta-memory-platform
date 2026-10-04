@@ -52,6 +52,8 @@ SELF_HOSTING_REQUIRED_PATHS=(
   "crates/quanta-memory-platform-facade/Cargo.toml"
   "crates/quanta-memory-platform-testkit/Cargo.toml"
   "crates/quanta-memory-platform-facade/examples/hello_world.rs"
+  "crates/quanta-memory-platform-facade/examples/effective_budget_report.rs"
+  "crates/quanta-memory-platform-facade/examples/transcript_session.rs"
   "scripts/check-workspace.sh"
   "scripts/extract-to-standalone-repo.sh"
   "scripts/verify-extracted-examples.sh"

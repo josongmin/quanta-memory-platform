@@ -70,14 +70,33 @@ class CargoTestOutputTest(unittest.TestCase):
             )
             fake_python.chmod(0o755)
             capture = temporary / "calls.txt"
+            fake_cargo = temporary / "cargo"
+            fake_cargo.write_text(
+                '#!/bin/sh\n'
+                'printf "%s\\n" "$*" >> "$QMP_TEST_CARGO_CAPTURE"\n'
+                'case "$*" in\n'
+                '  *"--features spill-durable"*) exit 0 ;;\n'
+                '  *"--features full --edges normal"*) exit 0 ;;\n'
+                '  *"--features spill"*|*"--features full"*)\n'
+                '    echo "error[E0432]: unresolved import qmp::DurableRecordId" >&2\n'
+                '    echo " --> src/main.rs:1:11" >&2\n'
+                '    exit 101 ;;\n'
+                '  *) exit 88 ;;\n'
+                'esac\n',
+                encoding="utf-8",
+            )
+            fake_cargo.chmod(0o755)
+            cargo_capture = temporary / "cargo-calls.txt"
             environment = dict(os.environ)
             # CircleCI's BASH_ENV prepends its tool paths in child Bash shells,
             # overriding this test's intentionally first PATH entry.
             environment.pop("BASH_ENV", None)
             environment["PATH"] = f"{temporary}:{environment['PATH']}"
             environment["QMP_TEST_CAPTURE"] = str(capture)
-            for arguments, expected_count in ((["--in-memory"], 14), ([], 17)):
+            environment["QMP_TEST_CARGO_CAPTURE"] = str(cargo_capture)
+            for arguments, expected_count in ((["--in-memory"], 14), ([], 18)):
                 capture.write_text("", encoding="utf-8")
+                cargo_capture.write_text("", encoding="utf-8")
                 completed = subprocess.run(
                     [str(root / "scripts/verify-feature-capabilities.sh"), *arguments],
                     cwd=root,
@@ -92,7 +111,11 @@ class CargoTestOutputTest(unittest.TestCase):
                 for call in calls:
                     self.assertIn("-- --nocapture --exact", call)
                     if " -p quanta-memory-platform-facade " in call and " --lib " in call:
-                        self.assertIn("::service::tests::", call)
+                        self.assertTrue(
+                            "::service::tests::" in call
+                            or "publish_pipeline::prepared_publication::tests::" in call,
+                            call,
+                        )
                 lib_selectors = {
                     call.split(" --lib ", 1)[1].split(" -- ", 1)[0]
                     for call in calls if " --lib " in call
@@ -108,16 +131,26 @@ class CargoTestOutputTest(unittest.TestCase):
                     "retained_map::service::tests::cases_01::put_get_remove_get_none_round_trip_corrects_bytes",
                     "revocable_store::service::tests::cases_01::insert_tracks_reclaimable_bytes",
                     "transcript_store::service::tests::cases_01::exact_request_retried_n_times_applies_once",
-                    "publish_pipeline::service::tests::default_pipeline_runs_stage_then_commit_each_exactly_once_no_rollback",
+                    "publish_pipeline::prepared_publication::tests::cases_01::identical_prepare_replays_same_token_without_second_charge",
                     "spill::service::tests::in_memory_target_write_then_restore_round_trips_the_payload",
                 }
                 if not arguments:
                     expected_lib_selectors.update({
                         "loom_models::loom_ticket_transition_has_single_terminal_owner",
+                        "revocable_store::service::tests::cases_02::bounded_codec_keeps_output_charged_until_durable_commit_returns",
                         "revocable_store::service::tests::cases_02::durable_redb_round_trip_transfers_charge_exactly_once",
                         "revocable_store::service::tests::cases_01::many_spills_share_large_binding_identity_without_unbilled_clones",
                     })
                 self.assertEqual(lib_selectors, expected_lib_selectors)
+                cargo_calls = cargo_capture.read_text(encoding="utf-8").splitlines()
+                if arguments:
+                    self.assertEqual(cargo_calls, [])
+                else:
+                    self.assertEqual(len(cargo_calls), 4)
+                    self.assertTrue(any("check --offline" in call and "--features spill" in call for call in cargo_calls))
+                    self.assertTrue(any("check --offline" in call and "--features full" in call for call in cargo_calls))
+                    self.assertTrue(any("check --offline" in call and "--features spill-durable" in call for call in cargo_calls))
+                    self.assertTrue(any("tree --offline" in call and "--features full" in call for call in cargo_calls))
 
 
 if __name__ == "__main__":

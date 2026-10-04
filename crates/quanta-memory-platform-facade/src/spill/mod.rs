@@ -1,17 +1,20 @@
 pub mod backings;
 pub mod service;
 
+#[cfg(feature = "spill-durable")]
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(feature = "spill-durable")]
 use std::sync::Arc;
 
 #[cfg(feature = "spill-redb")]
 use quanta_memory_platform_core::MemoryError;
 use quanta_memory_platform_core::MemoryResult;
 
+#[cfg(feature = "spill-durable")]
+pub use service::{DurableRestoreTarget, DurableSpillTarget};
 pub use service::{
-    DurableRestoreTarget, DurableSpillTarget, InMemorySpillTarget, InProcessSpillTarget,
-    NoopSpillController, RetainingSpillTarget, RoutedSpillController, SpillFailure, SpillInventory,
-    SpillReceipt, SpillTarget,
+    InMemorySpillTarget, InProcessSpillTarget, NoopSpillController, RetainingSpillTarget,
+    RoutedSpillController, SpillFailure, SpillInventory, SpillReceipt, SpillTarget,
 };
 
 pub trait SpillController<Handle> {
@@ -61,6 +64,7 @@ pub trait InProcessSpillController<Handle>:
 /// }
 /// impl DurableSpillController<Vec<u8>> for Foreign {}
 /// ```
+#[cfg(feature = "spill-durable")]
 pub trait DurableSpillController<Handle>:
     SpillController<Handle> + service::sealed::DurableSpillController<Handle>
 {
@@ -68,8 +72,10 @@ pub trait DurableSpillController<Handle>:
 
 /// Persisted, never-reused identity for one durable write attempt.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[cfg(feature = "spill-durable")]
 pub struct DurableRecordId(u64);
 
+#[cfg(feature = "spill-durable")]
 impl DurableRecordId {
     #[must_use]
     pub fn new(value: u64) -> Self {
@@ -84,6 +90,7 @@ impl DurableRecordId {
 
 /// Read-side resolution of an ambiguous durable write.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg(feature = "spill-durable")]
 pub enum DurableRecordResolution {
     Present {
         inventory_after: u64,
@@ -102,6 +109,7 @@ pub enum DurableRecordResolution {
 
 /// Durable write failure with an explicit authority disposition.
 #[derive(Debug)]
+#[cfg(feature = "spill-durable")]
 pub enum DurableWriteFailure {
     /// The record is known not to have committed; source authority remains live.
     NotCommitted(Box<quanta_memory_platform_core::MemoryError>),
@@ -118,6 +126,7 @@ pub enum DurableWriteFailure {
 /// Durable write protocol used by accounting-bearing stores. Bytes are borrowed,
 /// so a controller panic or precommit error cannot consume the source's only
 /// recovery copy.
+#[cfg(feature = "spill-durable")]
 pub trait ReconciledDurableSpillController:
     service::sealed::DurableSpillController<Vec<u8>>
 {
@@ -172,12 +181,14 @@ pub trait ReconciledDurableSpillController:
 /// require_copy::<DurableRestoreClaim>();
 /// ```
 #[derive(Debug, Eq, Hash, PartialEq)]
+#[cfg(feature = "spill-durable")]
 pub struct DurableRestoreClaim {
     backend: u128,
     generation: u64,
     sequence: u64,
 }
 
+#[cfg(feature = "spill-durable")]
 impl DurableRestoreClaim {
     /// Backend-issued claim. Only crate backends mint claims; callers receive
     /// them exclusively through a live restore candidate.
@@ -229,6 +240,7 @@ impl DurableRestoreClaim {
 /// require_clone::<DurableRestoreCandidate>();
 /// ```
 #[derive(Debug)]
+#[cfg(feature = "spill-durable")]
 pub struct DurableRestoreCandidate {
     pub sequence: u64,
     bytes: Vec<u8>,
@@ -241,6 +253,7 @@ pub struct DurableRestoreCandidate {
     _read_lease: Option<RestoreReadLease>,
 }
 
+#[cfg(feature = "spill-durable")]
 impl DurableRestoreCandidate {
     #[must_use]
     pub fn bytes(&self) -> &[u8] {
@@ -264,23 +277,27 @@ impl DurableRestoreCandidate {
     }
 }
 
+#[cfg(feature = "spill-durable")]
 impl PartialEq for DurableRestoreCandidate {
     fn eq(&self, other: &Self) -> bool {
         self.sequence == other.sequence && self.bytes == other.bytes && self.claim == other.claim
     }
 }
 
+#[cfg(feature = "spill-durable")]
 impl Eq for DurableRestoreCandidate {}
 
 /// Tracks only byte buffers allocated and retained by this backing. It cannot
 /// meter arbitrary caller copies or private codec scratch.
 #[derive(Debug)]
+#[cfg(feature = "spill-durable")]
 pub(crate) struct RestoreReadLease {
     used_bytes: Arc<AtomicU64>,
     used_buffers: Arc<AtomicU64>,
     bytes: u64,
 }
 
+#[cfg(feature = "spill-durable")]
 impl RestoreReadLease {
     #[cfg(feature = "spill-redb")]
     pub(crate) fn acquire(
@@ -324,6 +341,7 @@ impl RestoreReadLease {
     }
 }
 
+#[cfg(feature = "spill-durable")]
 impl Drop for RestoreReadLease {
     fn drop(&mut self) {
         // An impossible accounting mismatch must remain fail-closed: never
@@ -345,6 +363,7 @@ impl Drop for RestoreReadLease {
 
 /// Persisted phase of an interrupted durable restore.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg(feature = "spill-durable")]
 pub enum DurableRestorePhase {
     /// The record is still in the ordinary durable queue under an active claim.
     Prepared,
@@ -363,6 +382,7 @@ pub enum DurableRestorePhase {
 /// require_clone::<DurableRestoreRecovery>();
 /// ```
 #[derive(Debug, Eq, PartialEq)]
+#[cfg(feature = "spill-durable")]
 pub struct DurableRestoreRecovery {
     pub candidate: DurableRestoreCandidate,
     pub phase: DurableRestorePhase,
@@ -370,6 +390,7 @@ pub struct DurableRestoreRecovery {
 
 /// Classification of a failed durable-delete commit.
 #[derive(Debug)]
+#[cfg(feature = "spill-durable")]
 pub enum DurableCommitFailure {
     /// The durable record is known to remain authoritative.
     Retained(Box<quanta_memory_platform_core::MemoryError>),
@@ -377,6 +398,7 @@ pub enum DurableCommitFailure {
     Ambiguous(Box<quanta_memory_platform_core::MemoryError>),
 }
 
+#[cfg(feature = "spill-durable")]
 impl DurableCommitFailure {
     pub fn retained(error: quanta_memory_platform_core::MemoryError) -> Self {
         Self::Retained(Box::new(error))
@@ -390,12 +412,14 @@ impl DurableCommitFailure {
 /// Result of a durable-to-source transfer.
 #[derive(Debug)]
 #[must_use = "ambiguous restore outcomes require sequence reconciliation"]
+#[cfg(feature = "spill-durable")]
 pub enum DurableRestoreOutcome {
     Empty,
     Restored { sequence: u64 },
     RecoveryRequired { sequence: u64, commit_error: Box<quanta_memory_platform_core::MemoryError> },
 }
 
+#[cfg(feature = "spill-durable")]
 pub trait DurableRestoreController: DurableSpillController<Vec<u8>> {
     fn prepare_restore(&self) -> MemoryResult<Option<DurableRestoreCandidate>>;
     /// Move exactly the claimed record into the recovery slot. The presented

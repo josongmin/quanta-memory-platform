@@ -241,7 +241,12 @@ class CiEntryPointContracts(unittest.TestCase):
         self.assertIn("set -euo pipefail", script)
         self.assertIn('scripts/extract-to-standalone-repo.sh "${qmp_extract_dir}"', script)
         self.assertIn('scripts/check-workspace.sh', (ROOT / "scripts/extract-to-standalone-repo.sh").read_text())
-        self.assertEqual(script.count('--manifest-path "${qmp_extract_dir}/Cargo.toml"'), 2)
+        self.assertEqual(script.count('--manifest-path "${qmp_extract_dir}/Cargo.toml"'), 3)
+        self.assertIn(
+            'cargo run --locked --manifest-path "${qmp_extract_dir}/Cargo.toml" '
+            '-p quanta-memory-platform-facade --features transcript --example transcript_session',
+            script,
+        )
         self.assertTrue(EXAMPLES.stat().st_mode & 0o111)
 
     def test_early_halt_and_floating_tools_are_rejected(self) -> None:

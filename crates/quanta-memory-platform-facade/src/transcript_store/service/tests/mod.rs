@@ -1,5 +1,6 @@
 mod cases_01;
 mod cases_02;
+mod lifecycle_paging;
 
 use super::*;
 use crate::test_support::SingleTestCommand;
@@ -63,16 +64,17 @@ fn store_with_policy(retention: TranscriptRetentionPolicyV2) -> Store {
         ),
         retention,
     )
+    .expect("transcript store nonce")
 }
 
 fn request(
-    session_id: &str,
+    handle: SessionHandle,
     sequence: u64,
     message_id: &str,
     body: &str,
-) -> TranscriptAppendRequestV1<String, String, String> {
+) -> TranscriptAppendRequestV1<SessionHandle, String, String> {
     TranscriptAppendRequestV1::new(
-        TranscriptAppendIdentityV1::new(session_id.to_string(), sequence, message_id.to_string()),
+        TranscriptAppendIdentityV1::new(handle, sequence, message_id.to_string()),
         body.to_string(),
     )
 }

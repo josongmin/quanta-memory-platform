@@ -1,4 +1,4 @@
-#[cfg(feature = "spill")]
+#[cfg(feature = "spill-durable")]
 use std::collections::BTreeMap;
 use std::collections::VecDeque;
 use std::marker::PhantomData;
@@ -9,7 +9,7 @@ use quanta_memory_platform_core::{
     MemoryOperation, MemoryResult, StoreBindingHandle, StoreStats, StoreWriteError, SweepStats,
 };
 
-#[cfg(feature = "spill")]
+#[cfg(feature = "spill-durable")]
 use crate::revocable_store::durable_codec;
 use crate::revocable_store::RevocableStore;
 #[cfg(feature = "unbudgeted-stores")]
@@ -20,12 +20,14 @@ use crate::shared::measure::ByteSized;
 
 #[cfg(feature = "spill")]
 mod spill;
-#[cfg(feature = "spill")]
+#[cfg(feature = "spill-durable")]
 use crate::spill::{
     DurableCommitFailure, DurableRecordId, DurableRecordResolution, DurableRestoreClaim,
     DurableRestoreController, DurableRestoreOutcome, DurableRestorePhase, DurableWriteFailure,
-    InProcessSpillController, ReconciledDurableSpillController, SpillFailure, SpillReceipt,
+    ReconciledDurableSpillController, SpillReceipt,
 };
+#[cfg(feature = "spill")]
+use crate::spill::{InProcessSpillController, SpillFailure};
 
 #[derive(Debug)]
 struct RevocableEntry<Key, Value> {
@@ -39,7 +41,7 @@ struct RevocableEntry<Key, Value> {
     /// entry shares the immutable claim allocation with the in-flight
     /// reconciliation call; the private `Arc` pins the same token across
     /// lock-free controller calls, and no caller can clone this custody.
-    #[cfg(feature = "spill")]
+    #[cfg(feature = "spill-durable")]
     restore_claim: Option<Arc<DurableRestoreClaim>>,
 }
 
@@ -106,7 +108,7 @@ fn revocable_entry_cost<Key: ByteSized, Value: ByteSized>(
     super::cost::entry_cost(key.byte_size(), value.byte_size())
 }
 
-#[cfg(feature = "spill")]
+#[cfg(feature = "spill-durable")]
 fn bounded_record_cap<C: ReconciledDurableSpillController>(controller: &C) -> MemoryResult<u64> {
     controller.max_record_bytes().ok_or_else(|| {
         MemoryError::Unsupported(
@@ -121,12 +123,12 @@ struct RevocableState<Key, Value> {
     /// Source entries fenced while a durable commit acknowledgement is unknown.
     /// Their managed charges remain live until record reconciliation chooses the
     /// durable or resident authority.
-    #[cfg(feature = "spill")]
+    #[cfg(feature = "spill-durable")]
     pending_spills: BTreeMap<DurableRecordId, RevocableEntry<Key, Value>>,
     /// Provisional resident entries fenced while a durable delete
     /// acknowledgement is unknown. They are charged but not readable until
     /// reconciliation proves that the durable record is absent.
-    #[cfg(feature = "spill")]
+    #[cfg(feature = "spill-durable")]
     pending_restores: BTreeMap<DurableRecordId, RevocableEntry<Key, Value>>,
     committed_bytes: u64,
 }
@@ -166,9 +168,9 @@ impl<Key, Value, Mode> SimpleRevocableStore<Key, Value, Mode> {
             lifecycle: StoreLifecycle::new("revocable store"),
             state: Mutex::new(RevocableState {
                 entries: VecDeque::new(),
-                #[cfg(feature = "spill")]
+                #[cfg(feature = "spill-durable")]
                 pending_spills: BTreeMap::new(),
-                #[cfg(feature = "spill")]
+                #[cfg(feature = "spill-durable")]
                 pending_restores: BTreeMap::new(),
                 committed_bytes: 0,
             }),
@@ -282,7 +284,7 @@ impl<Key, Value, Mode> SimpleRevocableStore<Key, Value, Mode> {
 
         let mut plan = {
             let mut state = self.lock_state()?;
-            #[cfg(feature = "spill")]
+            #[cfg(feature = "spill-durable")]
             if !state.pending_spills.is_empty() || !state.pending_restores.is_empty() {
                 return Err(MemoryError::OperationInProgress(
                     "cannot close revocable store with unresolved durable transfers".into(),
@@ -361,7 +363,7 @@ where
             value: value.take(),
             charged_bytes,
             charge,
-            #[cfg(feature = "spill")]
+            #[cfg(feature = "spill-durable")]
             restore_claim: None,
         });
         state.committed_bytes = next_committed;
@@ -399,7 +401,7 @@ where
     fn stats(&self) -> MemoryResult<StoreStats> {
         let state = self.lock_read()?;
         let item_count = state.entries.len();
-        #[cfg(feature = "spill")]
+        #[cfg(feature = "spill-durable")]
         let item_count = item_count + state.pending_spills.len() + state.pending_restores.len();
         Ok(StoreStats { item_count, estimated_bytes: state.committed_bytes })
     }
@@ -414,15 +416,15 @@ impl<Key, Value, Mode> Drop for SimpleRevocableStore<Key, Value, Mode> {
         let _ = self.lifecycle.transition_to_closed_for_drop();
         let state = self.state.get_mut().unwrap_or_else(PoisonError::into_inner);
         let entries = std::mem::take(&mut state.entries);
-        #[cfg(feature = "spill")]
+        #[cfg(feature = "spill-durable")]
         let pending = std::mem::take(&mut state.pending_spills).into_values().collect();
-        #[cfg(feature = "spill")]
+        #[cfg(feature = "spill-durable")]
         let pending_restores = std::mem::take(&mut state.pending_restores).into_values().collect();
         state.committed_bytes = 0;
         retire_entries(entries);
-        #[cfg(feature = "spill")]
+        #[cfg(feature = "spill-durable")]
         retire_entries(pending);
-        #[cfg(feature = "spill")]
+        #[cfg(feature = "spill-durable")]
         retire_entries(pending_restores);
     }
 }

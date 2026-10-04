@@ -29,7 +29,7 @@ fn bounded_codec_rejects_malformed_durable_record_without_publication() {
     drop(controller);
     std::fs::remove_file(path).expect("remove test backing");
 }
-#[cfg(feature = "spill")]
+#[cfg(feature = "spill-durable")]
 #[test]
 fn bounded_codec_keeps_output_charged_until_durable_commit_returns() {
     struct ObservingTarget {
@@ -142,7 +142,7 @@ fn bounded_codec_committed_recovery_retries_after_capacity_denial() {
     drop(controller);
     std::fs::remove_file(path).expect("remove test backing");
 }
-#[cfg(feature = "spill")]
+#[cfg(feature = "spill-durable")]
 #[test]
 fn panicking_durable_encoder_restores_source_before_unwind() {
     struct DurableSink;
@@ -198,7 +198,7 @@ fn panicking_durable_encoder_restores_source_before_unwind() {
     assert_eq!(broker.ledger_snapshot().expect("ledger").total_owner_bytes(), total);
     assert_eq!(store.reclaim_one().expect("source").expect("entry").0, "first");
 }
-#[cfg(feature = "spill")]
+#[cfg(feature = "spill-durable")]
 #[test]
 fn panicking_durable_commit_fences_source_until_exact_record_resolution() {
     struct PanicCommitTarget {

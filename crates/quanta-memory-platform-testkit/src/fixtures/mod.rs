@@ -210,8 +210,8 @@ mod tests {
             "transcript_truncate_refund",
             "transcript_over_cap_fail_closed",
             "spill_round_trip",
-            "spill_offline_restore_fail_closed",
             "spill_unavailable_fail_closed",
+            "spill_offline_restore_fail_closed",
         ] {
             expected.insert(name.to_string(), 1usize);
         }

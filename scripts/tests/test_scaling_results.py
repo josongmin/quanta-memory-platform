@@ -22,7 +22,7 @@ SPEC.loader.exec_module(MODULE)
 # Independent fixture oracle: do not construct the sample matrix from the validator.
 SINGLE = (
     "payload_unique_fill", "payload_dedup_put", "revocable_fill_and_drain",
-    "broker_release_owner_cardinality", "scheduler_admission_group_cardinality",
+    "broker_release_owner_cardinality", "broker_group_admission_cardinality",
 )
 CONTENTIONS = ("metadata-stats-heavy", "write-heavy", "mixed-stats-put")
 PAIRWISE = (
@@ -35,11 +35,11 @@ def sample(
     operation: str, mode: str, entries: int, threads: int, repetition: int,
 ) -> dict[str, object]:
     timed = entries * (2 if operation in {
-        "revocable_fill_and_drain", "scheduler_admission_group_cardinality",
+        "revocable_fill_and_drain", "broker_group_admission_cardinality",
         "broker_pressure_cycle",
     } else 1)
     successful = entries // 2 if operation == "contended_pressure_reclaim" else entries if operation in {
-        "scheduler_admission_group_cardinality", "broker_pressure_cycle",
+        "broker_group_admission_cardinality", "broker_pressure_cycle",
     } else timed
     result = {
         "schema": MODULE.SAMPLE_SCHEMA,
@@ -58,7 +58,7 @@ def sample(
         "p95_ns": 20,
         "p99_ns": 30,
         "semantic_peak_bytes": (
-            0 if operation == "scheduler_admission_group_cardinality"
+            1_001 if operation == "broker_group_admission_cardinality"
             else 1 if operation == "broker_pressure_cycle"
             else 96 if operation == "contended_pressure_reclaim"
             else 100
@@ -72,13 +72,15 @@ def sample(
         "busy_retries": 0,
     }
     if operation in {
-        "scheduler_admission_group_cardinality", "broker_pressure_cycle",
+        "broker_group_admission_cardinality", "broker_pressure_cycle",
         "contended_pressure_reclaim",
     }:
         result.update({
             "admitted_p50_ns": 8, "admitted_p95_ns": 16, "admitted_p99_ns": 24,
             "denied_p50_ns": 12, "denied_p95_ns": 22, "denied_p99_ns": 32,
         })
+    if operation == "broker_group_admission_cardinality":
+        result["group_cardinality"] = min((entries + 39) // 40, 256)
     if operation == "revocable_fill_and_drain":
         result.update({
             "fill_p50_ns": 8, "fill_p95_ns": 16, "fill_p99_ns": 24,
@@ -215,7 +217,7 @@ class ScalingResultTests(unittest.TestCase):
     def test_phase_and_outcome_p99_cannot_exceed_whole_run(self) -> None:
         for operation, field in (
             ("revocable_fill_and_drain", "fill_p99_ns"),
-            ("scheduler_admission_group_cardinality", "denied_p99_ns"),
+            ("broker_group_admission_cardinality", "denied_p99_ns"),
         ):
             with self.subTest(operation=operation, field=field):
                 records = valid_records(["--smoke"])
@@ -331,7 +333,7 @@ class ScalingResultTests(unittest.TestCase):
         with self.assertRaisesRegex(MODULE.ValidationError, "p99 exceeds measured wall time"):
             MODULE.validate(records)
         records = valid_records(["--smoke"])
-        scheduler = next(row for row in records if row.get("operation") == "scheduler_admission_group_cardinality")
+        scheduler = next(row for row in records if row.get("operation") == "broker_group_admission_cardinality")
         scheduler["admitted_p50_ns"] = scheduler["admitted_p95_ns"] = scheduler["admitted_p99_ns"] = 100
         with self.assertRaisesRegex(MODULE.ValidationError, "outcome median exceeds combined p99"):
             MODULE.validate(records)
@@ -758,25 +760,26 @@ class ScalingResultTests(unittest.TestCase):
         with self.assertRaisesRegex(MODULE.ValidationError, "allocator high-water"):
             MODULE.validate(records)
 
-        # Scheduler admission deliberately starts allocation tracking after
-        # fixture construction and may have an allocation-free measured loop.
+        # Broker ticket admission performs actual accounting work and must
+        # report allocator activity during the measured loop.
         records = valid_records(["--smoke"])
         scheduler = next(
             record for record in records
-            if record.get("operation") == "scheduler_admission_group_cardinality"
+            if record.get("operation") == "broker_group_admission_cardinality"
         )
         for field in (
             "allocator_allocated_bytes", "allocator_deallocated_bytes",
             "allocator_high_water_bytes",
         ):
             scheduler[field] = 0
-        self.assertEqual(MODULE.validate(records), 48)
+        with self.assertRaisesRegex(MODULE.ValidationError, "missing allocator telemetry"):
+            MODULE.validate(records)
 
     def test_falsified_outcome_counts_are_rejected(self) -> None:
         records = valid_records(["--smoke"])
         scheduler = next(
             record for record in records
-            if record.get("operation") == "scheduler_admission_group_cardinality"
+            if record.get("operation") == "broker_group_admission_cardinality"
         )
         scheduler["successful_operations"] = scheduler["timed_operations"]
         scheduler["denied_operations"] = 0
@@ -798,11 +801,30 @@ class ScalingResultTests(unittest.TestCase):
         records = valid_records(["--smoke"])
         scheduler = next(
             record for record in records
-            if record.get("operation") == "scheduler_admission_group_cardinality"
+            if record.get("operation") == "broker_group_admission_cardinality"
         )
         scheduler["semantic_peak_bytes"] = 1
-        with self.assertRaisesRegex(MODULE.ValidationError, "scheduler admission must not retain"):
+        with self.assertRaisesRegex(MODULE.ValidationError, "broker group admission must peak"):
             MODULE.validate(records)
+
+    def test_broker_group_cardinality_is_bound_to_receipt_geometry(self) -> None:
+        records = valid_records(["--smoke"])
+        group = next(
+            record for record in records
+            if record.get("operation") == "broker_group_admission_cardinality"
+        )
+        self.assertEqual(group["group_cardinality"], 25)
+        group["group_cardinality"] = 256
+        with self.assertRaisesRegex(MODULE.ValidationError, "group cardinality does not match"):
+            MODULE.validate(records)
+
+    def test_standalone_scheduler_baseline_is_rejected(self) -> None:
+        baseline = valid_records(["--smoke"])
+        for record in baseline:
+            if record.get("operation") == "broker_group_admission_cardinality":
+                record["operation"] = "scheduler_admission_group_cardinality"
+        with self.assertRaises(MODULE.ValidationError):
+            MODULE.validate(valid_records(["--smoke"]), baseline)
 
     def test_latency_limit_is_rejected(self) -> None:
         records = valid_records(["--smoke"])
@@ -821,7 +843,7 @@ class ScalingResultTests(unittest.TestCase):
                 records = valid_records(["--smoke"])
                 scheduler = next(
                     record for record in records
-                    if record.get("operation") == "scheduler_admission_group_cardinality"
+                    if record.get("operation") == "broker_group_admission_cardinality"
                 )
                 if value is None:
                     del scheduler[field]
@@ -834,7 +856,7 @@ class ScalingResultTests(unittest.TestCase):
         baseline = valid_records(["--smoke"])
         current = valid_records(["--smoke"])
         for record in baseline:
-            if record.get("operation") == "scheduler_admission_group_cardinality":
+            if record.get("operation") == "broker_group_admission_cardinality":
                 for fields in MODULE.OUTCOME_LATENCY_FIELDS.values():
                     for field in fields:
                         del record[field]
@@ -845,7 +867,7 @@ class ScalingResultTests(unittest.TestCase):
         baseline = valid_records(["--smoke"])
         scheduler = next(
             record for record in baseline
-            if record.get("operation") == "scheduler_admission_group_cardinality"
+            if record.get("operation") == "broker_group_admission_cardinality"
         )
         for fields in MODULE.OUTCOME_LATENCY_FIELDS.values():
             for field in fields:
@@ -864,7 +886,7 @@ class ScalingResultTests(unittest.TestCase):
             with self.subTest(field=field):
                 current = valid_records(["--smoke"])
                 for record in current:
-                    if record.get("operation") == "scheduler_admission_group_cardinality":
+                    if record.get("operation") == "broker_group_admission_cardinality":
                         record[field] = 2_000_000
                 with self.assertRaisesRegex(MODULE.ValidationError, f"{label} p99 regressed"):
                     MODULE.validate(current, valid_records(["--smoke"]))

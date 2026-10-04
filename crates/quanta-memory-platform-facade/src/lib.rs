@@ -100,10 +100,9 @@ pub use shared::measure::{
 pub use payload_store::{PayloadReference, PayloadStore, PayloadStoreBuilder, SimplePayloadStore};
 #[cfg(feature = "publish_pipeline")]
 pub use publish_pipeline::{
-    AbortDispositionV1, CommitTransition, DefaultCommitTransition, PrepareDispositionV1,
-    PreparedPublicationErrorV1, PreparedPublicationIdentityV1, PreparedPublicationReceiptV1,
-    PreparedPublicationRequestV1, PreparedPublicationService, PreparedPublicationStatsV1,
-    PreparedPublicationTokenV1, PublishPipeline, PublishPipelineBuilder, SimplePublishPipeline,
+    AbortDispositionV1, PrepareDispositionV1, PreparedPublicationErrorV1,
+    PreparedPublicationIdentityV1, PreparedPublicationReceiptV1, PreparedPublicationRequestV1,
+    PreparedPublicationService, PreparedPublicationStatsV1, PreparedPublicationTokenV1,
 };
 #[cfg(feature = "retained_map")]
 pub use retained_map::{
@@ -120,20 +119,24 @@ pub use shared::builder::PreparedPublicationServiceBuilder;
 pub use shared::builder::SessionTranscriptStoreBuilder;
 #[cfg(feature = "spill-redb")]
 pub use spill::backings::redb::{RedbSpillBacking, RedbSpillLimits};
-#[cfg(feature = "spill")]
+#[cfg(feature = "spill-durable")]
 pub use spill::{
     DurableCommitFailure, DurableRecordId, DurableRecordResolution, DurableRestoreCandidate,
     DurableRestoreClaim, DurableRestoreController, DurableRestoreOutcome, DurableRestorePhase,
     DurableRestoreRecovery, DurableRestoreTarget, DurableSpillController, DurableSpillTarget,
-    DurableWriteFailure, InMemorySpillTarget, InProcessSpillController, InProcessSpillTarget,
-    NoopSpillController, ReconciledDurableSpillController, RetainingSpillTarget,
-    RoutedSpillController, SpillController, SpillFailure, SpillInventory, SpillReceipt,
-    SpillTarget,
+    DurableWriteFailure, ReconciledDurableSpillController,
+};
+#[cfg(feature = "spill")]
+pub use spill::{
+    InMemorySpillTarget, InProcessSpillController, InProcessSpillTarget, NoopSpillController,
+    RetainingSpillTarget, RoutedSpillController, SpillController, SpillFailure, SpillInventory,
+    SpillReceipt, SpillTarget,
 };
 #[cfg(feature = "transcript")]
 pub use transcript_store::{
-    SessionTranscriptStore, SimpleSessionTranscriptStore, TranscriptAppendDispositionV1,
-    TranscriptAppendErrorV1, TranscriptAppendIdentityV1, TranscriptAppendRequestV1,
-    TranscriptRecordV1, TranscriptRetainDispositionV1, TranscriptRetentionPolicyV2,
-    TranscriptRetentionReconfigureErrorV2, TranscriptRetentionStatsV2, TranscriptSnapshotV1,
+    SessionHandle, SessionTranscriptStore, SimpleSessionTranscriptStore,
+    TranscriptAppendDispositionV1, TranscriptAppendErrorV1, TranscriptAppendIdentityV1,
+    TranscriptAppendRequestV1, TranscriptCursor, TranscriptRecordV1, TranscriptRetainDispositionV1,
+    TranscriptRetentionPolicyV2, TranscriptRetentionReconfigureErrorV2, TranscriptRetentionStatsV2,
+    TranscriptSnapshotV1,
 };

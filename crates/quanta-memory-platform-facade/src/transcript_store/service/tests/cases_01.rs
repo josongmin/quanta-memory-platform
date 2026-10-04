@@ -3,13 +3,14 @@ use super::*;
 #[test]
 fn reentrant_load_stats_and_close_under_read_lock_are_typed_busy() {
     let store = store();
-    store.append(request("s", 0, "m", "body")).expect("seed row");
+    let s = store.open_session("s".to_string()).expect("open session");
+    store.append(request(s, 0, "m", "body")).expect("seed row");
     let held = store.state.lock().expect("simulated client clone holds read lock");
-    assert!(matches!(store.load(&"s".into()), Err(MemoryError::OperationInProgress(_))));
+    assert!(matches!(store.load(&s), Err(MemoryError::OperationInProgress(_))));
     assert!(matches!(store.stats(), Err(MemoryError::OperationInProgress(_))));
     assert!(matches!(store.close(), Err(MemoryError::OperationInProgress(_))));
     drop(held);
-    assert_eq!(store.load(&"s".into()).expect("complete row").len(), 1);
+    assert_eq!(store.load(&s).expect("complete row").len(), 1);
     store.close().expect("retry close");
 }
 #[test]
@@ -62,17 +63,15 @@ fn partial_snapshot_clone_and_drop_panics_cannot_abort() {
                 ),
                 TranscriptRetentionPolicyV2::default(),
                 broker.clone(),
-            );
+            )
+            .expect("transcript store nonce");
+        let s = store.open_session("s".to_string()).expect("open session");
         let calls = Arc::new(AtomicUsize::new(0));
         let drop_panics = Arc::new(AtomicBool::new(false));
         for sequence in 0..2 {
             store
                 .append(TranscriptAppendRequestV1::new(
-                    TranscriptAppendIdentityV1::new(
-                        "s".to_string(),
-                        sequence,
-                        format!("m{sequence}"),
-                    ),
+                    TranscriptAppendIdentityV1::new(s, sequence, format!("m{sequence}")),
                     HostileBody {
                         bytes: vec![sequence as u8],
                         calls: Arc::clone(&calls),
@@ -83,7 +82,7 @@ fn partial_snapshot_clone_and_drop_panics_cannot_abort() {
         }
         drop_panics.store(true, Ordering::SeqCst);
         let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            store.load_versioned_snapshot(&"s".to_string())
+            store.load_versioned_snapshot(&s)
         }));
         assert!(caught.is_err(), "later Clone must panic");
         drop_panics.store(false, Ordering::SeqCst);
@@ -155,17 +154,15 @@ fn partial_load_clone_and_drop_panics_cannot_abort() {
                 ),
                 TranscriptRetentionPolicyV2::default(),
                 broker.clone(),
-            );
+            )
+            .expect("transcript store nonce");
+        let s = store.open_session("s".to_string()).expect("open session");
         let calls = Arc::new(AtomicUsize::new(0));
         let drop_panics = Arc::new(AtomicBool::new(false));
         for sequence in 0..2 {
             store
                 .append(TranscriptAppendRequestV1::new(
-                    TranscriptAppendIdentityV1::new(
-                        "s".to_string(),
-                        sequence,
-                        format!("m{sequence}"),
-                    ),
+                    TranscriptAppendIdentityV1::new(s, sequence, format!("m{sequence}")),
                     HostileBody {
                         bytes: vec![sequence as u8],
                         calls: Arc::clone(&calls),
@@ -175,8 +172,7 @@ fn partial_load_clone_and_drop_panics_cannot_abort() {
                 .expect("seed row");
         }
         drop_panics.store(true, Ordering::SeqCst);
-        let caught =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| store.load(&"s".to_string())));
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| store.load(&s)));
         assert!(caught.is_err(), "later Clone must panic");
         drop_panics.store(false, Ordering::SeqCst);
         assert_eq!(store.checked_stats().expect("usable after unwind").item_count, 2);
@@ -200,7 +196,7 @@ fn partial_load_clone_and_drop_panics_cannot_abort() {
     );
 }
 #[test]
-fn new_session_clone_and_drop_panics_cannot_abort() {
+fn open_session_moves_metadata_without_clone_and_contains_body_drop() {
     use quanta_memory_platform_core::{MemoryPreset, ProcessMemoryBrokerBuilder};
     use std::sync::atomic::{AtomicBool, Ordering};
     const CHILD: &str = "QMP_TRANSCRIPT_NEW_SESSION_CHILD";
@@ -246,24 +242,23 @@ fn new_session_clone_and_drop_panics_cannot_abort() {
             .expect("broker");
         let store = SimpleSessionTranscriptStore::<HostileSession, String, HostileBody, Budgeted>::new_budgeted(
             StoreBindingHandle::new(MemoryClass::SessionTranscript, "owner:new-session".into(), None),
-            TranscriptRetentionPolicyV2::default(), broker.clone());
+            TranscriptRetentionPolicyV2::default(), broker.clone()).expect("transcript store nonce");
         let drop_panics = Arc::new(AtomicBool::new(true));
-        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            store.append(TranscriptAppendRequestV1::new(
-                TranscriptAppendIdentityV1::new(HostileSession("s".into()), 0, "m0".into()),
+        let session = store.open_session(HostileSession("s".into())).expect("open without clone");
+        store
+            .append(TranscriptAppendRequestV1::new(
+                TranscriptAppendIdentityV1::new(session, 0, "m0".into()),
                 HostileBody { drop_panics: Arc::clone(&drop_panics) },
             ))
-        }));
-        assert!(caught.is_err(), "session Clone must panic");
-        drop_panics.store(false, Ordering::SeqCst);
-        assert_eq!(store.checked_stats().expect("usable after unwind").item_count, 0);
+            .expect("append without metadata clone");
+        assert_eq!(store.checked_stats().expect("active row").item_count, 1);
         store.close().expect("close");
         assert_eq!(broker.ledger_snapshot().expect("drained").live_ticket_count, 0);
         return;
     }
     let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
         .arg("--exact")
-        .arg("transcript_store::service::tests::cases_01::new_session_clone_and_drop_panics_cannot_abort")
+        .arg("transcript_store::service::tests::cases_01::open_session_moves_metadata_without_clone_and_contains_body_drop")
         .env(CHILD, "1")
         .require_one_test()
         .output()
@@ -275,7 +270,7 @@ fn new_session_clone_and_drop_panics_cannot_abort() {
     );
 }
 #[test]
-fn owned_session_key_order_and_drop_panics_cannot_abort() {
+fn session_handle_lookup_skips_caller_order_and_close_contains_metadata_drop() {
     use quanta_memory_platform_core::{MemoryPreset, ProcessMemoryBrokerBuilder};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     const CHILD: &str = "QMP_TRANSCRIPT_OWNED_SESSION_KEY_CHILD";
@@ -328,7 +323,8 @@ fn owned_session_key_order_and_drop_panics_cannot_abort() {
                 ),
                 TranscriptRetentionPolicyV2::default(),
                 broker.clone(),
-            );
+            )
+            .expect("transcript store nonce");
         let comparisons = Arc::new(AtomicUsize::new(0));
         let panic_at = Arc::new(AtomicUsize::new(0));
         let drop_panics = Arc::new(AtomicBool::new(false));
@@ -338,32 +334,31 @@ fn owned_session_key_order_and_drop_panics_cannot_abort() {
             panic_at: Arc::clone(&panic_at),
             drop_panics: Arc::clone(&drop_panics),
         };
+        let old = store.open_session(key("old")).expect("open old");
         store
             .append(TranscriptAppendRequestV1::new(
-                TranscriptAppendIdentityV1::new(key("old"), 0, "m0".into()),
+                TranscriptAppendIdentityV1::new(old, 0, "m0".into()),
                 "old body".to_string(),
             ))
             .expect("seed old session");
-        let before = broker.ledger_snapshot().expect("before");
-        panic_at.store(comparisons.load(Ordering::SeqCst) + 3, Ordering::SeqCst);
+        panic_at.store(comparisons.load(Ordering::SeqCst) + 1, Ordering::SeqCst);
         drop_panics.store(true, Ordering::SeqCst);
-        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            store.append(TranscriptAppendRequestV1::new(
-                TranscriptAppendIdentityV1::new(key("new"), 0, "m1".into()),
+        let new = store.open_session(key("new")).expect("open new without caller order");
+        store
+            .append(TranscriptAppendRequestV1::new(
+                TranscriptAppendIdentityV1::new(new, 0, "m1".into()),
                 "new body".to_string(),
             ))
-        }));
-        assert!(caught.is_err(), "owned-key entry comparison must panic");
-        drop_panics.store(false, Ordering::SeqCst);
-        assert_eq!(store.checked_stats().expect("usable after unwind").item_count, 1);
-        assert_eq!(broker.ledger_snapshot().expect("after"), before);
+            .expect("append by handle");
+        assert_eq!(comparisons.load(Ordering::SeqCst), 0);
+        assert_eq!(store.checked_stats().expect("two rows").item_count, 2);
         store.close().expect("close");
         assert_eq!(broker.ledger_snapshot().expect("drained").live_ticket_count, 0);
         return;
     }
     let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
             .arg("--exact")
-            .arg("transcript_store::service::tests::cases_01::owned_session_key_order_and_drop_panics_cannot_abort")
+            .arg("transcript_store::service::tests::cases_01::session_handle_lookup_skips_caller_order_and_close_contains_metadata_drop")
             .env(CHILD, "1").require_one_test()
 .output().expect("isolated owned-key child");
     assert!(
@@ -434,13 +429,15 @@ fn partial_append_identity_clone_and_drop_panics_cannot_abort() {
                 ),
                 TranscriptRetentionPolicyV2::default(),
                 broker.clone(),
-            );
+            )
+            .expect("transcript store nonce");
+        let s = store.open_session("s".to_string()).expect("open session");
         let calls = Arc::new(AtomicUsize::new(0));
         let drop_panics = Arc::new(AtomicBool::new(true));
         let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             store.append(TranscriptAppendRequestV1::new(
                 TranscriptAppendIdentityV1::new(
-                    "s".to_string(),
+                    s,
                     0,
                     HostileId {
                         name: "m0".into(),
@@ -472,7 +469,7 @@ fn partial_append_identity_clone_and_drop_panics_cannot_abort() {
     );
 }
 #[test]
-fn client_message_clone_during_load_reenters_as_typed_busy_without_ledger_drift() {
+fn client_message_clone_during_load_allows_stats_but_close_is_busy() {
     use quanta_memory_platform_core::{MemoryPreset, ProcessMemoryBrokerBuilder};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{OnceLock, Weak};
@@ -490,7 +487,7 @@ fn client_message_clone_during_load_reenters_as_typed_busy_without_ledger_drift(
         fn clone(&self) -> Self {
             if self.armed.load(Ordering::SeqCst) {
                 let store = self.owner.get().expect("owner installed").upgrade().expect("live");
-                assert!(matches!(store.stats(), Err(MemoryError::OperationInProgress(_))));
+                assert_eq!(store.stats().expect("stats during detached clone").item_count, 1);
                 assert!(matches!(store.close(), Err(MemoryError::OperationInProgress(_))));
                 self.busy_callbacks.fetch_add(1, Ordering::SeqCst);
             }
@@ -519,18 +516,22 @@ fn client_message_clone_during_load_reenters_as_typed_busy_without_ledger_drift(
         .with_preset(MemoryPreset::Development)
         .build()
         .expect("broker");
-    let store = Arc::new(ReentrantStore::new_budgeted(
-        StoreBindingHandle::new(MemoryClass::SessionTranscript, "clone-owner".into(), None),
-        TranscriptRetentionPolicyV2::default(),
-        broker.clone(),
-    ));
+    let store = Arc::new(
+        ReentrantStore::new_budgeted(
+            StoreBindingHandle::new(MemoryClass::SessionTranscript, "clone-owner".into(), None),
+            TranscriptRetentionPolicyV2::default(),
+            broker.clone(),
+        )
+        .expect("transcript store nonce"),
+    );
+    let s = store.open_session("s".to_string()).expect("open session");
     let armed = Arc::new(AtomicBool::new(false));
     let busy_callbacks = Arc::new(AtomicUsize::new(0));
     let owner = Arc::new(OnceLock::new());
     owner.set(Arc::downgrade(&store)).expect("one owner");
     store
         .append(TranscriptAppendRequestV1::new(
-            TranscriptAppendIdentityV1::new("s".into(), 0, "m".into()),
+            TranscriptAppendIdentityV1::new(s, 0, "m".into()),
             ReentrantBody {
                 bytes: vec![1, 2, 3],
                 armed: Arc::clone(&armed),
@@ -540,7 +541,7 @@ fn client_message_clone_during_load_reenters_as_typed_busy_without_ledger_drift(
         ))
         .expect("append");
     armed.store(true, Ordering::SeqCst);
-    assert_eq!(store.load(&"s".into()).expect("outer load").len(), 1);
+    assert_eq!(store.load(&s).expect("outer load").len(), 1);
     armed.store(false, Ordering::SeqCst);
     assert_eq!(busy_callbacks.load(Ordering::SeqCst), 1);
     assert_eq!(store.stats().expect("postimage").estimated_bytes, cost("s", &[("m", "one", true)]));
@@ -554,8 +555,9 @@ fn client_message_clone_during_load_reenters_as_typed_busy_without_ledger_drift(
 #[test]
 fn exact_request_retried_n_times_applies_once() {
     let store = store();
+    let s = store.open_session("s".to_string()).expect("open session");
     let outcomes: Vec<_> =
-        (0..8).map(|_| store.append(request("s", 0, "m0", "body")).expect("append")).collect();
+        (0..8).map(|_| store.append(request(s, 0, "m0", "body")).expect("append")).collect();
     assert_eq!(
         outcomes.iter().filter(|d| **d == TranscriptAppendDispositionV1::Applied).count(),
         1
@@ -564,20 +566,21 @@ fn exact_request_retried_n_times_applies_once() {
         outcomes.iter().filter(|d| **d == TranscriptAppendDispositionV1::Replayed).count(),
         7
     );
-    assert_eq!(store.load(&"s".to_string()).expect("load").len(), 1);
+    assert_eq!(store.load(&s).expect("load").len(), 1);
     assert_eq!(store.retained_bytes().expect("bytes"), cost("s", &[("m0", "body", true)]));
 }
 #[test]
 fn append_truncate_cycles_cannot_grow_past_fail_closed_evidence_bound() {
     let store = store_with_policy(TranscriptRetentionPolicyV2::fail_closed(2, u64::MAX));
+    let s = store.open_session("s".to_string()).expect("open session");
     for sequence in 0..2 {
         store
-            .append(request("s", sequence, &format!("m{sequence}"), "body"))
+            .append(request(s, sequence, &format!("m{sequence}"), "body"))
             .expect("inside horizon");
-        store.truncate_to(&"s".to_string(), 0).expect("truncate active body");
+        store.truncate_to(&s, 0).expect("truncate active body");
     }
     let before = store.retention_stats().expect("bounded stats");
-    let error = store.append(request("s", 2, "m2", "body")).expect_err("saturated");
+    let error = store.append(request(s, 2, "m2", "body")).expect_err("saturated");
     assert!(matches!(
         error,
         TranscriptAppendErrorV1::RetentionSaturated {
@@ -587,24 +590,25 @@ fn append_truncate_cycles_cannot_grow_past_fail_closed_evidence_bound() {
         }
     ));
     assert_eq!(store.retention_stats().expect("unchanged stats"), before);
-    assert!(store.load(&"s".to_string()).expect("no active rows").is_empty());
+    assert!(store.load(&s).expect("no active rows").is_empty());
 }
 #[test]
 fn exact_retry_and_conflicts_remain_deterministic_at_saturation() {
     let store = store_with_policy(TranscriptRetentionPolicyV2::fail_closed(1, u64::MAX));
-    store.append(request("s", 7, "m0", "body")).expect("seed");
-    store.truncate_to(&"s".to_string(), 0).expect("truncate");
+    let s = store.open_session("s".to_string()).expect("open session");
+    store.append(request(s, 7, "m0", "body")).expect("seed");
+    store.truncate_to(&s, 0).expect("truncate");
     let before = store.retention_stats().expect("before retry");
     assert_eq!(
-        store.append(request("s", 7, "m0", "body")).expect("exact replay"),
+        store.append(request(s, 7, "m0", "body")).expect("exact replay"),
         TranscriptAppendDispositionV1::Replayed
     );
     assert!(matches!(
-        store.append(request("s", 7, "m1", "body")),
+        store.append(request(s, 7, "m1", "body")),
         Err(TranscriptAppendErrorV1::SequenceConflict { sequence: 7 })
     ));
     assert!(matches!(
-        store.append(request("s", 8, "m0", "body")),
+        store.append(request(s, 8, "m0", "body")),
         Err(TranscriptAppendErrorV1::MessageIdConflict)
     ));
     assert_eq!(store.retention_stats().expect("after retry"), before);
@@ -614,10 +618,11 @@ fn tombstone_byte_limit_counts_large_message_ids() {
     let first_evidence = identity_evidence_cost(2).expect("oracle setup");
     let store =
         store_with_policy(TranscriptRetentionPolicyV2::fail_closed(usize::MAX, first_evidence));
-    store.append(request("s", 0, "m0", "body")).expect("fits exact byte cap");
+    let s = store.open_session("s".to_string()).expect("open session");
+    store.append(request(s, 0, "m0", "body")).expect("fits exact byte cap");
     let before = store.retention_stats().expect("before saturation");
     let error = store
-        .append(request("s", 1, "message-id-that-exceeds-the-cap", "body"))
+        .append(request(s, 1, "message-id-that-exceeds-the-cap", "body"))
         .expect_err("large identity must exceed byte horizon");
     assert!(matches!(
         error,
@@ -633,7 +638,8 @@ fn tombstone_byte_limit_counts_large_message_ids() {
 #[test]
 fn retention_reconfigure_below_live_evidence_is_rejected() {
     let store = store();
-    store.append(request("s", 0, "m0", "body")).expect("seed");
+    let s = store.open_session("s".to_string()).expect("open session");
+    store.append(request(s, 0, "m0", "body")).expect("seed");
     let live = store.retention_stats().expect("live stats");
     let original = store.retention_policy().expect("original policy");
     let error = store
@@ -653,14 +659,15 @@ fn retention_reconfigure_below_live_evidence_is_rejected() {
     store.try_reconfigure_retention(exact_live).expect("exact live bound is valid");
     assert_eq!(store.retention_policy().expect("updated policy"), exact_live);
     assert!(matches!(
-        store.append(request("s", 1, "m1", "body")),
+        store.append(request(s, 1, "m1", "body")),
         Err(TranscriptAppendErrorV1::RetentionSaturated { .. })
     ));
 }
 #[test]
 fn retention_stats_separate_active_evidence_and_session_costs() {
     let store = store();
-    store.append(request("s", 0, "m0", "body")).expect("seed");
+    let s = store.open_session("s".to_string()).expect("open session");
+    store.append(request(s, 0, "m0", "body")).expect("seed");
     let (expected_active, expected_evidence, expected_session, expected_total) =
         expected_partition_costs("s", "m0", "body");
     assert_eq!(
@@ -679,7 +686,7 @@ fn retention_stats_separate_active_evidence_and_session_costs() {
         active.active_bytes + active.evidence_bytes + active.session_key_bytes
     );
 
-    store.truncate_to(&"s".to_string(), 0).expect("truncate body");
+    store.truncate_to(&s, 0).expect("truncate body");
     let truncated = store.retention_stats().expect("truncated stats");
     assert_eq!(truncated.active_row_count, 0);
     assert_eq!(truncated.active_bytes, 0);
@@ -697,36 +704,41 @@ fn retention_stats_separate_active_evidence_and_session_costs() {
 #[test]
 fn same_identity_with_body_drift_is_payload_conflict() {
     let store = store();
-    store.append(request("s", 0, "m0", "old")).expect("seed");
-    let err = store.append(request("s", 0, "m0", "new")).expect_err("conflict");
+    let s = store.open_session("s".to_string()).expect("open session");
+    store.append(request(s, 0, "m0", "old")).expect("seed");
+    let err = store.append(request(s, 0, "m0", "new")).expect_err("conflict");
     assert!(matches!(err, TranscriptAppendErrorV1::PayloadConflict { sequence: 0 }));
-    assert_eq!(store.load(&"s".to_string()).expect("load")[0].body(), "old");
+    assert_eq!(store.load(&s).expect("load")[0].body(), "old");
 }
 #[test]
 fn reused_sequence_with_different_message_id_is_typed_conflict() {
     let store = store();
-    store.append(request("s", 4, "m0", "body")).expect("seed");
-    let err = store.append(request("s", 4, "m1", "body")).expect_err("conflict");
+    let s = store.open_session("s".to_string()).expect("open session");
+    store.append(request(s, 4, "m0", "body")).expect("seed");
+    let err = store.append(request(s, 4, "m1", "body")).expect_err("conflict");
     assert!(matches!(err, TranscriptAppendErrorV1::SequenceConflict { sequence: 4 }));
 }
 #[test]
 fn reused_message_id_at_different_sequence_is_typed_conflict() {
     let store = store();
-    store.append(request("s", 4, "m0", "body")).expect("seed");
-    let err = store.append(request("s", 5, "m0", "body")).expect_err("conflict");
+    let s = store.open_session("s".to_string()).expect("open session");
+    store.append(request(s, 4, "m0", "body")).expect("seed");
+    let err = store.append(request(s, 5, "m0", "body")).expect_err("conflict");
     assert!(matches!(err, TranscriptAppendErrorV1::MessageIdConflict));
 }
 #[test]
 fn append_identity_is_partitioned_by_session() {
     let store = store();
+    let left = store.open_session("left".to_string()).expect("left session");
+    let right = store.open_session("right".to_string()).expect("right session");
     assert_eq!(
-        store.append(request("left", 4, "m0", "left-body")).expect("left"),
+        store.append(request(left, 4, "m0", "left-body")).expect("left"),
         TranscriptAppendDispositionV1::Applied
     );
     assert_eq!(
-        store.append(request("right", 4, "m0", "right-body")).expect("right"),
+        store.append(request(right, 4, "m0", "right-body")).expect("right"),
         TranscriptAppendDispositionV1::Applied
     );
-    assert_eq!(store.load(&"left".to_string()).expect("left load")[0].body(), "left-body");
-    assert_eq!(store.load(&"right".to_string()).expect("right load")[0].body(), "right-body");
+    assert_eq!(store.load(&left).expect("left load")[0].body(), "left-body");
+    assert_eq!(store.load(&right).expect("right load")[0].body(), "right-body");
 }

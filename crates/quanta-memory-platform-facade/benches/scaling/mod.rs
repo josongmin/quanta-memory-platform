@@ -2,18 +2,17 @@
 // code; the workspace deny policy permits only the delegated GlobalAlloc item.
 
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::collections::BTreeMap;
 use std::hint::black_box;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use quanta_memory_platform_core::domain::management_limits::MAX_RESOURCE_GROUPS_PER_POLICY;
 use quanta_memory_platform_core::{
     ChargeKind, ExecutionBudget, ManagedCharge, MemoryBudgetManifest, MemoryClass,
     MemoryClassBudget, MemoryContextKind, MemoryError, MemoryPreset, ReclaimPriority,
-    ResidencyPolicy, ResourceGroup, ResourceGroupScheduler, RetainedEnvelope, StoreBindingHandle,
-    WeightedResourceGroupScheduler,
+    ResidencyPolicy, ResourceGroup, RetainedEnvelope, StoreBindingHandle,
 };
 use quanta_memory_platform_facade::{
     MemoryPlatformBuilder, PayloadStore, PortableMemoryPresets, RetainedMapStore, RevocableStore,
@@ -283,6 +282,13 @@ fn parse_usize_list(raw: &str, option: &str) -> Vec<usize> {
         .collect()
 }
 
+// `entries` is the number of timed admission pairs. The production policy
+// bounds configured groups at 256, so benchmark cardinality scales within
+// that bound: standard 1K/10K runs use 25/250 configured groups.
+fn broker_group_cardinality(entries: usize) -> usize {
+    entries.div_ceil(40).clamp(1, MAX_RESOURCE_GROUPS_PER_POLICY)
+}
+
 fn begin_allocation_epoch(counters: &AllocationCounters) {
     assert_eq!(
         counters.live.load(Ordering::Relaxed),
@@ -374,6 +380,11 @@ fn emit(
     let throughput = (timed_operations as f64 / elapsed.as_secs_f64()).round() as u64;
     let successful_throughput =
         (operations.successful as f64 / elapsed.as_secs_f64()).round() as u64;
+    let group_cardinality_field = if operation == "broker_group_admission_cardinality" {
+        format!(",\"group_cardinality\":{}", broker_group_cardinality(entries))
+    } else {
+        String::new()
+    };
     let outcome_latency_fields = operations.outcome_latencies.map_or_else(String::new, |(admitted, denied)| {
         format!(
             ",\"admitted_p50_ns\":{},\"admitted_p95_ns\":{},\"admitted_p99_ns\":{},\"denied_p50_ns\":{},\"denied_p95_ns\":{},\"denied_p99_ns\":{}",
@@ -409,7 +420,7 @@ fn emit(
             "\"allocator_live_bytes\":{live},",
             "\"allocator_high_water_bytes\":{high_water},",
             "\"allocator_underflowed\":{underflowed},",
-            "\"busy_retries\":{busy_retries}{outcome_latency_fields}{detail_latency_fields}}}"
+            "\"busy_retries\":{busy_retries}{group_cardinality_field}{outcome_latency_fields}{detail_latency_fields}}}"
         ),
         operation = operation,
         mode = mode,
@@ -433,6 +444,7 @@ fn emit(
         high_water = allocation.high_water,
         underflowed = allocation.underflowed,
         busy_retries = busy_retries,
+        group_cardinality_field = group_cardinality_field,
         outcome_latency_fields = outcome_latency_fields,
         detail_latency_fields = detail_latency_fields,
     );
@@ -463,7 +475,7 @@ fn main() {
             payload_unique_fill_and_dedup_put(entries, repetition, allocations);
             revocable_fill_and_drain(entries, repetition, allocations);
             broker_release_owner_cardinality(entries, repetition, allocations);
-            scheduler_admission_group_cardinality(entries, repetition, allocations);
+            broker_group_admission_cardinality(entries, repetition, allocations);
             retained_map_point_read(entries, repetition, true, allocations);
             retained_map_point_read(entries, repetition, false, allocations);
             for mode in [

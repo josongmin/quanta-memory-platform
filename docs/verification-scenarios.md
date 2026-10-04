@@ -58,13 +58,17 @@ Correctness is managed as **tests**; benchmarks answer a different question
   absolute and optional same-host baseline thresholds; its negative fixtures
   prove drift and regressed results are rejected. Retained store/broker rows
   must report nonzero allocator activity, and a nonzero allocation total must
-  have a consistent high-water mark. Scheduler admission may legitimately
-  allocate zero bytes because its epoch starts after fixture construction.
+  have a consistent high-water mark. Broker group admission observes real
+  reserve/release allocations and requires positive balanced allocation totals.
   Correctness remains in the
-  owning unit/conformance suites. The scheduler-admission row retains its
+  owning unit/conformance suites. The broker group admission row retains its
   **combined** timed-call count, throughput and `p50/p95/p99_ns`,
   and also reports `admitted_*_ns` and `denied_*_ns` percentiles from the same
   timed calls. Every v4 admission row requires both distributions. The
+  `broker_group_admission_cardinality` workload records actual group cardinality
+  (ceil(entries/40), bounded to 1..=256) under validated broker policy. Prior
+  standalone scheduler receipts cannot serve as baselines for this operation.
+  The
   revocable fill/drain row additionally reports separate `fill_*_ns` and
   `reclaim_*_ns` distributions; release comparison gates both p99 values.
   The revocable fill-and-drain 1k→10k complexity gate compares the median
@@ -315,8 +319,8 @@ check helpers that the control plane enforces (see group C/D).
   (`facade/src/revocable_store/service.rs`), and
   `partial_snapshot_clone_and_drop_panics_cannot_abort`,
   `partial_load_clone_and_drop_panics_cannot_abort`,
-  `new_session_clone_and_drop_panics_cannot_abort`,
-  `owned_session_key_order_and_drop_panics_cannot_abort`, and
+  `open_session_moves_metadata_without_clone_and_contains_body_drop`,
+  `session_handle_lookup_skips_caller_order_and_close_contains_metadata_drop`, and
   `partial_append_identity_clone_and_drop_panics_cannot_abort`
   (`facade/src/transcript_store/service.rs`) run selected subprocess cases
   combining trait unwind with hostile destructors. They prove the specific
@@ -362,7 +366,7 @@ check helpers that the control plane enforces (see group C/D).
   use independent cost constants and check exact class/owner/context/kind
   postimages and live-ticket counts, including a zero-byte authority.
 - ✅ revocable FIFO/revoke/eviction — `reclaim_one_is_fifo_and_releases_its_bytes`, `revoke_makes_entry_unretrievable_and_decrements_accounting`, `reclaim_eviction_order_is_deterministic_fifo_at_capacity_boundary`.
-- ✅ publish_pipeline commit transition — `default_pipeline_runs_stage_then_commit_each_exactly_once_no_rollback`, `failed_commit_never_publishes_and_never_increments_count`.
+- Legacy non-retaining publish transitions were removed. Retaining publication uses the prepared identity/root contract; caller-owned value transformations use their own fallible callback.
 - ✅ **Prepared publication kind buckets and bounded orphan roots** —
   `prepared_identity_index_and_tombstone_keep_exact_independent_cost`
   (`facade/src/publish_pipeline/prepared_publication.rs`) pins an independent
@@ -384,23 +388,22 @@ check helpers that the control plane enforces (see group C/D).
   still-charged handle and its later retirement refunds once, even after the
   target controller is dropped.
 - ✅ transcript per-session isolation + charged mode — `append_identity_is_partitioned_by_session`, `retention_stats_separate_active_evidence_and_session_costs`, and (charged) `exact_retry_charges_once_and_truncate_refunds_only_active_body`, `quota_denial_leaves_row_indexes_and_charge_unchanged` (`facade/src/transcript_store/service.rs`).
-- ✅ **Transcript read-planning panic availability** —
-  `session_order_panic_before_mutation_keeps_public_transcript_available`,
-  `append_preflight_order_panic_keeps_public_store_available`,
+- ✅ **Transcript handle lookup and read-planning availability** —
+  `session_handle_mutations_do_not_invoke_caller_order`,
+  `foreign_handle_append_fails_before_accounting`,
   `append_preflight_message_order_panic_keeps_public_store_available`, and
   `append_replay_canonical_key_panic_keeps_public_store_available`
-  (`facade/src/transcript_store/service.rs`) exercise SessionId/MessageId Ord
-  and retained CanonicalKey panics before mutation. The public load/stats/close
-  path remains available, and ledger/source postimages stay exact.
+  (`facade/src/transcript_store/service.rs`) show that handle operations avoid
+  caller SessionId comparison, reject foreign handles before charge, and
+  preserve state through MessageId Ord / retained CanonicalKey panic.
 - ✅ **Public store reads run through one owned read boundary** —
   `StoreLifecycle::with_read_state` (`facade/src/shared/lifecycle.rs`) owns
   the lifecycle preflight, the nonblocking state lock, and unwind containment
   for facade public reads, so a caller-trait panic can no longer poison an
-  intact store. RED-turned-GREEN oracle:
-  `session_bytes_ord_panic_preserves_store_and_ledger` arms the SessionId Ord
-  probe inside the `session_bytes` lookup; after the panic the same store
-  still serves checked_stats/load/session_bytes/append/close and drains every
-  owner byte and ticket. Read-mechanism and plain-counter coverage continues
+  intact store. `session_bytes_by_handle_does_not_invoke_caller_order` arms
+  the caller metadata Ord probe and verifies handle lookup does not invoke it;
+  checked stats/load/append/close still drain exactly. Read-mechanism and
+  plain-counter coverage continues
   in `reference_eq_panic_before_mutation_keeps_public_store_available` (pin
   count lookup), `checked_reads_propagate_client_clone_panics_without_poisoning_owner_mutex_v1`
   (map get/entries clones), `resolve_clone_panic_preserves_readability_and_charge`
@@ -411,6 +414,23 @@ check helpers that the control plane enforces (see group C/D).
   prepared publication).
 - ✅ charged facade mutators are fail-closed before store mutation — `charged_remove_during_rebuild_is_fail_closed`, `charged_sweep_during_rebuild_is_fail_closed`, `reclaim_one_during_rebuild_is_fail_closed`, `reclaim_until_during_rebuild_is_fail_closed`, `truncate_refund_failure_preserves_rows_indexes_and_accounting`.
 - ✅ transcript charged breadth now matches the closeout bar — `append_identity_is_partitioned_by_session` proves session-local identity partitioning, and `truncate_refund_failure_preserves_rows_indexes_and_accounting` proves refund denial leaves both ledger and store untouched.
+- ✅ **Transcript public lifecycle and bounded read** —
+  `transcript_public_trait_keeps_session_incarnations_independent` calls the
+  actual trait for open/page/CAS/retire and rejects a late old handle after
+  reopening the same metadata. `empty_sessions_consume_limits_and_reopen_never_reuses_handle`,
+  `budgeted_empty_session_retire_and_close_refund_metadata_exactly`,
+  `count_and_key_byte_limits_independently_deny_open_before_charge`,
+  `cursor_limits_staleness_and_max_sequence_are_fail_closed`,
+  `failed_retire_restores_all_charges_and_handle_then_success_ends_replay`, and
+  `detached_slow_clone_allows_other_append_and_pins_target_charge_until_read_ends`
+  and `closing_phase_prevents_new_read_pin_and_clone_then_retry_succeeds`
+  (`facade/src/transcript_store/service/tests/lifecycle_paging.rs`) cover
+  zero-row metadata, cursor bounds and a read-first charge-preserving schedule.
+  The closing-first oracle observes no new pin/Clone and unchanged ledger.
+  A page is a partial result; CAS selectors describe the entire session.
+  `transcript_suite_rejects_swallowed_session_retirement` in testkit uses an
+  otherwise-honest target that lies only about retire, and requires exactly the
+  retirement assertion to fail. These selectors are contracts, not pass receipts.
 
 ### Optional durable maintenance (`spill-redb`, not active product support)
 
@@ -623,13 +643,9 @@ activation criteria. The optional L1/L2 evidence below does not prove L3.
   or general hardware qualification. Opt in only inside a disposable Linux VM by
   setting `QMP_DURABILITY_L2_DM_ALLOW_DISPOSABLE=1`.
 
-**`SimplePublishPipeline` is intentionally not charged.** It is a non-retaining
-*transition* stage (zero bytes held): it transforms a staged value into a
-published one and hands it off to the store that retains it. The destination
-store (payload / retained-map / transcript) is what charges those bytes; wiring
-a charger into the pipeline would double-count. This is a deliberate design
-choice documented in `facade/src/publish_pipeline/service.rs`, not a gap.
-The retaining prepared-publication service is separately charged.
+The legacy non-retaining publish wrapper has been removed. It owned no memory
+or canonical-root visibility. Callers that only transform values run their own
+transition; retaining publication uses the separately charged prepared service.
 
 ## G. Testkit conformance — ✅ ("the suite must bite", `testkit/`)
 

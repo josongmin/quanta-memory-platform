@@ -21,7 +21,7 @@ use quanta_memory_platform_facade::TranscriptRetentionPolicyV2;
 use quanta_memory_platform_facade::{
     AbortDispositionV1, Budgeted, PrepareDispositionV1, PreparedPublicationErrorV1,
     PreparedPublicationIdentityV1, PreparedPublicationRequestV1, PreparedPublicationService,
-    PreparedPublicationStatsV1, PreparedPublicationTokenV1, SessionTranscriptStore,
+    PreparedPublicationStatsV1, PreparedPublicationTokenV1, SessionHandle, SessionTranscriptStore,
     SimpleSessionTranscriptStore, TranscriptAppendDispositionV1, TranscriptAppendErrorV1,
     TranscriptAppendIdentityV1, TranscriptAppendRequestV1,
 };
@@ -248,24 +248,34 @@ pub type TranscriptRow = (u64, Vec<u8>, Vec<u8>);
 
 /// Backend-neutral target for transcript append idempotency conformance.
 pub trait TranscriptAppendConformanceTarget {
+    type Handle: Copy + std::fmt::Debug + Eq;
+
+    fn open_session(&self, session_id: &[u8]) -> Result<Self::Handle, MemoryError>;
     fn append(
         &self,
-        session_id: &[u8],
+        handle: Self::Handle,
         sequence: u64,
         message_id: &[u8],
         body: &[u8],
     ) -> Result<TranscriptAppendDispositionV1, TranscriptAppendErrorV1>;
-    fn load(&self, session_id: &[u8]) -> Result<Vec<TranscriptRow>, MemoryError>;
-    fn truncate_to(&self, session_id: &[u8], max_messages: usize) -> Result<(), MemoryError>;
+    fn load(&self, handle: &Self::Handle) -> Result<Vec<TranscriptRow>, MemoryError>;
+    fn truncate_to(&self, handle: &Self::Handle, max_messages: usize) -> Result<(), MemoryError>;
+    fn retire_session(&self, handle: &Self::Handle) -> Result<(), MemoryError>;
     fn retained_bytes(&self) -> Result<u64, MemoryError>;
 }
 
 impl TranscriptAppendConformanceTarget
     for SimpleSessionTranscriptStore<Vec<u8>, Vec<u8>, Vec<u8>, Budgeted>
 {
+    type Handle = SessionHandle;
+
+    fn open_session(&self, session_id: &[u8]) -> Result<Self::Handle, MemoryError> {
+        SessionTranscriptStore::open_session(self, session_id.to_vec())
+    }
+
     fn append(
         &self,
-        session_id: &[u8],
+        handle: Self::Handle,
         sequence: u64,
         message_id: &[u8],
         body: &[u8],
@@ -273,22 +283,26 @@ impl TranscriptAppendConformanceTarget
         SessionTranscriptStore::append(
             self,
             TranscriptAppendRequestV1::new(
-                TranscriptAppendIdentityV1::new(session_id.to_vec(), sequence, message_id.to_vec()),
+                TranscriptAppendIdentityV1::new(handle, sequence, message_id.to_vec()),
                 body.to_vec(),
             ),
         )
     }
 
-    fn load(&self, session_id: &[u8]) -> Result<Vec<TranscriptRow>, MemoryError> {
-        SessionTranscriptStore::load(self, &session_id.to_vec()).map(|rows| {
+    fn load(&self, handle: &Self::Handle) -> Result<Vec<TranscriptRow>, MemoryError> {
+        SessionTranscriptStore::load(self, handle).map(|rows| {
             rows.into_iter()
                 .map(|row| (row.sequence(), row.message_id().clone(), row.into_body()))
                 .collect()
         })
     }
 
-    fn truncate_to(&self, session_id: &[u8], max_messages: usize) -> Result<(), MemoryError> {
-        SessionTranscriptStore::truncate_to(self, &session_id.to_vec(), max_messages)
+    fn truncate_to(&self, handle: &Self::Handle, max_messages: usize) -> Result<(), MemoryError> {
+        SessionTranscriptStore::truncate_to(self, handle, max_messages)
+    }
+
+    fn retire_session(&self, handle: &Self::Handle) -> Result<(), MemoryError> {
+        SessionTranscriptStore::retire_session(self, handle)
     }
 
     fn retained_bytes(&self) -> Result<u64, MemoryError> {
@@ -309,6 +323,7 @@ where
     let first_active = 3 + 2 + 24 + 16;
     let first_expected = session + evidence + first_active;
     let after_truncate_expected = first_expected + evidence;
+    let expected_first_row = vec![(0, b"m0".to_vec(), b"one".to_vec())];
     let replay = InvariantAssertion::new(
         ContractFamily::ReserveFailClosed,
         "transcript_exact_replay_is_inert",
@@ -325,29 +340,42 @@ where
         ContractFamily::ReserveFailClosed,
         "transcript_new_identity_fails_closed_at_retention_bound",
     );
+    let incarnation = InvariantAssertion::new(
+        ContractFamily::ReclaimAccounting,
+        "transcript_retirement_invalidates_issued_handle",
+    );
 
-    let first = target.append(b"s", 0, b"m0", b"one");
-    let replayed = target.append(b"s", 0, b"m0", b"one");
-    let rows_after_replay = target.load(b"s");
+    let handle = match target.open_session(b"s") {
+        Ok(handle) => handle,
+        Err(error) => return vec![replay.assert_that(false, format!("open={error:?}"))],
+    };
+
+    let first = target.append(handle, 0, b"m0", b"one");
+    let replayed = target.append(handle, 0, b"m0", b"one");
+    let rows_after_replay = target.load(&handle);
     let bytes_after_replay = target.retained_bytes();
-    let payload_conflict = target.append(b"s", 0, b"m0", b"different");
-    let sequence_conflict = target.append(b"s", 0, b"m1", b"one");
-    let message_conflict = target.append(b"s", 1, b"m0", b"one");
+    let payload_conflict = target.append(handle, 0, b"m0", b"different");
+    let sequence_conflict = target.append(handle, 0, b"m1", b"one");
+    let message_conflict = target.append(handle, 1, b"m0", b"one");
 
-    let second = target.append(b"s", 1, b"m1", b"four");
-    let truncate = target.truncate_to(b"s", 1);
-    let late_retry = target.append(b"s", 1, b"m1", b"four");
-    let rows_after_late_retry = target.load(b"s");
+    let second = target.append(handle, 1, b"m1", b"four");
+    let truncate = target.truncate_to(&handle, 1);
+    let late_retry = target.append(handle, 1, b"m1", b"four");
+    let rows_after_late_retry = target.load(&handle);
     let bytes_after_late_retry = target.retained_bytes();
-    let saturated = target.append(b"s", 2, b"m2", b"five");
-    let rows_after_saturation = target.load(b"s");
+    let saturated = target.append(handle, 2, b"m2", b"five");
+    let rows_after_saturation = target.load(&handle);
     let bytes_after_saturation = target.retained_bytes();
+    let retired = target.retire_session(&handle);
+    let bytes_after_retire = target.retained_bytes();
+    let stale_load = target.load(&handle);
+    let reopened = target.open_session(b"s");
 
     vec![
         replay.assert_that(
             matches!(first, Ok(TranscriptAppendDispositionV1::Applied))
                 && matches!(replayed, Ok(TranscriptAppendDispositionV1::Replayed))
-                && matches!(&rows_after_replay, Ok(rows) if rows.len() == 1)
+                && matches!(&rows_after_replay, Ok(rows) if rows == &expected_first_row)
                 && matches!(bytes_after_replay, Ok(bytes) if bytes == first_expected),
             format!(
                 "first={first:?} replay={replayed:?} rows={rows_after_replay:?} bytes={bytes_after_replay:?}"
@@ -372,7 +400,7 @@ where
             matches!(second, Ok(TranscriptAppendDispositionV1::Applied))
                 && truncate.is_ok()
                 && matches!(late_retry, Ok(TranscriptAppendDispositionV1::Replayed))
-                && matches!(&rows_after_late_retry, Ok(rows) if rows.len() == 1)
+                && matches!(&rows_after_late_retry, Ok(rows) if rows == &expected_first_row)
                 && matches!(bytes_after_late_retry, Ok(bytes) if bytes == after_truncate_expected),
             format!(
                 "second={second:?} truncate={truncate:?} late={late_retry:?} rows={rows_after_late_retry:?} bytes={bytes_after_late_retry:?}"
@@ -390,6 +418,15 @@ where
                 && bytes_after_saturation == bytes_after_late_retry,
             format!(
                 "saturated={saturated:?} rows_before={rows_after_late_retry:?} rows_after={rows_after_saturation:?} bytes_before={bytes_after_late_retry:?} bytes_after={bytes_after_saturation:?}"
+            ),
+        ),
+        incarnation.assert_that(
+            retired.is_ok()
+                && matches!(bytes_after_retire, Ok(0))
+                && matches!(stale_load, Err(MemoryError::InvalidState(_)))
+                && matches!(&reopened, Ok(next) if *next != handle),
+            format!(
+                "retired={retired:?} bytes={bytes_after_retire:?} stale={stale_load:?} reopened={reopened:?}"
             ),
         ),
     ]
@@ -744,6 +781,7 @@ enum LifecycleStore {
 struct FacadeLifecycleTarget {
     platform: LiveMemoryPlatform,
     store: Option<LifecycleStore>,
+    transcript_handle: Option<SessionHandle>,
 }
 
 #[cfg(feature = "fixtures")]
@@ -787,7 +825,7 @@ impl FacadeLifecycleTarget {
             ),
             _ => return Err(format!("unknown lifecycle store: {name}")),
         };
-        Ok(Self { platform, store: Some(store) })
+        Ok(Self { platform, store: Some(store), transcript_handle: None })
     }
 
     fn store(&self) -> Result<&LifecycleStore, String> {
@@ -800,13 +838,14 @@ impl StoreLifecycleConformanceTarget for FacadeLifecycleTarget {
     type RebuildFence = quanta_memory_platform_core::RebuildFence;
 
     fn populate(&mut self) -> Result<(), String> {
-        match self.store()? {
+        let opened_transcript = match self.store()? {
             LifecycleStore::Payload(store) => {
                 for bytes in [vec![1; 8], vec![2; 13]] {
                     store
                         .put_canonical(quanta_memory_platform_core::RetainedEnvelope::new(bytes))
                         .map_err(|error| error.to_string())?;
                 }
+                None
             }
             LifecycleStore::Retained(store) => {
                 for (key, bytes) in [("a", vec![1; 8]), ("b", vec![2; 13])] {
@@ -814,6 +853,7 @@ impl StoreLifecycleConformanceTarget for FacadeLifecycleTarget {
                         .insert_checked(key.to_string(), bytes)
                         .map_err(|error| error.to_string())?;
                 }
+                None
             }
             LifecycleStore::Revocable(store) => {
                 for (key, bytes) in [("a", vec![1; 8]), ("b", vec![2; 13])] {
@@ -821,13 +861,16 @@ impl StoreLifecycleConformanceTarget for FacadeLifecycleTarget {
                         .insert_checked(key.to_string(), bytes)
                         .map_err(|error| error.to_string())?;
                 }
+                None
             }
             LifecycleStore::Transcript(store) => {
+                let handle =
+                    store.open_session("s".to_string()).map_err(|error| error.to_string())?;
                 for (sequence, bytes) in [(0, vec![1; 8]), (1, vec![2; 13])] {
                     store
                         .append(TranscriptAppendRequestV1::new(
                             TranscriptAppendIdentityV1::new(
-                                "s".to_string(),
+                                handle,
                                 sequence,
                                 format!("m{sequence}"),
                             ),
@@ -835,6 +878,7 @@ impl StoreLifecycleConformanceTarget for FacadeLifecycleTarget {
                         ))
                         .map_err(|error| error.to_string())?;
                 }
+                Some(handle)
             }
             LifecycleStore::Prepared(store) => {
                 for (identity, bytes) in
@@ -848,8 +892,10 @@ impl StoreLifecycleConformanceTarget for FacadeLifecycleTarget {
                         ))
                         .map_err(|error| error.to_string())?;
                 }
+                None
             }
-        }
+        };
+        self.transcript_handle = opened_transcript;
         Ok(())
     }
 
@@ -901,13 +947,15 @@ impl StoreLifecycleConformanceTarget for FacadeLifecycleTarget {
                 store.insert_checked("after".to_string(), vec![3; 1]),
                 Err(MemoryError::Closed(_))
             ),
-            Ok(LifecycleStore::Transcript(store)) => matches!(
-                store.append(TranscriptAppendRequestV1::new(
-                    TranscriptAppendIdentityV1::new("s".to_string(), 3, "after".to_string()),
-                    vec![3; 1],
-                )),
-                Err(TranscriptAppendErrorV1::Storage(MemoryError::Closed(_)))
-            ),
+            Ok(LifecycleStore::Transcript(store)) => self.transcript_handle.is_some_and(|handle| {
+                matches!(
+                    store.append(TranscriptAppendRequestV1::new(
+                        TranscriptAppendIdentityV1::new(handle, 3, "after".to_string()),
+                        vec![3; 1],
+                    )),
+                    Err(TranscriptAppendErrorV1::Storage(MemoryError::Closed(_)))
+                )
+            }),
             Ok(LifecycleStore::Prepared(store)) => matches!(
                 store.prepare(PreparedPublicationRequestV1::new(
                     PreparedPublicationIdentityV1::new(b"after".to_vec()).expect("valid identity"),
@@ -929,6 +977,7 @@ impl StoreLifecycleConformanceTarget for FacadeLifecycleTarget {
 
     fn drop_store(&mut self) {
         drop(self.store.take());
+        self.transcript_handle = None;
     }
 }
 

@@ -14,7 +14,7 @@ fn sparse_reclaim_partition_and_rollback_preserve_large_fifo() {
                 value: (),
                 charged_bytes: 1,
                 charge: None,
-                #[cfg(feature = "spill")]
+                #[cfg(feature = "spill-durable")]
                 restore_claim: None,
             })
             .collect::<VecDeque<_>>();
@@ -451,7 +451,7 @@ fn closed_source_rejects_restored_handle_without_losing_its_charge() {
     drop(handle);
     assert_eq!(broker.ledger_snapshot().expect("retired handle ledger").total_owner_bytes(), 0);
 }
-#[cfg(feature = "spill")]
+#[cfg(feature = "spill-durable")]
 #[test]
 fn durable_spill_releases_source_only_after_commit() {
     struct ObservingDurableTarget {
@@ -538,7 +538,7 @@ fn durable_spill_releases_source_only_after_commit() {
     assert_eq!(broker.ledger_snapshot().expect("released after commit").total_owner_bytes(), 0);
     assert_eq!(controller.spilled_count(), Ok(1));
 }
-#[cfg(feature = "spill")]
+#[cfg(feature = "spill-durable")]
 #[test]
 fn failed_durable_write_and_encoder_error_restore_source_fifo_and_charge() {
     struct RejectingDurableTarget {

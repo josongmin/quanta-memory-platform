@@ -77,6 +77,17 @@
 //! broker.record_group_usage("group", 1);
 //! # }
 //! ```
+//!
+//! The scheduler is derived from broker-owned tickets, so external callers
+//! cannot construct or mutate a second group-usage authority:
+//!
+//! ```compile_fail
+//! use quanta_memory_platform_core::WeightedResourceGroupScheduler;
+//! ```
+//!
+//! ```compile_fail
+//! use quanta_memory_platform_core::application::scheduler::WeightedResourceGroupScheduler;
+//! ```
 
 pub mod adapters;
 pub mod api;
@@ -98,8 +109,6 @@ pub use api::control::{
 pub use application::controller::{
     LadderPressureController, PressureController, PressureThresholds, ReclaimRung,
 };
-#[cfg(feature = "live_control")]
-pub use application::scheduler::{ResourceGroupScheduler, WeightedResourceGroupScheduler};
 pub use domain::config::{
     validate_residency, BudgetOverrideLayer, EffectiveBudgetResolver, OverrideRecord,
     OverrideSource, ResolvedBudget, ValidatedResidencyPolicy,
@@ -108,8 +117,7 @@ pub use domain::context::{
     MemoryContextHandle, MemoryContextKind, OwnerKey, RuntimeId, RuntimeKind,
 };
 pub use domain::errors::{
-    CapacityError, MemoryError, MemoryResult, PinError, PublishError, StoreDeleteError,
-    StoreWriteError,
+    CapacityError, MemoryError, MemoryResult, PinError, StoreDeleteError, StoreWriteError,
 };
 pub use domain::ledger::{ChargeKind, LedgerSnapshot, UsageBreakdown};
 pub use domain::management_limits::{
@@ -133,8 +141,7 @@ pub use ports::reclaim::{
 };
 pub use ports::scratch::{ScratchAllocator, ScratchRequest, ScratchReservation};
 pub use ports::store::{
-    PublishedPayload, RetainedEnvelope, StagedHandle, StoreBindingHandle, StoreStats, SweepHint,
-    SweepStats,
+    PublishedPayload, RetainedEnvelope, StoreBindingHandle, StoreStats, SweepHint, SweepStats,
 };
 pub use ports::telemetry::{
     AllocatorAdvisory, AllocatorTelemetry, MemoryEvent, MemoryEventSink, MemoryOperation,

@@ -32,10 +32,6 @@ use quanta_memory_platform_facade::{
 mod legacy_store_paths {
     #[cfg(feature = "payload_store")]
     use quanta_memory_platform_facade::payload_store::service::SimplePayloadStore;
-    #[cfg(feature = "publish_pipeline")]
-    use quanta_memory_platform_facade::publish_pipeline::service::{
-        CommitTransition, DefaultCommitTransition, SimplePublishPipeline,
-    };
     #[cfg(feature = "retained_map")]
     use quanta_memory_platform_facade::retained_map::service::SimpleRetainedMapStore;
     #[cfg(all(feature = "revocable_store", feature = "spill"))]
@@ -157,10 +153,11 @@ fn names_revocable_store_reexports() {
 
 #[cfg(feature = "transcript")]
 use quanta_memory_platform_facade::{
-    SessionTranscriptStore, SessionTranscriptStoreBuilder, SimpleSessionTranscriptStore,
-    TranscriptAppendDispositionV1, TranscriptAppendErrorV1, TranscriptAppendIdentityV1,
-    TranscriptAppendRequestV1, TranscriptRecordV1, TranscriptRetentionPolicyV2,
-    TranscriptRetentionReconfigureErrorV2, TranscriptRetentionStatsV2,
+    SessionHandle, SessionTranscriptStore, SessionTranscriptStoreBuilder,
+    SimpleSessionTranscriptStore, TranscriptAppendDispositionV1, TranscriptAppendErrorV1,
+    TranscriptAppendIdentityV1, TranscriptAppendRequestV1, TranscriptCursor, TranscriptRecordV1,
+    TranscriptRetainDispositionV1, TranscriptRetentionPolicyV2,
+    TranscriptRetentionReconfigureErrorV2, TranscriptRetentionStatsV2, TranscriptSnapshotV1,
 };
 
 /// Pins the `transcript` slice's public exports.
@@ -173,6 +170,10 @@ fn names_transcript_reexports() {
     type _Identity = TranscriptAppendIdentityV1<String, String>;
     type _Request = TranscriptAppendRequestV1<String, String, String>;
     type _Record = TranscriptRecordV1<String, String>;
+    type _Handle = SessionHandle;
+    type _Cursor = TranscriptCursor;
+    type _Snapshot = TranscriptSnapshotV1<String, String>;
+    type _RetainDisposition = TranscriptRetainDispositionV1;
     type _Error = TranscriptAppendErrorV1;
     type _Disposition = TranscriptAppendDispositionV1;
     type _Retention = TranscriptRetentionPolicyV2;
@@ -182,21 +183,15 @@ fn names_transcript_reexports() {
 
 #[cfg(feature = "publish_pipeline")]
 use quanta_memory_platform_facade::{
-    AbortDispositionV1, CommitTransition, DefaultCommitTransition, PrepareDispositionV1,
-    PreparedPublicationErrorV1, PreparedPublicationIdentityV1, PreparedPublicationRequestV1,
-    PreparedPublicationService, PreparedPublicationServiceBuilder, PreparedPublicationStatsV1,
-    PreparedPublicationTokenV1, PublishPipeline, PublishPipelineBuilder, SimplePublishPipeline,
+    AbortDispositionV1, PrepareDispositionV1, PreparedPublicationErrorV1,
+    PreparedPublicationIdentityV1, PreparedPublicationRequestV1, PreparedPublicationService,
+    PreparedPublicationServiceBuilder, PreparedPublicationStatsV1, PreparedPublicationTokenV1,
 };
 
 /// Pins the `publish_pipeline` slice's public exports.
 #[cfg(feature = "publish_pipeline")]
 #[allow(dead_code, clippy::type_complexity)] // -- reason: compile-time surface pin; never executed.
 fn names_publish_pipeline_reexports() {
-    type _Trait = Box<dyn PublishPipeline<String, String, String>>;
-    type _Transition = Box<dyn CommitTransition<String, String, String>>;
-    type _DefaultTransition = DefaultCommitTransition;
-    type _Impl = SimplePublishPipeline<String, String, String>;
-    type _Builder = PublishPipelineBuilder<String, String, String>;
     type _Prepared = PreparedPublicationService<Vec<u8>, Budgeted>;
     type _PreparedBuilder = PreparedPublicationServiceBuilder<Vec<u8>, AccountingUnset>;
     type _PreparedError = PreparedPublicationErrorV1;
@@ -247,12 +242,16 @@ fn prepared_publication_builder_exposes_root_bound_resolution_contract() {
 
 #[cfg(feature = "spill")]
 use quanta_memory_platform_core::MemoryResult;
-#[cfg(feature = "spill")]
+#[cfg(feature = "spill-durable")]
 use quanta_memory_platform_facade::{
     DurableCommitFailure, DurableRestoreCandidate, DurableRestoreController, DurableRestoreOutcome,
-    DurableRestoreTarget, DurableSpillController, DurableSpillTarget, InMemorySpillTarget,
-    InProcessSpillController, InProcessSpillTarget, NoopSpillController, RetainingSpillTarget,
-    RoutedSpillController, SpillController, SpillInventory, SpillReceipt, SpillTarget,
+    DurableRestoreTarget, DurableSpillController, DurableSpillTarget,
+};
+#[cfg(feature = "spill")]
+use quanta_memory_platform_facade::{
+    InMemorySpillTarget, InProcessSpillController, InProcessSpillTarget, NoopSpillController,
+    RetainingSpillTarget, RoutedSpillController, SpillController, SpillInventory, SpillReceipt,
+    SpillTarget,
 };
 
 /// Pins the `spill` slice's public exports, including the controller and target
@@ -268,7 +267,13 @@ fn names_spill_reexports() {
     type _Targets =
         (Box<dyn SpillTarget<u64>>, InMemorySpillTarget<u64>, RetainingSpillTarget<u64>);
     type _Inventory = Box<dyn SpillInventory>;
+    type _Receipt = SpillReceipt;
     type _InProcess = (Box<dyn InProcessSpillController<u64>>, Box<dyn InProcessSpillTarget<u64>>);
+}
+
+#[cfg(feature = "spill-durable")]
+#[allow(dead_code, clippy::type_complexity)] // -- reason: compile-time durable maintenance surface.
+fn names_durable_spill_reexports() {
     type _Durable = (
         Box<dyn DurableSpillController<Vec<u8>>>,
         Box<dyn DurableRestoreController>,
@@ -599,20 +604,110 @@ fn transcript_builder_exposes_public_charged_path() {
         .build()
         .expect("budgeted transcript builder must build");
 
+    let session = store.open_session("s".to_string()).expect("open session");
     let disposition = store
         .append(TranscriptAppendRequestV1::new(
-            TranscriptAppendIdentityV1::new("s".to_string(), 0, "m0".to_string()),
+            TranscriptAppendIdentityV1::new(session, 0, "m0".to_string()),
             "hello".to_string(),
         ))
         .expect("append");
     assert_eq!(disposition, TranscriptAppendDispositionV1::Applied);
-    assert_eq!(store.load(&"s".to_string()).expect("load").len(), 1);
+    assert_eq!(store.load(&session).expect("load").len(), 1);
     assert_eq!(store.stats().expect("checked transcript stats").estimated_bytes, 236);
     let retention = store.retention_stats().expect("retention stats");
     assert_eq!(retention.active_row_count, 1);
     assert_eq!(retention.evidence_count, 1);
     assert_eq!(retention.total_retained_bytes, 236);
     assert_eq!(platform.broker().ledger_snapshot().expect("snap").total_owner_bytes(), 236);
+}
+
+#[cfg(all(feature = "core-live-accounting", feature = "transcript"))]
+#[test]
+fn transcript_public_trait_keeps_session_incarnations_independent() {
+    use quanta_memory_platform_core::{MemoryError, StoreBindingHandle};
+
+    let platform = public_test_platform();
+    let store: SimpleSessionTranscriptStore<String, String, String, Budgeted> = platform
+        .transcript_store_builder::<String, String, String>()
+        .bind(StoreBindingHandle::new(
+            MemoryClass::SessionTranscript,
+            "public-session-incarnation".to_string(),
+            None,
+        ))
+        .build()
+        .expect("budgeted transcript store");
+    let api: &dyn SessionTranscriptStore<String, String, String> = &store;
+
+    let first = api.open_session("same-caller".to_string()).expect("first handle");
+    let independent = api.open_session("same-caller".to_string()).expect("second handle");
+    assert_ne!(first, independent, "caller metadata must not merge sessions");
+    for sequence in 0..2 {
+        assert_eq!(
+            api.append(TranscriptAppendRequestV1::new(
+                TranscriptAppendIdentityV1::new(first, sequence, format!("first-{sequence}")),
+                format!("body-{sequence}"),
+            ))
+            .expect("append first session"),
+            TranscriptAppendDispositionV1::Applied
+        );
+    }
+    api.append(TranscriptAppendRequestV1::new(
+        TranscriptAppendIdentityV1::new(independent, 0, "other-0".to_string()),
+        "other-body".to_string(),
+    ))
+    .expect("append independent session");
+
+    let first_page = api.read_page(&first, None, 1, u64::MAX).expect("first page");
+    assert_eq!(first_page.handle(), first);
+    assert_eq!(first_page.records().len(), 1);
+    assert_eq!(first_page.records()[0].sequence(), 0);
+    let cursor = first_page.next_cursor().expect("remaining row cursor");
+    assert_eq!(cursor.handle(), first);
+    assert_eq!(cursor.last_sequence(), 0);
+    let second_page = api.read_page(&first, Some(&cursor), 1, u64::MAX).expect("second page");
+    assert_eq!(second_page.records().len(), 1);
+    assert_eq!(second_page.records()[0].sequence(), 1);
+    assert_eq!(second_page.next_cursor(), None);
+
+    assert!(matches!(
+        api.retain_sequences_if_version(&first, first_page.version(), &[0, 1])
+            .expect("current-version retain"),
+        TranscriptRetainDispositionV1::Applied { .. }
+    ));
+    api.append(TranscriptAppendRequestV1::new(
+        TranscriptAppendIdentityV1::new(first, 2, "first-2".to_string()),
+        "body-2".to_string(),
+    ))
+    .expect("advance first-session version");
+    assert!(matches!(
+        api.retain_sequences_if_version(&first, first_page.version(), &[0, 1])
+            .expect("stale CAS response"),
+        TranscriptRetainDispositionV1::StaleSnapshot { .. }
+    ));
+    assert!(matches!(
+        api.read_page(&first, Some(&cursor), 1, u64::MAX),
+        Err(MemoryError::InvalidState(_))
+    ));
+
+    api.retire_session(&first).expect("retire first session");
+    let reopened = api.open_session("same-caller".to_string()).expect("reopen caller metadata");
+    assert_ne!(reopened, first);
+    assert_ne!(reopened, independent);
+    assert!(matches!(
+        api.append(TranscriptAppendRequestV1::new(
+            TranscriptAppendIdentityV1::new(first, 3, "late-old".to_string()),
+            "must not reroute".to_string(),
+        )),
+        Err(TranscriptAppendErrorV1::Storage(MemoryError::InvalidState(_)))
+    ));
+    assert_eq!(api.load(&independent).expect("independent session remains").len(), 1);
+    assert!(api.load(&reopened).expect("fresh session is empty").is_empty());
+    api.retire_session(&independent).expect("retire independent session");
+    api.retire_session(&reopened).expect("retire reopened empty session");
+    assert_eq!(
+        platform.broker().ledger_snapshot().expect("all charges returned").total_owner_bytes(),
+        0
+    );
 }
 
 /// The `spill` slice is a genuine two-way tier: a routed controller over a

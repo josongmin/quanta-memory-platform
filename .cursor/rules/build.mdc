@@ -63,6 +63,7 @@ Examples use the real public APIs:
 ```bash
 cargo run -p quanta-memory-platform-facade --example hello_world
 cargo run -p quanta-memory-platform-facade --example effective_budget_report
+cargo run -p quanta-memory-platform-facade --features transcript --example transcript_session
 ```
 
 Generated guidance:

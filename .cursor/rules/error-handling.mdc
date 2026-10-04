@@ -25,7 +25,7 @@ MemoryResult<T> = Result<T, MemoryError>
 ```
 
 Domain-intent aliases all resolve to `MemoryError`: `CapacityError`, `PinError`,
-`PublishError`, `StoreWriteError`, `StoreDeleteError`. Construct via the helpers
+`StoreWriteError`, `StoreDeleteError`. Construct via the helpers
 (`MemoryError::config("…")`, `::capacity("…")`, `::build("…")`, `::report("…")`).
 
 Principles:

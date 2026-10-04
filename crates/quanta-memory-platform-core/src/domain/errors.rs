@@ -4,7 +4,6 @@ use std::fmt::{Display, Formatter};
 pub type MemoryResult<T> = Result<T, MemoryError>;
 pub type CapacityError = MemoryError;
 pub type PinError = MemoryError;
-pub type PublishError = MemoryError;
 pub type StoreDeleteError = MemoryError;
 pub type StoreWriteError = MemoryError;
 

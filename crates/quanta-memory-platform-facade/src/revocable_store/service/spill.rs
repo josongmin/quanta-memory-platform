@@ -1,6 +1,6 @@
 use super::*;
 
-#[cfg(feature = "spill")]
+#[cfg(feature = "spill-durable")]
 impl SimpleRevocableStore<String, Vec<u8>, Budgeted> {
     /// Spill using the versioned `String`/`Vec<u8>` codec. Its complete output
     /// length is checked against the backend cap and broker-charged as live
@@ -141,6 +141,7 @@ impl<Key, Value> SimpleRevocableStore<Key, Value, Budgeted> {
     /// allocations are NOT preflighted or broker-charged. Use
     /// `spill_one_durable_bounded` on a `String`/`Vec<u8>` store when the codec
     /// output must be reserved before allocation.
+    #[cfg(feature = "spill-durable")]
     #[deprecated(
         since = "0.2.0",
         note = "use spill_one_durable_unbounded to acknowledge caller-owned codec allocations, or spill_one_durable_bounded for String/Vec<u8>"
@@ -159,6 +160,7 @@ impl<Key, Value> SimpleRevocableStore<Key, Value, Budgeted> {
 
     /// Arbitrary caller codec path. Unlike the bounded typed codec, private
     /// encoder allocations are outside the broker's pre-allocation guarantee.
+    #[cfg(feature = "spill-durable")]
     pub fn spill_one_durable_unbounded<C, Encode>(
         &self,
         controller: &C,
@@ -175,6 +177,7 @@ impl<Key, Value> SimpleRevocableStore<Key, Value, Budgeted> {
         result
     }
 
+    #[cfg(feature = "spill-durable")]
     pub(super) fn spill_one_durable_inner<C, Encode>(
         &self,
         controller: &C,
@@ -266,6 +269,7 @@ impl<Key, Value> SimpleRevocableStore<Key, Value, Budgeted> {
     }
 
     /// IDs whose source entries are fenced after an unresolved durable commit.
+    #[cfg(feature = "spill-durable")]
     pub fn pending_durable_spills(&self) -> MemoryResult<Vec<DurableRecordId>> {
         Ok(self.lock_read()?.pending_spills.keys().copied().collect())
     }
@@ -273,6 +277,7 @@ impl<Key, Value> SimpleRevocableStore<Key, Value, Budgeted> {
     /// Resolve one fenced durable write. A present record becomes authoritative
     /// and releases the source charge exactly once; an absent record restores
     /// the original FIFO source entry without changing its charge.
+    #[cfg(feature = "spill-durable")]
     pub fn reconcile_durable_spill<C>(
         &self,
         controller: &C,
@@ -336,6 +341,7 @@ impl<Key, Value> SimpleRevocableStore<Key, Value, Budgeted> {
     /// the claim and leaves the durable record authoritative and unchanged.
     /// This explicit escape hatch can allocate before its result is charged;
     /// use `restore_one_durable_bounded` for the audited `String`/`Vec<u8>` codec.
+    #[cfg(feature = "spill-durable")]
     #[deprecated(
         since = "0.2.0",
         note = "use restore_one_durable_unbounded to acknowledge caller-owned codec allocations, or restore_one_durable_bounded for String/Vec<u8>"
@@ -356,6 +362,7 @@ impl<Key, Value> SimpleRevocableStore<Key, Value, Budgeted> {
 
     /// Arbitrary caller decoder path; it does not preflight private codec
     /// allocations against a broker budget.
+    #[cfg(feature = "spill-durable")]
     pub fn restore_one_durable_unbounded<C, Decode>(
         &self,
         controller: &C,
@@ -372,6 +379,7 @@ impl<Key, Value> SimpleRevocableStore<Key, Value, Budgeted> {
         result
     }
 
+    #[cfg(feature = "spill-durable")]
     pub(super) fn restore_one_durable_inner<C, Decode, Preflight>(
         &self,
         controller: &C,
@@ -411,6 +419,7 @@ impl<Key, Value> SimpleRevocableStore<Key, Value, Budgeted> {
     /// restore, but cannot prove that an external caller has relinquished it.
     /// Explicitly unbounded recovery decoder. Its private allocations are
     /// outside the broker's pre-allocation admission contract.
+    #[cfg(feature = "spill-durable")]
     #[deprecated(
         since = "0.2.0",
         note = "use recover_active_durable_restore_unbounded to acknowledge caller-owned codec allocations, or recover_active_durable_restore_bounded for String/Vec<u8>"
@@ -430,6 +439,7 @@ impl<Key, Value> SimpleRevocableStore<Key, Value, Budgeted> {
     }
 
     /// Arbitrary caller decoder path for a persisted restore claim.
+    #[cfg(feature = "spill-durable")]
     pub fn recover_active_durable_restore_unbounded<C, Decode>(
         &self,
         controller: &C,
@@ -446,6 +456,7 @@ impl<Key, Value> SimpleRevocableStore<Key, Value, Budgeted> {
         result
     }
 
+    #[cfg(feature = "spill-durable")]
     pub(super) fn recover_active_durable_restore_inner<C, Decode, Preflight>(
         &self,
         controller: &C,
@@ -477,6 +488,7 @@ impl<Key, Value> SimpleRevocableStore<Key, Value, Budgeted> {
         )
     }
 
+    #[cfg(feature = "spill-durable")]
     pub(super) fn restore_durable_candidate<C, Decode, Preflight>(
         &self,
         controller: &C,
@@ -715,6 +727,7 @@ impl<Key, Value> SimpleRevocableStore<Key, Value, Budgeted> {
         }
     }
 
+    #[cfg(feature = "spill-durable")]
     pub(super) fn abort_prepared_restore_on_panic<C>(
         &self,
         controller: &C,
@@ -735,6 +748,7 @@ impl<Key, Value> SimpleRevocableStore<Key, Value, Budgeted> {
         }
     }
 
+    #[cfg(feature = "spill-durable")]
     pub(super) fn finish_failed_restore_prepare<C>(
         &self,
         controller: &C,
@@ -760,6 +774,7 @@ impl<Key, Value> SimpleRevocableStore<Key, Value, Budgeted> {
         }
     }
 
+    #[cfg(feature = "spill-durable")]
     pub(super) fn fence_durable_restore(
         &self,
         record_id: DurableRecordId,
@@ -772,6 +787,7 @@ impl<Key, Value> SimpleRevocableStore<Key, Value, Budgeted> {
         state.committed_bytes = next_committed;
     }
 
+    #[cfg(feature = "spill-durable")]
     pub(super) fn fence_published_restore(&self, sequence: u64, claim: Arc<DurableRestoreClaim>) {
         let mut state = self.lock_state_for_commit();
         let mut entry =
@@ -783,6 +799,7 @@ impl<Key, Value> SimpleRevocableStore<Key, Value, Budgeted> {
 
     /// IDs whose provisional resident copies are fenced after an unresolved
     /// durable delete. Fenced copies remain charged but are not readable.
+    #[cfg(feature = "spill-durable")]
     pub fn pending_durable_restores(&self) -> MemoryResult<Vec<DurableRecordId>> {
         Ok(self.lock_read()?.pending_restores.keys().copied().collect())
     }
@@ -792,6 +809,7 @@ impl<Key, Value> SimpleRevocableStore<Key, Value, Budgeted> {
     /// provisional resident copy and its charge are retired exactly once. If a
     /// different claimant consumed the record, the provisional copy is retired
     /// without ever becoming readable.
+    #[cfg(feature = "spill-durable")]
     pub fn reconcile_durable_restore<C>(
         &self,
         controller: &C,

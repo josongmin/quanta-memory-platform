@@ -28,10 +28,13 @@ revocable_store = ["core-live-accounting"]
 transcript = ["core-live-accounting", "dep:blake3"]
 publish_pipeline = ["core-live-accounting", "dep:blake3"]
 spill = []
+# Existing durable protocol and restore flow, without a disk backing. This is
+# optional maintenance scope; `full` keeps only the in-process spill surface.
+spill-durable = ["spill"]
 
 # Existing opt-in backing. `spill-redb` is outside the current product plan
 # and is not production-qualified; enabling it is not a release claim.
-spill-redb = ["spill", "dep:redb"]
+spill-redb = ["spill-durable", "dep:redb"]
 # Test-only finalize-kill L1 hooks. This is crash-rail
 # instrumentation, not a production capability: it stays absent from `default`,
 # `full`, and `full-backings`, and default builds compile the existing finalize
@@ -63,6 +66,10 @@ full-backings = ["full", "spill-redb"]
 [[example]]
 name = "hello_world"
 required-features = ["core-live-accounting"]
+
+[[example]]
+name = "transcript_session"
+required-features = ["transcript"]
 
 [[example]]
 name = "spill_redb_crash_child"
