@@ -32,8 +32,8 @@ success commit; a successful destination has a clean worktree.
 scripts/verify-extracted-examples.sh
 ```
 
-CircleCI's push workflow is the required hosted verifier. GitHub Actions has
-only explicit manual dispatch and is a diagnostic rerun, not push authority.
+CircleCI's main-push and PR-update workflow is the required hosted verifier.
+The `run_heavy=true` pipeline runs scaling receipts only on explicit request.
 A CI configuration or dry-run pass does not prove that extraction, examples or a
 hosted job executed. Record
 the exact source and actual result as specified by

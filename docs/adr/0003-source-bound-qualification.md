@@ -23,9 +23,10 @@ Status: Accepted.
 - Standalone extraction requires a committed clean source and the resolved
   `core <- facade <- testkit` graph. The actual extracted checkout must run
   the canonical workspace rail and public examples. CI config contracts are
-  not hosted-job results. Both CI configurations belong in the extracted
-  file set and call the same executable extraction/example verifier against
-  the extracted manifest. See [EXTRACTION.md](../../EXTRACTION.md).
+  not hosted-job results. The CircleCI configuration belongs in the extracted
+  file set; its normal job calls the executable extraction/example verifier
+  against the extracted manifest. Heavy scaling runs only with an explicit
+  pipeline parameter. See [EXTRACTION.md](../../EXTRACTION.md).
 - Host adoption, deployment and activation are distinct from QMP's local
   qualification. A paired host proof must verify the Cargo-resolved QMP
   revision and the actual product path, not merely an environment override.

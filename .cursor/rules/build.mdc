@@ -20,8 +20,9 @@ feature capability tests, documented selector validation, generated-guidance
 drift, and dependency policy.
 
 `Justfile` provides short local commands that delegate to the owning scripts;
-it does not define an independent check. CircleCI push is the required hosted
-extraction verifier. GitHub Actions full dispatch is an optional manual rerun.
+it does not define an independent check. CircleCI main-push and PR-update
+pipelines are the required hosted extraction verifier. The optional scaling
+receipts require `run_heavy=true` on the same CircleCI configuration.
 
 The source-shape check rejects Rust files over 1,000 physical lines; 600-line
 files are reported for review. The `grandfathered` baseline is empty and any
