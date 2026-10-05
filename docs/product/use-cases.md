@@ -139,12 +139,15 @@ flowchart LR
 
 - **사용자/트리거:** artifact producer가 같은 canonical payload를 반복 등록하고 참조 중 삭제를 막는다.
 - **흐름:** `put_canonical`로 store-issued `String` reference를 받는다.
-  Concrete store의 pin/unpin으로 사용 중임을 표시하고 `delete_if_unpinned`/close로 종료한다.
+  Concrete store의 pin/unpin으로 개별 삭제를 막고 `delete_if_unpinned`로 삭제한다.
+  `close`는 store 전체를 종료한다.
 - **결과:** 같은 live canonical payload는 같은 reference와 단일 charge를 유지한다.
   삭제 뒤 재등록·다른 store의 reference는 구분되며 stale reference가 새 entry를 수정할 수 없다.
 - **실패/host 의무:** pinned delete, foreign/stale mutation, identity 발급 고갈을 거부한다.
   Reference는 process/store-local lookup identity이며 권한 토큰·durable ID가 아니다.
   Host는 reference를 파싱하거나 restart 경계에서 재사용하지 않는다.
+  **Pin은 개별 delete만 막는다. `close`는 pin count와 관계없이 모든 entry를 해제한다.**
+  Host가 사용자의 수명과 store 종료를 조정해야 하며 pin을 store-close 방지 lease로 취급하지 않는다.
   **이 store에는 reference로 payload를 읽는 get/resolve API가 없다.** 조회가 필요한 데이터 흐름은
   별도로 선택한다; UC08의 prepared resolve와 혼동하지 않는다.
 - **근거:** [payload port](../../crates/quanta-memory-platform-facade/src/payload_store/mod.rs),
@@ -394,6 +397,107 @@ broken fake rejection을 연결한다. Source qualification은
 추가 운영 관측 후보는 `BrokerObservation`의 pending/committed ticket 분리, deferred cleanup depth,
 fence 상태다. 현재 ticket count는 합계이고 fence status/finish cleanup receipt는 별도 API다.
 이 차이도 실제 운영 질의가 확인되어야 기존 observation에 추가하며 새 correctness 결함으로 취급하지 않는다.
+
+### 7.3 추가 유즈케이스 감사와 도입 조건
+
+2026-10-06, QMP `79541311434cce918cdfd5546191670769fb0958`에서 consumer authority,
+store lifecycle, policy/운영 경계를 세 영역으로 병렬 감사했다. API·구현·owning test 소스를
+읽었으며 Rust·Cargo·CI·consumer 실행은 **NOT_RUN**이다. 아래 8개는 앞 절의 후보 외에
+검토할 기능이다. 이번 감사에서 도입을 요구하는 실제 caller나 부하 결과는 확인하지 않았다.
+기존 API의 의미가 잘못됐다는 판정이나 새 release gate가 아니다.
+
+#### 먼저 소비자 적용에서 확인할 후보
+
+| 후보 | 현재 대안 / 추가할 조건 | 기존 계약에 넣을 최소 변경 |
+| --- | --- | --- |
+| 상한 예약 후 실측 commit | `reserve_owned(max)` → `commit()` → `recharge(actual)`로 보수적으로 account할 수 있음. 후속 recharge의 fence·ticket ID 거부 때문에 상한 charge가 계속 남는 것이 실제 문제일 때 | 기존 `PendingReservation`에 `actual <= reserved`인 단일 shrink-and-commit 전이. 별도 `MemoryConsumer` 도입 없이 구현 가능. RFC 0001에 이미 제안됐으며 현재 미구현 |
+| Retained-map 조건부 교체·삭제 | Immutable entry는 insert-if-absent, mutable entry는 모든 writer가 공유하는 host mutex로 처리 가능. 독립 writer의 read→unconditional insert/remove가 lost update를 만들고 host 직렬화가 불가능할 때 | 기존 retained-map port에 expected value/version 기반 조건부 mutation. `insert_if_absent`는 생성 경쟁만 해결하며 기존 값의 조건부 갱신은 제공하지 않음 |
+| Policy revision CAS | 단일 policy owner 또는 모든 writer를 직렬화한 host read/update로 처리 가능. 복수 관리자가 같은 revision을 읽고 전체 policy를 교체해 먼저 적용된 변경을 덮어쓸 때 | 기존 `try_live_reconfigure`에 expected policy revision 검사와 typed conflict. 기존 observation의 revision을 재사용하며 별도 policy IR를 만들지 않음 |
+
+각 후보의 실패 계약:
+
+1. **실측 commit:** 차액 반환과 pending→committed 전이를 같은 broker 잠금에서 적용한다.
+   모든 byte/귀속 축·group floor·scratch/headroom·ticket-count 불변식을 유지한다.
+   상한 초과·fence·commit 실패 시 value는 게시하지 않는다. RFC의 consuming API를 적용하면
+   pending을 rollback하고 cleanup 실패 시 정확한 authority를 deferred retry에 남긴다.
+   0-byte commit도 한 ticket을 유지한다. 향후 broker lifetime peak를 도입한다면 상한 pending
+   예약의 실제 도달치를 실측 commit의 차액 반환으로 지우지 않는다.
+2. **Map 조건부 mutation:** 같은 store mutation lane에서 기대값 확인·net recharge·게시를
+   결합한다. Mismatch와 capacity 거부는 old value·charge·순서를 보존한다. 기대값 비교의
+   Eq/Hash/Clone panic·reentry를 기존 hostile-trait 경계로 처리한다. ABA를 구분해야 하면
+   단순 value equality 대신 host value의 version 계약이 필요하다. 반환 clone의 비용은 별도다.
+3. **Policy CAS:** expected revision 비교를 validation/install과 같은 broker 잠금에 둔다.
+   호출 전에 별도 `observe()`로 비교하는 것만으로는 race가 사라지지 않는다. Stale conflict는
+   policy·revision·scheduler·ledger·epoch를 유지한다. Caller는 최신 policy를 다시 읽고
+   자신의 변경을 재합성하며, 이전 전체 policy를 그대로 retry하지 않는다.
+
+근거: [pending/managed authority](../../crates/quanta-memory-platform-core/src/api/control.rs),
+[commit/replacement ledger](../../crates/quanta-memory-platform-core/src/domain/ledger/operations.rs),
+[기존 실측 commit 설계](../rfcs/0001-sdk-interface-contract.md),
+[map port](../../crates/quanta-memory-platform-facade/src/retained_map/mod.rs),
+[map 구현](../../crates/quanta-memory-platform-facade/src/retained_map/service.rs),
+[live reconfigure](../../crates/quanta-memory-platform-core/src/api/control/observation.rs).
+Version으로 stale update를 거부하는 비교 패턴은
+[Kubernetes 공식 API 계약](https://kubernetes.io/docs/reference/using-api/api-concepts/#updates-to-existing-resources)에도
+있다. 이는 QMP가 Kubernetes의 분산 consistency나 API 기능을 제공한다는 뜻이 아니다.
+
+#### Store 사용 방식이 확인된 뒤 검토할 후보
+
+| 후보 | 현재 대안 / 추가할 조건 | 필요한 경계 |
+| --- | --- | --- |
+| Payload reference 조회 | 현재 payload store에는 get/resolve가 없음. 처음부터 retained-map 또는 host-owned payload authority를 선택할 수 있음. Deduplicated canonical payload 자체가 읽기 원본이어야 할 때 | 기존 payload port에 issued-reference checked read. Foreign/stale/absence와 read failure를 구분하고 clone panic·close 경합을 처리. 반환 clone은 자동 charge하지 않으며 현재 pin은 close를 막지 않는다는 경계를 명시 |
+| 제한된 map 열거 | 현재 keys/entries checked API는 전체 clone 후 잠금 밖에서 정렬. 알려진 key의 point read나 host-owned index로 대체 가능. 큰 map의 전체 복사가 실제 비용일 때 | 기존 port에 row/semantic-byte bound와 mutation-version cursor. 출력 수만 제한한 HashMap scan은 scan/latency 상한이 아님. Ordered index가 필요하면 그 비용과 변경도 같은 fail-closed postimage에 포함 |
+| Transcript 일부 sequence 삭제 | 현재 `retain_sequences*`는 session 전체의 keep set. 전체 selector를 만들고 CAS할 수 있고, 앞쪽 N개 보존/뒤쪽 삭제에는 `truncate_to`를 쓸 수 있음. 일부 page만 읽고 그중 선택 항목을 지워야 하며 전체 selector 구축 비용이 클 때 | 기존 port에 expected version을 받는 선택 삭제. 다른 page의 row는 유지. Duplicate/unknown sequence의 의미, stale/foreign 거부, read pin, release-batch 복구, replay evidence 보존, 실제 변경 시 version 증가를 함께 정의 |
+
+Payload pin은 reference metadata이므로 stronger close-blocking lease와 같지 않다.
+단순 RAII unpin helper도 closed/poisoned 상태에서 fallible unpin의 성공을 보장하지 못한다.
+새 읽기 API를 설계할 때 pin 이름만으로 수명 보장을 추정하지 않는다.
+
+근거: [payload port](../../crates/quanta-memory-platform-facade/src/payload_store/mod.rs),
+[payload pin/close 구현](../../crates/quanta-memory-platform-facade/src/payload_store/service.rs),
+[map 전체 열거 구현](../../crates/quanta-memory-platform-facade/src/retained_map/service.rs),
+[transcript selector port](../../crates/quanta-memory-platform-facade/src/transcript_store/mod.rs),
+[paging/read-pin tests](../../crates/quanta-memory-platform-facade/src/transcript_store/service/tests/lifecycle_paging.rs).
+[Rust BTreeMap range](https://doc.rust-lang.org/std/collections/struct.BTreeMap.html#method.range)는
+정렬된 key 범위를 순회하는 자료구조 예시다. 현재 QMP map은 HashMap이며 자료구조 교체만으로
+snapshot paging·accounting·latency 계약이 완성되지는 않는다.
+
+#### 비용이 큰 authority 확장은 후순위
+
+- **동일 backing의 scratch→retained 전이:** 현재는 retained를 먼저 reserve하고 scratch를
+  반환할 수 있다. 실제로 같은 allocation을 인계할 때만 이중 charge 없이 단일 잠금에서
+  pending scratch→committed retained 전이를 검토한다. 임시 buffer와 새 retained buffer가
+  동시에 존재하면 둘 다 charge해야 한다. Denial은 scratch authority를 보존하고 retained를
+  게시하지 않는다. 기존 [scratch port](../../crates/quanta-memory-platform-core/src/ports/scratch.rs)와
+  authority를 확장하며 allocator 추정이나 refund-first 우회를 넣지 않는다.
+- **여러 component의 원자적 admission:** 현재 host-owned custom charge는 개별 pending으로
+  stage하고 모두 commit된 뒤 host value를 게시할 수 있다. 서로 다른 facade store mutation까지
+  이 방식으로 원자화할 수는 없다. Staging의 임시 점유가 실제 contention 문제가 될 때만
+  기존 broker의 batch reserve/commit을 검토한다.
+  Staging은 atomic batch가 아니며 중간 commit 실패 시 이미 committed된 lease를 host가
+  회수하거나 cleanup이 가능할 때까지 보존해야 한다. Rebuild 중 Drop은 deferred cleanup에 남을 수 있다.
+  Mixed-axis postimage·ticket 수·ID·floor를 같은 잠금에서 검사하고 일부 성공을 노출하지 않는다.
+  Ticket의 일괄 성공은 host publication까지 자동 transaction으로 만들지 않는다.
+  Batch release는 이미 [공개 `release_managed_many`](../../crates/quanta-memory-platform-core/src/api/control/authority.rs)로
+  지원하므로 신규 기능으로 다시 넣지 않는다.
+
+#### 기능을 늘리기 전에 가능한 보완
+
+- 공개 custom charge 사용 예제와 `Weak`로 다른 store를 참조하는 reclaimer 예제를 먼저
+  보강할 수 있다. Strong capture는 broker→callback→store→broker cycle을 만들 수 있다.
+  Safe late wiring은 이미 [cross-store test](../../crates/quanta-memory-platform-facade/tests/cross_store_hellgate.rs)에
+  있으므로 새 reclaim registry를 만들 필요는 없다.
+- Shared backing과 charge를 같은 host-owned Arc 안에 묶는 방식은 기존 API로 가능하다.
+  Private fields에서 value를 charge보다 먼저 두고 charge의 독립 조기 release를 막는다.
+  Mutable backing의 비용 변화는 상한 또는 recharge/replace로 account하며 store의 key/index
+  비용과 backing charge를 중복 계산하지 않도록 host가 설계한다.
+  Generic charged-value helper 부재를 새 core 기능 공백으로 단정하지 않는다.
+- `remove`의 old value 반환, batch release, 0-byte FIFO entry의 metadata 비용은 이미 커버한다.
+  Session/root registry·TTL/LRU·async wait·분산 예산·durable recovery는 현재 caller 근거 없이
+  이 감사에서 신규 필수 작업으로 추가하지 않는다.
+
+도입 시 owning tests와 public examples/conformance를 함께 변경한다. 이 절의 우선순위는
+실제 caller가 기존 대안으로 해결되지 않는 경우에만 적용하며 §7.2와 함께 자동 일괄 구현하지 않는다.
 
 ## 8. 문서 소유권
 
