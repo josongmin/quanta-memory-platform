@@ -499,6 +499,139 @@ snapshot paging·accounting·latency 계약이 완성되지는 않는다.
 도입 시 owning tests와 public examples/conformance를 함께 변경한다. 이 절의 우선순위는
 실제 caller가 기존 대안으로 해결되지 않는 경우에만 적용하며 §7.2와 함께 자동 일괄 구현하지 않는다.
 
+### 7.4 최종 작업 목록: 통합 P0와 추가 구현
+
+2026-10-06, QMP `867f96f7d7b389a4ad8344241b1b5d98d55e24cc`와 Semantica
+`08c0216a5077f491d6fe2eeb095244249310e129`의 관련 소스를 읽고 실행 범위를 재분류했다.
+QMP 작업 트리는 clean이었고 Semantica의 검사한 manifest/lockfile/host/compose/checkout-contract
+경로에도 dirty overlay가 없었다. Rust·Cargo resolution·QBC·host·CI 실행은 **NOT_RUN**이다.
+이 절이 실행 우선순위의 권위이며 §7.2–7.3은 세부 계약과 조건부 후보의 근거다.
+
+**P0는 요청한 최우선 통합 wave다. 모든 항목이 현재 운영 P0 장애라는 뜻은 아니다.**
+QMP 내부 통합, 소비자 cutover, 검증 공백을 구분한다. 필요한 변경은 기존 authority/port/IR를
+직접 확장하며 별도 V2 IR·호환 shim·독립 회계 계층을 만들지 않는다.
+
+#### 이미 배선된 경로
+
+- Platform builder→같은 broker→budgeted store/scratch/custom charge는 구현돼 있다.
+  `StoreAccounting::charge`도 public managed-charge 경로를 호출한다. 새 factory를 만들지 않는다.
+- Builder의 reclaimer/event-sink 설치 seam, 다른 store를 `Weak`로 참조하는 reclaim과
+  실제 ledger 재측정은 구현돼 있다. Host가 설치해야 하는 callback까지 자동 등록됐다는 뜻은 아니다.
+- Cross-store tests에는 공유 cap 경쟁, scratch/0-byte authority와 live policy, 다른 store 회수,
+  mixed charge-kind의 수명 검증이 있다. 테스트 소스의 존재를 이번 실행 성공으로 표시하지 않는다.
+
+근거: [platform builder](../../crates/quanta-memory-platform-facade/src/shared/builder.rs),
+[sealed accounting](../../crates/quanta-memory-platform-facade/src/shared/accounting.rs),
+[cross-store contracts](../../crates/quanta-memory-platform-facade/tests/cross_store_hellgate.rs).
+
+#### P0 — QMP 라이브러리 통합
+
+| ID | 목적 / 확인된 공백 | 변경할 owner와 완료 조건 |
+| --- | --- | --- |
+| P0-Q1. Public consumer 흐름과 extraction 배선 | Custom charge 수명과 Weak cross-store reclaim은 API/tests에 있지만 실제 extracted example rail은 scratch/report/transcript 세 예제만 실행 | Facade examples에 custom reserve→commit→recharge→denial 보존→release/Drop, 그리고 다른 store reclaim→재측정→재입장 흐름을 추가. 필요한 feature와 README/EXTRACTION/예제 verifier를 함께 연결. Public imports만 사용하고 별도 raw constructor·registry를 만들지 않음. Clean committed extraction에서 두 흐름을 실제 실행하고 종료 후 ledger/ticket 잔량 검사 |
+| P0-Q2. Growth admission에 pressure 경로 연결 | 실제 retained-map overwrite는 `ManagedCharge::recharge`를 호출하지만 신규 reserve의 soft/hard reclaim 경로에 연결되지 않음. Pressure 아래 신규 insert와 growth의 진행 조건이 다름 | Core admission의 replacement preflight와 기존 callback orchestration을 결합. Facade overwrite는 같은 charge API를 유지. 이 작업에는 새 replacement 의미의 구현도 필요하며 단순 함수 forwarding으로 처리할 수 없음. Positive 다른-store 회수 후 성장, negative terminal/blocked·wrong victim·callback panic·fence/reconfigure 경합·same-store busy, old content/authority 보존을 owning tests로 고정 |
+
+P0-Q2의 핵심 계약:
+
+- Old ticket을 제외하고 new attribution을 더한 **net replacement postimage**로 모든 cap,
+  group share/floor, scratch/headroom, ticket 수·ID를 검사한다. 전체 byte 감소라도 class/owner/group
+  귀속 증가가 있을 수 있으므로 `new_bytes - old_bytes` 하나로 판정하지 않는다.
+  단일 replacement의 live-ticket 수는 유지된다. Ticket cap에 도달한 상태에서 신규 reserve의
+  count preflight를 그대로 사용해 합법적인 replacement를 거부하지 않는다. ID 고갈은 별도 거부다.
+- Callback은 broker 잠금 밖에서 실행하고 hard retry는 최대 한 번이다. Terminal/blocked는
+  callback 없이 거부한다. 회수 목표도 제한 축의 부족량과 피해자 범위에 맞추며 full new size를
+  새 allocation처럼 double count하지 않는다. Admission에 도움이 되지 않는 단순 shrink에
+  불필요한 reclaim을 추가하지 않는다.
+- Callback 후 old ticket과 현재 policy의 전체 postimage를 다시 검사하고 같은 broker 잠금에서
+  replacement를 적용한다. 실패는 old authority를 유지한다. Callback이 다른 store에서 이미
+  수행한 회수까지 rollback하지 않는다. Target store mutation lane의 reentry/busy 계약을 유지한다.
+- 구조화 denial의 공개 API 확장(P1-02)은 독립 작업이다. P0-Q2의 내부 verdict를 먼저 정확히
+  유지하며 문자열 파싱이나 실패 뒤 새 observation으로 replacement 판정을 복원하지 않는다.
+
+근거: [reserve/recharge admission](../../crates/quanta-memory-platform-core/src/api/control/admission.rs),
+[atomic ledger replacement](../../crates/quanta-memory-platform-core/src/domain/ledger/operations.rs),
+[실제 map recharge caller](../../crates/quanta-memory-platform-facade/src/retained_map/service.rs),
+[현재 extracted example rail](../../scripts/verify-extracted-examples.sh).
+
+#### P0 — Semantica 소비자 cutover와 배선
+
+아래는 **Semantica에서 새 QMP를 사용할 때의 P0**이며 변경 owner는 Semantica다.
+Portable QMP의 독립 사용에 host 채택을 강제하지 않는다. 이번 감사에서는 해당 저장소를 수정하지 않았다.
+
+| ID | 현재 소스에서 확인한 상태 | 해야 할 일 / 완료 조건 |
+| --- | --- | --- |
+| P0-H1. 한 QMP revision으로 cutover | 두 workspace Cargo dependency/metadata, 두 lockfile, external checkout contract는 모두 `14cf0345004d0703c7d32da34055af5367a9212d`에 고정. 최신 QMP가 자동 채택되지 않음 | 먼저 QMP의 최종 코드 candidate C를 qualify. Semantica 두 root의 deps/metadata/lockfile, dependency contract 문서, external checkout/topology/static guards를 C로 함께 이행. Doctor baseline은 새 source inventory와 의미를 검토하며 허용량을 늘려 통과시키지 않음. 두 root의 실제 Cargo-resolved core/facade package IDs와 revision이 동일한 C여야 함 |
+| P0-H2. Transcript incarnation/end/read 배선 | Host adapter는 caller key를 append identity·session_bytes·load·retain에 넘기고 open/retire를 호출하지 않음. Compose product port도 문자열 session ID와 full Vec read를 전달. 현재 QMP는 issued `SessionHandle`을 요구 | 기존 host/runtime request IR와 port에 open 결과 handle을 전파하고 append/read/retain/end까지 같은 incarnation을 사용. 문자열→최신 handle 자동 라우팅 금지. End/취소의 retire 실패 시 handle/charge custody 보존. Bounded product read를 제공할 때 QMP page의 row/byte/cursor를 그대로 연결; full Vec convenience를 bounded 경로라고 표시하지 않음. Pinned system prompt는 host 의미로 유지. Exact retry·late old request·retire/reopen·read/retire race를 실제 SDK 경로에서 검증 |
+| P0-H3. 실제 reclaimer 설치와 cleanup authority 연결 | 검사한 Semantica Rust 소스에는 `with_reclaimer`/`MemoryReclaimer` 구현이 없음. Lifecycle helper는 `reclaim_one` 뒤 value length를 별도 sink에 전달하며 기본 sink는 누적 counter. 이는 실제 ledger refund 증거가 아님; 발견한 helper caller는 tests | Pressure recovery를 제공할 host bootstrap이 evictable victim/정책을 정하고 기존 builder callback seam에 Weak wiring을 설치. Budgeted store 자체가 lease를 반환하므로 별도 byte-only broker refund 금지. Lifecycle 결과는 semantic swept cost와 실제 ledger projection으로 정의하고 value length를 환급량으로 주장하지 않음. No victim/closed victim/부분 실패에서도 bounded denial과 custody 보존. Helper의 현재 production 실행을 확인한 결함으로 단정하지 않고 활성화 전에 계약을 정리 |
+
+P0-H2는 runtime→host 또는 runtime→QMP의 새 concrete import로 해결하지 않는다.
+기존 product port/request IR의 opaque incarnation 계약을 직접 확장하고 compose/host가
+실제 QMP handle과 그 수명을 연결한다. Producer가 소유한 incarnation을 end까지 전달하며
+host mapping만 최신 handle로 교체해서 늦은 옛 요청을 수용하는 방식은 금지한다.
+
+Semantica 근거 경로는 `Cargo.toml`, `Cargo.lock`, `packages/analysis/quanta-v2/{Cargo.toml,Cargo.lock}`,
+`tools/ci/contracts/external-rust-workspaces-v1.toml`,
+`docs/ssot/quanta-memory-platform-dependency-contract-v1.md`,
+`packages/analysis/quanta-v2/crates/quanta-memory-host/src/{session/transcript_adapter.rs,lifecycle.rs}`,
+`packages/analysis/quanta-v2/crates/quanta-runtime-memory-compose/src/session_transcript.rs`,
+`packages/analysis/quanta-v2/crates/quanta-runtime/src/sdk/runtime_kernel_core.rs`다.
+경로는 소비자 저장소 소유이며 QMP extraction에 복사하거나 host dependency를 추가하지 않는다.
+
+Host 통합의 공통 acceptance에는 root/GC 보호 집합의 완전성·outstanding prepare·게시 직렬화,
+returned clone/backing의 비용, cancel/rollback/close custody, observation/typed error 전파도 포함한다.
+해당 권한은 이미 host 책임이다. 이번 source pass가 각 제품 경로의 정확성을 실행으로 입증하거나
+그 경계에 새 결함을 확인한 것은 아니다. [Host adoption 계약](../adr/0004-host-adoption-boundary.md)을 따른다.
+
+#### P1 — 다음에 추가할 기본 API
+
+| ID / 기능 | 목적 | 현재 대안 / 최소 구현 |
+| --- | --- | --- |
+| P1-01. 실측 commit | 보수적 상한을 예약한 뒤 실제 보유 크기로 한 번에 확정해 과예약 잔류를 줄임 | 현재 commit 후 recharge. 기존 PendingReservation에 `actual <= reserved` shrink-and-commit. 실패 value 미게시·정확한 rollback/deferred authority·0-byte ticket 유지. RFC에 이미 있으며 새 consumer registry 없이 구현 |
+| P1-02. 구조화 denial | Caller가 제한 축·limit·postimage·deficit·policy revision으로 오류/재시도를 판단 | 현재 Capacity(String). 기존 내부 LimitBreach와 공개 MemoryError를 확장해 final locked verdict를 전달. Broker capacity와 store local capacity를 구분하고 overflow의 unrepresentable postimage도 표현. Hot path top-K 정렬·가짜 axis·error-string 파싱 금지 |
+| P1-03. Policy revision CAS | 복수 policy writer의 stale 전체 교체 방지 | 현재 단일 host writer/공유 mutex. 기존 revision을 install 잠금에서 비교하고 typed conflict. 실패 policy/report/revision/ledger/scheduler/epoch 유지; 최신 policy에 변경 재합성 |
+| P1-04. Map 조건부 교체·삭제 | 독립 writer의 read→write lost update 방지 | 현재 insert-if-absent 또는 모든 writer의 host 직렬화. 기존 port에 expected value/version 조건을 넣고 match→recharge→mutation을 같은 lane에서 수행. Mismatch/denial 보존, ABA·trait panic/reentry와 반환 clone 비용 정의 |
+
+P1-03/04는 복수 writer를 지원하려는 소비자에서 선택한다. 현재 API가 unconditional operation인
+사실만으로 existing accounting defect를 선언하지 않는다. 최소 실패 계약은 §7.2–7.3을 유지한다.
+
+#### P2 — 목적이 확인되면 추가할 기능 전체 목록
+
+| ID / 기능 | 목적과 시작 조건 | 현재 대안 / 구현 경계 |
+| --- | --- | --- |
+| P2-01. 전체 semantic peak | 실제 budget tuning/benchmark에서 정확한 broker lifetime maximum 필요 | Scratch peak/현재 usage는 있음. 성공한 ledger postimage에서 scalar 기록; 승인 pending의 이후 rollback은 peak를 지우지 않음. Owner history/reset/query window는 별도 요구 |
+| P2-02. 통합 lifecycle 관측 | Rebuild 지연·deferred backlog·pending/committed 구분이 필요한 운영 질의 | 현재 fence status/finish receipt/총 ticket count를 사용. 기존 BrokerObservation에 같은 잠금의 상태/count 추가. Metrics advisory와 authority를 혼합하지 않음 |
+| P2-03. Payload checked read | Canonical dedup store를 실제 읽기 원본으로 사용할 때 | Retained-map/host payload authority를 처음부터 선택 가능. 기존 payload port에 issued-ref read와 absence/failure/foreign/stale 정의. Clone 비용은 caller 책임; pin은 close 방지 lease가 아님 |
+| P2-04. Bounded map enumeration | 큰 map에서 전체 clone/sort 비용을 피하는 실제 listing/GC caller | Point read/host index 가능. Version cursor·row/semantic-byte bound. HashMap scan의 출력 cap은 scan/latency cap이 아님; ordered index 비용/atomicity 함께 설계 |
+| P2-05. Transcript 선택 삭제 | 일부 page의 특정 row만 지우고 다른 page는 보존 | 전체 keep-set+CAS 가능; truncate_to는 앞쪽 N개 보존. 기존 port에 expected-version evict set, unknown/duplicate 의미, read pin·replay evidence·batch-release rollback·actual-change version 정의 |
+| P2-06. Charge 부분 split | 한 charge의 subobject를 서로 독립된 수명으로 handoff | 처음부터 여러 charge/전체 move 가능. 같은 broker lock의 byte/귀속 보존, ticket-count/ID/fence 거부 시 원 authority 유지 |
+| P2-07. Scratch→retained 전환 | 실제 동일 backing을 임시 작업에서 장기 보유로 인계 | Retained reserve→scratch release 가능. Host의 same-backing 증명과 단일 pending→committed net 전이. 두 buffer가 공존하면 둘 다 charge |
+| P2-08. Atomic batch admission | 여러 custom component를 staging할 때 임시 점유 contention이 실제 문제 | Pending staging+host 미게시 가능. 기존 broker에서 mixed-axis 전체 reserve/commit; host publication transaction까지 자동 제공하지 않음. Batch release는 이미 지원 |
+| P2-09. Shared backing/read lease | Returned shared data를 마지막 참조까지 account해야 하며 host wrapper로 해결하기 어려울 때 | Private host Arc(value, charge)로 가능. Value-before-charge와 조기 release 방지, mutable 비용 갱신, store index/backing 중복 계산 방지부터 검증. 실제 필요 시 기존 facade/port 수명 확장 |
+| P2-10. Dynamic consumer allocation | 등록 operator 수 변화로 정적 group 배분이 실제 독점/진행 문제를 만들 때 | 현재 owner/group cap·정적 burst/floor. Live registration·0-byte consumer·공유 split의 등록 수·배분 단위를 명시. Host scheduling/throughput fairness와 구분 |
+| P2-11. Portable taxonomy/SDK DSL | 새 host가 현재 class enum/인자 묶음 때문에 이행이 막힐 때 | 현재 builder+기존 class/owner/context로 사용 가능. RFC의 기존 IR/API를 직접 수정하고 defaults·exports·feature/API examples·consumer 이행을 함께 수행. 새 DSL 전체를 P0에 묶지 않음 |
+
+#### 별도 요구 전까지 구현 대상으로 잡지 않는 범위
+
+- Async capacity wait/admission queue는 실제 대기 caller와 cancellation/deadline/fairness 요구가
+  있어야 한다. 현재 bounded synchronous denial/retry를 무제한 wait로 바꾸지 않는다.
+- RSS/allocator/GPU/cgroup hard cap, distributed quota, tenant authorization, cache TTL/LRU,
+  root/session registry는 해당 host/OS owner가 맡는다. Top-K는 기존 observation에서 off-lock 계산 가능하다.
+- Durable spill/restart/power-loss는 named durable consumer와 failure model이 생길 때 별도 제품 범위다.
+- Stronger payload close lease, generic charged wrapper, global shutdown registry는 현 API의 사용
+  예제/수명 조정으로 해결되는지 먼저 확인한다. Core abstraction을 자동 추가하지 않는다.
+
+#### 실행 순서와 종료 기준
+
+1. P0-Q1/Q2를 owner 단위로 구현하고 public exports/errors/examples/conformance를 함께 갱신.
+   Focused owner tests 후 `pm sync`와 canonical `scripts/check-workspace.sh`를 실행한다.
+2. Cargo/API 경로가 변경된 최종 clean commit C에서 extraction dry-run과 실제 extracted examples를
+   실행한다. 새 예제도 extractor에 포함되고 한 broker의 최종 ledger/ticket custody를 확인해야 한다.
+3. Semantica cutover를 수행할 때 P0-H1/H2/H3와 선택한 실제 bootstrap 경로를 함께 이행한다.
+   두 root Cargo resolution, owner-local host/compose proof, SDK producer/end 및 해당 worker proof를
+   정확한 QMP C + Semantica source tuple에 묶는다. Hosted job/SLO는 별도 receipt다.
+4. P1과 선택된 P2는 각각 목적/실제 caller/완료 oracle을 정한 뒤 진행한다. 이 목록 전체를
+   단일 대형 변경으로 합치지 않는다. 이번 납품은 최종 감사/작업 목록이며 위 Rust 변경은 미구현이다.
+
 ## 8. 문서 소유권
 
 - **이 문서:** 소비자 목표·사용 흐름·QMP/host 책임·현재 지원 범위의 단일 진입점.
