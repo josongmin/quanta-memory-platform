@@ -105,6 +105,9 @@ flowchart LR
   실제 보유를 게시할 때 `commit()`하여 `ManagedCharge`를 함께 소유한다.
   이미 확정한 비용은 `reserve_managed_charge(...)` 경로를 사용할 수 있다.
   크기·귀속 교체는 `recharge`, 수명 종료는 `release`/Drop과 결합한다.
+- **Resize 경계:** committed charge의 절대 크기를 원자적으로 교체하며 새 ticket ID를 발급한다.
+  감소는 차액을 반환하지만 pending/scratch authority의 resize나 기존 charge의 부분 분할은 아니다.
+  `recharge`는 새 reserve의 soft reclaim·hard reclaim/retry 경로를 호출하지 않는다.
 - **결과:** custom component와 내장 store가 같은 ledger cap을 경쟁한다. Charge는 non-Clone이며
   발급 broker에 묶인다. 내부 preflight의 판정은 예약 authority가 아니며 미래 성공 보장이 아니다.
   별도 public preflight API를 제공하지 않는다.
@@ -167,13 +170,16 @@ flowchart LR
 - **사용자/트리거:** reusable temporary data를 보유한 worker가 pressure 또는 capacity denial을 만난다.
 - **흐름:** FIFO revocable store에 insert하고 builder의 `with_reclaimer`로 host callback을 설치한다.
   Callback이 `reclaim_one`/`reclaim_until`로 버릴 항목을 제거한다. 공개 `reserve_owned`/
-  `reserve_managed_charge` 또는 budgeted store admission에서 broker가 내부적으로 재측정·재시도한다.
+  `reserve_managed_charge` 또는 새 reservation을 발급하는 store insert admission에서 broker가
+  내부적으로 재측정·재시도한다. 기존 charge를 교체하는 `recharge`에는 이 경로가 적용되지 않는다.
   Revocable store를 만들기만 하면 callback에 자동 등록되는 것은 아니다.
 - **결과:** release가 실제로 반환한 ledger capacity만 다시 사용할 수 있다.
   Callback의 reported reclaimed bytes는 advisory다. Reclaimer는 broker lock 밖에서 호출한다.
 - **실패/host 의무:** terminal denial·blocked 요청에는 reclaim을 호출하지 않는다.
   Hard admission은 reclaim 뒤 최대 한 번 재시도하며 실패하면 오류를 반환한다.
-  Reclaim 실패 시 entry/FIFO/charge를 보존한다. Host가 버려도 되는 victim과 대체 작업을 결정한다.
+  Revocable store의 `reclaim_one`/`reclaim_until` 자체가 실패하면 해당 operation의 entry/FIFO/charge를
+  보존한다. Host callback이 다른 store에서 이미 수행한 부작용까지 broker가 rollback하지 않는다.
+  Host가 버려도 되는 victim과 대체 작업을 결정한다.
   Same-store callback은 busy를 받을 수 있다. FIFO store에는 key lookup API가 없다.
   Reclaim rung은 host hint이며 자동 tier ladder·async wait·최소 회수량·throughput fairness를 보장하지 않는다.
 - **근거:** [revocable port](../../crates/quanta-memory-platform-facade/src/revocable_store/mod.rs),
@@ -308,6 +314,86 @@ broken fake rejection을 연결한다. Source qualification은
 | [Apache DataFusion MemoryPool](https://docs.rs/datafusion/latest/datafusion/execution/memory_pool/trait.MemoryPool.html) | 보유 데이터의 consumer가 공유 pool에 capacity를 요청하고, 거부 시 회수/오류를 처리. Reservation은 RAII 수명이며 `try_grow` 실패가 예약을 증가시키지 않음 | UC01/UC02/UC06의 shared admission·custody 근거. QMP는 semantic 다축 ledger이고 SQL operator/spill orchestration이 없음. DataFusion의 infallible `grow`를 QMP의 일반 admission 허용으로 옮기지 않음 |
 | [Apache Arrow C++ Memory Management](https://arrow.apache.org/docs/cpp/memory.html) | Buffer backing을 실제 MemoryPool로 allocate하며 작은 객체·temporary workspace 등은 다른 allocator를 사용할 수 있음 | Accounting 대상의 경계를 명시할 근거. QMP는 선언된 semantic 비용을 account하며 Arrow-style buffer allocator·물리 allocation 추적을 제공하지 않음 |
 | [Rust Reference — Destructors](https://doc.rust-lang.org/reference/destructors.html) | Scope/field의 Drop 순서와 destructor가 실행되지 않는 forget·process termination 경계를 정의 | UC02/UC03의 lease 수명과 공통 cleanup 조건. QMP는 tested unwind/deferred authority를 추가하지만 abort·누락된 Drop에서도 실행되는 cleanup을 보장하지 않음 |
+
+### 7.1 기능 커버리지 재감사
+
+2026-10-06, QMP `b4e37960127b715d02baf2b912fd7aa31e95cc51`의 공개 API·실제 구현·owning tests와
+공식 레퍼런스를 세 영역에서 병렬로 대조했다. 아래 테스트 근거는 소스를 읽은 결과이며
+이 재감사에서 Rust·Cargo·CI·consumer 실행은 **NOT_RUN**이다. 새 회계 결함은 확인하지 못했다.
+기능 공백의 존재와 해당 기능을 지금 추가해야 하는지는 별개로 판정한다.
+
+| 비교 기능 | 현재 QMP | 판정 / 소비자 시작 조건 |
+| --- | --- | --- |
+| 공유 budget·다축 귀속·RAII | 같은 broker의 reserve/commit/release와 class·owner·context·group projection. Pending 포기와 committed Drop의 authority를 보존 | 현재 커버. 새 consumer마다 별도 pool을 만드는 방식으로 합산 cap을 주장하지 않음 |
+| 성장·축소·전체 custody 이전 | `ManagedCharge::recharge`는 committed charge의 net postimage를 원자적으로 교체하며 denial 때 old charge 보존. 전체 이전은 Rust move로 가능 | 기본 resize·전체 handoff는 커버. 새 ticket을 발급하는 swap이므로 in-place incremental reservation과 완전히 같지는 않음. Ticket ID 고갈 때 shrink도 거부 가능하며 explicit release는 별도 경로 |
+| 성장 중 pressure 처리 | 신규 reserve는 soft callback·hard callback 한 번·재측정. `recharge`는 scheduler/ledger의 atomic replacement를 직접 호출 | 조건부 기능 공백. Mutable component/retained-map의 성장 caller가 다른 store를 회수해 계속 진행해야 할 때 평가 |
+| 기존 reservation의 부분 handoff | 같은 owner에 처음부터 여러 charge를 발급할 수 있으나 기존 하나를 추가 byte admission 없이 원자적으로 나누는 API는 없음 | 조건부 기능 공백. 독립 수명의 subobject를 넘기는 caller 필요. Refund-first는 live data를 undercharge하고 reserve-first는 transient double count로 cap에서 거부될 수 있음 |
+| 소비자별 공정 배분 | Policy-static group burst share와 live group usage, owner/class/global cap, peer reserved floor를 검사 | 정책 차이. DataFusion의 등록 수 기반 fair fraction과 동등하지 않음. 실제 operator 수 변화·예산 독점 사례 없이 dynamic registry를 추가하지 않음 |
+| 현재 상위 owner·denial 진단 | Public `BrokerObservation`의 owner usage에서 top-K를 off-lock 계산 가능. 내부 `LimitBreach`는 구조화됐지만 public `Capacity(String)`에서 해당 필드가 손실 | Top formatter는 편의 기능. 실패 후 별도 `observe()`는 같은 실패 상태를 보장하지 않으므로 machine-readable denial이 필요한 caller에는 final verdict에 묶인 detail이 개선 후보 |
+| 전체 peak·측정 구간 | Scratch scope의 observed peak는 있음. Broker 전체·owner별 high-water mark와 구간 reset은 없음 | 측정 기능 공백. Accepted semantic peak 목표가 있으면 최소 scalar부터 평가. 누락 가능한 advisory event나 polling으로 exact peak를 주장하지 않음 |
+| Buffer allocation·반환 데이터 수명 | `ByteSized`는 admission-time semantic 비용. Vec/String 기본값은 length이며 allocator capacity가 아님. Map/prepared/transcript의 caller-owned 반환 clone은 store retained charge 밖 | 명시된 범위 차이. 긴 수명 결과를 account하려면 host가 별도 charge와 실제 backing 수명을 결합. 현재 generic read lease/allocator/zero-copy buffer API는 없음 |
+
+근거: [공개 charge authority](../../crates/quanta-memory-platform-core/src/api/control.rs),
+[reserve/recharge 경로](../../crates/quanta-memory-platform-core/src/api/control/admission.rs),
+[atomic replacement와 floor tests](../../crates/quanta-memory-platform-core/src/api/control/tests/cases_04.rs),
+[group scheduler](../../crates/quanta-memory-platform-core/src/application/scheduler.rs),
+[observation IR](../../crates/quanta-memory-platform-core/src/domain/stats.rs),
+[내부 admission detail](../../crates/quanta-memory-platform-core/src/domain/admission.rs),
+[semantic measurement 계약](../../crates/quanta-memory-platform-facade/src/shared/measure.rs),
+[read pin/clone tests](../../crates/quanta-memory-platform-facade/src/transcript_store/service/tests/lifecycle_paging.rs).
+
+#### 레퍼런스에서 가져올 때 수정해야 할 가정
+
+- DataFusion docs.rs `latest`는 확인 시 **55.1.0**을 표시했다.
+  [MemoryReservation](https://docs.rs/datafusion/latest/datafusion/execution/memory_pool/struct.MemoryReservation.html)의
+  `split`/`new_empty`는 같은 consumer registration을 공유한다. QMP는 `OwnerKey`로 여러 charge를
+  이미 묶을 수 있으므로 consumer 등록 API의 부재를 accounting 불가로 판정하지 않는다.
+- DataFusion FairSpillPool의 분모는 **살아 있는 등록된 spillable consumer 수**이며, 등록 후
+  0-byte 상태도 포함한다. `split`/`new_empty`로 분모가 증가하지 않는다. Growth check는 해당
+  reservation의 size에 적용되므로 strict consumer-total equal-share라고 표현하지 않는다.
+  Pool은 직접 eviction·disk spill·async wait를 수행하지 않는다.
+  [공식 55.1.0 구현](https://docs.rs/datafusion-execution/55.1.0/src/datafusion_execution/memory_pool/pool.rs.html).
+- [TrackConsumersPool](https://docs.rs/datafusion/latest/datafusion/execution/memory_pool/struct.TrackConsumersPool.html)은
+  등록 consumer별 current/peak와 상위 소비자 오류 메시지를 제공한다. Inner pool과 tracker의 업데이트는
+  분리되므로 pool 전체·policy와 같은 순간의 snapshot을 보장하는 비교 근거로 쓰지 않는다.
+- [PeakRecordingPool](https://docs.rs/datafusion/latest/datafusion/execution/memory_pool/struct.PeakRecordingPool.html)의
+  reset은 현재 reserved bytes를 baseline으로 포함한다. 겹치는 query의 수명을 자동 분리한
+  per-query peak가 아니다. QMP의 공유 broker에 global reset을 넣기 전에 측정 구간의 owner를 정해야 한다.
+- Arrow 공식 문서는 확인 시 **25.0.1**이다. 실제 backing allocator와 shared Buffer slice 수명은
+  QMP의 semantic store accounting과 다른 계층이다. 반환 Arc의 backing 전체를 마지막 참조까지
+  account하려면 backing에 charge를 묶고 store의 key/index 비용과 중복 계산을 피하는 host 설계가
+  필요하다. 이는 가능한 적용 방식이며 현재 내장 read-lease API가 있다는 뜻이 아니다.
+
+### 7.2 후속 후보와 최소 계약
+
+아래는 현재 release gate가 아니라 소비자 요구가 확인될 때의 우선순위다.
+
+1. **구조화 denial:** 실제 caller가 문자열 파싱 없이 제한 축·limit·postimage·policy revision을
+   처리해야 하면 기존 `MemoryError`/admission detail을 확장한다. Final locked verdict에서 값을
+   확보하고 generic store capacity 오류에 가짜 axis를 만들지 않는다. Top-K 전체 snapshot·정렬을
+   reserve hot path에 추가하지 않으며 owner ID를 metric label로 사용하지 않는다.
+2. **전체 semantic peak:** Budget tuning/benchmark가 정확한 high-water mark를 요구하면 lifetime
+   broker scalar부터 추가한다. 성공한 accounting operation의 최종 postimage에서 기록하고,
+   거부된 요청 자체의 미게시 postimage는 기록하지 않는다. 승인되어 ledger에 게시된 pending
+   reserve는 이후 rollback되더라도 도달한 lifetime peak에 포함한다. Callback·동시 연산의
+   승인된 변동은 별도로 반영하며 deferred charge도 실제 release 전까지 포함한다.
+   Owner별 history·global reset·동시 query별 구간은 별도 요구가 없으면 추가하지 않는다.
+3. **성장 reclaim:** Pressure에서 진행해야 하는 실제 mutable caller가 있으면 기존 `recharge`에
+   net replacement preflight·lock 밖 callback·재검증·최대 한 번 retry를 결합한다.
+   Callback 뒤 broker 잠금을 재획득해 old ticket의 유효성, 현재 policy와 group/scratch/headroom을
+   포함한 net replacement postimage를 다시 검사하고 같은 잠금 아래 적용한다.
+   Denial 때 old charge를 보존한다.
+   Retained-map의 store mutation lane은 callback 중에도 잡혀 있으므로 same-store busy·reentry·
+   fence/reconfigure 경합과 다른-store victim 성공을 owning negative/positive tests로 고정해야 한다.
+4. **부분 split / 동적 policy / 반환 lease:** Subobject handoff·operator 등록 수 변화·반환 backing
+   수명이라는 구체적인 caller가 확인될 때만 해당 기존 authority/관측/port를 확장한다.
+   부분 split은 단일 broker 잠금 아래 원 charge와 새 charge의 총 byte·class/owner/context/kind/group
+   귀속을 보존한다. 추가 ticket 수·ID 고갈·fence 거부에서는 원 charge authority를 그대로 유지한다.
+   Public API/examples/conformance를 함께 바꾸며 별도 V2 IR·호환 shim으로 의미를 병행하지 않는다.
+
+추가 운영 관측 후보는 `BrokerObservation`의 pending/committed ticket 분리, deferred cleanup depth,
+fence 상태다. 현재 ticket count는 합계이고 fence status/finish cleanup receipt는 별도 API다.
+이 차이도 실제 운영 질의가 확인되어야 기존 observation에 추가하며 새 correctness 결함으로 취급하지 않는다.
 
 ## 8. 문서 소유권
 
