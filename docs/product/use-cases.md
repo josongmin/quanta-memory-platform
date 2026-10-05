@@ -831,13 +831,83 @@ clean committed C를 고정한다. H1/H2/H3를 같은 host integration candidate
 | H3 실제 eviction | 실제 memo insert로 pressure 생성→safe row GC→같은 broker admission 성공; pinned/prepared/held-lease는 보존; partial error/closed Weak/cleanup retry | 기존 memo retention/GC tests + compose bootstrap 통합. Lifecycle counter나 empty auxiliary store는 성공 oracle이 아님 |
 | H1 소비자 | 두 root resolved SHA=C; 실제 bootstrap/SDK caller compile+owner proof; 최종 revision static 계약 | Semantica owning QBC rail. Hosted job·load/SLO는 별도 receipt이며 local 성공으로 표시하지 않음 |
 
-Merge 단위는 **QMP Q2(core+owning tests) → QMP Q1(examples+feature+extraction+문서) →
-Semantica H1/H2/H3 공동 candidate**다. 각 단위가 해당 repository의 required gate를 통과한 뒤
-main에 반영한다. QMP 변경이 추가되면 C를 다시 qualify하고 host candidate 전체가 같은 C를 사용한다.
-H2/H3의 독립 준비 commit은 가능하지만 pin/API/bootstrap을 결합하지 않은 상태를 제품 완료로 배포하지 않는다.
+변경 묶음은 **QMP Q2(core+owning tests) → QMP Q1(examples+feature+extraction+문서) →
+Semantica H1/H2/H3 공동 candidate**다. UT checkpoint를 먼저 모으고 §7.6에 따라 QMP 전체 wave와
+host 전체 wave에서 각각 required gate를 실행한다. QMP 변경이 추가되면 C를 다시 qualify하고
+host candidate 전체가 같은 C를 사용한다. H2/H3의 독립 준비 commit은 가능하지만
+pin/API/bootstrap을 결합하지 않은 상태를 제품 완료로 배포하지 않는다.
 
 P1/P2, durable storage, async wait, 동적 allocation, 새 DSL은 이 wave에 포함하지 않는다.
 이번 변경은 계획 문서만 확정하며 위 구현과 실행 증거는 다음 작업이다.
+
+### 7.6 병렬 배정과 UT 우선 검증 운영
+
+2026-10-06 사용자 지시: 최대 병렬로 관련 왼쪽 채팅 세션에 배정하고, runtime 검증은 최종에
+모으며 UT를 강화한다. 아래 여섯 기존 세션을 사용한다. 이 절의 배정은 §7.5 계약을 유지한다.
+메시지 접수·작업 착수·UT 통과·최종 qualification은 각각 별도 상태다.
+
+| 작업 / 기존 세션 | 독점 수정 범위 | 지금 진행 / 의존 barrier |
+| --- | --- | --- |
+| T-Q2 / Fix QMP ratchet and ledger gaps | Q2 production core와 exports, 기존 callback caller의 필수 이행, test module 등록 | 공통 admission/reclaim contract 구현. Typed target의 정확한 Rust 선언을 먼저 게시. 다른 작업자의 새 UT 파일과 예제는 수정하지 않음 |
+| T-UT / quanta-memory-platform 평가 검증 | 새 replacement/reclaim owner UT module, 필요한 순수 domain oracle tests, retained-map/cross-store regression tests; QMP focused UT 실행 lane | 기존 coverage를 먼저 읽고 부족한 behavioral oracle만 추가. Production 수정 금지. Public target 세부 assertion은 T-Q2 선언 고정 후 진행 |
+| T-Q1 / QMP 100항목 체크리스트 검토 | 두 public examples, facade Cargo example entries, 기존 extraction verifier, README/EXTRACTION/MIGRATION의 소비자 설명 | Custom charge 예제와 extraction wiring 즉시 준비. Growth/target 예제는 T-Q2 계약 고정 후 확정. Core/UT와 이 문서 수정 금지 |
+| T-H2 / Summarize tools/pm emphasis | Host transcript adapter, compose session_transcript, SDK producer/request/forwarding와 해당 UT | Opaque incarnation·end custody·실제 caller 이행과 UT 작성. Compose lib/bootstrap, Cargo/locks는 T-INT 소유 |
+| T-H3 / 브랜치 워크트리 정리 | 실제 memo retention/GC 연결, compose private reclaimer module, lifecycle helper와 해당 UT | 실제 producer/보호 권한 확인부터 시작. Weak/GC/lease 반환 구현. 안전한 권한이 없으면 그 공급 경로를 선행 작업으로 해결. Compose lib/bootstrap, Cargo/locks는 T-INT 소유 |
+| T-INT / 워크트리 작업 체크포인트 조율 | 두 repository의 최종 Git 통합, H1 manifests/locks/checkout/static 계약, compose lib/bootstrap, 통합 test 파일과 qualification receipt | 소유권·static 계약·최종 selector 준비. QMP C 전에는 임의 pin을 넣지 않음. 최종에 QMP rail→C 발행→host H1/H2/H3 결합→host rail 수행 |
+
+**파일과 변경 authority:** 같은 checkout에서 non-overlapping 파일만 병렬 수정한다. 겹치는
+owner/UT 파일이 발견되면 해당 파일은 기존 단일 writer가 수정하고 다른 작업자는 patch 제안만 전달한다.
+T-Q2가 새 core UT module을 등록하며 T-UT는 module 본문을 작성한다. T-Q1의 verifier/Cargo 작업과
+T-INT의 최종 manifest 통합도 순차 인계한다. Worker는 checkout/reset/stash·`git add -A`·commit/push를
+독립 실행하지 않는다. T-INT가 정확한 owned paths만 checkpoint/main에 통합한다.
+별도 worktree가 필요하면 현재 dirty ownership을 먼저 확인하고 source를 명시적으로 고정한다.
+
+**동시에 시작할 수 있는 일:** T-Q2 구현, T-UT 독립 oracle 작성, T-Q1 custom-charge 예제,
+T-H2 producer 수명 이행, T-H3 실제 GC 권한 연결, T-INT static inventory는 즉시 병렬이다.
+Reclaim target Rust 선언은 T-Q2가 유일하게 확정한다. Q1 growth와 H3 target 소비는 이 계약에
+의존한다. Host compile/resolution은 실제 C cutover 뒤 증거이며, 구 pin에서 컴파일한 결과로
+새 source adoption을 주장하지 않는다. 중간 mock/fake UT는 해당 순수 owner 계약 증거만 제공한다.
+
+#### UT 강화의 구체적 범위
+
+- Core: exact before/after ledger·scheduler·attribution·ticket 수, 실패 시 old authority 보존.
+  Net replacement와 fresh reserve의 차이, multi-axis 귀속 이동, zero terminal probe,
+  callback 후 policy/fence/old 상태 변화, ID 고갈과 ticket cap의 구분을 독립 expected 값으로 검증한다.
+- Callback: actual release 0/부분/충분, wrong victim, 거짓 claimed bytes, error/panic, busy/reentry,
+  soft 이후 추가 hard callback 없음. Callback 횟수와 final ledger를 함께 관찰한다.
+- Facade: 실제 overwrite content와 charge postimage, other-store 성공과 same-store busy 거부를 검증한다.
+  Core의 전체 matrix를 같은 내용으로 재작성하지 않는다.
+- Transcript: exact replay와 충돌, foreign/retired handle, reopen 뒤 late request, read/end 경쟁,
+  Closing 재시도, 응답/요청 취소 시 cleanup custody. String-to-latest routing을 negative oracle로 막는다.
+- GC: root/pin/prepared/held-lease 보호, actual lease 반환, Weak expiry, partial failure와 pending cleanup
+  receipt 보존. Deleted-row count·value length·누적 counter를 실제 환급량으로 쓰지 않는다.
+- Fake는 정직한 구현 수락과 계약을 깨는 fake 거부를 모두 검사한다. Ignored/zero-test 성공은 통과가 아니다.
+  구현을 그대로 복사한 oracle, test 수 목표, 이미 존재하는 동일 regression의 재작성은 피한다.
+
+#### 검증을 모으는 순서
+
+1. **작성 중:** 영향을 받은 owner UT와 필요한 compile만 실행한다. Repository별 Cargo/QBC 실행
+   lane은 한 개다. QMP focused UT/compile은 T-UT, host QBC/UT는 T-INT가 실행하며 구현 worker는
+   selector와 source-ready checkpoint를 넘긴다. Worker가 독립적으로 전체 workspace/feature matrix/extraction/SDK E2E/hosted
+   qualification을 시작하지 않는다. Source 수정과 heavy build가 충돌하면 source checkpoint부터 고정한다.
+2. **QMP 통합 checkpoint:** Q2+UT+Q1을 모아 owner UT/feature seam을 확인한다. T-INT가 최종 source를
+   고정하고 `pm sync`와 canonical `scripts/check-workspace.sh`를 한 번 실행한다. 성공한 clean committed
+   C에서 extraction dry-run과 실제 extracted examples를 실행한다. Canonical rail이 이미 해당 단계의
+   같은 source/config 검증을 포함하면 receipt를 재사용하고 동일 실행을 추가하지 않는다.
+3. **C 발행 후 host checkpoint:** T-INT가 두 root와 H2/H3/bootstrap을 같은 C로 결합한다.
+   Host/compose/memo/SDK owning UT와 실제 resolution을 확인하고, 고정된 host source에서
+   실제 producer open→append/read/retain→end 및 memo pressure→GC→admission 경로를 묶어 실행한다.
+   QBC를 사용하며 동일 tuple의 selector는 한 담당만 실행한다.
+4. **실패 수리:** 실패한 owner의 UT와 해당 영향을 받는 rail만 재실행한다. Source/config가 바뀌어
+   final receipt가 무효화되면 그 qualification을 다시 수행한다. 이미 성공한 동일 source tuple의
+   전체 rail을 근거 없이 반복하지 않는다. Hosted CI는 required 외부 proof이며 local rail과 구분한다.
+
+각 worker handoff에는 task ID, 기준 HEAD/overlay, 정확한 changed paths, UT selector·features·실행
+test 수·결과, NOT_RUN, 남은 의존성을 남긴다. T-INT는 이를 모아 C와 host SHA에 결박한다.
+상태 인계는 ignored 실행 산출물 `target/p0-parallel/oct6/{task-id}.json`에 남긴다.
+상태는 working/ready_for_ut/ut_passed/awaiting_dependency/failed를 구분하고, final 채팅 응답에도
+같은 근거를 기록한다. 새로운 authority/제품 IR/중복 계획 문서는 만들지 않는다.
+이번 병렬 배정의 완료는 메시지 전달과 파일 소유권 확정이며, 코드 구현·UT·runtime 통과는 후속 증거다.
 
 ## 8. 문서 소유권
 
