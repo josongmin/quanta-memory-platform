@@ -2,6 +2,7 @@
 
 감사일: 2026-10-06. 소스 기준: `63b31fabae400fdd188547ed9b818b1a38b12269`.
 대상: 현재 `0.2.0` portable Rust library, in-memory accounting·reclaim.
+P0의 현재 구현·검증·중단 상태는 §7.7에서 확인한다. §7.4–7.6은 구현 전 감사와 실행 계획이다.
 
 이 문서는 **누가, 어떤 상황에서, 무엇을 위해 QMP를 사용하는가**의 단일 진입점이다.
 아래 사용자는 소비자 역할의 예시이며 해당 제품에 이미 배포됐다는 뜻이 아니다.
@@ -911,6 +912,48 @@ test 수·결과, NOT_RUN, 남은 의존성을 남긴다. T-INT는 이를 모아
 상태는 working/ready_for_ut/ut_passed/awaiting_dependency/failed를 구분하고, final 채팅 응답에도
 같은 근거를 기록한다. 새로운 authority/제품 IR/중복 계획 문서는 만들지 않는다.
 이번 병렬 배정의 완료는 메시지 전달과 파일 소유권 확정이며, 코드 구현·UT·runtime 통과는 후속 증거다.
+
+### 7.7 QMP P0 완료와 host 후속 중단
+
+2026-10-06 현재 QMP 코드 candidate는 `472048ac849c7450660b87c4476f5b687e8b389b`다.
+이 commit은 QMP `main`과 원격 `origin/main`에 게시됐다. §7.4–7.6의 초기
+`미구현`/`NOT_RUN`은 해당 감사·계획 당시 상태다. **현재 P0 실행 상태의 권위는 이 절이다.**
+
+| 범위 | 현재 상태 | 구현·검증 근거 |
+| --- | --- | --- |
+| P0-Q2 공통 growth admission | **완료** | Reserve/replacement의 공통 admission·reclaim 경로, net postimage, old authority 보존, 한 번 callback과 재측정. 기존 `ReclaimRequest`에 typed target을 직접 추가. Core/facade owning regressions가 canonical rail에 포함됨 |
+| P0-Q1 public consumer·extraction | **완료** | `managed_charge_lifecycle`과 `shared_budget_reclaim`을 공개 example/feature/verifier에 연결. C를 새로 추출한 checkout의 canonical gate와 공개 예제 5개 PASS. Charge 예제·공유 회수 예제는 종료 bytes/tickets 0을 검사 |
+| Semantica H1/H2/H3 | **후속 중단 / 미완료** | 소비자 source와 pin 준비·개별 owner 검증은 진행됐으나 최종 SDK/GC/end/caller 검증과 coherent host wave commit/push는 완료되지 않음. 남은 실행은 `USER_STOPPED / NOT_RUN` |
+| Hosted CI·배포·SLO·durable product | **이 wave의 완료 증거 없음** | QMP local canonical/extraction과 별도 qualification 범위 |
+
+완료된 공개 회수 계약은 다음과 같다.
+
+- `requested_bytes`는 absolute requested/new charge 크기다. Sweep 목표는
+  `target: ReclaimTarget { unit, scope, minimum_reduction }`에서 읽는다.
+- 단위는 `Bytes` 또는 `LiveTickets`이며, overflow의 감소량은 `None`이다.
+  Floor/borrow·복수 제한 축 때문에 목표 감소량을 달성해도 최종 admission을 보장하지 않는다.
+- Replacement는 old를 제외한 postimage를 검사하고 callback 동안 old authority를 유지한다.
+  Callback 후 현재 policy/fence/old ticket을 재검증한다. 단일 replacement는 live-ticket 수를
+  늘리지 않으며 ID 고갈은 별도 거부다. Callback은 broker 잠금 밖에서 최대 한 번 실행된다.
+- 다른 store의 실제 lease 반환이 admission 근거다. Claimed reclaimed bytes는 advisory이며
+  새 API/별도 회계 계층이나 facade의 추가 retry loop를 만들지 않았다.
+
+현재 source와 소비자 이행은 [reclaim port](../../crates/quanta-memory-platform-core/src/ports/reclaim.rs),
+[admission owner](../../crates/quanta-memory-platform-core/src/api/control/admission.rs),
+[MIGRATION](../../MIGRATION.md),
+[public example rail](../../scripts/verify-extracted-examples.sh)에서 확인한다.
+
+재사용한 로컬 실행 증거는 `target/p0-parallel/oct6/T-INT-canonical-final.log`,
+`T-INT-extraction-dry-run-final.log`, `T-INT-extracted-examples-final.log`와 `T-INT.json`이다.
+Extracted log는 `Source SHA: 472048ac849c7450660b87c4476f5b687e8b389b`,
+`check-workspace: clean (full repository gate)`, 예제 5개 실행 및 clean checkout 확인을 포함한다.
+이 로그는 로컬 ignored 실행 산출물이며 host adoption/hosted qualification으로 합산하지 않는다.
+
+사용자가 T-INT 원본 채팅에서 추가 빌드 중단과 QMP 마무리를 지시했다. 해당 배정의
+QBC/Rust compile을 중단했고 새 SDK·잔여 GC/end/caller rail은 재개하지 않는다.
+이미 통과한 QMP rail도 다시 실행하지 않는다. Semantica의 IR/PTA dependency compile 문제는
+해당 소비자 owner의 후속이며 QMP 본체 미완료 항목으로 이관하지 않는다.
+기존 host dirty source·실패/중단 receipt는 보존한다. 이 문서 갱신은 prose-only이며 코드 C는 그대로다.
 
 ## 8. 문서 소유권
 
