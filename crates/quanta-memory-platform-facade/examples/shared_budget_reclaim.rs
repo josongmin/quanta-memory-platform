@@ -74,11 +74,12 @@ fn class_budget(cap: u64) -> MemoryClassBudget {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The portable development preset supplies the rest of the manifest; this
     // example narrows the global limit to make the cross-store interaction
-    // deterministic while leaving both per-class limits non-binding.
+    // deterministic. Both participating classes have valid 100-byte caps,
+    // while each individual class postimage remains below its own cap.
     let mut manifest = PortableMemoryPresets::development();
     manifest.residency = ResidencyPolicy::new(100)
-        .with_class_budget(MemoryClass::MemoResidency, class_budget(1_000))
-        .with_class_budget(MemoryClass::ExecutionScratchRevocable, class_budget(1_000));
+        .with_class_budget(MemoryClass::MemoResidency, class_budget(100))
+        .with_class_budget(MemoryClass::ExecutionScratchRevocable, class_budget(100));
 
     let reclaimer =
         Arc::new(CrossStoreReclaimer { victim: OnceLock::new(), last_sweep: Mutex::new(None) });
