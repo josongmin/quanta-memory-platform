@@ -4,6 +4,10 @@ Scope: portable 0.2 in-memory SDK. Use the public facade builder API directly;
 Semantica adoption is optional. Completed contracts are in
 [the ADR index](../adr/README.md).
 
+Consumer goals, current workflows and host responsibilities are consolidated in
+[QMP use cases](../product/use-cases.md). This index owns work triggers, not a
+second use-case catalogue.
+
 The audited [remediation plan](audit-remediation.md) first closes confirmed
 accounting, payload identity, prepared evidence and guard repairs, then qualifies
 that source. The separately selected candidate extends the existing Transcript

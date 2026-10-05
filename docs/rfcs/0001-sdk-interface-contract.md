@@ -10,6 +10,8 @@ The interface decisions below do not claim those changes are implemented.
 
 The snippets specify the intended 0.3 interface, not the current 0.2 API.
 Before release they must become complete, compiling public examples.
+The implemented consumer use cases and current API boundaries are consolidated
+in [QMP use cases](../product/use-cases.md); this RFC owns the future interface design.
 
 ## 1. Background, purpose, and boundary
 

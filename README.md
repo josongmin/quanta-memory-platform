@@ -76,6 +76,10 @@ cargo run -p quanta-memory-platform-facade --features transcript --example trans
 
 ## What it covers
 
+The consumer goals, workflows, failure contracts and host responsibilities are
+consolidated in [QMP use cases](docs/product/use-cases.md). The table below is a
+capability overview; the 0.3 RFC remains a separate, unimplemented design target.
+
 | Area | Contract |
 | --- | --- |
 | Budget control | Global, class, owner, execution-scratch, headroom, reserved/soft/hard caps, resource groups, and bounded shared borrowing. `Context` is an accounting bucket with overflow guards, not a hard context cap. Reclaim rungs are host hints; the broker does not walk the ladder. |
@@ -171,6 +175,7 @@ Extraction and host adoption are separate operations; see
 
 | Need | Document |
 | --- | --- |
+| Consumer use cases and responsibility boundaries | [docs/product/use-cases.md](docs/product/use-cases.md) |
 | Architecture and ownership decisions | [docs/adr/README.md](docs/adr/README.md) |
 | Standalone-repository extraction procedure | [EXTRACTION.md](EXTRACTION.md) |
 | Consumer breaking changes | [MIGRATION.md](MIGRATION.md) |

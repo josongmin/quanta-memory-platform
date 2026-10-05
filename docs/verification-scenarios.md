@@ -4,6 +4,10 @@ What must be **verified** in this repo, derived from the contracts and invariant
 (ledger SSOT, policy/config validation, control plane, scheduler, facade stores,
 testkit conformance, extraction rails).
 
+Consumer goals, workflows and host responsibilities are consolidated in
+[QMP use cases](product/use-cases.md). This catalogue owns detailed verification
+scenarios and selectors rather than a second product use-case specification.
+
 Catalogue audited against `e21a3ddac4f8bc4d7dade34066ee8da4123b5aca` on
 2026-09-26. This identifies the source reviewed, not a release receipt.
 

@@ -1,5 +1,8 @@
 # QMP contract pointers
 
+Consumer use cases and responsibility boundaries:
+[QMP use cases](../product/use-cases.md).
+
 Live broker vs deferred product surface:
 [engine status](engine-status-v1.md).
 Audit repairs and operating boundaries:
