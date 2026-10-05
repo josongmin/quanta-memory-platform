@@ -632,6 +632,213 @@ P1-03/04는 복수 writer를 지원하려는 소비자에서 선택한다. 현�
 4. P1과 선택된 P2는 각각 목적/실제 caller/완료 oracle을 정한 뒤 진행한다. 이 목록 전체를
    단일 대형 변경으로 합치지 않는다. 이번 납품은 최종 감사/작업 목록이며 위 Rust 변경은 미구현이다.
 
+### 7.5 P0 실행 설계: 공통 authority부터 소비자 cutover까지
+
+2026-10-06 재확인 기준은 QMP `4d06d8814c11050407e8e2554f2a55d4e94a1c06`,
+Semantica `c48a50f2174754511d21f9eeb8116548399357ea`다. QMP는 clean이었고 검사한
+Semantica manifest/lockfile/host/compose/SDK 경로에도 dirty overlay가 없었다.
+아래는 **구현 계획**이며 Rust·Cargo resolution·QBC·제품 실행은 **NOT_RUN**이다.
+§7.4의 다섯 P0를 구체화한다. 별도 backlog나 두 번째 IR를 만들지 않는다.
+
+#### 의존 순서와 수정 소유권
+
+```mermaid
+flowchart TD
+    Q2["Q2: replacement 의미 + 공통 admission 실행기"] --> Q1["Q1: public examples + extraction rail"]
+    Q1 --> C["QMP clean commit C: canonical + extracted proof"]
+    Q2 --> H2["H2: issued incarnation → SDK producer → end"]
+    Q2 --> H3["H3: 실제 memo owner → 안전한 GC → Weak callback"]
+    C --> H1["H1: 두 Cargo root + locks + checkout을 C로 cutover"]
+    H2 --> H1
+    H3 --> H1
+    H1 --> P["Host 후보 하나: resolution + owner + SDK 경로 검증"]
+```
+
+H2/H3는 Q2의 공개 계약이 고정되면 준비할 수 있다. 최종 host candidate는 C를 사용하며,
+H1 pin만 먼저 main에 넣어 새 API와 옛 adapter가 섞인 상태를 만들지 않는다.
+
+| 작업 | 수정 owner / 파일 범위 | 공유 경계 |
+| --- | --- | --- |
+| Q2 | Core `domain/admission.rs`, `domain/ledger{,/operations.rs}`, `api/control/admission.rs`, `ports/reclaim.rs`; 필요한 exports와 owning tests | Admission 규칙과 callback 실행기를 한 owner가 수정. Facade는 기존 `ManagedCharge::recharge` caller 유지 |
+| Q1 | Facade `examples/`, `Cargo.toml`, 기존 extracted example verifier, README/EXTRACTION/MIGRATION | Q2의 최종 API로 예제 작성. Core 테스트/회수 실행기를 복제하지 않음 |
+| H2 | Host `session/transcript_adapter.rs`, compose `session_transcript.rs`, runtime `sdk/{runtime_kernel_core.rs,analysis_session.rs}`와 실제 forwarding/export caller | 기존 request/port를 직접 수정. Runtime에 QMP/host concrete dependency 추가 금지 |
+| H3 | 실제 memo retention·GC owner와 compose의 private reclaimer, host `lifecycle.rs` | Canonical memo row의 기존 lease와 GC 권한 사용. 보조 revocable store에 복사하거나 중복 charge하지 않음 |
+| H1 | 두 root의 deps/metadata/locks, checkout/static 계약, compose `lib.rs` bootstrap 결합 | H2/H3가 동시에 건드릴 수 있는 compose `lib.rs`의 최종 wiring은 통합 owner 한 명이 수정 |
+
+Q1/H2/H3 병렬 준비 시 Q2의 public contract 변경은 한곳에서 승인·반영한다. 공통 bootstrap
+파일을 각 작업자가 독립 수정하지 않는다. 구현 시작 때 실제 HEAD와 해당 경로 소유권을 다시 확인한다.
+
+#### Q2 — replacement를 신규 reserve와 같은 admission 경로로 연결
+
+**읽기용 postimage와 mutation authority를 분리한다.** 기존 `AdmissionRequest`, `UsageView`,
+`PreflightInputs`를 직접 확장하고 reserve/replacement를 같은 pure admission 규칙에 넣는다.
+Replacement 입력은 검증된 old ticket의 credit과 new attribution을 가진다. 별도 replacement
+규칙 엔진이나 전체 ledger/owner-map clone을 만들지 않는다. Owner 조회는 기존 keyed read를 유지한다.
+
+1. Broker 잠금에서 old ticket의 issuer·Committed 상태·attribution을 검증한다.
+   Live usage에서 old의 class/owner/context/kind/group/scratch/non-headroom 귀속을 제외한
+   읽기 view를 만든 뒤 absolute new charge를 더한다. Count delta는 reserve `+1`, replacement `0`이다.
+   ID 고갈·fence·identifier 거부는 callback 이전에 처리한다.
+2. 같은 admission chain으로 live verdict와 terminality probe를 계산한다. Zero-usage probe는
+   old credit을 다시 빼지 않는다. Static floor/policy는 유지한다. 모든 축이 감소하는 합법적 shrink에는
+   회수를 추가하지 않으며, 전체 bytes가 줄어도 새 owner/class/group 축이 증가하면 그 축을 검사한다.
+3. `reserve_with_reclaim`의 orchestration을 공통 실행기로 추출한다. Admit/soft, reclaimable/hard,
+   terminal/blocked 분기, callback permit·reentry·panic quarantine·통계·event 경로를 재사용한다.
+   Facade나 `ManagedCharge` 안에 두 번째 retry loop를 만들지 않는다.
+4. Callback 전에는 old ticket을 release하지 않는다. Broker 잠금 밖에서 callback을 최대 한 번
+   실행한다. Soft callback 뒤 상태가 나빠져도 추가 hard callback을 실행하지 않는다.
+5. 잠금을 다시 잡고 old ticket과 현재 policy/fence를 재검증한다. 최초 계획의 scheduler/postimage를
+   재사용하지 않고 현재 ledger에서 다시 계산한다. Final admission과 기존 `replace_committed`를
+   같은 잠금에서 수행하며, ledger 성공 뒤 scheduler/attribution을 함께 확정한다.
+6. `ManagedCharge`는 성공한 replacement ticket만 교체하고 map은 그 뒤 새 값을 게시한다.
+   이 연산의 실패는 old content/charge를 소비하지 않는다. 외부에서 이미 invalidated된 old authority를
+   되살리지 않으며, callback이 다른 victim에서 완료한 회수는 rollback하지 않는다.
+
+Preflight와 실제 ledger mutation은 같은 검사 함수를 사용한다. 기존 replacement의 원자적
+release→reserve→commit 및 실패 복원 primitive를 유지하고 그 안에 외부 callout을 넣지 않는다.
+Scheduler의 기존 staged commit도 유지한다. 새 preflight를 위해 ledger 전체를 복제하지 않는다.
+
+**Reclaim request의 단위를 먼저 고정한다.** 현재 `ReclaimRequest.requested_bytes`는 absolute
+입력 크기이며 예제 callback이 이를 sweep 목표로 사용한다. Replacement에 같은 의미를 적용하면
+과회수한다. 기존 request에 typed `target`을 추가하고 다음 의미를 문서·caller·tests에서 함께 고정한다.
+
+- `requested_bytes`는 absolute new charge 크기로 유지한다. Callback의 회수 목표는 `target`이다.
+- `target`은 byte 또는 live-ticket 단위, 제한 축에 맞는 victim scope, 필요한 감소량을 표현한다.
+  기존 내부 `LimitBreach`에서 직접 생성하며 string parsing과 두 번째 limit 계산을 하지 않는다.
+  공개 denial 확장인 P1-02를 이 작업에 묶지 않는다.
+- Representable hard postimage는 첫 limiting axis의 deficit을 전달한다. Byte deficit과 ticket
+  deficit을 혼동하지 않는다. 단일 replacement에는 count 증가가 없으므로 ticket 회수를 요구하지 않는다.
+- Unrepresentable byte postimage의 감소량은 `None`으로 표현한다. 포화된 `u64::MAX`를 정확한
+  최소 회수량이라고 전달하지 않는다. Host는 이 경우에도 유한한 작업 budget만 수행한다.
+- Soft 목표와 pressure는 `current - old + new`에서 계산한다. 여러 soft 축의 선택 순서는 고정한다.
+  Target은 advisory다. Floor/borrow·복수 제한 축 때문에 이 수치만큼 회수해도 승인된다는 보장은 없다.
+- 기존 deterministic priority는 유지하면서 limiting scope 밖의 victim을 유효한 회수로 주장하지 않는다.
+  Final verdict는 항상 실제 ledger 재측정이다. `ReclaimOutcome`의 claimed bytes는 authority가 아니다.
+
+Core builder/contracts, facade callback tests와 Q1 예제를 새 target 계약으로 함께 이행한다.
+신규 V2 request나 legacy fallback은 두지 않는다.
+
+#### Q1 — 구현된 공개 흐름을 기존 추출 rail에서 실행
+
+예제 이름은 아래로 정한다. 각 예제는 public facade imports와 builder만 사용한다.
+
+- `managed_charge_lifecycle`: reserve-owned→commit→recharge 성공→denial 시 old authority 유지→
+  explicit release와 Drop을 각각 보여준다. 마지막에 observation의 bytes와 live-ticket count가 0인지 검사한다.
+- `shared_budget_reclaim`: 하나의 platform에 retained map과 다른 revocable store를 만든다.
+  Callback은 `Weak` victim을 late-bind하고 Q2의 typed target으로 회수한다. 실제 map overwrite의
+  growth가 다른 store의 lease 반환 후 승인되고, 종료 때 두 store·charge를 drain한다.
+  Weak upgrade 실패와 강한 참조 cycle 부재도 확인한다.
+
+필요한 `required-features`는 각각 `core-live-accounting`, `retained_map`/`revocable_store`로 지정한다.
+기존 `verify-extracted-examples.sh`에 두 실행을 추가한다. 별도 extractor·verification script나
+예제용 공개 raw broker/registry를 만들지 않는다. Negative 회계 matrix는 owner tests에 두고,
+예제는 실제 소비자 흐름과 종료 oracle만 유지한다.
+
+#### H2 — 문자열 session을 issued capability로 직접 이행
+
+실제 producer 진입점은 SDK `AnalysisSession`의 append/load/retention이다. Adapter만 수정하면
+producer가 옛 문자열 request를 계속 만들므로 kernel/framework injector/orchestration forwarding과
+public exports까지 같은 변경에 포함한다.
+
+1. 기존 product port에 명시적 open/end를 추가한다. Open은 runtime-owned opaque incarnation
+   handle을 반환한다. Compose의 private binding이 실제 QMP `SessionHandle`을 소유하고 port/store/
+   workspace affinity를 검증한다. 문자열은 metadata로만 남긴다. 문자열→최신 handle registry는 만들지 않는다.
+2. 기존 `SessionTranscriptAppendV2`와 read/retain 인자는 issued handle을 받도록 직접 변경한다.
+   SDK producer는 open 결과를 session state에 보유하고 retries에도 같은 handle·sequence·message ID를
+   사용한다. 새 V3 IR나 key-only compatibility route를 추가하지 않는다.
+3. 모든 read/retain도 같은 handle로 이행한다. 기존 Full Vec 편의 함수가 QMP page를 순회하더라도
+   bounded 반환이라고 표시하지 않는다. Bounded product caller를 연결할 때만 기존 QMP의
+   row/semantic-byte/version cursor를 그대로 전달한다. 새 SDK paging 유즈케이스를 이 wave의
+   필수 작업으로 늘리지 않는다. System prompt를 보존하는 retain은 전체 보호 집합을 사용한다.
+4. Producer 종료는 새 append를 막고 in-flight/retry custody를 정리한 뒤 retire한다.
+   단일 요청 취소를 session 전체 종료로 오인하지 않는다. 실제 session 종료/취소 경로에서 end를 호출한다.
+   Retire가 fence/busy/error로 거부되면 기존 lifecycle owner가 handle과 종료 재시도 책임을 보유한다.
+   단순 Drop에서 오류를 버리고 종료 성공으로 처리하지 않는다.
+5. Retire 성공 후 같은 텍스트 ID로 reopen해도 새 incarnation이다. 늦은 old append/read/retain은 거부한다.
+   Lifecycle은 incarnation별 `Live(handle) → Closing(handle) → Retired`다. End 오류/취소는 Closing에
+   handle을 남기고 같은 handle로 재시도한다. 이미 성공한 end의 재호출은 owner가 기록한 Retired 결과를 반환한다.
+   Open은 issued handle을 producer lifecycle state에 설치한 뒤 응답하며 그 사이에 suspension을 넣지 않는다.
+   Response cancellation으로 handle/cleanup 책임이 일회성 request와 함께 사라지지 않게 한다.
+
+Host adapter는 QMP의 issued-handle·CAS·retire primitive를 사용한다. Compose의 opaque binding은
+dependency erasure이며 새 accounting/session authority가 아니다. Process restart persistence는 범위 밖이다.
+
+#### H3 — 실제 victim의 안전한 eviction을 bootstrap에 설치
+
+추가 source pass에서 `memo_residency()`의 발견된 소비자는 host test였고, 실제 memo table row는
+`MemoRetentionAccountV1`의 lease로 account된다. 현재 보조 revocable store에 callback만 설치해
+실제 pressure recovery가 완료됐다고 판정하지 않는다.
+
+첫 통합 대상은 **실제 producer가 쓰는 canonical memo table 중 GC가 허가한 row**다.
+기존 execution-owned `SnapshotGC`/`SafePointPort`와 `MemoGcPort`를 사용한다. Safe point뿐 아니라
+fresh retention guard와 완전한 추가 root 집합이 storage mutation 동안 유효해야 한다.
+Active/prepared/retry/read 보호를 증명할 수 없는 row는 victim에서 제외한다.
+
+1. Compose에 host-owned reclaimer를 만들고 기존 builder의 `with_reclaimer`로 설치한다.
+   Platform/kit를 만든 뒤 실제 memo table이 생성되는 경로에서 Weak target을 등록한다.
+   Table·GC authority·broker affinity가 함께 검증돼야 한다. 데이터 없는 대체 store를 새로 만들지 않는다.
+2. Target slot은 유한한 host 구성으로 제한한다. Registry 잠금을 놓은 뒤 Weak를 upgrade하고
+   GC owner를 호출한다. 강한 broker→callback→store→broker cycle을 만들지 않는다.
+   SQL shadow의 기존 process domain은 유지하며 leg마다 새 broker를 만들지 않는다.
+3. Callback은 고정된 page/snapshot/memo budget만 수행한다. 기존 GC의 prepared-active·generation·
+   pending acknowledgement 계약을 유지한다. 필요 downstream cleanup은 기존 GC progress에
+   정확한 completed-page custody를 남기며, pressure callback이 receipt를 버리거나 조기 ack하지 않는다.
+   이 budget은 작업량 제한이다. 잠금 대기까지 포함한 wall-time/SLO 보장은 별도 host 검증이며
+   QMP의 한 번 callback 계약을 deadline 보장으로 표시하지 않는다.
+4. GC가 row를 detach하면 마지막 retention lease Drop이 기존 broker에서 환급한다.
+   Returned Arc/rollback receipt가 lease를 보유하면 즉시 환급되지 않는다. 삭제 row 수와 실제
+   ledger 감소를 구분한다. Byte-only release를 덧붙이거나 보유 참조를 무시해 비용을 환급하지 않는다.
+5. Host admission callout과 GC/root/registry/store 잠금 순서를 확인한다. 특히 memo insert는 현재
+   charge admission을 table mutation 잠금 전에 수행한다. 다른 호출 경로도 같은 조건인지 확인하며,
+   동일 target busy·prepared state는 유한한 skip/denial로 처리한다. Callback 중 새 reserve/recharge 금지다.
+6. `lifecycle.rs`의 `BrokerReleaseSink` 모델은 계량 observer로 바꾸거나 실제 미사용이면 제거한다.
+   이미 budgeted store가 반환한 charge를 value length로 다시 환급하는 경로는 설치하지 않는다.
+   Partial sweep 이후 오류도 이미 반환된 ledger 상태를 보존하며 broker가 재측정한다.
+
+완전한 root/GC 권한이 해당 producer에서 공급되지 않는다면 그것이 **H3의 실제 선행 작업**이다.
+빈 root 집합·무조건 `can_gc=true`·전 store close로 통과시키지 않는다. No safe victim은 정상적인
+bounded denial이며 recovery 성공 oracle은 실제로 GC 가능한 row를 가진 제품 경로에서 별도로 증명한다.
+
+Semantica의 추가 근거 경로는 `packages/analysis/quanta-v2/crates/` 아래
+`quanta-runtime/src/sdk/analysis_session.rs`,
+`quanta-runtime-memory-compose/src/lib.rs`, `quanta-memory-host/src/runtime/memo_retention.rs`,
+`quanta-adapters-in-memory-shared/src/in_memory/core/memo_table{.rs,/gc.rs}`,
+`quanta-runtime-execution/src/invalidation/snapshot_gc/gc.rs`,
+`quanta-contract-ports/src/{memo_gc_port.rs,safe_point_port.rs}`다.
+
+#### H1 — 최종 revision 하나로 소비자 후보를 결합
+
+QMP 구현 중 매 commit을 pin하지 않는다. Q2/Q1과 public feature/export/migration 변경을 검증한
+clean committed C를 고정한다. H1/H2/H3를 같은 host integration candidate에 결합한다.
+
+- 두 Cargo root의 QMP deps/metadata, 두 lockfile, external checkout contract, dependency 문서와
+  관련 static/topology guard를 C로 변경한다. Actual Cargo-resolved core/facade package IDs가
+  두 root에서 모두 C인지 확인한다. 환경 변수의 path override는 git resolution 증거가 아니다.
+- Doctor baseline은 새 inventory와 허용 항목의 의미를 재검토한다. 자동 baseline 확대를 완료로 보지 않는다.
+- Compose bootstrap은 reclaimer 설치→kit/table 생성→Weak 등록→product port 노출 순서다.
+  초기 wiring이 실패하면 불완전한 pressure-recovery domain을 성공으로 반환하지 않는다.
+- 관련 경로가 concurrent main에서 바뀌면 candidate를 다시 고정하고 affected proof를 재실행한다.
+  QMP C와 host SHA/overlay/config/selector를 receipt에 함께 남긴다.
+
+#### 중복 없는 검증과 merge 단위
+
+| 단위 | 최소 추가 oracle | 재사용할 rail / 통과 경계 |
+| --- | --- | --- |
+| Q2 core | Net replacement preflight와 실제 mutation의 일치; zero probe의 old-credit underflow 부재; 축 이동/soft crossing; callback 후 policy/fence/old 재검증; 한 번 회수·거짓 bytes·실패 보존 | 기존 recharge/group/scratch/ticket-cap cases를 확장하고 admission randomized consistency에 replacement를 추가. 동일 negative matrix를 facade에서 전부 복제하지 않음 |
+| Q2 facade | 실제 map overwrite→다른 store 회수→새 값; wrong victim/same-store busy→old value/authority 유지 | 기존 retained-map owner tests와 `cross_store_hellgate` 확장. Public integration의 seam만 검증 |
+| Q1 extraction | Public imports/정확한 feature로 두 새 흐름 실행; 마지막 bytes/tickets 0; Weak cycle 없음 | `pm sync` + `scripts/check-workspace.sh`; clean C의 extraction dry-run + 기존 extracted example verifier |
+| H2 producer | Open→append→exact replay→read/retain→end→reopen; foreign/old handle 거부; read/end race; 실패·취소 시 handle custody | Host/compose owner tests와 실제 `AnalysisSession` forwarding 통합. Bounded caller는 QMP page 계약까지 검증. Mock adapter 성공만으로 producer 종료 proof를 대체하지 않음 |
+| H3 실제 eviction | 실제 memo insert로 pressure 생성→safe row GC→같은 broker admission 성공; pinned/prepared/held-lease는 보존; partial error/closed Weak/cleanup retry | 기존 memo retention/GC tests + compose bootstrap 통합. Lifecycle counter나 empty auxiliary store는 성공 oracle이 아님 |
+| H1 소비자 | 두 root resolved SHA=C; 실제 bootstrap/SDK caller compile+owner proof; 최종 revision static 계약 | Semantica owning QBC rail. Hosted job·load/SLO는 별도 receipt이며 local 성공으로 표시하지 않음 |
+
+Merge 단위는 **QMP Q2(core+owning tests) → QMP Q1(examples+feature+extraction+문서) →
+Semantica H1/H2/H3 공동 candidate**다. 각 단위가 해당 repository의 required gate를 통과한 뒤
+main에 반영한다. QMP 변경이 추가되면 C를 다시 qualify하고 host candidate 전체가 같은 C를 사용한다.
+H2/H3의 독립 준비 commit은 가능하지만 pin/API/bootstrap을 결합하지 않은 상태를 제품 완료로 배포하지 않는다.
+
+P1/P2, durable storage, async wait, 동적 allocation, 새 DSL은 이 wave에 포함하지 않는다.
+이번 변경은 계획 문서만 확정하며 위 구현과 실행 증거는 다음 작업이다.
+
 ## 8. 문서 소유권
 
 - **이 문서:** 소비자 목표·사용 흐름·QMP/host 책임·현재 지원 범위의 단일 진입점.
