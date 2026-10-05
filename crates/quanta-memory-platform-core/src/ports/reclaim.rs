@@ -3,18 +3,57 @@
 //! The broker prepares an immutable request while holding its internal lock,
 //! drops that lock, and only then calls this port. Implementations may evict or
 //! close stores that release broker-bound charges. The broker always remeasures
-//! semantic usage before the final admission decision. A synchronous reserve
+//! semantic usage before the final admission decision. A synchronous admission
 //! reentered on the same broker from this callback fails with
 //! `OperationInProgress`; release and legal reconfiguration remain available.
 //! The broker executes at most one reclaim callback concurrently per broker;
 //! a competing reclaim plan skips the callback and re-evaluates admission.
 
-use crate::{MemoryClass, MemoryResult, PressureState, ReclaimPriority, ReclaimRung};
+use crate::{
+    ChargeKind, MemoryClass, MemoryContextKind, MemoryResult, PressureState, ReclaimPriority,
+    ReclaimRung,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReclaimTrigger {
     SoftThreshold,
     CapacityDenial,
+}
+
+/// Unit of the limiting admission axis. Ticket pressure includes zero-byte
+/// authorities and must never be treated as a byte sweep target.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReclaimUnit {
+    Bytes,
+    LiveTickets,
+}
+
+/// Scope in which releasing authority may reduce the limiting postimage.
+///
+/// A matching victim remains subject to host safety/root/lease policy. Floors,
+/// borrowing and other limits can still deny admission after a matching sweep.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReclaimScope {
+    Global,
+    Class(MemoryClass),
+    Owner(String),
+    ResourceGroup(String),
+    NonHeadroom,
+    SharedBorrowPool,
+    Context(MemoryContextKind),
+    ChargeKind(ChargeKind),
+    ExecutionScratch,
+}
+
+/// Advisory reduction for the first limiting axis (or first soft crossing).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReclaimTarget {
+    pub unit: ReclaimUnit,
+    pub scope: ReclaimScope,
+    /// Exact representable deficit; `None` means the prospective postimage
+    /// overflowed. The host must apply a finite work budget in either case.
+    /// Reaching this reduction does not guarantee final admission.
+    pub minimum_reduction: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -35,7 +74,10 @@ pub struct ReclaimRequest {
     pub requested_class: MemoryClass,
     pub requested_owner: String,
     pub resource_group: Option<String>,
+    /// Absolute requested/new charge, including for atomic replacement. This
+    /// is request telemetry, not the amount a callback should sweep.
     pub requested_bytes: u64,
+    pub target: ReclaimTarget,
     pub pressure: PressureState,
     pub rungs: Vec<ReclaimRung>,
     /// Deterministic victim order: `Last`, then `Normal`, then protected `First`.

@@ -10,8 +10,9 @@ use std::sync::{Arc, Barrier, Mutex, OnceLock, Weak};
 use quanta_memory_platform_core::{
     ChargeKind, ExecutionBudget, LedgerSnapshot, ManagedCharge, MemoryBudgetManifest, MemoryClass,
     MemoryClassBudget, MemoryContextKind, MemoryError, MemoryPreset, MemoryReclaimer, MemoryResult,
-    ProcessMemoryBroker, ReclaimOutcome, ReclaimPriority, ReclaimRequest, ResidencyPolicy,
-    ResourceGroup, RuntimeKind, ScratchRequest, StoreBindingHandle, SweepStats, UsageBreakdown,
+    ProcessMemoryBroker, ReclaimOutcome, ReclaimPriority, ReclaimRequest, ReclaimScope,
+    ReclaimUnit, ResidencyPolicy, ResourceGroup, RuntimeKind, ScratchRequest, StoreBindingHandle,
+    SweepStats, UsageBreakdown,
 };
 use quanta_memory_platform_facade::{
     Budgeted, LiveMemoryPlatform, MemoryPlatformBuilder, RetainedMapStore, RevocableStore,
@@ -343,7 +344,19 @@ fn other_store_reclaim_frees_admission_and_drains_every_ticket() {
                 .expect("victim store registered before use")
                 .upgrade()
                 .expect("victim remains live during callback");
-            let swept = victim.reclaim_until(request.requested_bytes)?;
+            if request.target.unit != ReclaimUnit::Bytes
+                || !matches!(
+                    &request.target.scope,
+                    ReclaimScope::Class(MemoryClass::ExecutionScratchRevocable)
+                )
+            {
+                return Err(MemoryError::config("fixture victim does not match reclaim target"));
+            }
+            let reduction = request
+                .target
+                .minimum_reduction
+                .ok_or_else(|| MemoryError::config("fixture requires a representable reduction"))?;
+            let swept = victim.reclaim_until(reduction)?;
             self.inner_results.lock().expect("results").push(Ok(swept));
             // Advisory lie: report zero reclaimed bytes while the victim store
             // actually released its FIFO head. The broker must remeasure.
@@ -429,6 +442,155 @@ fn other_store_reclaim_frees_admission_and_drains_every_ticket() {
     let weak_victim = Arc::downgrade(&victim);
     drop(victim);
     assert!(weak_victim.upgrade().is_none(), "reclaimer must not pin a closed victim store");
+}
+
+/// Exercise the actual map overwrite seam: the old entry remains charged
+/// during callout, publication follows successful recharge, and a broken host
+/// callback cannot turn wrong-scope refunds or a same-store Busy into admission.
+#[test]
+fn retained_map_growth_reclaim_observes_content_authority_and_victim_scope() {
+    type Map = SimpleRetainedMapStore<String, Vec<u8>, Budgeted>;
+    type Revocable = SimpleRevocableStore<String, Vec<u8>, Budgeted>;
+
+    struct GrowthReclaimer {
+        same_store: bool,
+        map: OnceLock<Weak<Map>>,
+        victim: OnceLock<Weak<Revocable>>,
+        requests: Mutex<Vec<ReclaimRequest>>,
+        results: Mutex<Vec<MemoryResult<SweepStats>>>,
+    }
+
+    impl MemoryReclaimer for GrowthReclaimer {
+        fn reclaim(&self, request: &ReclaimRequest) -> MemoryResult<ReclaimOutcome> {
+            self.requests.lock().expect("requests").push(request.clone());
+            let reduction = request
+                .target
+                .minimum_reduction
+                .ok_or_else(|| MemoryError::config("bounded fixture requires exact reduction"))?;
+            if request.target.unit != ReclaimUnit::Bytes {
+                return Err(MemoryError::config("byte-only fixture"));
+            }
+            let result = if self.same_store {
+                self.map
+                    .get()
+                    .and_then(Weak::upgrade)
+                    .ok_or_else(|| MemoryError::InvalidState("map victim expired".into()))?
+                    .sweep(quanta_memory_platform_core::SweepHint { target_bytes: reduction })
+            } else {
+                // The wrong-victim case deliberately violates advisory scope.
+                // Final ledger admission must still reject it.
+                self.victim
+                    .get()
+                    .and_then(Weak::upgrade)
+                    .ok_or_else(|| MemoryError::InvalidState("revocable victim expired".into()))?
+                    .reclaim_until(reduction)
+            };
+            self.results.lock().expect("results").push(result.clone());
+            result?;
+            Ok(ReclaimOutcome { reclaimed_bytes: u64::MAX })
+        }
+    }
+
+    for scenario in ["enough", "same-store", "wrong-victim"] {
+        let reclaimer = Arc::new(GrowthReclaimer {
+            same_store: scenario == "same-store",
+            map: OnceLock::new(),
+            victim: OnceLock::new(),
+            requests: Mutex::new(Vec::new()),
+            results: Mutex::new(Vec::new()),
+        });
+        let platform = MemoryPlatformBuilder::new()
+            .with_manifest(MemoryBudgetManifest::new(
+                MemoryPreset::Production,
+                ExecutionBudget::default(),
+                ResidencyPolicy::new(if scenario == "wrong-victim" { 1_000 } else { 100 })
+                    .with_class_budget(MemoryClass::MemoResidency, class_budget(100))
+                    .with_class_budget(MemoryClass::ExecutionScratchRevocable, class_budget(100)),
+            ))
+            .with_reclaimer(reclaimer.clone() as Arc<dyn MemoryReclaimer>)
+            .build()
+            .expect("growth fixture");
+        let map = Arc::new(map_store(&platform));
+        let victim = Arc::new(revocable_store(&platform));
+        assert!(reclaimer.map.set(Arc::downgrade(&map)).is_ok());
+        assert!(reclaimer.victim.set(Arc::downgrade(&victim)).is_ok());
+        map.insert_checked("m".into(), vec![1; 4]).expect("old map entry: 45 metadata bytes");
+        victim.insert_checked("v".into(), vec![9; 4]).expect("victim: 37 scratch bytes");
+        let extra = platform
+            .retained_map_store_builder::<String, Vec<u8>>()
+            .bind(StoreBindingHandle::new(MemoryClass::MemoResidency, "other-map".into(), None))
+            .build();
+        if scenario == "wrong-victim" {
+            extra.insert_checked("x".into(), vec![2; 4]).expect("fill map class to 90");
+        }
+        let before = platform.broker().ledger_snapshot().expect("old charged image");
+        let new_len = if scenario == "wrong-victim" { 24 } else { 44 };
+        let result = map.insert_checked("m".into(), vec![7; new_len]);
+        let requests = reclaimer.requests.lock().expect("requests");
+        assert_eq!(requests.len(), 1, "{scenario}: replacement invokes one callback");
+        assert_eq!(requests[0].requested_bytes, map_cost("m", new_len));
+        assert_eq!(requests[0].target.unit, ReclaimUnit::Bytes);
+        assert_eq!(
+            requests[0].target.minimum_reduction,
+            Some(if scenario == "wrong-victim" { 10 } else { 22 })
+        );
+        if scenario == "wrong-victim" {
+            assert_eq!(requests[0].target.scope, ReclaimScope::Class(MemoryClass::MemoResidency));
+        } else {
+            assert!(matches!(
+                requests[0].target.scope,
+                ReclaimScope::Global | ReclaimScope::NonHeadroom
+            ));
+        }
+        drop(requests);
+        let after = platform.broker().ledger_snapshot().expect("postimage");
+        assert_balanced(&after);
+        if scenario == "enough" {
+            result.expect("other-store actual refund admits overwrite");
+            assert_only_charge(
+                &after,
+                MemoryClass::MemoResidency,
+                MAP_OWNER,
+                MemoryContextKind::Request,
+                ChargeKind::RetainedMetadata,
+                85,
+            );
+            assert_eq!(map.get_checked(&"m".into()).expect("published value"), Some(vec![7; 44]));
+            assert_eq!(map.committed_bytes().expect("replacement charge"), 85);
+            assert_eq!(after.total_owner_bytes(), 85);
+            assert_eq!(after.live_ticket_count, 1);
+            assert_eq!(after.owner_usage[MAP_OWNER].retained_metadata_bytes, 85);
+            assert!(!after.owner_usage.contains_key(REVOCABLE_OWNER));
+            assert_eq!(victim.reclaim_one().expect("victim empty"), None);
+        } else {
+            assert!(matches!(result, Err(MemoryError::Capacity(_))), "{scenario}: denial");
+            assert_eq!(map.get_checked(&"m".into()).expect("old content"), Some(vec![1; 4]));
+            assert_eq!(map.committed_bytes().expect("old charge"), 45);
+            assert_eq!(after.owner_usage[MAP_OWNER], before.owner_usage[MAP_OWNER]);
+            let results = reclaimer.results.lock().expect("results");
+            if scenario == "same-store" {
+                assert!(matches!(&results[0], Err(MemoryError::OperationInProgress(_))));
+                assert_eq!(after, before, "busy callback preserves the full preimage");
+            } else {
+                assert_eq!(
+                    results[0].as_ref().expect("wrong victim really released").reclaimed_bytes,
+                    37
+                );
+                assert_eq!(after.total_owner_bytes(), 90, "external release stays completed");
+                assert_eq!(extra.get_checked(&"x".into()).expect("other map"), Some(vec![2; 4]));
+            }
+        }
+        map.close().expect("old or replacement release remains usable");
+        victim.close().expect("victim close");
+        extra.close().expect("extra close");
+        assert_drained(&platform.broker().ledger_snapshot().expect("all stores drain"));
+        let weak_map = Arc::downgrade(&map);
+        let weak_victim = Arc::downgrade(&victim);
+        drop(map);
+        drop(victim);
+        assert!(weak_map.upgrade().is_none());
+        assert!(weak_victim.upgrade().is_none(), "callback does not create a strong store cycle");
+    }
 }
 
 /// One mixed-store lifecycle pins every charge-kind axis with independent

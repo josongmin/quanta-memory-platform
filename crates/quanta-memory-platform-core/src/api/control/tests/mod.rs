@@ -8,6 +8,7 @@ mod cases_06;
 mod cases_07;
 mod cases_08;
 mod live_class_authority;
+mod replacement_reclaim;
 
 use super::*;
 use crate::api::broker::ProcessMemoryBroker;

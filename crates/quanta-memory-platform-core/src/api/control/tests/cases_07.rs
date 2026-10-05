@@ -233,6 +233,7 @@ fn sep23_fup003_ticket_exhaustion_blocks_without_callback() {
             owner_usage: (&empty_owners).into(),
             context_usage: &empty_contexts,
             total_usage: &empty_total,
+            credit: None,
         },
         non_headroom_bytes: 0,
         live_scratch_bytes: 0,
@@ -252,6 +253,7 @@ fn sep23_fup003_ticket_exhaustion_blocks_without_callback() {
         rebuild_in_progress: false,
         ticket_id_space_exhausted: true,
         live_ticket_limit_reached: false,
+        ticket_count_delta: 1,
     };
     assert_eq!(
         crate::domain::admission::preflight(&inputs),
@@ -584,7 +586,7 @@ fn sep23_fup006_accepted_reconfigure_inside_callback_remeasures_under_new_policy
     sep23_assert_fully_drained(&broker);
 }
 #[test]
-fn sep23_audit_max_scale_plus_one_byte_denies_clean_without_callback() {
+fn sep23_audit_max_scale_plus_one_byte_denies_clean_after_bounded_reclaim() {
     let reclaimer = Arc::new(RecordingReclaimer::default());
     let policy = ResidencyPolicy::new(u64::MAX)
         .with_class_budget(MemoryClass::ArtifactCache, class_budget(0, u64::MAX, u64::MAX, false));
@@ -604,9 +606,10 @@ fn sep23_audit_max_scale_plus_one_byte_denies_clean_without_callback() {
         )
         .expect("exact u64::MAX fill admits");
     assert!(reclaimer.requests.lock().expect("requests").is_empty());
-    // One more byte: the preflight sees a reclaimable breach, but the
-    // hard plan's prospective aggregate overflows u64, so construction
-    // fails before any callback can run.
+    let before = broker.ledger_snapshot().expect("exact-fill preimage");
+    // One more byte has an unrepresentable postimage but fits at zero usage.
+    // The host gets one unknown-reduction target; without actual release the
+    // same limiting-axis denial survives the final remeasurement.
     let denied = broker.reserve(
         MemoryClass::ArtifactCache,
         "owner:max".to_string(),
@@ -614,9 +617,17 @@ fn sep23_audit_max_scale_plus_one_byte_denies_clean_without_callback() {
         ChargeKind::RetainedMetadata,
         1,
     );
-    assert_eq!(denied, Err(MemoryError::capacity("reclaim prospective usage exceeds u64")));
-    assert_eq!(broker.reclaim_runtime_stats().expect("stats").attempts, 0);
-    assert!(reclaimer.requests.lock().expect("requests").is_empty());
+    assert_eq!(denied, Err(MemoryError::capacity("non-headroom reserve total exceeds u64")));
+    assert_eq!(broker.reclaim_runtime_stats().expect("stats").attempts, 1);
+    let requests = reclaimer.requests.lock().expect("requests");
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].trigger, ReclaimTrigger::CapacityDenial);
+    assert_eq!(requests[0].requested_bytes, 1);
+    assert_eq!(requests[0].target.unit, crate::ports::reclaim::ReclaimUnit::Bytes);
+    assert_eq!(requests[0].target.scope, crate::ports::reclaim::ReclaimScope::NonHeadroom);
+    assert_eq!(requests[0].target.minimum_reduction, None);
+    drop(requests);
+    assert_eq!(broker.ledger_snapshot().expect("unchanged denied image"), before);
     // The broker is fully usable afterwards: observe, release, drain.
     assert_eq!(broker.ledger_snapshot().expect("snapshot").total_owner_bytes(), u64::MAX);
     drop(maxed);
@@ -629,7 +640,7 @@ fn sep23_audit_max_scale_plus_one_byte_denies_clean_without_callback() {
             ChargeKind::RetainedMetadata,
             7,
         )
-        .expect("broker admits after the blocked attempt");
+        .expect("broker admits after the denied attempt");
     drop(fresh);
     sep23_assert_fully_drained(&broker);
 }

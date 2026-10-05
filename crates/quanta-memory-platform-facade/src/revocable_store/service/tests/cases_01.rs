@@ -118,7 +118,8 @@ fn reclaim_one_is_fifo_and_releases_its_bytes() {
 #[test]
 fn same_store_reclaimer_returns_busy_without_losing_fifo() {
     use quanta_memory_platform_core::{
-        MemoryError, MemoryReclaimer, MemoryResult, ReclaimOutcome, ReclaimRequest,
+        MemoryError, MemoryReclaimer, MemoryResult, ReclaimOutcome, ReclaimRequest, ReclaimScope,
+        ReclaimUnit,
     };
     use std::sync::OnceLock;
 
@@ -130,10 +131,23 @@ fn same_store_reclaimer_returns_busy_without_losing_fifo() {
     impl MemoryReclaimer for SameStoreReclaimer {
         fn reclaim(&self, request: &ReclaimRequest) -> MemoryResult<ReclaimOutcome> {
             let store = self.store.get().expect("store registered before use");
+            // This fixture's only pressure is its configured class cap. Check
+            // the victim scope and unit before interpreting the reduction.
+            assert_eq!(request.target.unit, ReclaimUnit::Bytes);
+            assert_eq!(
+                request.target.scope,
+                ReclaimScope::Class(MemoryClass::ExecutionScratchRevocable)
+            );
+            const WORK_BUDGET_BYTES: u64 = 64 * 1024;
+            let target = request
+                .target
+                .minimum_reduction
+                .unwrap_or(WORK_BUDGET_BYTES)
+                .min(WORK_BUDGET_BYTES);
             // The inserting thread holds this store's mutation lane while
             // the broker runs the callback, so a synchronous same-store
             // reclaim observes typed Busy instead of blocking or evicting.
-            let inner = store.reclaim_until(request.requested_bytes);
+            let inner = store.reclaim_until(target);
             let busy = matches!(inner, Err(MemoryError::OperationInProgress(_)));
             self.inner_results.lock().expect("results").push(inner);
             if busy {

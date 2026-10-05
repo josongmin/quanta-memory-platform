@@ -42,6 +42,7 @@ impl AccountingLedger {
             },
             context_usage: &self.context_usage,
             total_usage: &self.total_usage,
+            credit: None,
         }
     }
 
@@ -564,7 +565,7 @@ impl AccountingLedger {
         Ok(())
     }
 
-    fn validate_committed_ticket(&self, ticket: &ReservationTicket) -> MemoryResult<()> {
+    pub(crate) fn validate_committed_ticket(&self, ticket: &ReservationTicket) -> MemoryResult<()> {
         self.validate_release_ticket(ticket)?;
         if self.ticket_states.get(&ticket.id) != Some(&TicketState::Committed) {
             return Err(MemoryError::InvalidState(format!(

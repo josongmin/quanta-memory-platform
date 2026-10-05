@@ -23,8 +23,9 @@ use std::collections::BTreeMap;
 
 use crate::domain::context::{MemoryContextKind, OwnerKey};
 use crate::domain::errors::MemoryError;
-use crate::domain::ledger::{ChargeKind, UsageBreakdown};
+use crate::domain::ledger::{ChargeKind, ReservationTicket, UsageBreakdown};
 use crate::domain::policy::{MemoryClass, ResidencyPolicy, ResourceGroup};
+use crate::ports::reclaim::{ReclaimScope, ReclaimTarget, ReclaimUnit};
 
 /// One structured capacity limit that a reservation can breach.
 ///
@@ -105,6 +106,62 @@ pub(crate) struct UsageView<'a> {
     pub owner_usage: crate::domain::ledger::OwnerUsageRead<'a>,
     pub context_usage: &'a BTreeMap<MemoryContextKind, UsageBreakdown>,
     pub total_usage: &'a UsageBreakdown,
+    /// Validated live committed authority excluded only from the read view.
+    /// The real ledger keeps this ticket charged during any host callback.
+    pub credit: Option<&'a ReservationTicket>,
+}
+
+impl<'a> UsageView<'a> {
+    pub(crate) fn with_credit(mut self, ticket: &'a ReservationTicket) -> Self {
+        self.credit = Some(ticket);
+        self
+    }
+
+    fn adjusted(
+        &self,
+        mut usage: UsageBreakdown,
+        matches: bool,
+    ) -> Result<UsageBreakdown, MemoryError> {
+        if let Some(credit) = self.credit.filter(|_| matches) {
+            let slot = match credit.kind() {
+                ChargeKind::RetainedPayload => &mut usage.retained_payload_bytes,
+                ChargeKind::RetainedMetadata => &mut usage.retained_metadata_bytes,
+                ChargeKind::LiveScratch => &mut usage.live_scratch_bytes,
+            };
+            *slot = slot.checked_sub(credit.bytes()).ok_or_else(|| {
+                MemoryError::InvalidState("replacement credit exceeds its live usage axis".into())
+            })?;
+        }
+        Ok(usage)
+    }
+
+    pub(crate) fn class(&self, class: &MemoryClass) -> Result<UsageBreakdown, MemoryError> {
+        self.adjusted(
+            self.class_usage.get(class).copied().unwrap_or_default(),
+            self.credit.is_some_and(|credit| credit.class() == class),
+        )
+    }
+
+    pub(crate) fn owner(&self, owner: &OwnerKey) -> Result<UsageBreakdown, MemoryError> {
+        self.adjusted(
+            self.owner_usage.get(owner).copied().unwrap_or_default(),
+            self.credit.is_some_and(|credit| credit.owner() == owner),
+        )
+    }
+
+    pub(crate) fn context(
+        &self,
+        context: MemoryContextKind,
+    ) -> Result<UsageBreakdown, MemoryError> {
+        self.adjusted(
+            self.context_usage.get(&context).copied().unwrap_or_default(),
+            self.credit.is_some_and(|credit| credit.context() == context),
+        )
+    }
+
+    pub(crate) fn total(&self) -> Result<UsageBreakdown, MemoryError> {
+        self.adjusted(*self.total_usage, true)
+    }
 }
 
 /// One reservation request under evaluation.
@@ -134,6 +191,8 @@ pub(crate) struct PreflightInputs<'a> {
     pub rebuild_in_progress: bool,
     pub ticket_id_space_exhausted: bool,
     pub live_ticket_limit_reached: bool,
+    /// Reserve adds one authority; a validated replacement adds none.
+    pub ticket_count_delta: u8,
 }
 
 impl LimitBreach {
@@ -152,6 +211,31 @@ impl LimitBreach {
     #[must_use]
     pub(crate) fn into_error(self) -> MemoryError {
         self.error
+    }
+
+    pub(crate) fn reclaim_target(&self) -> ReclaimTarget {
+        let (unit, scope) = match &self.axis {
+            LimitAxis::LiveTicketCount => (ReclaimUnit::LiveTickets, ReclaimScope::Global),
+            LimitAxis::Global => (ReclaimUnit::Bytes, ReclaimScope::Global),
+            LimitAxis::Class { class } => (ReclaimUnit::Bytes, ReclaimScope::Class(class.clone())),
+            LimitAxis::Owner { owner } => (ReclaimUnit::Bytes, ReclaimScope::Owner(owner.clone())),
+            LimitAxis::Group { group } => {
+                (ReclaimUnit::Bytes, ReclaimScope::ResourceGroup(group.clone()))
+            }
+            LimitAxis::SharedBorrowPool => (ReclaimUnit::Bytes, ReclaimScope::SharedBorrowPool),
+            LimitAxis::ContextTotal { context } => {
+                (ReclaimUnit::Bytes, ReclaimScope::Context(*context))
+            }
+            LimitAxis::KindSlot { kind } => (ReclaimUnit::Bytes, ReclaimScope::ChargeKind(*kind)),
+            LimitAxis::ExecutionScratch { .. } => {
+                (ReclaimUnit::Bytes, ReclaimScope::ExecutionScratch)
+            }
+            LimitAxis::ProtectedBand { .. }
+            | LimitAxis::GroupFloor { .. }
+            | LimitAxis::NonHeadroomTotal
+            | LimitAxis::ClassFloorSum => (ReclaimUnit::Bytes, ReclaimScope::NonHeadroom),
+        };
+        ReclaimTarget { unit, scope, minimum_reduction: self.postimage.map(|_| self.deficit) }
     }
 }
 
@@ -213,7 +297,8 @@ pub(crate) fn check_ledger_postimage(
     // defense-in-depth for the pure function — but a pure predicate must fail
     // closed on any input, never panic.
     let global_current = usage
-        .total_usage
+        .total()
+        .map_err(|error| AdmissionFailure::Block(AdmissionBlock::Internal(error)))?
         .checked_total()
         .map_err(|error| AdmissionFailure::Block(AdmissionBlock::Internal(error)))?;
     let global_after = global_current.checked_add(bytes).ok_or_else(|| {
@@ -241,10 +326,8 @@ pub(crate) fn check_ledger_postimage(
     let mut total_borrow = 0u64;
     for (candidate, budget) in &policy.classes {
         let current = usage
-            .class_usage
-            .get(candidate)
-            .copied()
-            .unwrap_or_default()
+            .class(candidate)
+            .map_err(|error| AdmissionFailure::Block(AdmissionBlock::Internal(error)))?
             .checked_total()
             .map_err(|error| AdmissionFailure::Block(AdmissionBlock::Internal(error)))?;
         let used = if candidate == class {
@@ -342,10 +425,8 @@ pub(crate) fn check_ledger_postimage(
 
     if let Some(quota) = policy.owner_quotas.get(owner) {
         let owner_after = usage
-            .owner_usage
-            .get(owner)
-            .copied()
-            .unwrap_or_default()
+            .owner(owner)
+            .map_err(|error| AdmissionFailure::Block(AdmissionBlock::Internal(error)))?
             .checked_total()
             .map_err(|error| AdmissionFailure::Block(AdmissionBlock::Internal(error)))?
             .checked_add(bytes)
@@ -371,10 +452,8 @@ pub(crate) fn check_ledger_postimage(
     }
 
     usage
-        .context_usage
-        .get(&request.context)
-        .copied()
-        .unwrap_or_default()
+        .context(request.context)
+        .map_err(|error| AdmissionFailure::Block(AdmissionBlock::Internal(error)))?
         .checked_total()
         .map_err(|error| AdmissionFailure::Block(AdmissionBlock::Internal(error)))?
         .checked_add(bytes)
@@ -386,13 +465,12 @@ pub(crate) fn check_ledger_postimage(
                 MemoryError::capacity("context reserve total exceeds u64"),
             ))
         })?;
-    for slot in [
-        usage.class_usage.get(class),
-        usage.owner_usage.get(owner),
-        usage.context_usage.get(&request.context),
-        Some(usage.total_usage),
-    ] {
-        if slot.map_or(0, |u| current_slot(u, request.kind)).checked_add(bytes).is_none() {
+    for slot in
+        [usage.class(class), usage.owner(owner), usage.context(request.context), usage.total()]
+    {
+        let slot =
+            slot.map_err(|error| AdmissionFailure::Block(AdmissionBlock::Internal(error)))?;
+        if current_slot(&slot, request.kind).checked_add(bytes).is_none() {
             return Err(AdmissionFailure::Breach(LimitBreach::new(
                 LimitAxis::KindSlot { kind: request.kind },
                 u64::MAX,
@@ -635,7 +713,8 @@ pub(crate) fn check_group_floor(
                 floors: prospective_unused,
             },
             non_headroom_band,
-            Some(u64::try_from(protected_postimage).unwrap_or(u64::MAX)),
+            // A wider protected postimage must not become a fake exact MAX deficit.
+            u64::try_from(protected_postimage).ok(),
             MemoryError::capacity(format!(
                 "resource-group usage {non_headroom_after} plus unused floors {prospective_unused} \
                  exceeds non-headroom band {non_headroom_band}"
@@ -714,16 +793,16 @@ fn evaluate_chain(inputs: &PreflightInputs) -> Result<(), AdmissionFailure> {
             return Err(AdmissionFailure::Breach(breach));
         }
     }
-    if *request.class != MemoryClass::Headroom {
-        let non_headroom_after =
-            inputs.non_headroom_bytes.checked_add(request.bytes).ok_or_else(|| {
-                AdmissionFailure::Breach(LimitBreach::new(
-                    LimitAxis::NonHeadroomTotal,
-                    u64::MAX,
-                    None,
-                    MemoryError::capacity("non-headroom reserve total exceeds u64"),
-                ))
-            })?;
+    if *request.class != MemoryClass::Headroom || inputs.usage.credit.is_some() {
+        let delta = if *request.class == MemoryClass::Headroom { 0 } else { request.bytes };
+        let non_headroom_after = inputs.non_headroom_bytes.checked_add(delta).ok_or_else(|| {
+            AdmissionFailure::Breach(LimitBreach::new(
+                LimitAxis::NonHeadroomTotal,
+                u64::MAX,
+                None,
+                MemoryError::capacity("non-headroom reserve total exceeds u64"),
+            ))
+        })?;
         let band = inputs
             .policy
             .global_hard_limit_bytes
@@ -738,7 +817,7 @@ fn evaluate_chain(inputs: &PreflightInputs) -> Result<(), AdmissionFailure> {
             inputs.unused_group_floors,
             inputs.owner_group,
             inputs.group_current_non_headroom_usage,
-            request.bytes,
+            delta,
             non_headroom_after,
             band,
         )?;
@@ -749,7 +828,12 @@ fn evaluate_chain(inputs: &PreflightInputs) -> Result<(), AdmissionFailure> {
         request.kind,
         request.bytes,
     )?;
-    if inputs.live_ticket_limit_reached {
+    if inputs.ticket_count_delta > 1 {
+        return Err(AdmissionFailure::Block(AdmissionBlock::Internal(MemoryError::InvalidState(
+            "admission ticket delta must be zero or one".into(),
+        ))));
+    }
+    if inputs.live_ticket_limit_reached && inputs.ticket_count_delta != 0 {
         let limit = crate::domain::management_limits::MAX_LIVE_TICKETS_PER_BROKER as u64;
         return Err(AdmissionFailure::Breach(LimitBreach::new(
             LimitAxis::LiveTicketCount,
@@ -786,6 +870,7 @@ pub(crate) fn preflight(inputs: &PreflightInputs) -> AdmissionVerdict {
                     owner_usage: (&empty_owners).into(),
                     context_usage: &empty_contexts,
                     total_usage: &empty_usage,
+                    credit: None,
                 },
                 non_headroom_bytes: 0,
                 live_scratch_bytes: 0,
@@ -861,6 +946,7 @@ mod tests {
             owner_usage: (&empty_owners).into(),
             context_usage: &empty_contexts,
             total_usage: &total,
+            credit: None,
         };
         let class = MemoryClass::ArtifactCache;
         let owner = "owner:x".to_string();

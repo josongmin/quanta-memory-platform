@@ -341,7 +341,7 @@ fn identity_reconfigure_succeeds_during_legal_group_burst() {
 #[test]
 fn reclaim_priority_orders_victims_deterministically() {
     let reclaimer = Arc::new(RecordingReclaimer::default());
-    let mut last = class_budget(0, 10, 100, false);
+    let mut last = class_budget(0, 100, 100, false);
     last.reclaim_priority = ReclaimPriority::Last;
     let mut normal = class_budget(0, 100, 100, false);
     normal.reclaim_priority = ReclaimPriority::Normal;
@@ -359,6 +359,7 @@ fn reclaim_priority_orders_victims_deterministically() {
         .with_class_budget(MemoryClass::ArtifactCache, last)
         .with_class_budget(MemoryClass::EvidenceCache, normal)
         .with_class_budget(MemoryClass::TraceIndex, first)
+        .with_owner_quota("priority-owner", OwnerQuota { soft_cap_bytes: 10, hard_cap_bytes: 100 })
         .with_resource_group("last-group", group_with_priority(ReclaimPriority::Last))
         .with_resource_group("normal-group", group_with_priority(ReclaimPriority::Normal))
         .with_resource_group("first-group", group_with_priority(ReclaimPriority::First));
@@ -375,8 +376,12 @@ fn reclaim_priority_orders_victims_deterministically() {
             ChargeKind::RetainedPayload,
             11,
         )
-        .expect("soft crossing");
+        .expect("owner soft crossing covers victims across classes");
     let requests = reclaimer.requests.lock().expect("requests");
+    assert_eq!(
+        requests[0].target.scope,
+        crate::ports::reclaim::ReclaimScope::Owner("priority-owner".into())
+    );
     let candidates = &requests[0].candidates;
     let last_pos = candidates
         .iter()

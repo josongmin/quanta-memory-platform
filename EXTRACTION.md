@@ -28,7 +28,7 @@ success commit; a successful destination has a clean worktree.
 ## Public examples and CI
 
 ```bash
-# Shared verifier: actual extraction plus all three public examples against its manifest
+# Shared verifier: actual extraction plus public examples against its manifest
 scripts/verify-extracted-examples.sh
 ```
 

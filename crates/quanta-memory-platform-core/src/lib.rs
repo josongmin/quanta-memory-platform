@@ -137,7 +137,7 @@ pub use ports::pin::{InvalidationOutcome, PayloadPinLease, PinRegistry};
 #[cfg(feature = "live_control")]
 pub use ports::reclaim::{
     MemoryReclaimer, ReclaimCandidate, ReclaimGroupCandidate, ReclaimOutcome, ReclaimRequest,
-    ReclaimTrigger,
+    ReclaimScope, ReclaimTarget, ReclaimTrigger, ReclaimUnit,
 };
 pub use ports::scratch::{ScratchAllocator, ScratchRequest, ScratchReservation};
 pub use ports::store::{

@@ -71,6 +71,8 @@ Runnable public examples:
 ```bash
 cargo run -p quanta-memory-platform-facade --example hello_world
 cargo run -p quanta-memory-platform-facade --example effective_budget_report
+cargo run -p quanta-memory-platform-facade --features core-live-accounting --example managed_charge_lifecycle
+cargo run -p quanta-memory-platform-facade --features core-live-accounting,retained_map,revocable_store --example shared_budget_reclaim
 cargo run -p quanta-memory-platform-facade --features transcript --example transcript_session
 ```
 
@@ -159,7 +161,7 @@ scripts/extract-to-standalone-repo.sh --dry-run /path/to/qmp-extracted
 
 The scaling results are same-host signals, not portable latency guarantees.
 The main-push and PR-update CI entry point is `.circleci/config.yml`, which verifies a
-clean standalone extraction, its full workspace rail, and all three public examples.
+clean standalone extraction, its full workspace rail, and the public examples.
 Check the live trigger with `python3 scripts/verify-hosted-ci-binding.py` before
 accepting a hosted green; also confirm the exact SHA's extraction step ran.
 The explicit `run_heavy=true` CircleCI workflow collects three independent full 60-row `in-memory-pressure`

@@ -241,7 +241,16 @@ class CiEntryPointContracts(unittest.TestCase):
         self.assertIn("set -euo pipefail", script)
         self.assertIn('scripts/extract-to-standalone-repo.sh "${qmp_extract_dir}"', script)
         self.assertIn('scripts/check-workspace.sh', (ROOT / "scripts/extract-to-standalone-repo.sh").read_text())
-        self.assertEqual(script.count('--manifest-path "${qmp_extract_dir}/Cargo.toml"'), 3)
+        self.assertEqual(script.count('--manifest-path "${qmp_extract_dir}/Cargo.toml"'), 5)
+        for features, example in (
+            ("core-live-accounting", "managed_charge_lifecycle"),
+            ("core-live-accounting,retained_map,revocable_store", "shared_budget_reclaim"),
+        ):
+            self.assertIn(
+                'cargo run --locked --manifest-path "${qmp_extract_dir}/Cargo.toml" '
+                f'-p quanta-memory-platform-facade --features {features} --example {example}',
+                script,
+            )
         self.assertIn(
             'cargo run --locked --manifest-path "${qmp_extract_dir}/Cargo.toml" '
             '-p quanta-memory-platform-facade --features transcript --example transcript_session',

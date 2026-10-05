@@ -248,7 +248,7 @@
   "sep23_audit_finalize_retry_succeeds_while_unrelated_claim_is_live": "crates/quanta-memory-platform-facade/src/spill/backings/redb/tests/cases_03.rs",
   "sep23_audit_forged_reclaimed_bytes_are_recorded_but_never_trusted": "crates/quanta-memory-platform-core/src/api/control/tests/cases_08.rs",
   "sep23_audit_group_denial_runs_single_hard_regardless_of_soft_crossing": "crates/quanta-memory-platform-core/src/api/control/tests/cases_08.rs",
-  "sep23_audit_max_scale_plus_one_byte_denies_clean_without_callback": "crates/quanta-memory-platform-core/src/api/control/tests/cases_07.rs",
+  "sep23_audit_max_scale_plus_one_byte_denies_clean_after_bounded_reclaim": "crates/quanta-memory-platform-core/src/api/control/tests/cases_07.rs",
   "sep23_audit_panicking_decode_aborts_prepared_claim_and_retries_clean": "crates/quanta-memory-platform-facade/src/revocable_store/service/tests/cases_03.rs",
   "sep23_audit_panicking_decode_preserves_committed_recovery_until_retry": "crates/quanta-memory-platform-facade/src/revocable_store/service/tests/cases_03.rs",
   "sep23_audit_panicking_reclaimer_is_contained_and_broker_survives": "crates/quanta-memory-platform-core/src/api/control/tests/cases_08.rs",

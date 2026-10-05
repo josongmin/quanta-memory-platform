@@ -68,6 +68,14 @@ name = "hello_world"
 required-features = ["core-live-accounting"]
 
 [[example]]
+name = "managed_charge_lifecycle"
+required-features = ["core-live-accounting"]
+
+[[example]]
+name = "shared_budget_reclaim"
+required-features = ["core-live-accounting", "retained_map", "revocable_store"]
+
+[[example]]
 name = "transcript_session"
 required-features = ["transcript"]
 

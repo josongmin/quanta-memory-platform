@@ -329,6 +329,31 @@ references keep their previous typed semantics under the cap.
   one `Arc<StoreBindingHandle>` and carry the original managed charge; they do
   not deep-clone owner/runtime identity or create an uncharged destination copy.
 
+## Public lifecycle examples
+
+The facade's public consumer examples now include the
+[managed charge lifecycle](crates/quanta-memory-platform-facade/examples/managed_charge_lifecycle.rs),
+which demonstrates `reserve_owned` → `commit` →
+successful `recharge` → denied recharge with the old `ManagedCharge` preserved
+→ explicit `release` and Drop. Its final broker observation asserts both zero
+semantic bytes and zero live tickets. Run it with:
+
+```bash
+cargo run -p quanta-memory-platform-facade --features core-live-accounting --example managed_charge_lifecycle
+```
+
+[shared budget reclaim](crates/quanta-memory-platform-facade/examples/shared_budget_reclaim.rs)
+demonstrates a retained-map overwrite admitted only after a different revocable
+store releases its lease on the same broker. Its
+callback follows the typed reclaim unit/scope, bounds work when the requested
+reduction is unrepresentable, and deliberately under-reports bytes so the
+broker's post-callback remeasurement is observable. The example closes both
+stores and asserts zero final bytes and live tickets. Run it with:
+
+```bash
+cargo run -p quanta-memory-platform-facade --features core-live-accounting,retained_map,revocable_store --example shared_budget_reclaim
+```
+
 ## Feature policy
 
 - Default: live accounting bridge only.

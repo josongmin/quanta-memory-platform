@@ -1,4 +1,21 @@
 use super::*;
+use crate::domain::admission::AdmissionBlock;
+use crate::ports::reclaim::{ReclaimScope, ReclaimTarget, ReclaimUnit};
+
+#[derive(Clone, Copy)]
+enum AdmissionAction<'a> {
+    Reserve { commit: bool },
+    Replace(&'a ReservationTicket),
+}
+
+impl<'a> AdmissionAction<'a> {
+    fn old(self) -> Option<&'a ReservationTicket> {
+        match self {
+            Self::Reserve { .. } => None,
+            Self::Replace(old) => Some(old),
+        }
+    }
+}
 
 impl LiveProcessMemoryBroker {
     /// Reserve bytes against (class, owner, context). Fail-closed before
@@ -123,20 +140,8 @@ impl LiveProcessMemoryBroker {
         result
     }
 
-    /// Atomically swap one committed charge for another under a SINGLE lock:
-    /// release `old`, then reserve+commit a new charge. All-or-nothing — this is
-    /// the primitive a charged store uses for an in-place overwrite.
-    ///
-    /// - `Ok(new)`: the swap happened; `old` is consumed (released) and `new` is
-    ///   the fresh committed receipt.
-    /// - `Err(..OldChargePreserved)`: nothing was mutated and the original old
-    ///   ticket remains valid.
-    /// - other recovery states are reserved for generic accounting sinks; this
-    ///   broker's ledger replacement never needs external rollback.
-    ///
-    /// Because release-then-charge happens under one lock, an overwrite never
-    /// transiently double-counts against caps/group admission, and no rebuild can
-    /// interleave to strand bytes.
+    /// Replace a committed charge through the same bounded admission/reclaim
+    /// executor as reserve. The old authority remains live across the callout.
     pub(crate) fn recharge(
         &self,
         old: &ReservationTicket,
@@ -146,132 +151,34 @@ impl LiveProcessMemoryBroker {
         kind: ChargeKind,
         bytes: u64,
     ) -> Result<ReservationTicket, RechargeError> {
-        use crate::application::scheduler::ResourceGroupScheduler;
-
-        // Same reentry bound as a reentrant reserve: a recharge is a
-        // synchronous release+reserve+commit swap, so a callback running for
-        // this broker must not grow or shrink charges reentrantly. The old
-        // charge is untouched (OldChargePreserved).
-        let broker_identity = Arc::as_ptr(&self.inner) as usize;
-        if BrokerCallbackScope::is_active(BrokerCallbackKind::Reclaimer, broker_identity) {
-            return Err(RechargeError {
-                error: MemoryError::operation_in_progress(
-                    "reentrant recharge from this broker's memory reclaimer",
-                ),
-                recovery: RechargeRecoveryV1::OldChargePreserved,
-            });
-        }
-
-        let mut core = self.lock().map_err(|error| RechargeError {
-            error,
-            recovery: RechargeRecoveryV1::OldChargePreserved,
-        })?;
-
-        // Validate resource-group admission against the replacement postimage,
-        // not against a transient double charge. A cloned candidate gives us an
-        // infallible scheduler commit after the ledger replacement succeeds.
-        let old_attribution = Self::attribution_for(&core, old).map_err(|error| RechargeError {
-            error,
-            recovery: RechargeRecoveryV1::OldChargePreserved,
-        })?;
-        let old_group = old_attribution.group;
-        let new_group = core.ledger.policy().owner_groups.get(&owner).cloned();
-        let mut next_scheduler = core.scheduler.clone();
-        if let Some(group) = &old_group {
-            next_scheduler.record_release(group, old.class(), old.bytes()).map_err(|error| {
-                RechargeError { error, recovery: RechargeRecoveryV1::OldChargePreserved }
-            })?;
-        }
-        if let Some(group) = &new_group {
-            if !next_scheduler.admits(group, bytes) {
-                return Err(RechargeError {
-                    error: MemoryError::capacity(format!(
-                        "resource group {group} admission denied for owner {owner} recharge of {bytes} bytes"
-                    )),
-                    recovery: RechargeRecoveryV1::OldChargePreserved,
-                });
-            }
-            next_scheduler.record_usage(group, &class, bytes).map_err(|error| RechargeError {
+        self.admit_with_reclaim(class, owner, context, kind, bytes, AdmissionAction::Replace(old))
+            .map_err(|error| RechargeError {
                 error,
                 recovery: RechargeRecoveryV1::OldChargePreserved,
-            })?;
+            })
+    }
+
+    /// Final locked replacement. All admission checks use the shared net read
+    /// view; the staged scheduler is published only after the ledger succeeds.
+    fn recharge_on(
+        core: &mut BrokerCore,
+        old: &ReservationTicket,
+        class: MemoryClass,
+        owner: OwnerKey,
+        context: MemoryContextKind,
+        kind: ChargeKind,
+        bytes: u64,
+    ) -> MemoryResult<ReservationTicket> {
+        let old_attribution = Self::attribution_for(core, old)?;
+        let new_group = core.ledger.policy().owner_groups.get(&owner).cloned();
+        let mut next_scheduler = core.scheduler.clone();
+        if let Some(group) = &old_attribution.group {
+            next_scheduler.record_release(group, old.class(), old.bytes())?;
         }
-
-        // Recharge is an admission operation too. Validate the same complete
-        // resource-group floor postimage as reserve, after removing the old
-        // non-headroom charge and adding the replacement. Without this check a
-        // peer group could consume another group's reserved floor by growing an
-        // already-live charge instead of issuing a fresh reserve.
-        let non_headroom_current = core.ledger.non_headroom_bytes();
-        let without_old = if *old.class() == MemoryClass::Headroom {
-            non_headroom_current
-        } else {
-            non_headroom_current.checked_sub(old.bytes()).ok_or_else(|| RechargeError {
-                error: MemoryError::InvalidState(
-                    "non-headroom recharge old charge exceeds live usage".into(),
-                ),
-                recovery: RechargeRecoveryV1::OldChargePreserved,
-            })?
-        };
-        let non_headroom_after = if class == MemoryClass::Headroom {
-            without_old
-        } else {
-            without_old.checked_add(bytes).ok_or_else(|| RechargeError {
-                error: MemoryError::capacity("non-headroom recharge total exceeds u64"),
-                recovery: RechargeRecoveryV1::OldChargePreserved,
-            })?
-        };
-        let non_headroom_band = core
-            .ledger
-            .policy()
-            .global_hard_limit_bytes
-            .checked_sub(core.ledger.policy().headroom_bytes)
-            .ok_or_else(|| RechargeError {
-                error: MemoryError::capacity("headroom exceeds global hard limit"),
-                recovery: RechargeRecoveryV1::OldChargePreserved,
-            })?;
-        next_scheduler.protected_floor_fits(non_headroom_after, non_headroom_band).map_err(
-            |error| RechargeError { error, recovery: RechargeRecoveryV1::OldChargePreserved },
-        )?;
-
-        // The execution scratch ceiling is a broker-owned admission axis, not a
-        // ledger class cap. Evaluate the same replacement postimage used by the
-        // ledger so the atomic primitive cannot bypass this outer authority.
-        if let Some(max) = core.report.execution.max_execution_scratch_bytes {
-            let max = u64::try_from(max).unwrap_or(u64::MAX);
-            let current = core.ledger.total_live_scratch_bytes();
-            let without_old = if old.kind() == ChargeKind::LiveScratch {
-                current.checked_sub(old.bytes()).ok_or_else(|| RechargeError {
-                    error: MemoryError::InvalidState(
-                        "scratch recharge old charge exceeds live usage".into(),
-                    ),
-                    recovery: RechargeRecoveryV1::OldChargePreserved,
-                })?
-            } else {
-                current
-            };
-            let live_after = if kind == ChargeKind::LiveScratch {
-                without_old.checked_add(bytes).ok_or_else(|| RechargeError {
-                    error: MemoryError::capacity("execution scratch recharge total exceeds u64"),
-                    recovery: RechargeRecoveryV1::OldChargePreserved,
-                })?
-            } else {
-                without_old
-            };
-            if live_after > max {
-                return Err(RechargeError {
-                    error: MemoryError::capacity(format!(
-                        "execution scratch budget {max} exceeded by recharge to {live_after}"
-                    )),
-                    recovery: RechargeRecoveryV1::OldChargePreserved,
-                });
-            }
+        if let Some(group) = &new_group {
+            next_scheduler.record_usage(group, &class, bytes)?;
         }
-
-        let replacement =
-            core.ledger.replace_committed(old, class, owner, context, kind, bytes).map_err(
-                |error| RechargeError { error, recovery: RechargeRecoveryV1::OldChargePreserved },
-            )?;
+        let replacement = core.ledger.replace_committed(old, class, owner, context, kind, bytes)?;
         core.scheduler = next_scheduler;
         core.ticket_attribution.remove(&old.id());
         core.ticket_attribution
@@ -307,60 +214,76 @@ impl LiveProcessMemoryBroker {
         Ok(ticket)
     }
 
-    pub(super) fn soft_threshold_request(
+    /// Select the first crossing in the stable class -> owner -> group order.
+    /// Crossing compares live usage to the net replacement postimage, so an
+    /// ordinary same-attribution shrink cannot provoke a soft callback.
+    fn soft_threshold_request(
         core: &BrokerCore,
-        class: &MemoryClass,
-        owner: &OwnerKey,
-        bytes: u64,
+        inputs: &PreflightInputs<'_>,
     ) -> MemoryResult<Option<ReclaimRequest>> {
-        let policy = core.ledger.policy();
-        let class_current = core.ledger.class_usage(class).checked_total()?;
-        let class_after = class_current
-            .checked_add(bytes)
+        let request = &inputs.request;
+        let policy = inputs.policy;
+        let class_current = core.ledger.class_usage(request.class).checked_total()?;
+        let class_after = inputs
+            .usage
+            .class(request.class)?
+            .checked_total()?
+            .checked_add(request.bytes)
             .ok_or_else(|| MemoryError::capacity("class prospective usage exceeds u64"))?;
-        let class_crossed = policy.classes.get(class).is_some_and(|budget| {
-            class_current <= budget.soft_cap_bytes && class_after > budget.soft_cap_bytes
-        });
-
-        let owner_current = core.ledger.owner_usage(owner).checked_total()?;
-        let owner_after = owner_current
-            .checked_add(bytes)
+        let owner_current = core.ledger.owner_usage(request.owner).checked_total()?;
+        let owner_after = inputs
+            .usage
+            .owner(request.owner)?
+            .checked_total()?
+            .checked_add(request.bytes)
             .ok_or_else(|| MemoryError::capacity("owner prospective usage exceeds u64"))?;
-        let owner_crossed = policy.owner_quotas.get(owner).is_some_and(|quota| {
+        let crossing = if let Some(budget) = policy.classes.get(request.class).filter(|budget| {
+            class_current <= budget.soft_cap_bytes && class_after > budget.soft_cap_bytes
+        }) {
+            Some((ReclaimScope::Class(request.class.clone()), class_after - budget.soft_cap_bytes))
+        } else if let Some(quota) = policy.owner_quotas.get(request.owner).filter(|quota| {
             owner_current <= quota.soft_cap_bytes && owner_after > quota.soft_cap_bytes
-        });
-
-        let group = policy.owner_groups.get(owner).cloned();
-        let group_crossed = group.as_ref().is_some_and(|name| {
-            policy.resource_groups.get(name).is_some_and(|budget| {
-                let current = core.scheduler.current_usage(name);
-                current <= budget.soft_cap_bytes
-                    && current.checked_add(bytes).is_some_and(|after| after > budget.soft_cap_bytes)
-            })
-        });
-
-        if !(class_crossed || owner_crossed || group_crossed) {
+        }) {
+            Some((ReclaimScope::Owner(request.owner.clone()), owner_after - quota.soft_cap_bytes))
+        } else if let Some(group) = inputs.owner_group {
+            let current = core.scheduler.current_usage(group);
+            let after = inputs
+                .group_current_usage
+                .checked_add(request.bytes)
+                .ok_or_else(|| MemoryError::capacity("group prospective usage exceeds u64"))?;
+            policy
+                .resource_groups
+                .get(group)
+                .filter(|budget| current <= budget.soft_cap_bytes && after > budget.soft_cap_bytes)
+                .map(|budget| {
+                    (ReclaimScope::ResourceGroup(group.to_string()), after - budget.soft_cap_bytes)
+                })
+        } else {
+            None
+        };
+        let Some((scope, minimum_reduction)) = crossing else {
             return Ok(None);
-        }
-        Self::reclaim_request(core, class, owner, group, bytes, ReclaimTrigger::SoftThreshold)
-            .map(Some)
+        };
+        let target = ReclaimTarget {
+            unit: ReclaimUnit::Bytes,
+            scope,
+            minimum_reduction: Some(minimum_reduction),
+        };
+        Self::reclaim_request(core, inputs, ReclaimTrigger::SoftThreshold, target).map(Some)
     }
 
-    pub(super) fn reclaim_request(
+    fn reclaim_request(
         core: &BrokerCore,
-        class: &MemoryClass,
-        owner: &OwnerKey,
-        group: Option<String>,
-        bytes: u64,
+        inputs: &PreflightInputs<'_>,
         trigger: ReclaimTrigger,
+        target: ReclaimTarget,
     ) -> MemoryResult<ReclaimRequest> {
-        let snapshot = core.ledger.snapshot();
-        snapshot.validate_exact()?;
-        let prospective = snapshot
-            .total_owner_bytes()
-            .checked_add(bytes)
-            .ok_or_else(|| MemoryError::capacity("reclaim prospective usage exceeds u64"))?;
-        let classified = core.controller.classify_semantic(prospective);
+        let request = &inputs.request;
+        // Read only the keyed/aggregate ledger projection. A reclaim request
+        // must not clone the complete owner map just to compute its pressure.
+        let prospective = inputs.usage.total()?.checked_total()?.checked_add(request.bytes);
+        let classified = prospective
+            .map_or(PressureState::Fatal, |bytes| core.controller.classify_semantic(bytes));
         let pressure = match (trigger, classified) {
             (ReclaimTrigger::SoftThreshold, PressureState::Normal) => PressureState::Soft,
             (ReclaimTrigger::CapacityDenial, PressureState::Normal | PressureState::Soft) => {
@@ -368,23 +291,35 @@ impl LiveProcessMemoryBroker {
             }
             _ => classified,
         };
-        let ticket_count_full = core.ledger.live_ticket_limit_reached();
-        let mut candidates: Vec<ReclaimCandidate> = core
-            .ledger
-            .policy()
+        let ticket_pressure = target.unit == ReclaimUnit::LiveTickets;
+        let mut candidates: Vec<ReclaimCandidate> = inputs
+            .policy
             .classes
             .iter()
-            // A class with a zero hard cap may still hold positive borrowed
-            // bytes from the shared pool. Include that live victim even when
-            // a different class requests the capacity. At the ticket-count
-            // ceiling, zero-byte authorities may also need eviction.
-            .filter(|(candidate, budget)| {
-                budget.hard_cap_bytes > 0
-                    || snapshot.class_usage.get(candidate).is_some_and(|usage| usage.total() > 0)
-                    || ticket_count_full
+            .filter(|(class, budget)| {
+                let live = core.ledger.class_usage(class);
+                let relevant = match &target.scope {
+                    ReclaimScope::Class(target_class) => *class == target_class,
+                    ReclaimScope::NonHeadroom => **class != MemoryClass::Headroom,
+                    ReclaimScope::SharedBorrowPool => {
+                        budget.borrow_from_shared_pool
+                            && (*class == request.class || live.total() > budget.hard_cap_bytes)
+                    }
+                    ReclaimScope::ExecutionScratch => live.live_scratch_bytes > 0,
+                    ReclaimScope::ChargeKind(kind) => match kind {
+                        ChargeKind::RetainedPayload => live.retained_payload_bytes > 0,
+                        ChargeKind::RetainedMetadata => live.retained_metadata_bytes > 0,
+                        ChargeKind::LiveScratch => live.live_scratch_bytes > 0,
+                    },
+                    ReclaimScope::Global
+                    | ReclaimScope::Owner(_)
+                    | ReclaimScope::ResourceGroup(_)
+                    | ReclaimScope::Context(_) => true,
+                };
+                relevant && (budget.hard_cap_bytes > 0 || live.total() > 0 || ticket_pressure)
             })
-            .map(|(candidate, budget)| ReclaimCandidate {
-                class: candidate.clone(),
+            .map(|(class, budget)| ReclaimCandidate {
+                class: class.clone(),
                 priority: budget.reclaim_priority,
             })
             .collect();
@@ -396,13 +331,16 @@ impl LiveProcessMemoryBroker {
             };
             (priority, candidate.class.clone())
         });
-        let mut group_candidates: Vec<ReclaimGroupCandidate> = core
-            .ledger
-            .policy()
+        let mut group_candidates: Vec<ReclaimGroupCandidate> = inputs
+            .policy
             .resource_groups
             .iter()
-            .map(|(name, budget)| ReclaimGroupCandidate {
-                group: name.clone(),
+            .filter(|(group, _)| match &target.scope {
+                ReclaimScope::ResourceGroup(target_group) => *group == target_group,
+                _ => true,
+            })
+            .map(|(group, budget)| ReclaimGroupCandidate {
+                group: group.clone(),
                 priority: budget.reclaim_priority,
             })
             .collect();
@@ -416,10 +354,11 @@ impl LiveProcessMemoryBroker {
         });
         Ok(ReclaimRequest {
             trigger,
-            requested_class: class.clone(),
-            requested_owner: owner.clone(),
-            resource_group: group,
-            requested_bytes: bytes,
+            requested_class: request.class.clone(),
+            requested_owner: request.owner.clone(),
+            resource_group: inputs.owner_group.map(str::to_string),
+            requested_bytes: request.bytes,
+            target,
             pressure,
             rungs: core.controller.ladder_for(pressure),
             candidates,
@@ -456,7 +395,7 @@ impl LiveProcessMemoryBroker {
             return;
         }
         let broker_identity = Arc::as_ptr(&self.inner) as usize;
-        // The entry guard in `reserve_with_reclaim` rejects same-broker reserve
+        // The entry guard in `admit_with_reclaim` rejects same-broker admission
         // reentry before it can prepare another callback. This local guard is a
         // second boundary for future internal callers of this method.
         let Some(callback_scope) =
@@ -509,11 +448,126 @@ impl LiveProcessMemoryBroker {
         ));
     }
 
-    /// Pure admission preflight over locked state (FUP-003): evaluates the
-    /// shared admission engine against the live ledger, scheduler, and report
-    /// without mutating anything. The verdict decides the reclaim plan BEFORE
-    /// any callback can fire, so terminally impossible and blocked requests
-    /// never touch a host callback.
+    /// Construct a net read projection without cloning the ledger or owner map.
+    /// Old authority is validated before crediting any of its accounting axes.
+    fn admission_inputs<'a>(
+        core: &'a BrokerCore,
+        class: &'a MemoryClass,
+        owner: &'a OwnerKey,
+        context: MemoryContextKind,
+        kind: ChargeKind,
+        bytes: u64,
+        old: Option<&'a ReservationTicket>,
+    ) -> MemoryResult<PreflightInputs<'a>> {
+        let policy = core.ledger.policy();
+        let owner_group = policy.owner_groups.get(owner).map(String::as_str);
+        let mut usage = core.ledger.usage_view();
+        let mut non_headroom_bytes = core.ledger.non_headroom_bytes();
+        let mut live_scratch_bytes = core.ledger.total_live_scratch_bytes();
+        let mut group_current_usage =
+            owner_group.map_or(0, |group| core.scheduler.current_usage(group));
+        let mut group_current_non_headroom_usage =
+            owner_group.map_or(0, |group| core.scheduler.current_non_headroom_usage(group));
+        let mut unused_group_floors = core.scheduler.unused_reserved_floor_bytes();
+        if let Some(old) = old {
+            core.ledger.validate_committed_ticket(old)?;
+            let attribution = Self::attribution_for(core, old)?;
+            usage = usage.with_credit(old);
+            if *old.class() != MemoryClass::Headroom {
+                non_headroom_bytes =
+                    non_headroom_bytes.checked_sub(old.bytes()).ok_or_else(|| {
+                        MemoryError::InvalidState(
+                            "replacement credit exceeds non-headroom usage".into(),
+                        )
+                    })?;
+            }
+            if old.kind() == ChargeKind::LiveScratch {
+                live_scratch_bytes =
+                    live_scratch_bytes.checked_sub(old.bytes()).ok_or_else(|| {
+                        MemoryError::InvalidState(
+                            "replacement credit exceeds live scratch usage".into(),
+                        )
+                    })?;
+            }
+            if let Some(old_group) = attribution.group.as_deref() {
+                if owner_group == Some(old_group) {
+                    group_current_usage =
+                        group_current_usage.checked_sub(old.bytes()).ok_or_else(|| {
+                            MemoryError::InvalidState(
+                                "replacement credit exceeds group usage".into(),
+                            )
+                        })?;
+                    if *old.class() != MemoryClass::Headroom {
+                        group_current_non_headroom_usage = group_current_non_headroom_usage
+                            .checked_sub(old.bytes())
+                            .ok_or_else(|| {
+                                MemoryError::InvalidState(
+                                    "replacement credit exceeds group non-headroom usage".into(),
+                                )
+                            })?;
+                    }
+                }
+                if *old.class() != MemoryClass::Headroom {
+                    let budget = policy.resource_groups.get(old_group).ok_or_else(|| {
+                        MemoryError::InvalidState("replacement issuing group is missing".into())
+                    })?;
+                    let current = core.scheduler.current_non_headroom_usage(old_group);
+                    let after_release = current.checked_sub(old.bytes()).ok_or_else(|| {
+                        MemoryError::InvalidState(
+                            "replacement credit exceeds issuing group usage".into(),
+                        )
+                    })?;
+                    unused_group_floors = unused_group_floors
+                        .checked_sub(u128::from(budget.reserved_bytes.saturating_sub(current)))
+                        .and_then(|total| {
+                            total.checked_add(u128::from(
+                                budget.reserved_bytes.saturating_sub(after_release),
+                            ))
+                        })
+                        .ok_or_else(|| {
+                            MemoryError::InvalidState(
+                                "replacement group floors are inconsistent".into(),
+                            )
+                        })?;
+                }
+            }
+        }
+        Ok(PreflightInputs {
+            policy,
+            usage,
+            non_headroom_bytes,
+            live_scratch_bytes,
+            execution_scratch_max: core.report.execution.max_execution_scratch_bytes,
+            fair_burst_shares: core.scheduler.fair_burst_shares(),
+            group_current_usage,
+            group_current_non_headroom_usage,
+            unused_group_floors,
+            owner_group,
+            request: AdmissionRequest { class, owner, context, kind, bytes },
+            rebuild_in_progress: core.ledger.rebuild_in_progress(),
+            ticket_id_space_exhausted: core.ledger.ticket_id_space_exhausted(),
+            live_ticket_limit_reached: core.ledger.live_ticket_limit_reached(),
+            ticket_count_delta: u8::from(old.is_none()),
+        })
+    }
+
+    fn operation_preflight(
+        core: &BrokerCore,
+        class: &MemoryClass,
+        owner: &OwnerKey,
+        context: MemoryContextKind,
+        kind: ChargeKind,
+        bytes: u64,
+        old: Option<&ReservationTicket>,
+    ) -> AdmissionVerdict {
+        match Self::admission_inputs(core, class, owner, context, kind, bytes, old) {
+            Ok(inputs) => crate::domain::admission::preflight(&inputs),
+            Err(error) => AdmissionVerdict::Blocked { reason: AdmissionBlock::Internal(error) },
+        }
+    }
+
+    /// Existing reserve oracle entry; production uses the shared executor.
+    #[cfg(test)]
     pub(super) fn admission_preflight(
         core: &BrokerCore,
         class: &MemoryClass,
@@ -522,25 +576,7 @@ impl LiveProcessMemoryBroker {
         kind: ChargeKind,
         bytes: u64,
     ) -> AdmissionVerdict {
-        let owner_group = core.ledger.policy().owner_groups.get(owner).map(String::as_str);
-        let inputs = PreflightInputs {
-            policy: core.ledger.policy(),
-            usage: core.ledger.usage_view(),
-            non_headroom_bytes: core.ledger.non_headroom_bytes(),
-            live_scratch_bytes: core.ledger.total_live_scratch_bytes(),
-            execution_scratch_max: core.report.execution.max_execution_scratch_bytes,
-            fair_burst_shares: core.scheduler.fair_burst_shares(),
-            group_current_usage: owner_group.map_or(0, |group| core.scheduler.current_usage(group)),
-            group_current_non_headroom_usage: owner_group
-                .map_or(0, |group| core.scheduler.current_non_headroom_usage(group)),
-            unused_group_floors: core.scheduler.unused_reserved_floor_bytes(),
-            owner_group,
-            request: AdmissionRequest { class, owner, context, kind, bytes },
-            rebuild_in_progress: core.ledger.rebuild_in_progress(),
-            ticket_id_space_exhausted: core.ledger.ticket_id_space_exhausted(),
-            live_ticket_limit_reached: core.ledger.live_ticket_limit_reached(),
-        };
-        crate::domain::admission::preflight(&inputs)
+        Self::operation_preflight(core, class, owner, context, kind, bytes, None)
     }
 
     pub(super) fn reserve_with_reclaim(
@@ -552,35 +588,51 @@ impl LiveProcessMemoryBroker {
         bytes: u64,
         commit: bool,
     ) -> MemoryResult<ReservationTicket> {
+        self.admit_with_reclaim(
+            class,
+            owner,
+            context,
+            kind,
+            bytes,
+            AdmissionAction::Reserve { commit },
+        )
+    }
+
+    /// One executor for pending/committed reserve and atomic replacement.
+    /// Callback failures never substitute for the current ledger verdict.
+    fn admit_with_reclaim(
+        &self,
+        class: MemoryClass,
+        owner: OwnerKey,
+        context: MemoryContextKind,
+        kind: ChargeKind,
+        bytes: u64,
+        action: AdmissionAction<'_>,
+    ) -> MemoryResult<ReservationTicket> {
         let broker_identity = Arc::as_ptr(&self.inner) as usize;
         if BrokerCallbackScope::is_active(BrokerCallbackKind::Reclaimer, broker_identity) {
-            return Err(MemoryError::operation_in_progress(
-                "reentrant reserve from this broker's memory reclaimer",
-            ));
+            let message = match action {
+                AdmissionAction::Reserve { .. } => {
+                    "reentrant reserve from this broker's memory reclaimer"
+                }
+                AdmissionAction::Replace(_) => {
+                    "reentrant recharge from this broker's memory reclaimer"
+                }
+            };
+            return Err(MemoryError::operation_in_progress(message));
         }
-
-        // Reject oversized identifiers before preflight can invoke host reclaim
-        // callbacks or mutate diagnostic counters. `reserve_on` and the ledger
-        // repeat the check at the mutation authority boundary.
         if owner.len() > crate::domain::management_limits::MAX_OWNER_KEY_BYTES {
             return Err(MemoryError::capacity(format!(
                 "owner identifier is {} bytes; maximum is {}",
                 owner.len(),
-                crate::domain::management_limits::MAX_OWNER_KEY_BYTES
+                crate::domain::management_limits::MAX_OWNER_KEY_BYTES,
             )));
         }
-
-        // Locked preflight FIRST: Blocked and Terminal verdicts return before
-        // any callback is even built. A predicted failure goes straight to the
-        // hard (capacity-denial) plan — a soft request is only proactive, sent
-        // when the request itself is admissible but crosses a soft threshold.
-        enum Plan {
-            Admit(Option<(Arc<dyn MemoryReclaimer>, ReclaimRequest)>),
-            Hard(Arc<dyn MemoryReclaimer>, ReclaimRequest),
-        }
-        let plan = {
+        let (work, hard_retry) = {
             let mut core = self.lock()?;
-            match Self::admission_preflight(&core, &class, &owner, context, kind, bytes) {
+            let inputs =
+                Self::admission_inputs(&core, &class, &owner, context, kind, bytes, action.old())?;
+            match crate::domain::admission::preflight(&inputs) {
                 AdmissionVerdict::Blocked { reason } => {
                     core.reclaim_stats.blocked_denials += 1;
                     return Err(reason.into_error());
@@ -590,78 +642,57 @@ impl LiveProcessMemoryBroker {
                     return Err(breach.into_error());
                 }
                 AdmissionVerdict::Admit => {
-                    let request = Self::soft_threshold_request(&core, &class, &owner, bytes)?;
+                    let request = Self::soft_threshold_request(&core, &inputs)?;
                     let work = request.and_then(|request| {
-                        core.reclaimer.clone().map(|reclaimer| (reclaimer, request))
+                        core.reclaimer.clone().map(|callback| (callback, request))
                     });
-                    Plan::Admit(work)
+                    (work, false)
                 }
                 AdmissionVerdict::ReclaimCandidate { breach } => {
-                    let group = core.ledger.policy().owner_groups.get(&owner).cloned();
+                    let Some(callback) = core.reclaimer.clone() else {
+                        core.reclaim_stats.terminal_denials += 1;
+                        return Err(breach.into_error());
+                    };
                     let request = Self::reclaim_request(
                         &core,
-                        &class,
-                        &owner,
-                        group,
-                        bytes,
+                        &inputs,
                         ReclaimTrigger::CapacityDenial,
+                        breach.reclaim_target(),
                     )?;
-                    match core.reclaimer.clone() {
-                        Some(reclaimer) => Plan::Hard(reclaimer, request),
-                        // No callback available: the live breach is final,
-                        // exactly as if the attempt had run.
-                        None => {
-                            core.reclaim_stats.terminal_denials += 1;
-                            return Err(breach.into_error());
-                        }
-                    }
+                    (Some((callback, request)), true)
                 }
             }
         };
-        match plan {
-            Plan::Admit(soft_work) => {
-                if let Some((reclaimer, request)) = soft_work {
-                    self.run_reclaim(reclaimer, &request);
-                }
-                let mut core = self.lock()?;
-                if commit {
+        if let Some((callback, request)) = work {
+            self.run_reclaim(callback, &request);
+        }
+        // Rebuild/policy/old-ticket may have changed while the lock was absent.
+        // No second callback, including after a soft callback worsens pressure.
+        let mut core = self.lock()?;
+        match Self::operation_preflight(&core, &class, &owner, context, kind, bytes, action.old()) {
+            AdmissionVerdict::Admit => match action {
+                AdmissionAction::Reserve { commit: true } => {
                     Self::reserve_committed_on(&mut core, class, owner, context, kind, bytes)
-                } else {
+                }
+                AdmissionAction::Reserve { commit: false } => {
                     Self::reserve_on(&mut core, class, owner, context, kind, bytes)
                 }
-            }
-            Plan::Hard(reclaimer, request) => {
-                self.run_reclaim(reclaimer, &request);
-                // Final authority is the remeasured semantic state, never the
-                // callback's claimed byte count. One retry is the bounded
-                // exhaustion contract: no second callback whatever the
-                // remeasure says.
-                let mut core = self.lock()?;
-                match Self::admission_preflight(&core, &class, &owner, context, kind, bytes) {
-                    AdmissionVerdict::Admit => {
-                        if commit {
-                            Self::reserve_committed_on(
-                                &mut core,
-                                class.clone(),
-                                owner.clone(),
-                                context,
-                                kind,
-                                bytes,
-                            )
-                        } else {
-                            Self::reserve_on(&mut core, class, owner, context, kind, bytes)
-                        }
-                    }
-                    AdmissionVerdict::Blocked { reason } => {
-                        core.reclaim_stats.blocked_denials += 1;
-                        Err(reason.into_error())
-                    }
-                    AdmissionVerdict::TerminalDenial { breach }
-                    | AdmissionVerdict::ReclaimCandidate { breach } => {
-                        core.reclaim_stats.terminal_denials += 1;
-                        Err(breach.into_error())
-                    }
+                AdmissionAction::Replace(old) => {
+                    Self::recharge_on(&mut core, old, class, owner, context, kind, bytes)
                 }
+            },
+            AdmissionVerdict::Blocked { reason } => {
+                if hard_retry {
+                    core.reclaim_stats.blocked_denials += 1;
+                }
+                Err(reason.into_error())
+            }
+            AdmissionVerdict::TerminalDenial { breach }
+            | AdmissionVerdict::ReclaimCandidate { breach } => {
+                if hard_retry {
+                    core.reclaim_stats.terminal_denials += 1;
+                }
+                Err(breach.into_error())
             }
         }
     }

@@ -239,13 +239,16 @@ check helpers that the control plane enforces (see group C/D).
   `sep23_audit_forged_reclaimed_bytes_are_recorded_but_never_trusted`,
   `sep23_audit_panicking_reclaimer_is_contained_and_broker_survives`,
   `sep23_audit_zero_byte_reserve_fires_no_callback_even_over_soft`, and
-  `sep23_audit_max_scale_plus_one_byte_denies_clean_without_callback`
+  `sep23_audit_max_scale_plus_one_byte_denies_clean_after_bounded_reclaim`
   (`core/src/api/control.rs`). Terminal/blocked denials never fire the
   callback; a predicted failure runs one hard plan, never soft-first. A live
   ticket-count cap is reclaimable when the host drops a ticket: it gets one
   callback and a fresh ledger check, even if the callback reports zero bytes.
   When tickets are 0-byte authorities in a zero-hard-byte class, that class
   remains a reclaim candidate at the ticket-count ceiling.
+  An unrepresentable but reclaimable byte postimage gets one callback with
+  `target.minimum_reduction = None`; without actual release, the original
+  limiting-axis denial and exact accounting preimage are preserved.
 - ✅ **Partial callback progress followed by panic** — `reclaimer_release_then_panic_uses_remeasured_ledger_not_callback_result` (`core/src/api/control.rs`) proves a host callback can release a real victim and then panic: callback failure is counted, but admission uses the remeasured ledger. One attempt, exact postimage and full drain are required.
 - ✅ 🔬 **Preflight/attempt agreement** —
   `sep23_fup003_preflight_attempt_agreement_randomized`

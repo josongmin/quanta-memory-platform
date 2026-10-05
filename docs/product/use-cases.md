@@ -848,12 +848,15 @@ P1/P2, durable storage, async wait, 동적 allocation, 새 DSL은 이 wave에 �
 
 | 작업 / 기존 세션 | 독점 수정 범위 | 지금 진행 / 의존 barrier |
 | --- | --- | --- |
-| T-Q2 / Fix QMP ratchet and ledger gaps | Q2 production core와 exports, 기존 callback caller의 필수 이행, test module 등록 | 공통 admission/reclaim contract 구현. Typed target의 정확한 Rust 선언을 먼저 게시. 다른 작업자의 새 UT 파일과 예제는 수정하지 않음 |
-| T-UT / quanta-memory-platform 평가 검증 | 새 replacement/reclaim owner UT module, 필요한 순수 domain oracle tests, retained-map/cross-store regression tests; QMP focused UT 실행 lane | 기존 coverage를 먼저 읽고 부족한 behavioral oracle만 추가. Production 수정 금지. Public target 세부 assertion은 T-Q2 선언 고정 후 진행 |
-| T-Q1 / QMP 100항목 체크리스트 검토 | 두 public examples, facade Cargo example entries, 기존 extraction verifier, README/EXTRACTION/MIGRATION의 소비자 설명 | Custom charge 예제와 extraction wiring 즉시 준비. Growth/target 예제는 T-Q2 계약 고정 후 확정. Core/UT와 이 문서 수정 금지 |
-| T-H2 / Summarize tools/pm emphasis | Host transcript adapter, compose session_transcript, SDK producer/request/forwarding와 해당 UT | Opaque incarnation·end custody·실제 caller 이행과 UT 작성. Compose lib/bootstrap, Cargo/locks는 T-INT 소유 |
-| T-H3 / 브랜치 워크트리 정리 | 실제 memo retention/GC 연결, compose private reclaimer module, lifecycle helper와 해당 UT | 실제 producer/보호 권한 확인부터 시작. Weak/GC/lease 반환 구현. 안전한 권한이 없으면 그 공급 경로를 선행 작업으로 해결. Compose lib/bootstrap, Cargo/locks는 T-INT 소유 |
-| T-INT / 워크트리 작업 체크포인트 조율 | 두 repository의 최종 Git 통합, H1 manifests/locks/checkout/static 계약, compose lib/bootstrap, 통합 test 파일과 qualification receipt | 소유권·static 계약·최종 selector 준비. QMP C 전에는 임의 pin을 넣지 않음. 최종에 QMP rail→C 발행→host H1/H2/H3 결합→host rail 수행 |
+| T-Q2 / QMP P0 · Q2 admission·reclaim 구현 | Q2 production core와 exports, 기존 callback caller의 필수 이행, test module 등록 | 공통 admission/reclaim contract 구현. Typed target의 정확한 Rust 선언을 먼저 게시. 다른 작업자의 새 UT 파일과 예제는 수정하지 않음 |
+| T-UT / QMP P0 · 독립 UT·회귀 검증 | 새 replacement/reclaim owner UT module, 필요한 순수 domain oracle tests, retained-map/cross-store regression tests; QMP focused UT 실행 lane | 기존 coverage를 먼저 읽고 부족한 behavioral oracle만 추가. Production 수정 금지. Public target 세부 assertion은 T-Q2 선언 고정 후 진행 |
+| T-Q1 / QMP P0 · Q1 공개 예제·추출 | 두 public examples, facade Cargo example entries, 기존 extraction verifier, README/EXTRACTION/MIGRATION의 소비자 설명 | Custom charge 예제와 extraction wiring 즉시 준비. Growth/target 예제는 T-Q2 계약 고정 후 확정. Core/UT와 이 문서 수정 금지 |
+| T-H2 / QMP P0 · H2 transcript·SDK 종료 | Host transcript adapter, compose session_transcript, SDK producer/request/forwarding와 해당 UT | Opaque incarnation·end custody·실제 caller 이행과 UT 작성. Compose lib/bootstrap, Cargo/locks는 T-INT 소유 |
+| T-H3 / QMP P0 · H3 memo GC·reclaimer | 실제 memo retention/GC 연결, compose private reclaimer module, lifecycle helper와 해당 UT | 실제 producer/보호 권한 확인부터 시작. Weak/GC/lease 반환 구현. 안전한 권한이 없으면 그 공급 경로를 선행 작업으로 해결. Compose lib/bootstrap, Cargo/locks는 T-INT 소유 |
+| T-INT / QMP P0 · H1 통합·최종 검증 | 두 repository의 최종 Git 통합, H1 manifests/locks/checkout/static 계약, compose lib/bootstrap, 통합 test 파일과 qualification receipt | 소유권·static 계약·최종 selector 준비. QMP C 전에는 임의 pin을 넣지 않음. 최종에 QMP rail→C 발행→host H1/H2/H3 결합→host rail 수행 |
+
+기존 세션의 제목을 위 작업명으로 변경하고 왼쪽 상단의 `QMP P0 병렬 작업` section에 모았다.
+새 세션을 중복 생성한 것이 아니며 기존 thread ID와 작업 owner는 유지한다.
 
 **파일과 변경 authority:** 같은 checkout에서 non-overlapping 파일만 병렬 수정한다. 겹치는
 owner/UT 파일이 발견되면 해당 파일은 기존 단일 writer가 수정하고 다른 작업자는 patch 제안만 전달한다.

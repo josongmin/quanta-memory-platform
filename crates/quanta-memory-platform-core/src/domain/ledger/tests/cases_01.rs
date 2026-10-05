@@ -270,6 +270,35 @@ fn ticket_id_exhaustion_fails_without_reuse() {
     assert_eq!(ledger.snapshot(), before, "exhaustion must not mutate or reuse an id");
 }
 #[test]
+fn committed_replacement_cannot_recycle_old_id_after_identifier_exhaustion() {
+    let mut ledger = ledger_from_policy(ResidencyPolicy::new(100));
+    let old = reserve(&mut ledger, MemoryClass::ArtifactCache, "old", 40).expect("old ticket");
+    ledger.commit(&old).expect("old committed");
+    ledger.next_ticket_id = Some(u64::MAX);
+    let last = reserve(&mut ledger, MemoryClass::ArtifactCache, "last", 0).expect("last id");
+    ledger.commit(&last).expect("zero-byte last authority");
+    let before = ledger.snapshot();
+    for bytes in [0, 20, 101] {
+        assert_eq!(
+            ledger.replace_committed(
+                &old,
+                MemoryClass::ArtifactCache,
+                "new".into(),
+                MemoryContextKind::Session,
+                ChargeKind::RetainedMetadata,
+                bytes
+            ),
+            Err(MemoryError::InvalidState("reservation ticket id space exhausted".into())),
+            "replacement {bytes} requires a fresh monotonic identity even with ticket delta zero"
+        );
+        assert_eq!(ledger.snapshot(), before, "permanent exhaustion preserves every old axis");
+    }
+    ledger.release(&old).expect("exhaustion does not strand old release authority");
+    ledger.release(&last).expect("drain last ticket");
+    assert_eq!(ledger.snapshot().live_ticket_count, 0);
+    assert_eq!(ledger.snapshot().total_owner_bytes(), 0);
+}
+#[test]
 fn borrow_over_class_cap_is_bounded_by_shared_burst_pool() {
     // global is roomy so only the class cap / burst pool gate the reserve.
     let mut ledger = ledger_from_policy(
