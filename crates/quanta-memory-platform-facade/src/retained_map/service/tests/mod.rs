@@ -1,5 +1,6 @@
 mod cases_01;
 mod cases_02;
+mod read_admission_v73;
 
 use super::*;
 use crate::test_support::SingleTestCommand;

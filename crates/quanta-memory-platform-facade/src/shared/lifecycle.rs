@@ -9,6 +9,43 @@ use std::sync::{Mutex, MutexGuard, TryLockError};
 
 use quanta_memory_platform_core::{MemoryError, MemoryResult};
 
+#[cfg(any(
+    feature = "payload_store",
+    feature = "retained_map",
+    feature = "transcript",
+    feature = "publish_pipeline"
+))]
+mod read_v73;
+
+/// A read refused before the caller's lookup callback runs. The caller can
+/// supply an already funded `MemoryError` for this condition.
+#[cfg(any(
+    feature = "payload_store",
+    feature = "retained_map",
+    feature = "transcript",
+    feature = "publish_pipeline"
+))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RetainedMapReadRefusalV73 {
+    OperationInProgress { resource: &'static str },
+    Poisoned { resource: &'static str },
+}
+
+#[cfg(any(
+    feature = "payload_store",
+    feature = "retained_map",
+    feature = "transcript",
+    feature = "publish_pipeline"
+))]
+impl RetainedMapReadRefusalV73 {
+    pub(crate) fn into_memory_error(self) -> MemoryError {
+        match self {
+            Self::OperationInProgress { resource } => MemoryError::operation_in_progress(resource),
+            Self::Poisoned { resource } => MemoryError::poisoned(format!("{resource} lock")),
+        }
+    }
+}
+
 const OPEN: u8 = 0;
 const OPERATION_IN_PROGRESS: u8 = 1;
 const CLOSING: u8 = 2;
@@ -171,6 +208,7 @@ impl StoreLifecycle {
     /// Read either a complete open-state image or the terminal empty image.
     /// A store calls this before and after acquiring its container lock, so a
     /// temporarily detached accounting plan is never mistaken for empty data.
+    #[cfg(any(feature = "revocable_store", test))]
     pub(crate) fn ensure_readable(&self) -> MemoryResult<()> {
         match self.phase() {
             StoreLifecyclePhase::Open | StoreLifecyclePhase::Closed => Ok(()),
@@ -205,14 +243,14 @@ impl StoreLifecycle {
         state: &Mutex<T>,
         read: impl FnOnce(&T) -> R,
     ) -> MemoryResult<R> {
-        self.ensure_readable()?;
-        let guard = self.try_lock_state(state)?;
-        self.ensure_readable()?;
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| read(&guard)));
-        drop(guard);
+        let result = self.with_read_state_with_refusal_v73(
+            state,
+            |state| Ok::<R, std::convert::Infallible>(read(state)),
+            RetainedMapReadRefusalV73::into_memory_error,
+        )?;
         match result {
             Ok(value) => Ok(value),
-            Err(payload) => std::panic::resume_unwind(payload),
+            Err(never) => match never {},
         }
     }
 

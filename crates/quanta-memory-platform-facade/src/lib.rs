@@ -107,7 +107,7 @@ pub use publish_pipeline::{
 #[cfg(feature = "retained_map")]
 pub use retained_map::{
     BoundRetainedMapStoreBuilder, RetainedMapInsertOrExistingV1, RetainedMapInsertOutcomeV1,
-    RetainedMapStore, RetainedMapStoreBuilder, SimpleRetainedMapStore,
+    RetainedMapReadRefusalV73, RetainedMapStore, RetainedMapStoreBuilder, SimpleRetainedMapStore,
 };
 #[cfg(all(feature = "revocable_store", feature = "spill"))]
 pub use revocable_store::RevocableSpillHandle;

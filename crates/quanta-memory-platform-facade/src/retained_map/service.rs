@@ -19,10 +19,14 @@ use crate::retained_map::{
 #[cfg(feature = "unbudgeted-stores")]
 use crate::shared::accounting::Unbudgeted;
 use crate::shared::accounting::{Budgeted, StoreAccounting};
+use crate::shared::lifecycle::RetainedMapReadRefusalV73;
 use crate::shared::lifecycle::{
     retire_client_value, BeginClose, DropTransition, InFlight, StoreLifecycle,
 };
 use crate::shared::measure::{semantic_cost_v1, ByteSized, RetainedCostV1};
+
+mod accounting;
+mod read_admission_v73;
 
 #[derive(Debug)]
 struct MapEntry<Value> {
@@ -268,21 +272,6 @@ where
     /// Committed retained bytes (sum of live entry charges).
     pub fn committed_bytes(&self) -> Result<u64, MemoryError> {
         self.lifecycle.with_read_state(&self.state, |state| state.committed_bytes)
-    }
-
-    fn committed_bytes_after_replace_v1(
-        committed_bytes: u64,
-        removed_bytes: u64,
-        added_bytes: u64,
-    ) -> Result<u64, StoreWriteError> {
-        let retained_without_old = committed_bytes.checked_sub(removed_bytes).ok_or_else(|| {
-            MemoryError::InvalidState(
-                "retained-map committed bytes are smaller than the replaced entry".to_string(),
-            )
-        })?;
-        retained_without_old
-            .checked_add(added_bytes)
-            .ok_or_else(|| MemoryError::capacity("retained-map committed byte accounting overflow"))
     }
 
     /// Publish `value` only when `key` is absent, otherwise return the existing
@@ -535,9 +524,14 @@ where
     }
 
     fn get_checked(&self, key: &Key) -> Result<Option<Value>, MemoryError> {
-        self.lifecycle.with_read_state(&self.state, |state| {
-            state.entries.get(key).map(|entry| entry.value.clone())
-        })
+        match self.get_checked_with_admission_v73(
+            key,
+            |_| Ok::<(), std::convert::Infallible>(()),
+            RetainedMapReadRefusalV73::into_memory_error,
+        )? {
+            Ok(value) => Ok(value),
+            Err(never) => match never {},
+        }
     }
 
     fn remove(&self, key: &Key) -> Result<Option<Value>, MemoryError> {

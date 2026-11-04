@@ -7,6 +7,7 @@ use quanta_memory_platform_core::{
 };
 
 pub use crate::shared::builder::{BoundRetainedMapStoreBuilder, RetainedMapStoreBuilder};
+pub use crate::shared::lifecycle::RetainedMapReadRefusalV73;
 pub use service::SimpleRetainedMapStore;
 
 /// Result of an atomic insert-if-absent publication.
