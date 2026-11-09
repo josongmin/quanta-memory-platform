@@ -1,8 +1,33 @@
+<p align="center"><img src="readme-banner.svg" alt="Quanta Memory Platform — Budget authority for retained data, ownership transfer, and reclaim." width="100%"></p>
+
 # Quanta Memory Platform
 
 A portable Rust library for **semantic memory budgeting, accounting, and lifecycle control**. A host decides what data means; QMP decides whether retaining it is admissible and tracks the authority to retain, transfer, and release it.
 
 [Use cases](docs/product/use-cases.md) · [Architecture decisions](docs/adr/README.md) · [Migration](MIGRATION.md) · [Verification contract](docs/verification-scenarios.md)
+
+
+## Engineering highlights
+
+| Mechanism | Engineering purpose |
+| :--- | :--- |
+| **Ledger-owned authority** | Budgeted operations reserve and commit accounting authority; allocator telemetry is advisory rather than the source of truth. |
+| **Fail-closed mutation** | A failed accounting operation leaves the ledger unchanged instead of partially charging or releasing counters. |
+| **Ownership and custody** | Class, owner, and context attribution make retained data, ownership transfer, and reclaim explicit contracts. |
+| **Builder-first integration** | Consumers configure the facade through public builders; host adapters remain outside this portable library. |
+| **Feature-scoped stores** | Payload, retained-map, revocable, transcript, and publication slices can be selected without adopting durable disk backing. |
+
+
+## Architecture at a glance
+
+```mermaid
+flowchart LR
+    H["Consumer / host adapter"] --> F["Facade builders and store APIs"]
+    F --> C["Core domain and ports"]
+    F --> B["Feature-selected backings"]
+    T["Testkit and conformance"] --> F
+    T --> C
+```
 
 ## What QMP owns
 
