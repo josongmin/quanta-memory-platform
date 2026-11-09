@@ -2,23 +2,25 @@
 
 # Quanta Memory Platform
 
+<p align="center"><a href="#engineering-highlights">Engineering</a> · <a href="#architecture">Architecture</a> · <a href="#start-with-the-builder">Get started</a> · <a href="#documentation">Reference</a></p>
+
 A portable Rust library for **semantic memory budgeting, accounting, and lifecycle control**. A host decides what data means; QMP decides whether retaining it is admissible and tracks the authority to retain, transfer, and release it.
 
 [Use cases](docs/product/use-cases.md) · [Architecture decisions](docs/adr/README.md) · [Migration](MIGRATION.md) · [Verification contract](docs/verification-scenarios.md)
 
-
 ## Engineering highlights
 
-| Mechanism | Engineering purpose |
-| :--- | :--- |
-| **Ledger-owned authority** | Budgeted operations reserve and commit accounting authority; allocator telemetry is advisory rather than the source of truth. |
-| **Fail-closed mutation** | A failed accounting operation leaves the ledger unchanged instead of partially charging or releasing counters. |
-| **Ownership and custody** | Class, owner, and context attribution make retained data, ownership transfer, and reclaim explicit contracts. |
-| **Builder-first integration** | Consumers configure the facade through public builders; host adapters remain outside this portable library. |
-| **Feature-scoped stores** | Payload, retained-map, revocable, transcript, and publication slices can be selected without adopting durable disk backing. |
+| Mechanism | Engineering purpose | Source |
+| :--- | :--- | :--- |
+| **Ledger-owned authority** | Budgeted operations reserve and commit accounting authority; allocator telemetry is advisory rather than the source of truth. | [Ledger](crates/quanta-memory-platform-core/src/domain/ledger.rs) |
+| **Fail-closed mutation** | A failed accounting operation leaves the ledger unchanged instead of partially charging or releasing counters. | [Ledger operations](crates/quanta-memory-platform-core/src/domain/ledger/operations.rs) |
+| **Ownership and custody** | Class, owner, and context attribution make retained data, ownership transfer, and reclaim explicit contracts. | [Core domain](crates/quanta-memory-platform-core/src/domain/) |
+| **Builder-first integration** | Consumers configure the facade through public builders; host adapters remain outside this portable library. | [Public builder](crates/quanta-memory-platform-facade/src/shared/builder.rs) |
+| **Feature-scoped stores** | Payload, retained-map, revocable, transcript, and publication slices can be selected without adopting durable disk backing. | [Feature gates](crates/quanta-memory-platform-facade/Cargo.toml) |
 
+## Architecture
 
-## Architecture at a glance
+<a id="architecture-at-a-glance"></a>
 
 ```mermaid
 flowchart LR
@@ -28,6 +30,8 @@ flowchart LR
     T["Testkit and conformance"] --> F
     T --> C
 ```
+
+Dependency direction is `core <- facade <- testkit`; no package depends on a host. The Semantica adapter lives outside this repository. Existing `MemoryClass` labels such as `MemoResidency`, `PtaResumeState`, and `IdeWorkingSet` are ledger keys and preset weights, not embedded host algorithms. Portable-taxonomy work remains a separate RFC target.
 
 ## What QMP owns
 
@@ -42,16 +46,6 @@ flowchart LR
 
 QMP is not an allocator, RSS limiter, or general-purpose database. Allocator telemetry is advisory; the semantic ledger is authoritative. `Context` is an overflow-checked accounting bucket, not a hard context cap. Reclaim rungs are host hints, not a broker-executed eviction ladder.
 
-## Architecture
-
-```text
-host adapter → facade → core
-                 ↑
-              testkit
-```
-
-Dependency direction is `core <- facade <- testkit`; no package depends on a host. The Semantica adapter lives outside this repository. Existing `MemoryClass` labels such as `MemoResidency`, `PtaResumeState`, and `IdeWorkingSet` are ledger keys and preset weights, not embedded host algorithms. Portable-taxonomy work remains a separate RFC target.
-
 ## Start with the builder
 
 Construct the facade rather than a raw ledger or broker:
@@ -59,13 +53,15 @@ Construct the facade rather than a raw ledger or broker:
 ```rust
 use quanta_memory_platform_facade::{MemoryPlatformBuilder, PortableMemoryPresets};
 
-let platform = MemoryPlatformBuilder::new()
-    .with_manifest(PortableMemoryPresets::development())
-    .build()?;
+fn main() -> Result<(), quanta_memory_platform_core::MemoryError> {
+    let platform = MemoryPlatformBuilder::new()
+        .with_manifest(PortableMemoryPresets::development())
+        .build()?;
 
-// Create budgeted stores from this one platform/ledger.
-// let store = platform.payload_store_builder::<PayloadRef, Vec<u8>>().build()?;
-# Ok::<(), quanta_memory_platform_core::MemoryError>(())
+    // Create budgeted stores from this one platform/ledger.
+    // let store = platform.payload_store_builder::<PayloadRef, Vec<u8>>().build()?;
+    Ok(())
+}
 ```
 
 `build_report_only()` returns the effective budget report without creating runtime or accounting authority.
@@ -133,3 +129,5 @@ Consumer integration, deployment, and activation are separate from library-local
 - [Change inventory](CHANGELOG.md)
 - [QMP/host authority map](docs/ssot/README.md)
 - [Plans and remaining work](docs/plans/README.md)
+
+<p align="center"><sub><a href="https://github.com/josongmin">Project map</a> · <a href="#engineering-highlights">Back to overview</a></sub></p>
