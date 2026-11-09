@@ -1,55 +1,35 @@
-# quanta-memory-platform
+# Quanta Memory Platform
 
-`quanta-memory-platform` is a portable Rust library for **semantic memory
-budgeting, accounting, and lifecycle control**. A host uses it to decide
-whether retaining data is allowed, charge that data to an owner/class/context,
-and release or transfer that authority without counter drift.
+A portable Rust library for **semantic memory budgeting, accounting, and lifecycle control**. A host decides what data means; QMP decides whether retaining it is admissible and tracks the authority to retain, transfer, and release it.
 
-It is not an allocator, an RSS limiter, a general-purpose database, or the
-Semantica host adapter. Allocator telemetry is advisory; the ledger is the
-accounting source of truth.
+[Use cases](docs/product/use-cases.md) · [Architecture decisions](docs/adr/README.md) · [Migration](MIGRATION.md) · [Verification contract](docs/verification-scenarios.md)
 
-## Status and boundary
+## What QMP owns
 
-This workspace is an internal, pre-1.0 library (`0.2.0`, `publish = false`).
-Consumers can use the public facade builder API directly; Semantica adoption
-is not required. Repo-local checks establish library behavior. Host-specific
-integration, deployment and activation are separate consumer work.
+| Area | Contract |
+| --- | --- |
+| Admission | Global/class/owner budgets, scratch/headroom, reserved/soft/hard caps, resource groups, and bounded shared borrowing |
+| Accounting | Atomic reserve, commit, release, recharge, and restore; rejected mutations leave accounting unchanged |
+| Retention | Payloads, retained maps, revocable stores, prepared publication, and transcripts use the same broker |
+| Pressure | Reclaim callbacks run outside the broker lock; hard-cap admission retries at most once after remeasurement |
+| Transfer | In-process ownership transfer preserves accounting authority |
+| Verification | Conformance fakes, deterministic failures, allocation tracking, Loom models, and feature/extraction checks |
 
-Current product scope is in-memory accounting and reclaim. Redb-backed durable
-spill, its codec, and disk-recovery qualification are **excluded from the active
-QMP/SDK/Semantica plan**: no current consumer requirement has been identified.
-The opt-in code still exists in this 0.2 workspace, but is **not
-production-qualified or supported as a current product capability**. This
-scope decision does not remove its API or turn historical test results into a
-release claim.
-Reconsider it only with a named consumer, measured reuse benefit, and an owned
-disk-failure and invalidation contract.
-Physical power-loss qualification (L3) is therefore not a current defect,
-backlog item, or release gate. Open that work only if a named consumer adopts
-`spill-redb` and requires a production power-loss guarantee for a specified
-device, filesystem, mount configuration, and recovery policy.
+QMP is not an allocator, RSS limiter, or general-purpose database. Allocator telemetry is advisory; the semantic ledger is authoritative. `Context` is an overflow-checked accounting bucket, not a hard context cap. Reclaim rungs are host hints, not a broker-executed eviction ladder.
 
-The host adapter is deliberately outside this repository:
+## Architecture
 
 ```text
-Semantica quanta-memory-host  ->  quanta-memory-platform-facade  ->  core
-                                                        ^
-                                                        |
-                                                     testkit
+host adapter → facade → core
+                 ↑
+              testkit
 ```
 
-Dependency direction is strict: `core <- facade <- testkit`. No package here
-may depend on a host. Public APIs do **not** import the Semantica host crate.
-`MemoryClass` still uses stable class labels that originated as host workload
-names (`MemoResidency`, `PtaResumeState`, `PtaAuthorityState`,
-`PtaPortableBundle`, `IdeWorkingSet`). Those variants are ledger keys and
-preset weights, not Memo/PTA/IDE algorithms. RFC 0001 remains the 0.3
-portable-taxonomy target.
+Dependency direction is `core <- facade <- testkit`; no package depends on a host. The Semantica adapter lives outside this repository. Existing `MemoryClass` labels such as `MemoResidency`, `PtaResumeState`, and `IdeWorkingSet` are ledger keys and preset weights, not embedded host algorithms. Portable-taxonomy work remains a separate RFC target.
 
-## Start here
+## Start with the builder
 
-Consumers should construct the facade, not a raw ledger or broker:
+Construct the facade rather than a raw ledger or broker:
 
 ```rust
 use quanta_memory_platform_facade::{MemoryPlatformBuilder, PortableMemoryPresets};
@@ -63,12 +43,11 @@ let platform = MemoryPlatformBuilder::new()
 # Ok::<(), quanta_memory_platform_core::MemoryError>(())
 ```
 
-For a configuration-only caller, use `build_report_only()`; it returns an
-effective budget report but creates no runtime or accounting authority.
+`build_report_only()` returns the effective budget report without creating runtime or accounting authority.
 
-Runnable public examples:
+Runnable examples:
 
-```bash
+```sh
 cargo run -p quanta-memory-platform-facade --example hello_world
 cargo run -p quanta-memory-platform-facade --example effective_budget_report
 cargo run -p quanta-memory-platform-facade --features core-live-accounting --example managed_charge_lifecycle
@@ -76,112 +55,56 @@ cargo run -p quanta-memory-platform-facade --features core-live-accounting,retai
 cargo run -p quanta-memory-platform-facade --features transcript --example transcript_session
 ```
 
-## What it covers
+## Choose the required features
 
-The consumer goals, workflows, failure contracts and host responsibilities are
-consolidated in [QMP use cases](docs/product/use-cases.md). The table below is a
-capability overview; the 0.3 RFC remains a separate, unimplemented design target.
-
-| Area | Contract |
+| Feature | Surface |
 | --- | --- |
-| Budget control | Global, class, owner, execution-scratch, headroom, reserved/soft/hard caps, resource groups, and bounded shared borrowing. `Context` is an accounting bucket with overflow guards, not a hard context cap. Reclaim rungs are host hints; the broker does not walk the ladder. |
-| Accounting | Every budgeted mutation is fail-closed; a charge is reserved, committed, released, recharged, or restored atomically. |
-| Retaining data | Canonical payloads, retained maps, FIFO revocable stores, prepared publication, and session transcripts all route bytes through the same broker. |
-| Pressure | Soft-cap reclaim requests run outside the broker lock; hard-cap admission retries at most once after remeasurement. |
-| Transfer | In-process transfer preserves accounting authority; the existing optional durable path is outside the active product plan. |
-| Correctness tooling | Conformance fakes, deterministic fault scenarios, allocation tracking, Loom models, feature-matrix checks, and standalone extraction checks. |
+| `payload_store` | Canonical retained payloads |
+| `retained_map` | Typed retained key/value map |
+| `revocable_store` | FIFO reclaimable store |
+| `transcript` | Session handles, bounded pages, replay evidence, and explicit retirement |
+| `publish_pipeline` | Prepared publication with caller-owned canonical roots |
+| `spill` | Portable in-process spill contracts |
+| `full` | All in-memory facade slices; no durable backing |
+| `spill-durable` | Existing optional durable protocol/restore API; no disk backing |
+| `spill-redb` | Existing optional Redb backing; maintenance scope |
+| `full-backings` | Existing aggregate including Redb; not a current release target |
 
-Management metadata has independent public bounds because a zero-byte ticket
-still owns single-use authority: one broker admits at most
-MAX_LIVE_TICKETS_PER_BROKER live tickets, owner and resource-group identifiers
-are limited to 256 UTF-8 bytes, and deferred ticket cleanup processes at most
-MAX_DEFERRED_TICKET_DRAIN_BATCH authorities per broker-lock acquisition. These
-are logical bookkeeping bounds, not an RSS guarantee.
+Default features enable live accounting. `unbudgeted-stores` is a distinct product type for fixtures or deliberate non-accounted use, excluded from default/full/full-backings. `--all-features` exercises it as an isolated surface.
 
-Public payload/metadata totals are semantic **charge buckets per owned
-lifetime component**, not per-field byte telemetry: a bucket covers the
-retained object together with the key/index/entry overhead held under the
-same lease. The prepared-publication service splits its two leases across
-buckets — the active payload component is charged as payload and the
-persistent identity/index/tombstone evidence is charged as metadata, so an
-aborted entry leaves a metadata-only tombstone. Prepared-publication
-orphan enumeration and GC also bound the raw caller-supplied
-reference-root slice at 16,384 tokens (duplicates counted) and reject a
-larger slice with a typed storage capacity error before any state lock.
+## Bounds and lifecycle details
 
-The authority, lifecycle, failure and verification boundaries are in the
-[architecture decisions](docs/adr/README.md).
+Zero-byte tickets still carry single-use authority. Ticket count, identifier size, and deferred cleanup therefore have independent bounds: `MAX_LIVE_TICKETS_PER_BROKER`, 256 UTF-8 bytes per owner/resource-group identifier, and `MAX_DEFERRED_TICKET_DRAIN_BATCH` per broker-lock acquisition.
 
-## Feature selection
+Payload/metadata totals are semantic charge buckets for owned lifetime components, not per-field physical-byte telemetry. Prepared publication uses separate leases for active payload and persistent identity/index/tombstone evidence. An aborted entry can retain metadata-only authority. Orphan/GC reference-root input is bounded at 16,384 tokens, including duplicates, before acquiring the state lock.
 
-`quanta-memory-platform-facade` defaults to live accounting. Enable only the
-store slices a consumer needs:
+## Checks and integration
 
-| Feature | Enables |
-| --- | --- |
-| `payload_store` | Canonical retained payload store. |
-| `retained_map` | Typed retained key/value map. |
-| `revocable_store` | FIFO reclaimable store. |
-| `transcript` | Session-handle transcript with bounded pages, replay evidence, and explicit retirement. |
-| `publish_pipeline` | Prepared-publication lifecycle with caller-owned canonical-root visibility. |
-| `spill` | Portable in-process spill contracts. |
-| `spill-durable` | Opt-in durable protocol and restore API, without a disk backing; maintenance scope. |
-| `spill-redb` | Existing opt-in Redb backing; enables `spill-durable` and is not production-qualified or supported as a current product capability. |
-| `full` | All in-memory facade slices; no durable backing dependency. |
-| `full-backings` | Existing aggregate feature that adds `spill-redb`; not a current release target or production qualification claim. |
-
-The optional durable custody contract is recorded in
-[ADR 0002](docs/adr/0002-store-custody-and-durable-spill.md); it is not an
-SDK integration or release prerequisite.
-
-`unbudgeted-stores` is an explicit, distinct product type for fixtures or
-deliberate non-accounted use. It is absent from `default`, `full`, and
-`full-backings`; `--all-features` enables it only to test that isolated surface.
-
-## Repository checks
-
-```bash
-# optional short command front door (delegates to the scripts below)
+```sh
 just check
 just in-memory
-
-# authoritative repo-local static, contract, feature, test, and dependency rail
 scripts/check-workspace.sh
-
-# shorter local in-memory check; does not build/test Redb or qualify extraction
 scripts/check-workspace.sh --in-memory
-
-# public broker/store scaling and final semantic/allocator-drift checks
-scripts/run-scaling-bench.sh --smoke
-scripts/run-scaling-bench.sh
-
-# fail-closed standalone-repository preflight
 scripts/extract-to-standalone-repo.sh --dry-run /path/to/qmp-extracted
 ```
 
-The scaling results are same-host signals, not portable latency guarantees.
-The main-push and PR-update CI entry point is `.circleci/config.yml`, which verifies a
-clean standalone extraction, its full workspace rail, and the public examples.
-Check the live trigger with `python3 scripts/verify-hosted-ci-binding.py` before
-accepting a hosted green; also confirm the exact SHA's extraction step ran.
-The explicit `run_heavy=true` CircleCI workflow collects three independent full 60-row `in-memory-pressure`
-v4 process receipts and one 220-row standard scaling receipt at one pinned commit,
-retaining each raw JSONL artifact. Passing those receipts establishes only the
-profiles' absolute/structural guards; release regression or SLO claims still
-require an approved policy and compatible baseline receipts as described in
-[verification scenarios](docs/verification-scenarios.md).
-Extraction and host adoption are separate operations; see
-[EXTRACTION.md](EXTRACTION.md).
+The full script is the repository-local static, contract, feature, dependency, and test authority. The shorter in-memory rail excludes Redb and does not qualify standalone extraction. Scaling commands and evidence policies are documented in [verification scenarios](docs/verification-scenarios.md).
 
-## Documentation map
+CircleCI's normal workflow verifies a clean standalone extraction, the extracted workspace, and public examples. Confirm the exact SHA and live binding with `python3 scripts/verify-hosted-ci-binding.py`; configuration alone does not prove execution. Heavy scaling receipts are opt-in and are separate from an approved regression baseline or service SLO.
 
-| Need | Document |
-| --- | --- |
-| Consumer use cases and responsibility boundaries | [docs/product/use-cases.md](docs/product/use-cases.md) |
-| Architecture and ownership decisions | [docs/adr/README.md](docs/adr/README.md) |
-| Standalone-repository extraction procedure | [EXTRACTION.md](EXTRACTION.md) |
-| Consumer breaking changes | [MIGRATION.md](MIGRATION.md) |
-| Release inventory | [CHANGELOG.md](CHANGELOG.md) |
-| QMP and Semantica contract ownership | [docs/ssot/README.md](docs/ssot/README.md) |
-| Current plan status and remaining gates | [docs/plans/README.md](docs/plans/README.md) |
-| Executable verification contract | [docs/verification-scenarios.md](docs/verification-scenarios.md) |
+## Status and boundaries
+
+The workspace is pre-1.0 (`0.2.0`, `publish = false`, `UNLICENSED`). Public source visibility does not change its license or registry-publication status.
+
+The active product scope is **in-memory accounting and reclaim**. Durable Redb spill, its codec, and disk/power-loss qualification are excluded from the current QMP/SDK/Semantica plan. Existing optional code is retained as maintenance scope and is not a production-qualified capability. Reopen that work only for a named consumer with a measured benefit and an owned recovery/invalidation contract.
+
+Consumer integration, deployment, and activation are separate from library-local checks. Standalone extraction is described in [EXTRACTION.md](EXTRACTION.md).
+
+## Documentation
+
+- [Consumer use cases](docs/product/use-cases.md)
+- [Architecture and custody decisions](docs/adr/README.md)
+- [Breaking changes](MIGRATION.md)
+- [Change inventory](CHANGELOG.md)
+- [QMP/host authority map](docs/ssot/README.md)
+- [Plans and remaining work](docs/plans/README.md)
